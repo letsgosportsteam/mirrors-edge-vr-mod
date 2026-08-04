@@ -1,0 +1,17 @@
+# Git hooks are run by sh. A CRLF line ending after the `#!/bin/sh` shebang makes the
+# kernel look for an interpreter literally named "/bin/sh\r", and the failure surfaces as
+# a confusing "bad interpreter: no such file or directory" or, worse on Windows, as the
+# hook silently not running - which would leave you believing you are protected when you
+# are not. Force LF regardless of anyone's core.autocrlf setting.
+.githooks/* text eol=lf
+*.sh        text eol=lf
+
+# PowerShell is fine with either, but keeping the repo consistent means a diff never
+# shows a whole file changed because someone's editor rewrote the endings.
+*.ps1       text eol=crlf
+
+*.cpp       text
+*.h         text
+*.c         text
+*.md        text
+*.def       text

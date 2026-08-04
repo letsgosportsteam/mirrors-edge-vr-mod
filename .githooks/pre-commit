@@ -1,0 +1,66 @@
+#!/bin/sh
+# Refuse to create a commit whose author or committer email is not a private
+# GitHub noreply address.
+#
+# WHY THIS EXISTS
+# Commit authorship is permanent and public. Once a commit carrying a real email
+# address is pushed, removing it means rewriting history and force-pushing, and
+# GitHub may still serve the old object from its cache. The cheapest place to stop
+# that is before the commit exists at all.
+#
+# WHAT IT CHECKS
+# `git var` is used rather than `git config user.email` deliberately: it reports the
+# identity git has ACTUALLY resolved for this commit, which accounts for the
+# GIT_AUTHOR_EMAIL / GIT_COMMITTER_EMAIL environment variables and for repo-vs-global
+# config precedence. Reading the config directly would miss an env override and report
+# a value that is not the one about to be written.
+#
+# Author and committer are checked separately because they are separate fields and
+# only the author one is easy to override by accident (`git commit --author=...`,
+# `git rebase`, patches applied with `git am`).
+#
+# CONFIGURING IT
+#   git config hooks.allowedEmailSuffix "@users.noreply.github.com"
+# Defaults to the GitHub noreply suffix if unset.
+#
+# BYPASS
+# `git commit --no-verify` skips this, as it skips every hook. That is deliberate on
+# git's part and cannot be disabled locally. This hook stops accidents, not intent.
+# The backstop you cannot bypass from this machine is GitHub's server-side setting,
+# "Block command line pushes that expose my email".
+
+set -e
+
+suffix=$(git config hooks.allowedEmailSuffix || true)
+[ -n "$suffix" ] || suffix="@users.noreply.github.com"
+
+ident_email() {
+    # `git var` prints: Name <email> 1700000000 +0000
+    git var "$1" | sed -e 's/^.*<//' -e 's/>.*$//'
+}
+
+fail() {
+    echo ""
+    echo "COMMIT BLOCKED - $1 email is not private" >&2
+    echo "" >&2
+    echo "  $1 email : $2" >&2
+    echo "  required suffix : $suffix" >&2
+    echo "" >&2
+    echo "  Find your noreply address at GitHub -> Settings -> Emails, then:" >&2
+    echo "" >&2
+    echo "    git config user.email \"ID+USERNAME$suffix\"" >&2
+    echo "    git config user.name  \"USERNAME\"" >&2
+    echo "" >&2
+    echo "  Set it WITHOUT --global. This repository uses a different account than" >&2
+    echo "  your others, and a global setting would follow you into all of them." >&2
+    echo "" >&2
+    exit 1
+}
+
+author=$(ident_email GIT_AUTHOR_IDENT)
+committer=$(ident_email GIT_COMMITTER_IDENT)
+
+case "$author"    in *"$suffix") ;; *) fail "author"    "$author"    ;; esac
+case "$committer" in *"$suffix") ;; *) fail "committer" "$committer" ;; esac
+
+exit 0

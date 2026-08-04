@@ -1,0 +1,56 @@
+# ---- machine-local paths ----
+# Nothing in this repo hardcodes a path on anyone's machine. Each developer copies
+# paths.local.ps1.example to paths.local.ps1 and fills in their own. That file is the
+# ONLY place a local path is allowed to exist, and it is never committed.
+paths.local.ps1
+*.local.ps1
+!*.local.ps1.example
+
+# ---- build output ----
+*.dll
+*.exe
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.log
+# /analyze output - build.ps1 runs a static-analysis pass, see the note in it
+*.nativecodeanalysis.xml
+
+# keep the OpenXR loader out - it is vendored at build time from the SDK
+openxr_loader*.dll
+
+# ---- run artefacts ----
+last_run.log
+run*.log
+
+# ---- NEVER COMMIT ----
+# Game-derived data. Ghidra projects contain a full analysis of the game binary, and
+# save files are the user's own game data. Both live outside this tree by design; these
+# entries exist so an accidental copy cannot slip in.
+*.gpr
+*.rep/
+ghidra_projects/
+save_backups/
+*.ue3profile*
+
+# extracted or decompiled game content of any kind
+uscript/
+script_dump/
+*.upk
+*.u
+*.xxx
+
+# ---- tooling local state ----
+# Claude Code's per-project settings record absolute paths from this machine. Something
+# already excludes this by default, but "already excluded by something" is not a guarantee
+# worth trusting with a file that provably contains a user profile path.
+.claude/settings.local.json
+
+# ---- editor / OS ----
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini

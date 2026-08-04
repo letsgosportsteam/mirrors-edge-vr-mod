@@ -1,0 +1,69 @@
+#!/bin/sh
+# Refuse to push if ANY commit being sent carries a non-private email address.
+#
+# WHY BOTH THIS AND pre-commit
+# pre-commit only sees commits made on this machine, after the hook was installed,
+# by someone who did not pass --no-verify. This one inspects the finished commits
+# actually about to leave the machine, so it also catches:
+#
+#   - commits made before the hook existed
+#   - commits authored elsewhere and merged, cherry-picked, or applied with `git am`
+#   - commits rewritten by a rebase, which re-runs neither pre-commit nor commit-msg
+#   - a single --no-verify slip earlier in the session
+#
+# It is the last check that runs on your machine. After this, the commits are public.
+#
+# It reads the ref updates git feeds it on stdin, one per line:
+#   <local ref> <local sha> <remote ref> <remote sha>
+
+set -e
+
+suffix=$(git config hooks.allowedEmailSuffix || true)
+[ -n "$suffix" ] || suffix="@users.noreply.github.com"
+
+zero=$(git hash-object --stdin </dev/null | tr '[0-9a-f]' '0')
+bad=""
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    # Deleting a remote branch pushes no objects.
+    [ "$local_sha" = "$zero" ] && continue
+
+    if [ "$remote_sha" = "$zero" ]; then
+        # New branch on the remote: everything reachable from it that the remote
+        # does not already have.
+        range="$local_sha --not --remotes"
+    else
+        range="$remote_sha..$local_sha"
+    fi
+
+    # %ae = author email, %ce = committer email. Both are published.
+    found=$(git log --format='%h %ae %ce' $range | awk -v s="$suffix" '
+        function ends_with(str, sfx) {
+            return length(str) >= length(sfx) &&
+                   substr(str, length(str) - length(sfx) + 1) == sfx
+        }
+        !ends_with($2, s) || !ends_with($3, s) { print "    " $0 }
+    ')
+    [ -n "$found" ] && bad="$bad$found\n"
+done
+
+if [ -n "$bad" ]; then
+    echo "" >&2
+    echo "PUSH BLOCKED - these commits carry a non-private email address:" >&2
+    echo "" >&2
+    printf "%b" "$bad" >&2
+    echo "" >&2
+    echo "  required suffix : $suffix" >&2
+    echo "" >&2
+    echo "  Nothing has been sent. To rewrite the author and committer of every" >&2
+    echo "  commit on this branch, after fixing your config:" >&2
+    echo "" >&2
+    echo "    git config user.email \"ID+USERNAME$suffix\"" >&2
+    echo "    git rebase -r --root --exec 'git commit --amend --no-edit --reset-author'" >&2
+    echo "" >&2
+    echo "  Check the result with:  git log --format='%h %ae %ce'" >&2
+    echo "" >&2
+    exit 1
+fi
+
+exit 0
