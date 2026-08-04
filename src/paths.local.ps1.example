@@ -1,0 +1,17 @@
+# Machine-local paths. Copy this file to `paths.local.ps1` and edit it.
+#
+# `paths.local.ps1` is gitignored and is the ONLY place in this repository where a path
+# on somebody's machine is allowed to live. Nothing else hardcodes one, so the repo is
+# safe to publish and portable between machines without edits.
+#
+# Environment variables override these, so CI or a second machine can set
+# MEVR_OPENXR_SDK / MEVR_GAME_BIN instead of writing this file at all.
+
+# The OpenXR SDK, unpacked. Must contain include\ and native\Win32\release\{lib,bin}.
+# Win32 (x86) is not optional - Mirror's Edge is a 32-bit process.
+$OpenXrSdk = "X:\path\to\openxr-sdk"
+
+# The Binaries folder of a DISPOSABLE copy of the game - the one `-Install` writes into.
+# Do not point this at your only install; the mod drops a d3d9.dll next to the exe and
+# testing means crashing the game repeatedly.
+$GameBin = "X:\path\to\MirrorsEdge-Dev\Binaries"
