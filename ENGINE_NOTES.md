@@ -315,6 +315,23 @@ GObjects TArray @ .data 0x0204A344   Data=0x460F0000  Count=114081  Max=123943
 That is UE3's bootstrap class registration order, which is what confirms it — the same
 sequence the Singularity notes record.
 
+**Verified end to end**: walking all 113,310 live objects and matching names finds every class
+the project needs.
+
+```
+walked 113310 live objects of 113310 slots
+  TdPlayerPawn        FOUND (2)     TdPlayerController  FOUND (2)
+  TdPlayerCamera      FOUND (2)     TdSwanNeck          FOUND (2)
+  TdGameInfo          FOUND (1)
+```
+
+Two hits per class is expected — the `UClass` and its instance share a name. Telling them
+apart needs `Outer` and `Class`, which are not yet derived; the Singularity rule was that a
+live actor has `Outer == PersistentLevel` and a name without the `Default__` prefix.
+
+The scoring table also flags three other varying offsets worth identifying later: `+0x04`
+(132/400, 64 distinct), `+0x24` (330/400, 64 distinct) and `+0x50` (135/400, 55 distinct).
+
 > **⚠️ Hit rate alone cannot find this offset, and it took a wasted run to see why.** In the
 > first scoring pass, `+0x18`, `+0x1C`, `+0x2C`, `+0x30`, `+0x40`, `+0x44` and `+0x48` all
 > scored **400/400** and the detector correctly refused to choose.
