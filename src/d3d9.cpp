@@ -1349,6 +1349,11 @@ static void ProbeKnownObjects()
 // which is already guarded. It touches no D3D or OpenXR state. The object graph may shift
 // underneath it, which costs a missed candidate at worst, never a wrong one - every match is
 // validated against three exact strings before it is believed.
+// Defined below. The scan body reads better before them, so they are declared here rather
+// than reordered.
+static void DetectPointerFields();
+static void ProbeSwanNeck();
+
 static DWORD WINAPI ObjectModelThread(LPVOID)
 {
     Log("");
@@ -1362,11 +1367,145 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
         if (FindGObjects()) {
             DetectUObjectLayout();
             ProbeKnownObjects();
+            DetectPointerFields();
+            ProbeSwanNeck();
         }
     }
     Log("======== scan took %.1f ms (off the render thread) ========", NowMs() - t0);
     Log("");
     return 0;
+}
+
+// ---- which header dwords are pointers to other UObjects? ----
+//
+// Name was found by decoding it. Outer and Class cannot be: they hold POINTERS, not name
+// indices, so the name-scoring pass is blind to them. The test here is "does this dword point
+// at something that is itself a UObject" - a vtable inside the module, and a decodable name at
+// the offset we already trust.
+//
+// Sample pointee names are logged rather than a verdict being computed. Singularity's notes
+// record picking +0x28 as Class because 783 objects pointed at the right UClasses - and being
+// wrong, because those were the classes' own members, whose OUTER is the class. Pointing at a
+// UClass is not sufficient evidence of being Class, so the names go in the log for judgement
+// rather than into an automatic answer that has already misfired once elsewhere.
+static void DetectPointerFields()
+{
+    if (!g_gobjAddr || g_offName < 0) return;
+    uint32_t data, count;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return;
+
+    const int kMaxOff = 0x60, kSlots = kMaxOff / 4;
+    int pts[kSlots] = {}, sampled = 0;
+
+    for (uint32_t i = 0; i < count && sampled < 400; ++i) {
+        uint32_t obj;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+        uint32_t vt;
+        if (!SafeU32(obj, &vt) || !InModule(vt)) continue;
+        sampled++;
+        for (int off = 4; off < kMaxOff; off += 4) {
+            uint32_t p;
+            if (!SafeU32(obj + off, &p) || p < 0x10000) continue;
+            uint32_t pvt, pn; char nm[64];
+            if (!SafeU32(p, &pvt) || !InModule(pvt)) continue;
+            if (!SafeU32(p + g_offName, &pn) || !NameOf(pn, nm, sizeof(nm))) continue;
+            pts[off / 4]++;
+        }
+    }
+
+    Log("[obj] pointer-to-UObject scoring over %d objects:", sampled);
+    for (int off = 4; off < kMaxOff; off += 4) {
+        if (pts[off / 4] < sampled / 4) continue;
+        char line[512]; int n = 0;
+        n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE,
+                         "[obj]   +0x%02X %3d/%d ->", off, pts[off / 4], sampled);
+        int shown = 0;
+        for (uint32_t i = 0; i < count && shown < 8; ++i) {
+            uint32_t obj, p, pvt, pn; char nm[64];
+            if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+            if (!SafeU32(obj, &pvt) || !InModule(pvt)) continue;
+            if (!SafeU32(obj + off, &p) || p < 0x10000) continue;
+            if (!SafeU32(p, &pvt) || !InModule(pvt)) continue;
+            if (!SafeU32(p + g_offName, &pn) || !NameOf(pn, nm, sizeof(nm))) continue;
+            n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE, " %s", nm);
+            shown++;
+        }
+        Log("%s", line);
+    }
+}
+
+// ---- find TdSwanNeck's property offsets by their DEFAULT VALUES ----
+//
+// Walking UProperty chains would work and needs three more offsets derived first. This does
+// not need any of them, because the defaults in DefaultGame.ini are distinctive enough to
+// identify by content:
+//
+//   DegToUnDeg        = 182.0440063   a float nothing else here will hold
+//   DownwardPitchWorld= 48151         likewise as an int
+//   ForwardPitchWorld = 65536
+//   Quadratic Fwd/Down= 35.0 / 30.0
+//   StartTranslateAt  = 15.0
+//
+// Finding several of those at fixed offsets inside an object named TdSwanNeck is both the
+// property map AND the proof that this object is the live instance rather than its UClass -
+// a UClass does not carry instance values.
+static void ProbeSwanNeck()
+{
+    if (!g_gobjAddr || g_offName < 0) return;
+    uint32_t data, count;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return;
+
+    struct Sig { const char* name; bool isFloat; float f; uint32_t u; };
+    const Sig sigs[] = {
+        { "DegToUnDeg",                   true,  182.0440063f, 0 },
+        { "DownwardPitchWorld",           false, 0.0f,         48151 },
+        { "ForwardPitchWorld",            false, 0.0f,         65536 },
+        { "QuadraticForwardTranslation",  true,  35.0f,        0 },
+        { "QuadraticDownwardTranslation", true,  30.0f,        0 },
+        { "LinearForwardTranslation",     true,  25.0f,        0 },
+        { "StartTranslateAtDegree",       true,  15.0f,        0 },
+    };
+    const int NS = (int)(sizeof(sigs) / sizeof(sigs[0]));
+    const uint32_t kScanBytes = 0x400;
+
+    int instance = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t obj, vt, ni; char nm[64];
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+        if (!SafeU32(obj, &vt) || !InModule(vt)) continue;
+        if (!SafeU32(obj + g_offName, &ni) || !NameOf(ni, nm, sizeof(nm))) continue;
+        if (strcmp(nm, "TdSwanNeck") != 0) continue;
+
+        Log("[swan] object #%u at %p named TdSwanNeck", i, (void*)obj);
+        int matched = 0;
+        for (int s = 0; s < NS; ++s) {
+            for (uint32_t off = 0; off < kScanBytes; off += 4) {
+                uint32_t raw;
+                if (!SafeU32(obj + off, &raw)) continue;
+                bool hit;
+                if (sigs[s].isFloat) {
+                    float f; memcpy(&f, &raw, 4);
+                    hit = (f > sigs[s].f - 0.01f) && (f < sigs[s].f + 0.01f);
+                } else {
+                    hit = (raw == sigs[s].u);
+                }
+                if (hit) {
+                    Log("[swan]     +0x%03X = %-28s (%s)", off, sigs[s].name,
+                        sigs[s].isFloat ? "float" : "int");
+                    matched++;
+                    break;
+                }
+            }
+        }
+        if (matched >= 4) {
+            instance++;
+            Log("[swan]   ^ %d/%d defaults present - this is a LIVE INSTANCE", matched, NS);
+        } else {
+            Log("[swan]   ^ only %d/%d defaults present - probably the UClass, not an instance",
+                matched, NS);
+        }
+    }
+    if (!instance) Log("[swan] no TdSwanNeck instance carrying the expected defaults was found");
 }
 
 static void RunObjectModelScan()
