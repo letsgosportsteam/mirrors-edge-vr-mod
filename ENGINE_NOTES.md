@@ -232,20 +232,89 @@ Backups live in the gitignored `save_backups/`.
 
 ---
 
-## Script
+## Script — ✅ opened and read, 2026-08-04
 
-`TdGame.u` is 29 MB, `PackageFlags = 0x02A80009` (`PKG_Compressed`), 20,592 names / 52,410
-exports / 2,246 imports. The name table is inside compressed chunks — standard UE3 chunked LZO,
-which the Singularity project's `uedecompress` does not handle (it assumes fully-compressed
-packages and fails with `chunk 0 runs past end of file`).
+`TdGame.u` is 29 MB, `CompressionFlags = 2` (`COMPRESS_LZO`), 55 chunks of 128 KB blocks,
+20,592 names / 52,410 exports / 2,246 imports. Expanded to 58.9 MB by `tools/uedecompress3`,
+then decompiled with **UELib 1.13.7** (NuGet `Eliot.UELib`), which has an explicit
+`Build:MirrorsEdge` profile. 54,656 objects, 1,341 classes.
 
-`DefaultCamera.ini` confirms the camera class exists as UnrealScript, not native:
+> **Tooling note:** a decompressed package must have its compression markers cleared *and* the
+> fields that followed the chunk table moved up into its place. Zeroing `CompressionFlags` and
+> the chunk count alone leaves 880 stale bytes, so `PackageSource` and everything after it is
+> misaligned — UELib read `PackageSource` as `109` and then died with an
+> `OutOfMemoryException` on an array length taken from garbage. `uedecompress3` relocates the
+> trailer; the check is that `PackageSource` reads `1972846046`.
+>
+> UELib emits `__NFUN_nnn__` placeholders for native operators in this build, so structure is
+> readable but arithmetic is not. Meanings below are **inferred from context**, not verified:
+> `161` `+=`, `143` unary minus, `119` `!= None`, `129` `!`, `130` `&&`, `132` `||`.
 
-```ini
-[TdGame.TdPlayerCamera]
-FreeflightScale = 1.0
+### ⭐ `TdPlayerCamera` is a thin dispatcher and is NOT where the camera is built
+
+158 lines, two functions. `UpdateViewTarget` selects between camera styles — `Fixed`,
+`FreeFlight`, `FixedPerson`, `ThirdPerson`, `ThirdPerson360`, `FreeCam`, `FirstPerson` — but
+**the entire switch is skipped in normal gameplay**, because it is guarded on
+`Pawn(OutVT.Target).CalcCamera(...)` returning false, and the pawn's returns
+`IsFirstPerson()`.
+
+So the class named after the camera does nothing during play. Its `FirstPerson`/default branch
+merely calls `GetActorEyesViewPoint`. Worth knowing anyway: `FreeFlight` is a complete
+mouse-and-stick free camera already in the shipped build, and `FreeflightScale` is the
+`DefaultCamera.ini` value.
+
+### ⭐⭐ `TdPlayerPawn.CalcCamera` IS the first-person camera
+
+This is the single most important finding so far, and it relocates the project's biggest risk
+from "somewhere in an animation system" to one function. Composition order:
+
+| step | source |
+|---|---|
+| **Position** | `Mesh1p.GetBoneLocation('EyeJoint')` — the camera rides a **bone on the animated first-person mesh** |
+| **Rotation** | `GetViewRotation()` — the player's own look input |
+| **+ camera animation** | `GetCameraAnimation()`, added with an **axis swizzle** (below) |
+| **+ swan neck** | `SwanNeck1p.GetSwanNeckPos()`, a positional offset derived from yaw only |
+| **collision** | `Moves[MovementState].CheckForCameraCollision()`, skipped when `bCinematicMode` |
+| **cached** | into `PlayerCameraLocation` / `PlayerCameraRotation` on the pawn |
+| **FOV** | `TdPlayerController.FOVAngle` |
+
+The swizzle is not a typo — animation axes are remapped into view axes:
+
+```
+view.Pitch += -anim.Roll        view.Yaw += anim.Pitch        view.Roll += -anim.Yaw
 ```
 
-Reading `TdPlayerCamera` and `TdPlayerController` is the highest-information-per-hour task
-outstanding. It decides whether the camera is steered by binary detour or by a custom
-UnrealScript package, and that choice should not be guessed.
+### What this means for VR
+
+**Good, and better than feared.** The camera-animation contribution — the wall-run roll,
+landing dips and bob that made this the project's headline risk — is **not diffuse**. It
+arrives through *one* call and *three* add-assignments. Neutralising or attenuating it is a
+local change, not a fight with an animation system.
+
+Consequences to design around, in order of awkwardness:
+
+1. **Position rides an animated bone.** 6-DOF head tracking has to add to a moving anchor, and
+   the bone's own motion *is* the bob. This is the harder half of the comfort problem — head
+   rotation can be made authoritative easily, position cannot simply be overridden without
+   detaching the view from Faith's body.
+2. **`GetViewRotation()` is the natural injection point** for head orientation, and it composes
+   with the animation term rather than replacing it.
+3. **`SwanNeck1p` is separable** and can be neutralised independently of the animation term.
+4. **FOV has exactly one source**, so the projection work has a single lever.
+5. `bCinematicMode` already gates camera collision — a ready-made signal for cutscene handling,
+   which the Singularity project had to discover the hard way.
+
+**Not yet read:** `GetCameraAnimation` itself, `SwanNeck1p.GetSwanNeckPos`, `GetViewRotation`,
+and `TdPlayerController.UpdateRotation` (line 1761 of the decompiled controller, which has
+several state-specific overrides). Those decide exactly which term carries which motion.
+
+### Consequence for the architecture choice
+
+The first-person camera is **UnrealScript, not native**, so both routes are live:
+
+- **Binary detour** — hook the native `ProcessEvent`/script VM, or intercept the view matrix as
+  the reference does, and correct downstream.
+- **Custom UnrealScript package** — subclass or replace `TdPlayerPawn.CalcCamera`, which is
+  proven possible in this game by MirrorsEdgeTweaks.
+
+The second is now clearly worth pricing, because the whole camera is 40 readable lines.

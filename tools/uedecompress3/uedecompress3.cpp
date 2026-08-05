@@ -76,6 +76,7 @@ int main(int argc, char** argv)
     int32_t fnLen = I32(p); p += 4;
     if (fnLen >= 0) p += (size_t)fnLen; else p += (size_t)(-fnLen) * 2;
 
+    const size_t pkgFlagsAt = p;
     uint32_t pkgFlags = U32(p); p += 4;
     int32_t nameCount = I32(p); p += 4;
     int32_t nameOff   = I32(p); p += 4;
@@ -95,7 +96,9 @@ int main(int argc, char** argv)
 
     int32_t engineVer = I32(p); p += 4;
     int32_t cookerVer = I32(p); p += 4;
+    const size_t compFlagsAt = p;
     int32_t compFlags = I32(p); p += 4;
+    const size_t chunkCountAt = p;
     int32_t chunkCount= I32(p); p += 4;
     printf("engine %d  cooker %d  CompressionFlags %d (%s)  chunks %d\n",
            engineVer, cookerVer, compFlags,
@@ -179,6 +182,54 @@ int main(int argc, char** argv)
         }
     }
     printf("decompressed %zu blocks across %d chunks\n", blocksDone, chunkCount);
+
+    // ---- clear the compression markers, or the output is unreadable ----
+    //
+    // The header is copied verbatim, so it still advertises CompressionFlags=2 and 55 chunks.
+    // A reader that believes it then tries to decompress data that is already expanded.
+    // UELib did exactly that and died with an OutOfMemoryException - a failure that looks
+    // nothing like "your header says the wrong thing".
+    //
+    // Zeroing the count is NOT sufficient on its own, and the first attempt to do only that
+    // failed instructively: UELib then read PackageSource out of the stale chunk table and
+    // got 109, after which an array length read from misaligned bytes threw
+    // OutOfMemoryException. Every field AFTER the chunk table has to move up into its place.
+    //
+    // The compressed and decompressed header layouts genuinely differ. In the compressed
+    // file the chunk table sits between chunkCount and the trailing fields; in the
+    // decompressed one there is no table, so those trailing fields land directly after
+    // chunkCount and the name table begins at chunks[0].uOff exactly as the header claims.
+    if (compFlagsAt + 4 <= out.size() && chunkCountAt + 4 <= out.size() && pkgFlagsAt + 4 <= out.size()) {
+        int32_t zero = 0;
+        memcpy(out.data() + compFlagsAt,  &zero, 4);
+        uint32_t cleared = pkgFlags & ~0x02000000u;   // PKG_StoreCompressed
+        memcpy(out.data() + pkgFlagsAt, &cleared, 4);
+
+        // PackageSource and whatever follows it, lifted from after the table to where a
+        // reader that saw chunkCount == 0 will look for them.
+        const size_t tableEnd = chunkCountAt + 4 + (size_t)chunkCount * 16;
+        const size_t trailerSrc = tableEnd;
+        const size_t trailerDst = chunkCountAt + 4;
+        const size_t trailerLen = (size_t)chunks[0].cOff > tableEnd
+                                ? (size_t)chunks[0].cOff - tableEnd : 0;
+
+        if (trailerLen > 0 && trailerSrc + trailerLen <= f.size()
+            && trailerDst + trailerLen <= out.size()) {
+            memcpy(out.data() + trailerDst, f.data() + trailerSrc, trailerLen);
+            memcpy(out.data() + chunkCountAt, &zero, 4);
+            printf("cleared compression markers and moved %zu trailer byte(s) from 0x%zX to 0x%zX\n",
+                   trailerLen, trailerSrc, trailerDst);
+            if (trailerDst + trailerLen != (size_t)chunks[0].uOff)
+                printf("  warn: trailer ends at 0x%zX but the name table starts at 0x%X\n",
+                       trailerDst + trailerLen, chunks[0].uOff);
+        } else {
+            printf("WARNING: could not relocate the post-table trailer (len %zu) - the header "
+                   "will be misaligned for readers\n", trailerLen);
+        }
+        printf("  PackageFlags 0x%08X -> 0x%08X, CompressionFlags -> 0\n", pkgFlags, cleared);
+    } else {
+        printf("WARNING: could not clear compression markers - readers may try to decompress\n");
+    }
 
     // ---- correctness check that cannot pass by accident ----
     //
