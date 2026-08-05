@@ -329,8 +329,77 @@ Two hits per class is expected — the `UClass` and its instance share a name. T
 apart needs `Outer` and `Class`, which are not yet derived; the Singularity rule was that a
 live actor has `Outer == PersistentLevel` and a name without the `Default__` prefix.
 
-The scoring table also flags three other varying offsets worth identifying later: `+0x04`
-(132/400, 64 distinct), `+0x24` (330/400, 64 distinct) and `+0x50` (135/400, 55 distinct).
+### ✅ The full `UObject` header — identical to Singularity's, and derived not assumed
+
+Found by scoring which dwords point at other `UObject`s, then logging what they point *at*:
+
+```
++0x28  400/400 -> Core Core Core Core Core Core            Outer
++0x34  400/400 -> Class Class Class Class Class Class      Class
++0x38  332/400 -> Default__Class Default__Class ...        ObjectArchetype
++0x3C  399/400 -> Factory Object Object Subsystem ...      SuperField (UStruct)
+```
+
+| Offset | Field |
+|---|---|
+| `+0x00` | vtable (in `.rdata`) |
+| `+0x28` | `Outer` |
+| `+0x2C` | `Name` (FName index) |
+| `+0x30` | `Name.Number` — always 0 in samples |
+| `+0x34` | `Class` |
+| `+0x38` | `ObjectArchetype` |
+| `+0x3C` | `SuperField` (on `UStruct`/`UClass`) |
+
+**The same layout as UE3 584**, even though `FNameEntry` differs in both index placement and
+encoding. That is a useful asymmetry to remember: the object header transferred, the name entry
+did not, and there was no way to know which without deriving both.
+
+**Distinguishing an instance from its `UClass`**: the class object's `Class` (`+0x34`) points at
+the object named `Class`; an instance's points at its own `UClass`. Cheaper and more robust
+than the Singularity rule of `Outer == PersistentLevel` plus a `Default__` prefix check.
+
+> **⚠️ The selection was unstable before it validated itself.** Two consecutive runs of the same
+> build picked different arrays — `0x0204A344` (Count 113310, 64/64) then `0x01FFA644`
+> (Count 57020, 58/64) — because the scan took the *first* candidate passing a threshold while
+> walking `.data` in address order, and the loser's contents vary between runs.
+>
+> Fixed by making `GObjects` and the layout confirm **each other**: candidates are collected,
+> ordered, and the winner is the one for which a `Name` offset exists that decodes for nearly
+> every object *and varies across them*. Neither fact is now assumed in order to check the
+> other.
+
+### ✅ `TdSwanNeck` instance layout — found by its default VALUES
+
+Located without walking a single `UProperty` chain, by searching each object named
+`TdSwanNeck` for its shipped defaults. 7/7 present identifies the live instance; the `UClass`
+scored 0/7, as it must.
+
+| Offset | Property | Default |
+|---|---|---|
+| `+0x3C` | `WantedTranslation` (FVector) | — |
+| `+0x48` | `Translation` (FVector) | — |
+| `+0x54` | `PreviousTranslation` (FVector) | — |
+| **`+0x60`** | **`LinearForwardTranslation`** | 25.0 |
+| **`+0x64`** | **`LinearDownwardTranslation`** | 25.0 |
+| **`+0x68`** | **`QuadraticForwardTranslation`** | 35.0 |
+| **`+0x6C`** | **`QuadraticDownwardTranslation`** | 30.0 |
+| `+0x70` | `StartTranslateAtDegree` | 15.0 |
+| `+0x74` | `ForwardPitchWorld` (int) | 65536 |
+| `+0x78` | `DownwardPitchWorld` (int) | 48151 |
+| `+0x7C` | `DegToUnDeg` | 182.0440063 |
+| `+0x80` | `Type` | `ESNT_Quadratic` |
+
+**The offsets reproduce the declaration order in the decompiled class exactly** — three
+`FVector`s at 12 bytes each from `+0x3C`, then the config floats, then the consts. Two
+independent methods agreeing on the same layout is stronger evidence than either alone, and it
+also confirms the decompilation is faithful.
+
+⚠️ `+0x60` and `+0x64` both hold 25.0, so the probe cannot tell `LinearForward` from
+`LinearDownward` by value. Order is taken from the declaration, not measured. It does not
+matter for zeroing both, but do not cite it as measured.
+
+**This is what unblocks the swan-neck experiment.** Writing `+0x60`, `+0x64`, `+0x68` and
+`+0x6C` to zero at runtime disables the lean with no file touched and no hash to defeat.
 
 > **⚠️ Hit rate alone cannot find this offset, and it took a wasted run to see why.** In the
 > first scoring pass, `+0x18`, `+0x1C`, `+0x2C`, `+0x30`, `+0x40`, `+0x44` and `+0x48` all

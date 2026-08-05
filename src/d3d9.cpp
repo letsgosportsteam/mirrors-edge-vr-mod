@@ -1589,6 +1589,142 @@ static void RunObjectModelScan()
     else   { Log("[obj] CreateThread failed (%lu) - scan skipped", GetLastError()); }
 }
 
+// ================================================================ rung 4b: write a property
+//
+// The swan neck is a pitch-driven lean: look down past StartTranslateAtDegree and the camera
+// translates forward and down, modelling craning your neck to see your feet. In a headset the
+// player's real neck already does that, so the engine doing it too is a comfort candidate.
+//
+// ---- why this is a memory write and not an ini edit ----
+//
+// Mirror's Edge hash-checks its config files and refuses to start when they are modified -
+// measured, and it cost two runs. But the hash is over the FILE. It says nothing about the
+// values once they are loaded, so writing the properties directly sidesteps the check entirely
+// and needs no external patcher.
+//
+// ---- identifying the live instance ----
+//
+// NOT by its default values. That worked to FIND the offsets, and stops working the moment we
+// write to them - the object would stop matching its own signature. Instead: an instance's
+// Class (+0x34) points at its UClass, while the UClass's Class points at the object named
+// "Class". That test survives our own writes.
+//
+// Instances are recreated on level load, so the pointer is re-resolved rather than cached
+// forever, and re-resolution is cheap because it is only done when the cached one stops
+// looking like a TdSwanNeck.
+
+static const uint32_t SWAN_LinearFwd   = 0x60;
+static const uint32_t SWAN_LinearDown  = 0x64;
+static const uint32_t SWAN_QuadFwd     = 0x68;
+static const uint32_t SWAN_QuadDown    = 0x6C;
+
+static uintptr_t g_swanNeck = 0;
+static int  g_swanMode = 0;          // 0 = untouched, 1 = zeroed
+static bool g_swanApplied = false;
+static float g_swanSaved[4] = { 0, 0, 0, 0 };
+static bool  g_swanSavedOk = false;
+
+static bool ObjNameIs(uintptr_t obj, const char* want)
+{
+    uint32_t ni; char nm[64];
+    if (!SafeU32(obj + g_offName, &ni) || !NameOf(ni, nm, sizeof(nm))) return false;
+    return strcmp(nm, want) == 0;
+}
+
+static bool LooksLikeSwanInstance(uintptr_t obj)
+{
+    if (!obj || g_offName < 0) return false;
+    uint32_t vt;
+    if (!SafeU32(obj, &vt) || !InModule(vt)) return false;
+    if (!ObjNameIs(obj, "TdSwanNeck")) return false;
+    uint32_t cls;
+    if (!SafeU32(obj + 0x34, &cls) || cls < 0x10000) return false;
+    // The UClass itself has Class -> "Class"; an instance has Class -> "TdSwanNeck".
+    return ObjNameIs(cls, "TdSwanNeck");
+}
+
+static uintptr_t FindSwanNeck()
+{
+    if (LooksLikeSwanInstance(g_swanNeck)) return g_swanNeck;
+    g_swanNeck = 0;
+    g_swanApplied = false;
+    g_swanSavedOk = false;
+
+    if (!g_gobjAddr || g_offName < 0) return 0;
+    uint32_t data, count;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t obj;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+        if (!LooksLikeSwanInstance(obj)) continue;
+        g_swanNeck = obj;
+        Log("[swan] live instance at %p", (void*)obj);
+        return obj;
+    }
+    return 0;
+}
+
+static bool WriteF32(uintptr_t addr, float v)
+{
+    SIZE_T wrote = 0;
+    return WriteProcessMemory(GetCurrentProcess(), (LPVOID)addr, &v, 4, &wrote) && wrote == 4;
+}
+
+static void ApplySwanNeck()
+{
+    if (g_offName < 0) return;
+    const uintptr_t obj = FindSwanNeck();
+    if (!obj) return;
+
+    // Saved on first sight so the original values can be put back, rather than assuming the
+    // shipped defaults - the player may have a config that differs from DefaultGame.ini.
+    if (!g_swanSavedOk) {
+        const uint32_t offs[4] = { SWAN_LinearFwd, SWAN_LinearDown, SWAN_QuadFwd, SWAN_QuadDown };
+        bool all = true;
+        float tmp[4] = { 0, 0, 0, 0 };
+        for (int i = 0; i < 4; ++i)
+            if (!SafeRead(obj + offs[i], &tmp[i], sizeof(float))) { all = false; break; }
+        if (all) {
+            for (int i = 0; i < 4; ++i) g_swanSaved[i] = tmp[i];
+            g_swanSavedOk = true;
+            Log("[swan] original values: linear %.1f/%.1f  quadratic %.1f/%.1f",
+                tmp[0], tmp[1], tmp[2], tmp[3]);
+        }
+    }
+
+    const bool want = (g_swanMode == 1);
+    if (want == g_swanApplied) return;
+
+    if (want) {
+        const bool ok = WriteF32(obj + SWAN_LinearFwd,  0.0f) &&
+                        WriteF32(obj + SWAN_LinearDown, 0.0f) &&
+                        WriteF32(obj + SWAN_QuadFwd,    0.0f) &&
+                        WriteF32(obj + SWAN_QuadDown,   0.0f);
+        Log("*** [swan] ZEROED the translations (%s) - look down; the lean should be gone",
+            ok ? "all four written" : "A WRITE FAILED");
+    } else if (g_swanSavedOk) {
+        WriteF32(obj + SWAN_LinearFwd,  g_swanSaved[0]);
+        WriteF32(obj + SWAN_LinearDown, g_swanSaved[1]);
+        WriteF32(obj + SWAN_QuadFwd,    g_swanSaved[2]);
+        WriteF32(obj + SWAN_QuadDown,   g_swanSaved[3]);
+        Log("*** [swan] RESTORED the original translations");
+    }
+    g_swanApplied = want;
+}
+
+// F7 toggles it. A raw key read, like PAUSE - this is a test lever, and an A/B the player can
+// perform without relaunching is worth far more than one that needs two runs to compare.
+static void CheckSwanHotkey()
+{
+    static bool wasDown = false;
+    const bool down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+    if (down && !wasDown) {
+        g_swanMode = g_swanMode ? 0 : 1;
+        Log("[swan] F7 -> mode %d (%s)", g_swanMode, g_swanMode ? "zeroed" : "original");
+    }
+    wasDown = down;
+}
+
 // ================================================================ hold PAUSE to quit
 //
 // Ported from the Singularity mod, where it earned its place. Inside a headset you cannot
@@ -1755,6 +1891,10 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     // from startup, so the scan is still valid there - but the class probe is far more useful
     // once a level is up, and 900 frames is cheap insurance either way.
     if (f == 900) RunObjectModelScan();
+
+    // Cheap once the object model is up: re-resolves only when the cached pointer stops
+    // looking like a TdSwanNeck, which is on level transitions.
+    if (g_offName >= 0) { CheckSwanHotkey(); ApplySwanNeck(); }
 
     // After the XR work, so a quit still gets posted on a frame where XR failed or stalled.
     CheckQuitHotkey();
