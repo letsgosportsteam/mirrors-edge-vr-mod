@@ -1643,23 +1643,62 @@ static bool LooksLikeSwanInstance(uintptr_t obj)
     return ObjNameIs(cls, "TdSwanNeck");
 }
 
+// ⚠️ A FAILED search must not repeat every frame.
+//
+// This walks ~88,000 objects with several ReadProcessMemory calls each. Cached, that costs
+// three reads a frame and is free. UNCACHED it is a few hundred thousand syscalls per frame,
+// and it runs on the render thread.
+//
+// That is exactly what happened: with no TdSwanNeck instance present - at a menu, during a
+// load, before one is constructed - the search failed, so it ran in full on every frame. The
+// framerate collapsed AND F7 appeared dead, because "no instance" means no write. One cause,
+// two symptoms that look unrelated.
+//
+// The Singularity project measured the identical failure in its run 35: "a failed scan is
+// enormously expensive, and it repeats every frame... 69-82 ms a frame against a normal 6. So
+// a failed scan arms a backoff." That note was read while porting and not applied here.
+static long g_swanNextTry = 0;          // frame number before which we do not search again
+static const long kSwanBackoffFrames = 600;
+static bool g_swanMissLogged = false;
+
 static uintptr_t FindSwanNeck()
 {
     if (LooksLikeSwanInstance(g_swanNeck)) return g_swanNeck;
-    g_swanNeck = 0;
-    g_swanAppliedMode = -1;   // the new instance holds its own defaults; re-apply on sight
-    g_swanSavedOk = false;
 
-    if (!g_gobjAddr || g_offName < 0) return 0;
+    if (g_swanNeck) {          // had one, lost it - a level transition, so try again promptly
+        Log("[swan] cached instance %p is no longer valid, re-resolving", (void*)g_swanNeck);
+        g_swanNeck = 0;
+        g_swanAppliedMode = -1;
+        g_swanSavedOk = false;
+        g_swanNextTry = 0;
+    }
+    if (g_frames < g_swanNextTry) return 0;
+
+    if (!g_gobjAddr || g_offName < 0) { g_swanNextTry = g_frames + kSwanBackoffFrames; return 0; }
     uint32_t data, count;
-    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return 0;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) {
+        g_swanNextTry = g_frames + kSwanBackoffFrames; return 0;
+    }
+
+    const double t0 = NowMs();
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t obj;
         if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
         if (!LooksLikeSwanInstance(obj)) continue;
         g_swanNeck = obj;
-        Log("[swan] live instance at %p", (void*)obj);
+        g_swanMissLogged = false;
+        Log("[swan] live instance at %p (search took %.1f ms over %u slots)",
+            (void*)obj, NowMs() - t0, count);
         return obj;
+    }
+
+    // Cost is reported the first time, because a search that finds nothing still costs the
+    // full walk and that number is the reason the backoff exists.
+    g_swanNextTry = g_frames + kSwanBackoffFrames;
+    if (!g_swanMissLogged) {
+        g_swanMissLogged = true;
+        Log("[swan] no live TdSwanNeck yet - %.1f ms wasted over %u slots; backing off %ld frames",
+            NowMs() - t0, count, kSwanBackoffFrames);
     }
     return 0;
 }
@@ -1732,6 +1771,13 @@ static void CheckSwanHotkey()
         g_swanMode = (g_swanMode + 1) % 3;
         static const char* kNames[3] = { "original", "zeroed", "exaggerated 8x" };
         Log("[swan] F7 -> mode %d (%s)", g_swanMode, kNames[g_swanMode]);
+        // A keypress is an explicit request, so it clears the backoff and retries at once.
+        // Otherwise F7 can look dead for up to 600 frames while the backoff is armed - and
+        // "F7 did nothing" is precisely the report that has to be unambiguous.
+        g_swanNextTry = 0;
+        g_swanMissLogged = false;
+        if (!g_swanNeck)
+            Log("[swan] (no instance resolved yet - retrying now, the write follows if found)");
     }
     wasDown = down;
 }
