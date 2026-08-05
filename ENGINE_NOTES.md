@@ -276,6 +276,59 @@ ANSI/wide flag, and **ANSI** text at `+0x10`:
 > `"ByteProperty"` — index 1, its own slot — and that one detail ended the search. Every run
 > that only said "not found" cost a launch and taught nothing.
 
+### ✅ `GObjects` — located, 2026-08-05
+
+```
+GObjects TArray @ .data 0x0204A344   Data=0x460F0000  Count=114081  Max=123943
+64/64 sampled objects have a vtable inside the module image
+```
+
+114,081 objects, against Singularity's 112,565 — the right magnitude for a UE3 title.
+`GObjects − GNames` is **−0x4494**, so the "adjacent globals" adjacency that held in Singularity
+(`+0x30`) does **not** transfer. Both must be found independently.
+
+> **⚠️ Vtables are in `.rdata`, not `.text`.** MSVC emits them there, and in this image `.rdata`
+> sits *above* `.text`:
+> ```
+> .text   00401000-01A8B000
+> .rdata  ~01A8C000-01F54000    <- vtables
+> .data    01F53000-02095000
+> ```
+> A scan testing `.text` only rejects every real object. The Singularity notes describe their
+> first entry's vtable as "inside `.text`", which was taken as a fact about this binary and is
+> not one. **Test the whole module image.**
+
+> **⚠️ A false positive got through first, and the reason is instructive.** An earlier version
+> reported `Data=0x01F9C9BC Count=5100 Max=0xFFFFFFFF` — a static `.data` structure whose bytes
+> fit the `TArray` shape. It passed because an invented `Max` constraint had been removed and
+> **nothing put in its place**. Rejecting a made-up rule is not a reason to stop sanity-checking
+> a field. Real constraints: `Max` a plausible allocation count, and `Data` **outside** the
+> module image, because it is a heap allocation.
+
+### ✅ `UObject::Name` at `+0x2C` — same as Singularity, despite `FNameEntry` differing
+
+```
++0x2C sample names: TextBufferFactory Factory Object TextBuffer System Subsystem
+                    StructProperty Property Field StrProperty
+```
+
+That is UE3's bootstrap class registration order, which is what confirms it — the same
+sequence the Singularity notes record.
+
+> **⚠️ Hit rate alone cannot find this offset, and it took a wasted run to see why.** In the
+> first scoring pass, `+0x18`, `+0x1C`, `+0x2C`, `+0x30`, `+0x40`, `+0x44` and `+0x48` all
+> scored **400/400** and the detector correctly refused to choose.
+>
+> Those other offsets hold **zero** for every object — null pointers and unset `FName`s — and
+> index 0 decodes as `"None"`. A constant field scores a *perfect* hit rate. Worse, any small
+> integer below the name count indexes some valid entry, and real structures are full of small
+> integers.
+>
+> **The discriminator is DISTINCTNESS.** The `Name` field varies across objects; a null field
+> does not. Scoring now requires both a high hit rate and many distinct values, and prints the
+> actual names each leading offset produces — a human separates class names from an assortment
+> of unrelated words instantly, and no statistic available here does that as reliably.
+
 ### Cost
 
 The memory-wide search was **20.4 s** across 1.5 GB and stalled level loading when it ran on

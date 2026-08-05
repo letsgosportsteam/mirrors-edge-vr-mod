@@ -1213,7 +1213,16 @@ static void DetectUObjectLayout()
     if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return;
 
     const int kMaxOff = 0x60;
-    int hits[kMaxOff / 4] = {};
+    const int kSlots  = kMaxOff / 4;
+    int hits[kSlots] = {};
+    // ⚠️ DISTINCTNESS is the discriminator, not the hit rate.
+    //
+    // The first scoring run had +0x18, +0x1C, +0x2C, +0x30, +0x40, +0x44 and +0x48 all at
+    // 400/400 and refused to choose. Those offsets hold ZERO for every object - null pointers
+    // and unset FNames - and index 0 decodes as "None", so a constant field scored a perfect
+    // hit rate. The Name field is different in kind: it VARIES across objects.
+    uint32_t seen[kSlots][64] = {};
+    int      nseen[kSlots] = {};
     int sampled = 0;
 
     for (uint32_t i = 0; i < count && sampled < 400; ++i) {
@@ -1223,23 +1232,32 @@ static void DetectUObjectLayout()
         if (!SafeU32(obj, &vtbl) || !InModule(vtbl)) continue;
         sampled++;
         for (int off = 4; off < kMaxOff; off += 4) {
+            const int s = off / 4;
             uint32_t v;
             if (!SafeU32(obj + off, &v)) continue;
             char nm[128];
-            if (NameOf(v, nm, sizeof(nm))) hits[off / 4]++;
+            if (!NameOf(v, nm, sizeof(nm))) continue;
+            hits[s]++;
+            bool known = false;
+            for (int k = 0; k < nseen[s]; ++k) if (seen[s][k] == v) { known = true; break; }
+            if (!known && nseen[s] < 64) seen[s][nseen[s]++] = v;
         }
     }
 
+    // Only offsets that both decode reliably AND vary are candidates.
     int best = -1, bestOff = -1, second = -1;
     for (int off = 4; off < kMaxOff; off += 4) {
-        int h = hits[off / 4];
-        if (h > best) { second = best; best = h; bestOff = off; }
-        else if (h > second) second = h;
+        const int s = off / 4;
+        if (nseen[s] < 8) continue;                  // constant or near-constant: not a name
+        if (hits[s] < sampled * 95 / 100) continue;
+        if (hits[s] > best) { second = best; best = hits[s]; bestOff = off; }
+        else if (hits[s] > second) second = hits[s];
     }
-    Log("[obj] UObject layout scored over %d objects:", sampled);
+    Log("[obj] UObject layout scored over %d objects (hit rate / distinct values):", sampled);
     for (int off = 4; off < kMaxOff; off += 4)
         if (hits[off / 4] > 0)
-            Log("[obj]     +0x%02X decoded as a name %d/%d", off, hits[off / 4], sampled);
+            Log("[obj]     +0x%02X  %3d/%d  %2d distinct%s", off, hits[off / 4], sampled,
+                nseen[off / 4], nseen[off / 4] < 8 ? "   <- constant, rejected" : "");
 
     // ⚠️ "decodes as a name" is a WEAK test on its own, and the first scoring run showed why:
     // twenty offsets scored 40-70% and nothing was decisive. Any small integer below the name
@@ -1278,11 +1296,10 @@ static void DetectUObjectLayout()
         Log("%s", line);
     }
 
-    // 95%, not 90%. The real Name offset decodes for essentially every object; anything less
-    // is a coincidence that happens to be common.
-    if (bestOff > 0 && best >= sampled * 95 / 100 && best >= second + sampled / 10) {
+    if (bestOff > 0) {
         g_offName = bestOff;
-        Log("*** [obj] UObject::Name at +0x%02X (%d/%d, next best %d)", bestOff, best, sampled, second);
+        Log("*** [obj] UObject::Name at +0x%02X (%d/%d, %d distinct values)",
+            bestOff, best, sampled, nseen[bestOff / 4]);
     } else {
         Log("[obj] Name offset NOT decisive (best +0x%02X %d/%d, second %d) - do not trust it.",
             bestOff, best, sampled, second);
