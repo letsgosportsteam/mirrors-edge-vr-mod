@@ -1589,6 +1589,180 @@ static void RunObjectModelScan()
     else   { Log("[obj] CreateThread failed (%lu) - scan skipped", GetLastError()); }
 }
 
+// ================================================================ rung 5a: the property walker
+//
+// Finding offsets by their default values worked for TdSwanNeck and does not generalise: it
+// needs distinctive constants, and it stops working the moment anything writes to them. The
+// general mechanism is UE3's own reflection - every UClass carries a linked list of UProperty
+// objects, each holding its name and its byte offset within an instance.
+//
+// Three offsets are needed and all three are DERIVED, because UE3 536 has already disagreed
+// with the Singularity build on FNameEntry while agreeing on the UObject header, and there is
+// no way to tell which case applies without checking:
+//
+//   UStruct::Children   pointer to the first UField
+//   UField::Next        pointer to the next
+//   UProperty::Offset   byte offset within the instance
+//
+// ---- the derivation validates itself against a known answer ----
+//
+// TdSwanNeck's layout is already MEASURED by value search: LinearForwardTranslation is at
+// +0x60, QuadraticForwardTranslation at +0x68, DegToUnDeg at +0x7C. So the walk is run against
+// TdSwanNeck first, and the candidate for UProperty::Offset is the one that reports those
+// same numbers. Two independent methods have to agree before anything else uses the result.
+
+static int g_offChildren = -1;
+static int g_offNext     = -1;
+static int g_offPropOff  = -1;
+
+static bool ObjNameIs(uintptr_t obj, const char* want);   // defined with the swan-neck code
+
+// Find a UClass by name: an object whose own Class points at the object named "Class".
+static uintptr_t FindClassByName(const char* want)
+{
+    if (!g_gobjAddr || g_offName < 0) return 0;
+    uint32_t data, count;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t obj, vt, cls;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+        if (!SafeU32(obj, &vt) || !InModule(vt)) continue;
+        if (!ObjNameIs(obj, want)) continue;
+        if (!SafeU32(obj + 0x34, &cls) || cls < 0x10000) continue;
+        if (ObjNameIs(cls, "Class")) return obj;     // its Class is "Class" => it IS a class
+    }
+    return 0;
+}
+
+static bool ReadObjName(uintptr_t obj, char* out, size_t cap)
+{
+    uint32_t ni;
+    if (!SafeU32(obj + g_offName, &ni)) return false;
+    return NameOf(ni, out, cap);
+}
+
+// Derive Children / Next / Offset against TdSwanNeck, whose real layout is already known.
+static bool DerivePropertyOffsets()
+{
+    const uintptr_t cls = FindClassByName("TdSwanNeck");
+    if (!cls) { Log("[prop] TdSwanNeck UClass not found"); return false; }
+    Log("[prop] TdSwanNeck UClass at %p", (void*)cls);
+
+    // Known from the value search. If the walker cannot reproduce these it is wrong.
+    struct Known { const char* name; uint32_t off; };
+    const Known known[] = {
+        { "LinearForwardTranslation",     0x60 },
+        { "QuadraticForwardTranslation",  0x68 },
+        { "QuadraticDownwardTranslation", 0x6C },
+        { "StartTranslateAtDegree",       0x70 },
+        { "DegToUnDeg",                   0x7C },
+    };
+    const int NK = (int)(sizeof(known) / sizeof(known[0]));
+
+    // ---- Children: a pointer in the UClass leading to an object named like a property ----
+    for (int co = 4; co <= 0xB0 && g_offChildren < 0; co += 4) {
+        uint32_t first;
+        if (!SafeU32(cls + co, &first) || first < 0x10000) continue;
+        uint32_t vt;
+        if (!SafeU32(first, &vt) || !InModule(vt)) continue;
+        char nm[96];
+        if (!ReadObjName(first, nm, sizeof(nm))) continue;
+        for (int k = 0; k < NK; ++k) {
+            if (strcmp(nm, known[k].name) != 0) continue;
+            g_offChildren = co;
+            Log("[prop] UStruct::Children at +0x%02X -> \"%s\"", co, nm);
+            break;
+        }
+    }
+    if (g_offChildren < 0) {
+        Log("[prop] Children NOT FOUND - no pointer in the UClass leads to a known property");
+        return false;
+    }
+
+    uint32_t head = 0;
+    SafeU32(cls + g_offChildren, &head);
+
+    // ---- Next: a pointer from one property to another property of the same class ----
+    for (int no = 4; no <= 0xB0 && g_offNext < 0; no += 4) {
+        uint32_t nxt;
+        if (!SafeU32(head + no, &nxt) || nxt < 0x10000) continue;
+        uint32_t vt;
+        if (!SafeU32(nxt, &vt) || !InModule(vt)) continue;
+        char nm[96];
+        if (!ReadObjName(nxt, nm, sizeof(nm))) continue;
+        for (int k = 0; k < NK; ++k) {
+            if (strcmp(nm, known[k].name) != 0) continue;
+            g_offNext = no;
+            Log("[prop] UField::Next at +0x%02X -> \"%s\"", no, nm);
+            break;
+        }
+    }
+    if (g_offNext < 0) { Log("[prop] Next NOT FOUND"); return false; }
+
+    // ---- Offset: the dword in each UProperty that equals its MEASURED offset ----
+    //
+    // Every candidate must agree for EVERY known property, not just one. A single match is
+    // easy to hit by accident; five in a row at the same dword is not.
+    for (int oo = 4; oo <= 0xB0 && g_offPropOff < 0; oo += 4) {
+        int agree = 0, seen = 0;
+        for (uintptr_t p = head; p; ) {
+            char nm[96];
+            if (!ReadObjName(p, nm, sizeof(nm))) break;
+            for (int k = 0; k < NK; ++k) {
+                if (strcmp(nm, known[k].name) != 0) continue;
+                seen++;
+                uint32_t v;
+                if (SafeU32(p + oo, &v) && v == known[k].off) agree++;
+            }
+            uint32_t nxt;
+            if (!SafeU32(p + g_offNext, &nxt) || nxt < 0x10000) break;
+            p = nxt;
+        }
+        if (seen >= 3 && agree == seen) {
+            g_offPropOff = oo;
+            Log("*** [prop] UProperty::Offset at +0x%02X (agreed with %d/%d measured offsets)",
+                oo, agree, seen);
+        }
+    }
+    if (g_offPropOff < 0) {
+        Log("[prop] Offset NOT FOUND - no dword reproduced the measured TdSwanNeck offsets");
+        return false;
+    }
+    return true;
+}
+
+// Walk a class and its superclasses, logging every property with its offset.
+static void DumpClassProperties(const char* className, int maxLines)
+{
+    if (g_offChildren < 0 || g_offNext < 0 || g_offPropOff < 0) return;
+    uintptr_t cls = FindClassByName(className);
+    if (!cls) { Log("[prop] class %s not found", className); return; }
+
+    Log("[prop] ---- %s ----", className);
+    int lines = 0;
+    for (int depth = 0; cls && depth < 12; ++depth) {
+        char cn[96] = "?";
+        ReadObjName(cls, cn, sizeof(cn));
+        uint32_t head = 0;
+        if (!SafeU32(cls + g_offChildren, &head)) break;
+        for (uintptr_t p = head; p && lines < maxLines; ) {
+            char nm[96];
+            uint32_t off;
+            if (!ReadObjName(p, nm, sizeof(nm))) break;
+            if (SafeU32(p + g_offPropOff, &off) && off < 0x4000) {
+                Log("[prop]   +0x%04X  %-40s (%s)", off, nm, cn);
+                lines++;
+            }
+            uint32_t nxt;
+            if (!SafeU32(p + g_offNext, &nxt) || nxt < 0x10000) break;
+            p = nxt;
+        }
+        uint32_t super;
+        if (!SafeU32(cls + 0x3C, &super) || super < 0x10000) break;   // SuperField
+        cls = super;
+    }
+}
+
 // ================================================================ rung 4b: write a property
 //
 // The swan neck is a pitch-driven lean: look down past StartTranslateAtDegree and the camera
