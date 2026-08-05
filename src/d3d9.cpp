@@ -758,6 +758,272 @@ static void SubmitTestQuad()
     }
 }
 
+// ================================================================ rung 4a: the object model
+//
+// Locates GNames and GObjects and derives the UObject layout for UE3 536, at runtime, by
+// scanning and validating rather than by static analysis.
+//
+// ---- why scan instead of using Ghidra ----
+//
+// The Singularity project found these by decompiling FName::FName, following it to the
+// interning function, and picking out the writable globals it touched - then had to confirm
+// the guess against a live process anyway. The scan skips the first half and keeps the second,
+// and it produces an answer that is self-validating rather than inferred.
+//
+// It is only viable because there is a test that cannot pass by accident: the RUNTIME GNames
+// array always begins None, ByteProperty, IntProperty, because the engine interns its own type
+// names before anything else. Three exact strings in order, at an address arrived at by
+// arithmetic, is not something random data does.
+//
+// ⚠️ Note that this is the RUNTIME array. A cooked package's name table is a different thing
+// in a different order - assuming otherwise already produced one false failure when verifying
+// the decompressor, and the same mistake here would be much harder to spot.
+//
+// ---- everything is read through ReadProcessMemory ----
+//
+// Scanning walks addresses that are not guaranteed mapped. ReadProcessMemory returns false on
+// an unmapped page instead of raising, so a wrong guess costs a failed read rather than
+// killing the game's render thread.
+
+static uintptr_t g_imgBase = 0, g_textLo = 0, g_textHi = 0, g_dataLo = 0, g_dataHi = 0;
+static uintptr_t g_gnamesAddr = 0;
+static uint32_t  g_nameTextOff = 0;      // offset of the char data inside FNameEntry
+static uintptr_t g_gobjAddr = 0;
+static int       g_offName = -1;
+static bool      g_objModelDone = false;
+
+static bool SafeRead(uintptr_t addr, void* out, size_t n)
+{
+    SIZE_T got = 0;
+    return ReadProcessMemory(GetCurrentProcess(), (LPCVOID)addr, out, n, &got) && got == n;
+}
+
+static bool SafeU32(uintptr_t addr, uint32_t* out) { return SafeRead(addr, out, 4); }
+
+// Reads an ANSI string, refusing anything unprintable. The refusal is the point: it is what
+// stops a random dword that happens to look like a pointer from scoring as a name.
+static bool SafeAnsi(uintptr_t addr, char* out, size_t cap)
+{
+    size_t i = 0;
+    for (; i + 1 < cap; ++i) {
+        char c;
+        if (!SafeRead(addr + i, &c, 1)) return false;
+        if (c == 0) break;
+        if ((unsigned char)c < 32 || (unsigned char)c > 126) return false;
+        out[i] = c;
+    }
+    out[i] = 0;
+    return i > 0;
+}
+
+static void FindSections()
+{
+    g_imgBase = (uintptr_t)GetModuleHandleW(nullptr);
+    auto* dos = (IMAGE_DOS_HEADER*)g_imgBase;
+    auto* nt  = (IMAGE_NT_HEADERS*)(g_imgBase + dos->e_lfanew);
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        char name[9] = {};
+        memcpy(name, sec[i].Name, 8);
+        uintptr_t lo = g_imgBase + sec[i].VirtualAddress;
+        uintptr_t hi = lo + sec[i].Misc.VirtualSize;
+        if (!strcmp(name, ".text")) { g_textLo = lo; g_textHi = hi; }
+        if (!strcmp(name, ".data")) { g_dataLo = lo; g_dataHi = hi; }
+    }
+    Log("[obj] image base %p  .text %p-%p  .data %p-%p",
+        (void*)g_imgBase, (void*)g_textLo, (void*)g_textHi, (void*)g_dataLo, (void*)g_dataHi);
+}
+
+// Does the FNameEntry at `entry` hold `expect` when its text starts at `textOff`?
+static bool NameEntryIs(uintptr_t entry, uint32_t textOff, const char* expect)
+{
+    char buf[128];
+    if (!SafeAnsi(entry + textOff, buf, sizeof(buf))) return false;
+    return strcmp(buf, expect) == 0;
+}
+
+static bool FindGNames()
+{
+    // UE3's TArray is {void* Data, int Count, int Max} - three consecutive dwords.
+    const char* kFirst[3] = { "None", "ByteProperty", "IntProperty" };
+    const uint32_t kTextOffsets[] = { 0x08, 0x0C, 0x10, 0x14, 0x18 };
+
+    for (uintptr_t a = g_dataLo; a + 12 < g_dataHi; a += 4) {
+        uint32_t data, count, maxn;
+        if (!SafeU32(a, &data) || !SafeU32(a + 4, &count) || !SafeU32(a + 8, &maxn)) continue;
+        if (data < 0x10000) continue;
+        if (count < 1000 || count > 500000) continue;          // a UE3 title interns tens of thousands
+        if (maxn < count || maxn > count * 4 + 1024) continue;  // Max is a growth bound, not arbitrary
+
+        uint32_t e0, e1, e2;
+        if (!SafeU32(data, &e0) || !SafeU32(data + 4, &e1) || !SafeU32(data + 8, &e2)) continue;
+        if (e0 < 0x10000 || e1 < 0x10000 || e2 < 0x10000) continue;
+
+        for (uint32_t off : kTextOffsets) {
+            if (NameEntryIs(e0, off, kFirst[0]) &&
+                NameEntryIs(e1, off, kFirst[1]) &&
+                NameEntryIs(e2, off, kFirst[2])) {
+                g_gnamesAddr  = a;
+                g_nameTextOff = off;
+                Log("*** [obj] GNames at %p  Data=%p Count=%u Max=%u  FNameEntry text at +0x%02X",
+                    (void*)a, (void*)data, count, maxn, off);
+                Log("[obj]     validated: entries 0/1/2 are None / ByteProperty / IntProperty");
+                return true;
+            }
+        }
+    }
+    Log("[obj] GNames NOT FOUND - no TArray in .data whose first three entries are"
+        " None/ByteProperty/IntProperty");
+    return false;
+}
+
+static bool NameOf(uint32_t index, char* out, size_t cap)
+{
+    if (!g_gnamesAddr) return false;
+    uint32_t data, count;
+    if (!SafeU32(g_gnamesAddr, &data) || !SafeU32(g_gnamesAddr + 4, &count)) return false;
+    if (index >= count) return false;
+    uint32_t entry;
+    if (!SafeU32(data + index * 4, &entry) || entry < 0x10000) return false;
+    return SafeAnsi(entry + g_nameTextOff, out, cap);
+}
+
+static bool FindGObjects()
+{
+    // Same TArray shape, but the elements are UObject* whose first dword is a vtable pointing
+    // into .text. Requiring that of a sample is what separates it from any other pointer array.
+    for (uintptr_t a = g_dataLo; a + 12 < g_dataHi; a += 4) {
+        if (a == g_gnamesAddr) continue;
+        uint32_t data, count, maxn;
+        if (!SafeU32(a, &data) || !SafeU32(a + 4, &count) || !SafeU32(a + 8, &maxn)) continue;
+        if (data < 0x10000) continue;
+        if (count < 1000 || count > 4000000) continue;
+        if (maxn < count || maxn > count * 4 + 1024) continue;
+
+        int checked = 0, vtblOk = 0;
+        for (uint32_t i = 0; i < count && checked < 64; ++i) {
+            uint32_t obj;
+            if (!SafeU32(data + i * 4, &obj)) break;
+            if (obj == 0) continue;             // UE3 leaves holes where objects were destroyed
+            checked++;
+            uint32_t vtbl;
+            if (SafeU32(obj, &vtbl) && vtbl >= g_textLo && vtbl < g_textHi) vtblOk++;
+        }
+        if (checked >= 32 && vtblOk >= checked * 9 / 10) {
+            g_gobjAddr = a;
+            Log("*** [obj] GObjects at %p  Data=%p Count=%u Max=%u  (%d/%d sampled objects have"
+                " a vtable inside .text)", (void*)a, (void*)data, count, maxn, vtblOk, checked);
+            if (g_gnamesAddr)
+                Log("[obj]     GObjects - GNames = 0x%X   (was 0x30 in the Singularity build)",
+                    (unsigned)(a - g_gnamesAddr));
+            return true;
+        }
+    }
+    Log("[obj] GObjects NOT FOUND");
+    return false;
+}
+
+// Scores every dword offset in the object header by how often it decodes as a valid GNames
+// index whose name is printable. The right offset wins by a wide margin; this is the
+// reference's method, and the reason it is a score rather than a guess is that UE3 484 and 536
+// do not have to agree on the layout.
+static void DetectUObjectLayout()
+{
+    if (!g_gobjAddr || !g_gnamesAddr) return;
+
+    uint32_t data, count;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return;
+
+    const int kMaxOff = 0x60;
+    int hits[kMaxOff / 4] = {};
+    int sampled = 0;
+
+    for (uint32_t i = 0; i < count && sampled < 400; ++i) {
+        uint32_t obj;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+        uint32_t vtbl;
+        if (!SafeU32(obj, &vtbl) || vtbl < g_textLo || vtbl >= g_textHi) continue;
+        sampled++;
+        for (int off = 4; off < kMaxOff; off += 4) {
+            uint32_t v;
+            if (!SafeU32(obj + off, &v)) continue;
+            char nm[128];
+            if (NameOf(v, nm, sizeof(nm))) hits[off / 4]++;
+        }
+    }
+
+    int best = -1, bestOff = -1, second = -1;
+    for (int off = 4; off < kMaxOff; off += 4) {
+        int h = hits[off / 4];
+        if (h > best) { second = best; best = h; bestOff = off; }
+        else if (h > second) second = h;
+    }
+    Log("[obj] UObject layout scored over %d objects:", sampled);
+    for (int off = 4; off < kMaxOff; off += 4)
+        if (hits[off / 4] > 0)
+            Log("[obj]     +0x%02X decoded as a name %d/%d", off, hits[off / 4], sampled);
+
+    if (bestOff > 0 && best >= sampled * 9 / 10 && best > second) {
+        g_offName = bestOff;
+        Log("*** [obj] UObject::Name at +0x%02X (%d/%d, next best %d)", bestOff, best, sampled, second);
+    } else {
+        Log("[obj] Name offset NOT decisive (best +0x%02X %d/%d, second %d) - do not trust it",
+            bestOff, best, sampled, second);
+    }
+}
+
+// Reports whether the classes we actually care about are present and findable by name.
+// A layout that scores well but cannot find TdPlayerPawn has not proven anything useful.
+static void ProbeKnownObjects()
+{
+    if (g_offName < 0) return;
+    uint32_t data, count;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return;
+
+    const char* wanted[] = { "TdPlayerPawn", "TdPlayerController", "TdPlayerCamera",
+                             "TdSwanNeck", "TdGameInfo" };
+    int found[5] = {};
+    int live = 0;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t obj;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+        uint32_t vtbl;
+        if (!SafeU32(obj, &vtbl) || vtbl < g_textLo || vtbl >= g_textHi) continue;
+        live++;
+        uint32_t nameIdx;
+        if (!SafeU32(obj + g_offName, &nameIdx)) continue;
+        char nm[128];
+        if (!NameOf(nameIdx, nm, sizeof(nm))) continue;
+        for (int w = 0; w < 5; ++w) if (!strcmp(nm, wanted[w])) found[w]++;
+    }
+    Log("[obj] walked %d live objects of %u slots", live, count);
+    for (int w = 0; w < 5; ++w)
+        Log("[obj]     %-20s %s (%d)", wanted[w], found[w] ? "FOUND" : "not found", found[w]);
+}
+
+static void RunObjectModelScan()
+{
+    if (g_objModelDone) return;
+    g_objModelDone = true;
+
+    Log("");
+    Log("======== object model scan (rung 4a) ========");
+    const double t0 = NowMs();
+    FindSections();
+    if (FindGNames()) {
+        char nm[128];
+        for (uint32_t i = 0; i < 5; ++i)
+            if (NameOf(i, nm, sizeof(nm))) Log("[obj]     GNames[%u] = \"%s\"", i, nm);
+        if (FindGObjects()) {
+            DetectUObjectLayout();
+            ProbeKnownObjects();
+        }
+    }
+    Log("======== scan took %.1f ms ========", NowMs() - t0);
+    Log("");
+}
+
 // ================================================================ hold PAUSE to quit
 //
 // Ported from the Singularity mod, where it earned its place. Inside a headset you cannot
@@ -915,6 +1181,15 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
         g_haveFrame = CaptureFrame(dev);
         SubmitTestQuad();
     }
+
+    // ---- the object model scan, once, well into the run ----
+    //
+    // Frame 900 rather than a low number, on the Singularity project's evidence: it dumped at
+    // frame 120 for three runs, which lands in the MAIN MENU before any level is loaded, and
+    // saw only UClass objects and zero live instances. GNames and GObjects themselves exist
+    // from startup, so the scan is still valid there - but the class probe is far more useful
+    // once a level is up, and 900 frames is cheap insurance either way.
+    if (f == 900) RunObjectModelScan();
 
     // After the XR work, so a quit still gets posted on a frame where XR failed or stalled.
     CheckQuitHotkey();
