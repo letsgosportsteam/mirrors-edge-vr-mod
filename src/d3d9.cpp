@@ -789,7 +789,8 @@ static void SubmitTestQuad()
 
 static uintptr_t g_imgBase = 0, g_textLo = 0, g_textHi = 0, g_dataLo = 0, g_dataHi = 0;
 static uintptr_t g_gnamesAddr = 0;
-static uint32_t  g_nameTextOff = 0;      // offset of the char data inside FNameEntry
+static uint32_t  g_nameTextOff = 0;
+static bool      g_nameWide = false;      // offset of the char data inside FNameEntry
 static uintptr_t g_gobjAddr = 0;
 static int       g_offName = -1;
 static bool      g_objModelDone = false;
@@ -842,6 +843,21 @@ static bool NameEntryIs(uintptr_t entry, uint32_t textOff, const char* expect)
     char buf[128];
     if (!SafeAnsi(entry + textOff, buf, sizeof(buf))) return false;
     return strcmp(buf, expect) == 0;
+}
+
+// The UTF-16 form. Mirror's Edge stores name text WIDE, which is what defeated the first two
+// scans - one assumed ANSI outright, the other only tried wide if the ANSI search found
+// nothing at all, and it always found something.
+static bool NameEntryIsW(uintptr_t entry, uint32_t textOff, const char* expect)
+{
+    for (size_t i = 0; ; ++i) {
+        uint16_t ch;
+        if (!SafeRead(entry + textOff + i * 2, &ch, 2)) return false;
+        const char e = expect[i];
+        if (e == 0) return ch == 0;
+        if (ch != (uint16_t)(unsigned char)e) return false;
+        if (i > 64) return false;
+    }
 }
 
 // ---- find a literal string anywhere in committed, writable memory ----
@@ -945,8 +961,62 @@ static void HexDump(uintptr_t addr, int bytes, const char* label)
     }
 }
 
+// ---- the fast path, which is what should have worked from the start ----
+//
+// Walk .data for the TArray shape and validate each candidate by reading its first three
+// entries. No memory-wide search: the array points at the entries, so there is nothing to
+// hunt for.
+//
+// The first version of this was right in structure and wrong in one detail - it tested ANSI
+// only. Mirror's Edge stores name text as UTF-16. Both encodings are tried here, over a wider
+// offset range, and the winning combination is reported rather than assumed.
+//
+// The Count/Max bounds are deliberately loose. The earlier version required
+// Max <= Count*4+1024, which is an invented constraint - a TArray's Max is whatever the last
+// growth left it at, and rejecting a real candidate for failing a made-up rule is exactly the
+// kind of self-inflicted null result this rung has already produced twice.
+static bool FindGNamesFast()
+{
+    for (uintptr_t a = g_dataLo; a + 12 < g_dataHi; a += 4) {
+        uint32_t data, count, maxn;
+        if (!SafeU32(a, &data) || !SafeU32(a + 4, &count) || !SafeU32(a + 8, &maxn)) continue;
+        if (data < 0x10000) continue;
+        if (count < 1000 || count > 2000000) continue;
+        if (maxn < count) continue;
+
+        uint32_t e0, e1, e2;
+        if (!SafeU32(data,     &e0) || e0 < 0x10000) continue;
+        if (!SafeU32(data + 4, &e1) || e1 < 0x10000) continue;
+        if (!SafeU32(data + 8, &e2) || e2 < 0x10000) continue;
+
+        for (uint32_t off = 0; off <= 0x40; off += 2) {
+            const bool wide = NameEntryIsW(e0, off, "None") &&
+                              NameEntryIsW(e1, off, "ByteProperty") &&
+                              NameEntryIsW(e2, off, "IntProperty");
+            const bool ansi = !wide &&
+                              NameEntryIs(e0, off, "None") &&
+                              NameEntryIs(e1, off, "ByteProperty") &&
+                              NameEntryIs(e2, off, "IntProperty");
+            if (!wide && !ansi) continue;
+
+            g_gnamesAddr  = a;
+            g_nameTextOff = off;
+            g_nameWide    = wide;
+            Log("*** [obj] GNames at %p  Data=%p Count=%u Max=%u", (void*)a, (void*)data, count, maxn);
+            Log("*** [obj] FNameEntry text at +0x%02X, encoding %s", off, wide ? "UTF-16" : "ANSI");
+            Log("[obj]     validated: entries 0/1/2 read None / ByteProperty / IntProperty");
+            HexDump(e1 - 0x10, 0x40, "entry1");
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool FindGNames()
 {
+    if (FindGNamesFast()) return true;
+    Log("[obj] fast .data scan found nothing - falling back to the memory-wide search");
+
     static const wchar_t wNone[] = L"None";
     static const wchar_t wByte[] = L"ByteProperty";
     static const wchar_t wInt[]  = L"IntProperty";
@@ -1030,7 +1100,19 @@ static bool NameOf(uint32_t index, char* out, size_t cap)
     if (index >= count) return false;
     uint32_t entry;
     if (!SafeU32(data + index * 4, &entry) || entry < 0x10000) return false;
-    return SafeAnsi(entry + g_nameTextOff, out, cap);
+    if (!g_nameWide) return SafeAnsi(entry + g_nameTextOff, out, cap);
+    // UTF-16 in memory, narrowed for logging. Anything outside printable ASCII rejects the
+    // whole name - that rejection is what keeps a stray dword from scoring as a valid index.
+    size_t i = 0;
+    for (; i + 1 < cap; ++i) {
+        uint16_t ch;
+        if (!SafeRead(entry + g_nameTextOff + i * 2, &ch, 2)) return false;
+        if (ch == 0) break;
+        if (ch < 32 || ch > 126) return false;
+        out[i] = (char)ch;
+    }
+    out[i] = 0;
+    return i > 0;
 }
 
 static bool FindGObjects()
