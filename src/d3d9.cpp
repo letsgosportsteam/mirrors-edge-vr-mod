@@ -77,6 +77,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cmath>
+#include <vector>
 
 // ---------------------------------------------------------------- vtable slots
 
@@ -842,38 +843,136 @@ static bool NameEntryIs(uintptr_t entry, uint32_t textOff, const char* expect)
     return strcmp(buf, expect) == 0;
 }
 
-static bool FindGNames()
+// ---- find a literal string anywhere in committed, writable memory ----
+//
+// The first scan assumed the FNameEntry text offset was one of five values and that the text
+// was ANSI. It found nothing, which says one of those assumptions is wrong but not which.
+// Anchoring on the STRING instead assumes neither: wherever "ByteProperty" physically is, the
+// entry containing it is a fixed distance below, and something points at that entry.
+//
+// Returns up to `cap` addresses of the string data itself.
+static int FindStringInMemory(const void* pattern, size_t patLen, uintptr_t* out, int cap,
+                              size_t* scannedOut)
 {
-    // UE3's TArray is {void* Data, int Count, int Max} - three consecutive dwords.
-    const char* kFirst[3] = { "None", "ByteProperty", "IntProperty" };
-    const uint32_t kTextOffsets[] = { 0x08, 0x0C, 0x10, 0x14, 0x18 };
+    int found = 0;
+    size_t scanned = 0;
+    std::vector<uint8_t> buf;
 
-    for (uintptr_t a = g_dataLo; a + 12 < g_dataHi; a += 4) {
-        uint32_t data, count, maxn;
-        if (!SafeU32(a, &data) || !SafeU32(a + 4, &count) || !SafeU32(a + 8, &maxn)) continue;
-        if (data < 0x10000) continue;
-        if (count < 1000 || count > 500000) continue;          // a UE3 title interns tens of thousands
-        if (maxn < count || maxn > count * 4 + 1024) continue;  // Max is a growth bound, not arbitrary
+    MEMORY_BASIC_INFORMATION mbi{};
+    for (uintptr_t addr = 0x10000; addr < 0x7FFF0000 && found < cap; ) {
+        if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) break;
+        uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (next <= addr) break;
 
-        uint32_t e0, e1, e2;
-        if (!SafeU32(data, &e0) || !SafeU32(data + 4, &e1) || !SafeU32(data + 8, &e2)) continue;
-        if (e0 < 0x10000 || e1 < 0x10000 || e2 < 0x10000) continue;
-
-        for (uint32_t off : kTextOffsets) {
-            if (NameEntryIs(e0, off, kFirst[0]) &&
-                NameEntryIs(e1, off, kFirst[1]) &&
-                NameEntryIs(e2, off, kFirst[2])) {
-                g_gnamesAddr  = a;
-                g_nameTextOff = off;
-                Log("*** [obj] GNames at %p  Data=%p Count=%u Max=%u  FNameEntry text at +0x%02X",
-                    (void*)a, (void*)data, count, maxn, off);
-                Log("[obj]     validated: entries 0/1/2 are None / ByteProperty / IntProperty");
-                return true;
+        const bool readable = (mbi.State == MEM_COMMIT) &&
+                              !(mbi.Protect & PAGE_GUARD) &&
+                              (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY |
+                                              PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE));
+        // 256 MB of one region is already far past anything plausible; the cap keeps a
+        // pathological mapping from turning a diagnostic into a hang.
+        if (readable && mbi.RegionSize <= (256u << 20)) {
+            buf.resize(mbi.RegionSize);
+            SIZE_T got = 0;
+            if (ReadProcessMemory(GetCurrentProcess(), mbi.BaseAddress, buf.data(),
+                                  mbi.RegionSize, &got) && got >= patLen) {
+                scanned += got;
+                for (size_t i = 0; i + patLen <= got && found < cap; ++i)
+                    if (memcmp(buf.data() + i, pattern, patLen) == 0)
+                        out[found++] = (uintptr_t)mbi.BaseAddress + i;
             }
         }
+        addr = next;
     }
-    Log("[obj] GNames NOT FOUND - no TArray in .data whose first three entries are"
-        " None/ByteProperty/IntProperty");
+    if (scannedOut) *scannedOut = scanned;
+    return found;
+}
+
+static void HexDump(uintptr_t addr, int bytes, const char* label)
+{
+    char line[256];
+    for (int row = 0; row < bytes; row += 16) {
+        int n = 0;
+        n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE, "[obj]   %s %p:", label,
+                         (void*)(addr + row));
+        for (int i = 0; i < 16 && row + i < bytes; ++i) {
+            uint8_t b;
+            if (!SafeRead(addr + row + i, &b, 1)) { n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE, " ??"); continue; }
+            n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE, " %02X", b);
+        }
+        n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE, "  ");
+        for (int i = 0; i < 16 && row + i < bytes; ++i) {
+            uint8_t b;
+            if (!SafeRead(addr + row + i, &b, 1)) b = '?';
+            n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE, "%c",
+                             (b >= 32 && b <= 126) ? (char)b : '.');
+        }
+        Log("%s", line);
+    }
+}
+
+static bool FindGNames()
+{
+    // ---- step 1: where does the text "ByteProperty" physically live? ----
+    uintptr_t hits[16];
+    size_t scanned = 0;
+    int n = FindStringInMemory("ByteProperty\0", 13, hits, 16, &scanned);
+    Log("[obj] scanned %.1f MB; found ANSI \"ByteProperty\" x%d", scanned / 1048576.0, n);
+
+    // If the ANSI form is absent the names may be stored UTF-16, which the first scan could
+    // never have matched. Reported either way so the next step is not another guess.
+    if (n == 0) {
+        wchar_t wpat[] = L"ByteProperty";
+        int wn = FindStringInMemory(wpat, sizeof(wpat), hits, 16, &scanned);
+        Log("[obj] found UTF-16 \"ByteProperty\" x%d", wn);
+        if (wn > 0) {
+            Log("[obj] names are WIDE in this build - the ANSI assumption was wrong");
+            for (int i = 0; i < wn && i < 3; ++i) HexDump(hits[i] - 0x20, 0x40, "wide");
+        }
+        return false;
+    }
+
+    for (int i = 0; i < n && i < 4; ++i) {
+        Log("[obj] --- candidate FNameEntry region around hit %d (%p) ---", i, (void*)hits[i]);
+        HexDump(hits[i] - 0x20, 0x50, "ansi");
+    }
+
+    // ---- step 2: find something that POINTS at one of those entries ----
+    //
+    // GNames.Data is an array of FNameEntry*, so entry[1] holds a pointer landing a small
+    // fixed distance before the text. Finding three such pointers in a row - one per expected
+    // name, in order - identifies the array and yields the text offset at the same time.
+    uintptr_t noneHits[16], intHits[16];
+    int nn = FindStringInMemory("None\0", 5, noneHits, 16, nullptr);
+    int ni = FindStringInMemory("IntProperty\0", 12, intHits, 16, nullptr);
+    Log("[obj] \"None\" x%d, \"IntProperty\" x%d", nn, ni);
+
+    for (uintptr_t a = g_dataLo; a + 12 < g_dataHi; a += 4) {
+        uint32_t data;
+        if (!SafeU32(a, &data) || data < 0x10000) continue;
+        uint32_t p0, p1, p2;
+        if (!SafeU32(data, &p0) || !SafeU32(data + 4, &p1) || !SafeU32(data + 8, &p2)) continue;
+
+        for (int b = 0; b < n; ++b) {
+            if (p1 > hits[b] || hits[b] - p1 > 0x40) continue;
+            uint32_t off = (uint32_t)(hits[b] - p1);
+            bool okNone = false, okInt = false;
+            for (int k = 0; k < nn; ++k) if (noneHits[k] == p0 + off) okNone = true;
+            for (int k = 0; k < ni; ++k) if (intHits[k]  == p2 + off) okInt  = true;
+            if (!okNone || !okInt) continue;
+
+            uint32_t count = 0, maxn = 0;
+            SafeU32(a + 4, &count); SafeU32(a + 8, &maxn);
+            g_gnamesAddr  = a;
+            g_nameTextOff = off;
+            Log("*** [obj] GNames at %p  Data=%p Count=%u Max=%u  FNameEntry text at +0x%02X",
+                (void*)a, (void*)data, count, maxn, off);
+            Log("[obj]     triangulated: entries 0/1/2 point at None / ByteProperty / IntProperty");
+            return true;
+        }
+    }
+
+    Log("[obj] the strings exist but no .data TArray points at them in order.");
+    Log("[obj] GNames may live outside .data, or the array may not be FNameEntry*.");
     return false;
 }
 
