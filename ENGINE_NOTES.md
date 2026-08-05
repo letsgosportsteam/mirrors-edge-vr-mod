@@ -214,6 +214,79 @@ file was rewritten instead.
 
 ---
 
+## The object model
+
+### ✅ `GNames` — located and validated, 2026-08-05
+
+```
+GNames TArray @ .data 0x0204E7D8    Data=0x0D8C0000  Count=38211  Max=49641
+GNames[0..4] = None, ByteProperty, IntProperty, BoolProperty, FloatProperty
+```
+
+Found by walking `.data` for the `{Data, Count, Max}` shape and validating each candidate's
+first three entries against `None` / `ByteProperty` / `IntProperty` — the runtime array always
+begins that way because the engine interns its own type names first. Three exact strings in
+order is not something random data produces.
+
+Only the **TArray address is stable**. `Data` is a heap allocation and moves between runs;
+always read it at runtime.
+
+### ⭐ `FNameEntry` — UTF-16, and different from the Singularity build
+
+```
+03D6FFC0:  01 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00
+03D6FFD0:  42 00 79 00  74 00 65 00  50 00 72 00  6F 00 70 00   B.y.t.e.P.r.o.p.
+03D6FFE0:  65 00 72 00  74 00 79 00  00 00 ...                  e.r.t.y...
+```
+
+| Offset | Field |
+|---|---|
+| `+0x00` | **`Index`** — plain, not shifted. Reads `1` for `ByteProperty`, which is slot 1. |
+| `+0x04`–`+0x0F` | zero in this sample; hash link and/or flags, not yet identified |
+| **`+0x10`** | **the text, UTF-16** |
+
+Against Singularity (UE3 584), which recorded `Index << 1` at `+0x08` with bit 0 as an
+ANSI/wide flag, and **ANSI** text at `+0x10`:
+
+| | Singularity 584 | Mirror's Edge 536 |
+|---|---|---|
+| Index | `+0x08`, shifted left 1 | **`+0x00`, plain** |
+| Encoding | ANSI (flagged) | **UTF-16, unconditionally** |
+| Text offset | `+0x10` | `+0x10` |
+
+> ### ⚠️ The encoding cost three runs, and the reason is worth keeping
+>
+> The first scan tested ANSI only. The second tested UTF-16 **but only if the ANSI search
+> returned zero hits** — and it never did, because package name tables held in memory and this
+> DLL's own string literals always supplied some. A conditional fallback that is gated on the
+> wrong signal is worse than no fallback: it looks like coverage.
+>
+> Two invented constraints were also rejecting correct answers while presented as validity
+> tests:
+>
+> - **`Max <= Count*4 + 1024`.** A `TArray`'s `Max` is wherever the last growth left it. Made
+>   up. (`GNames` reports `Max=49641` against `Count=38211`, so it happened not to bite — which
+>   is exactly why it survived.)
+> - **A 24-hit cap per search pattern.** `"None"` reported `x24 (capped)` in a run whose real
+>   entry was past the cut, so the triangulation could not have succeeded **even with entirely
+>   correct data**.
+>
+> Method, earned: *when a scan fails, make the failure carry evidence.* The hex dump around
+> each hit is what eventually showed `01 00 00 00` twelve bytes before a UTF-16
+> `"ByteProperty"` — index 1, its own slot — and that one detail ended the search. Every run
+> that only said "not found" cost a launch and taught nothing.
+
+### Cost
+
+The memory-wide search was **20.4 s** across 1.5 GB and stalled level loading when it ran on
+the render thread. Once the encoding was known it was unnecessary: the array points at the
+entries, so a `.data` walk finds them in **1.4 s**. The wide search is retained only as a
+fallback, because it is what produced the evidence when the fast path had nothing to say.
+
+Run it off the render thread regardless — it is read-only, and nothing should wait on it.
+
+---
+
 ## Save data
 
 Stored **outside the install**, keyed by the game's identity, so every copy — Steam, GOG, and the

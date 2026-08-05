@@ -1119,13 +1119,26 @@ static bool FindGObjects()
 {
     // Same TArray shape, but the elements are UObject* whose first dword is a vtable pointing
     // into .text. Requiring that of a sample is what separates it from any other pointer array.
+    //
+    // ⚠️ No Max upper bound. The version that ran first carried `maxn > count*4+1024` here -
+    // the same invented rule that was already removed from the GNames scan and forgotten
+    // about in this one. GNames itself reports Count=38211 Max=49641, so the rule happens not
+    // to bite there; there is no reason to assume GObjects grew as politely.
+    //
+    // The threshold is 75%, not 90%. Slots hold objects mid-construction and freshly freed
+    // pointers, and demanding near-perfection of a live heap is another way to reject a
+    // correct answer.
+    uintptr_t bestAddr = 0; int bestOk = 0, bestChecked = 0; uint32_t bestCount = 0;
+    int candidates = 0;
+
     for (uintptr_t a = g_dataLo; a + 12 < g_dataHi; a += 4) {
         if (a == g_gnamesAddr) continue;
         uint32_t data, count, maxn;
         if (!SafeU32(a, &data) || !SafeU32(a + 4, &count) || !SafeU32(a + 8, &maxn)) continue;
         if (data < 0x10000) continue;
         if (count < 1000 || count > 4000000) continue;
-        if (maxn < count || maxn > count * 4 + 1024) continue;
+        if (maxn < count) continue;
+        candidates++;
 
         int checked = 0, vtblOk = 0;
         for (uint32_t i = 0; i < count && checked < 64; ++i) {
@@ -1136,7 +1149,14 @@ static bool FindGObjects()
             uint32_t vtbl;
             if (SafeU32(obj, &vtbl) && vtbl >= g_textLo && vtbl < g_textHi) vtblOk++;
         }
-        if (checked >= 32 && vtblOk >= checked * 9 / 10) {
+        // Remembered even when it loses, so a failure reports the closest thing it saw
+        // instead of only "not found".
+        if (checked >= 8 && vtblOk * 100 / (checked ? checked : 1) >
+                            (bestChecked ? bestOk * 100 / bestChecked : 0)) {
+            bestAddr = a; bestOk = vtblOk; bestChecked = checked; bestCount = count;
+        }
+
+        if (checked >= 32 && vtblOk >= checked * 3 / 4) {
             g_gobjAddr = a;
             Log("*** [obj] GObjects at %p  Data=%p Count=%u Max=%u  (%d/%d sampled objects have"
                 " a vtable inside .text)", (void*)a, (void*)data, count, maxn, vtblOk, checked);
@@ -1146,7 +1166,12 @@ static bool FindGObjects()
             return true;
         }
     }
-    Log("[obj] GObjects NOT FOUND");
+    Log("[obj] GObjects NOT FOUND after %d TArray-shaped candidates", candidates);
+    if (bestAddr) {
+        Log("[obj]     closest was %p Count=%u with %d/%d vtables in .text",
+            (void*)bestAddr, bestCount, bestOk, bestChecked);
+        HexDump(bestAddr, 0x20, "cand");
+    }
     return false;
 }
 
