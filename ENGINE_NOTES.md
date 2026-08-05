@@ -48,21 +48,78 @@ allocator handed back the same slot. So two consequences, and the second is the 
   seen this object" test would merge two genuinely distinct objects in the first run's pattern.
   Identity must come from the wrapper instance, not the address it happens to occupy.
 
-**Why it is created twice is not yet known.** The plausible reading is a throwaway instance for
-adapter and display-mode enumeration to populate the video options, followed by the real one —
-but that is a hypothesis, not a measurement. Rung 1 settles it by logging which instance
-receives `CreateDevice`; until then, do not build on the assumption that call #2 is the one.
+**Why it is created twice is still not known, and rung 1 FAILED to settle it.** The plan was to
+log `self` inside `CreateDevice` and see which instance it was. In the rung-1 run both
+`Direct3DCreate9` calls returned `0278D960` and `CreateDevice` arrived on `0278D960` — so the
+address identifies nothing. The aliasing described above is precisely what defeated the
+instrument.
 
-### Not yet measured
+Settling it would need identity that survives reallocation: a counter assigned at creation
+time, or hooking `AddRef`/`Release` to watch the first object die. **Not worth doing unless
+something later depends on it.** Vtable patching means nothing currently does — which is the
+second time that choice has paid for itself here.
 
-Deliberately left to rung 1 rather than guessed, because a wrong backbuffer format cost the
-Singularity project a `D3DERR_INVALIDCALL` that was traced back to a note saying `X8R8G8B8`
-where the truth was `A8R8G8B8`:
+Recorded as a method note: *an instrument that reads an address cannot distinguish objects that
+share one.* The trap was written down before the test was built and the test was still built
+around it.
 
-- backbuffer format, dimensions, and whether MSAA is in use
-- `CreateDevice` behaviour flags
-- windowed vs fullscreen at device creation (the ini says fullscreen; the mod will need windowed)
-- `D3DPOOL_MANAGED` vs `DEFAULT` allocation counts, which drive the texture wrapper design
+### ✅ Device parameters — measured, rung 1, 2026-08-04
+
+6,832 frames across real gameplay plus two resolution changes.
+
+| Property | Value |
+|---|---|
+| **Backbuffer** | **2560×1440, `D3DFMT_A8R8G8B8` (21)** — read from the *surface descriptor* |
+| **MSAA** | **none** (`MultiSampleType=0, quality=0`) — **no resolve step needed before sharing** |
+| `BehaviorFlags` | **`0x00000142`** = `HARDWARE_VERTEXPROCESSING \| FPU_PRESERVE \| MULTITHREADED` |
+| Windowed | `0` — fullscreen. The mod will need windowed. |
+| `SwapEffect` | `1` (`DISCARD`) |
+| `PresentationInterval` | `0x80000000` (`IMMEDIATE`) — vsync off, matching `UseVsync=False` |
+| `EnableAutoDepthStencil` | `0` — the engine owns its own depth buffer |
+| `Flags` | **`0x00000001`** = `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` |
+| Device type | `1` (`HAL`), adapter 0 |
+
+The format was read from `GetBackBuffer`→`GetDesc`, not from `D3DPRESENT_PARAMETERS`. Here they
+happen to agree, but in windowed mode `BackBufferFormat` is permitted to be `D3DFMT_UNKNOWN`, so
+the request is not a reliable source — and the Singularity project's `D3DERR_INVALIDCALL` came
+from a note recording `X8R8G8B8` where the answer was `A8R8G8B8`.
+
+**`LOCKABLE_BACKBUFFER` is set**, which is unusual and potentially useful: the backbuffer can be
+locked directly. Whether that is a cheaper frame-grab route than `GetRenderTargetData` is
+untested and should be measured, not assumed — a lockable backbuffer also carries a known
+performance cost on some drivers.
+
+### Resource pools — measured over a full session
+
+```
+frame  600   DEFAULT=83     MANAGED=776
+frame 3600   DEFAULT=255    MANAGED=10654
+frame 4800   DEFAULT=5057   MANAGED=10871
+final        DEFAULT=5160   MANAGED=11084   SYSTEMMEM=0   other=0
+```
+
+Against the Singularity mod, which had to translate `MANAGED`→`DEFAULT` because **D3D9Ex does
+not support `D3DPOOL_MANAGED` at all**:
+
+| | Singularity | Mirror's Edge |
+|---|---|---|
+| Backbuffer format | `A8R8G8B8` | `A8R8G8B8` — same |
+| MSAA | none | none — same |
+| `BehaviorFlags` | `0x142` | `0x142` — identical |
+| `MANAGED` allocations | 10,454 | **11,084** — comparable |
+| `DEFAULT` allocations | 47 | **5,160** — two orders of magnitude more |
+
+The `MANAGED` count is what sizes the translation problem, and it is close enough that the
+Singularity texture wrapper should transfer at similar cost. The `DEFAULT` count differing so
+sharply is unexplained; the two figures may not be measured over comparable sessions, so it is
+noted rather than concluded.
+
+### Device `Reset` — clean, and survivable
+
+Two resolution changes, both `hr=0`, backbuffer re-measured correctly each time
+(2560×1440 → 1920×1200 → 2560×1440). `DEFAULT`-pool allocations rose across each reset as
+resources were recreated. Reset is a path the VR frame plumbing must survive, and it is now
+known to be exercised by an ordinary video-options change rather than only by alt-tab.
 
 ---
 
