@@ -24,16 +24,39 @@ if ((-not $OpenXrSdk) -or (-not $GameBin)) {
         if (-not $GameBin)   { $GameBin   = $script:GameBin }
     }
 }
-if (-not $OpenXrSdk) {
-    throw "OpenXR SDK path not set. Copy src\paths.local.ps1.example to src\paths.local.ps1 " +
-          "and fill it in, or set `$env:MEVR_OPENXR_SDK."
-}
 
-$mh     = Join-Path $root "third_party\minhook"
-$inc    = Join-Path $OpenXrSdk "include"
-$libDir = Join-Path $OpenXrSdk "native\Win32\release\lib"
-$binDir = Join-Path $OpenXrSdk "native\Win32\release\bin"
-foreach ($p in @($inc, $libDir, $binDir, $mh)) { if (-not (Test-Path $p)) { throw "missing: $p" } }
+$mh = Join-Path $root "third_party\minhook"
+if (-not (Test-Path $mh)) { throw "missing: $mh" }
+
+# ---- does this build actually need OpenXR? ----
+#
+# The source declares its own dependency, so read it rather than carry a flag that can
+# disagree with reality. This is not a convenience: an unused openxr_loader.lib still puts
+# openxr_loader.dll in our import table, and a d3d9.dll that cannot resolve its imports is
+# silently not loaded by the game at all - which looks exactly like "the game does not use
+# D3D9", the precise question the early rungs exist to answer.
+$needsOpenXr = [bool](Select-String -LiteralPath (Join-Path $here "d3d9.cpp") `
+                                    -Pattern '#include\s*[<"]openxr' -Quiet)
+
+# MinHook is likewise only linked once something detours. Rung 0 forwards and hooks nothing.
+$needsMinHook = [bool](Select-String -LiteralPath (Join-Path $here "d3d9.cpp") `
+                                     -Pattern '#include\s*[<"]MinHook\.h' -Quiet)
+
+$inc = $null; $libDir = $null; $binDir = $null
+if ($needsOpenXr) {
+    if (-not $OpenXrSdk) {
+        throw "d3d9.cpp includes an OpenXR header but no SDK path is set. Copy " +
+              "src\paths.local.ps1.example to src\paths.local.ps1 and fill it in, " +
+              "or set `$env:MEVR_OPENXR_SDK."
+    }
+    $inc    = Join-Path $OpenXrSdk "include"
+    $libDir = Join-Path $OpenXrSdk "native\Win32\release\lib"
+    $binDir = Join-Path $OpenXrSdk "native\Win32\release\bin"
+    foreach ($p in @($inc, $libDir, $binDir)) { if (-not (Test-Path $p)) { throw "missing: $p" } }
+}
+Write-Host ("OpenXR: {0}   MinHook: {1}" -f
+            $(if ($needsOpenXr) { "linked" } else { "not needed by this source" }),
+            $(if ($needsMinHook) { "compiled in" } else { "not needed by this source" }))
 
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vsPath = & $vswhere -latest -products * `
@@ -42,12 +65,18 @@ $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
 
 Push-Location $here
 try {
-    $mhSrc = @(
-        "`"$mh\src\buffer.c`"",
-        "`"$mh\src\hook.c`"",
-        "`"$mh\src\trampoline.c`"",
-        "`"$mh\src\hde\hde32.c`""
-    ) -join " "
+    $mhSrc = ""
+    if ($needsMinHook) {
+        $mhSrc = @(
+            "`"$mh\src\buffer.c`"",
+            "`"$mh\src\hook.c`"",
+            "`"$mh\src\trampoline.c`"",
+            "`"$mh\src\hde\hde32.c`""
+        ) -join " "
+    }
+    $incArgs = "/I`"$mh\include`""
+    if ($needsOpenXr) { $incArgs = "/I`"$inc`" $incArgs" }
+    $xrLib = if ($needsOpenXr) { "/LIBPATH:`"$libDir`" openxr_loader.lib" } else { "" }
 
     # ---- static analysis pass on d3d9.cpp, before the real build ----
     #
@@ -66,7 +95,7 @@ try {
     # ErrorRecord - which $ErrorActionPreference = "Stop" then treats as fatal. cl writes its
     # warnings to stdout, so there is nothing to gain from the redirect anyway.
     $an = "`"$vcvars`" x86 >nul && cl /nologo /EHsc /W3 /MD /std:c++17 /analyze:only " +
-          "/I`"$inc`" /I`"$mh\include`" /c d3d9.cpp"
+          "$incArgs /c d3d9.cpp"
     $anOut = cmd /c $an
     $anOut | Write-Host
     # Format-string mistakes are the ones that have actually cost time, so they fail the
@@ -79,9 +108,9 @@ try {
     if ($fatal) { throw "static analysis found a format-string defect - fix it before building" }
 
     $cmd = "`"$vcvars`" x86 && cl /nologo /LD /EHsc /W3 /Zi /MD /std:c++17 " +
-           "/I`"$inc`" /I`"$mh\include`" " +
+           "$incArgs " +
            "/Fe:d3d9.dll d3d9.cpp $mhSrc " +
-           "/link /DEF:d3d9.def /LIBPATH:`"$libDir`" openxr_loader.lib dxgi.lib user32.lib shell32.lib"
+           "/link /DEF:d3d9.def $xrLib user32.lib shell32.lib"
     cmd /c $cmd
     if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
     Write-Host ""
@@ -94,8 +123,12 @@ try {
         }
         if (-not (Test-Path $GameBin)) { throw "game Binaries folder not found: $GameBin" }
         Copy-Item (Join-Path $here "d3d9.dll") $GameBin -Force
-        Copy-Item (Join-Path $binDir "openxr_loader.dll") $GameBin -Force
-        Write-Host "Installed d3d9.dll + openxr_loader.dll to the configured game folder."
+        if ($needsOpenXr) {
+            Copy-Item (Join-Path $binDir "openxr_loader.dll") $GameBin -Force
+            Write-Host "Installed d3d9.dll + openxr_loader.dll to the configured game folder."
+        } else {
+            Write-Host "Installed d3d9.dll to the configured game folder."
+        }
     }
 } finally {
     Pop-Location
