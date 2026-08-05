@@ -1127,6 +1127,47 @@ static bool NameOf(uint32_t index, char* out, size_t cap)
     return i > 0;
 }
 
+// Does a candidate array behave like UObjects? Returns the Name offset, or -1.
+//
+// This is the validation that makes GObjects selection self-checking rather than
+// threshold-based. A name offset must decode for nearly every object AND vary across them -
+// distinctness is the part that matters, because null fields decode as index 0 ("None") and so
+// score a perfect hit rate while being constant.
+static int FindNameOffsetFor(uint32_t data, uint32_t count)
+{
+    const int kMaxOff = 0x60, kSlots = kMaxOff / 4;
+    int hits[kSlots] = {};
+    uint32_t seen[kSlots][64] = {};
+    int nseen[kSlots] = {};
+    int sampled = 0;
+
+    for (uint32_t i = 0; i < count && sampled < 400; ++i) {
+        uint32_t obj, vt;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+        if (!SafeU32(obj, &vt) || !InModule(vt)) continue;
+        sampled++;
+        for (int off = 4; off < kMaxOff; off += 4) {
+            const int s = off / 4;
+            uint32_t v; char nm[64];
+            if (!SafeU32(obj + off, &v) || !NameOf(v, nm, sizeof(nm))) continue;
+            hits[s]++;
+            bool known = false;
+            for (int k = 0; k < nseen[s]; ++k) if (seen[s][k] == v) { known = true; break; }
+            if (!known && nseen[s] < 64) seen[s][nseen[s]++] = v;
+        }
+    }
+    if (sampled < 64) return -1;
+
+    int best = -1, bestOff = -1;
+    for (int off = 4; off < kMaxOff; off += 4) {
+        const int s = off / 4;
+        if (nseen[s] < 32) continue;                      // must genuinely vary
+        if (hits[s] < sampled * 95 / 100) continue;        // and decode nearly always
+        if (hits[s] > best) { best = hits[s]; bestOff = off; }
+    }
+    return bestOff;
+}
+
 static bool FindGObjects()
 {
     // Same TArray shape, but the elements are UObject* whose first dword is a vtable pointing
@@ -1140,7 +1181,19 @@ static bool FindGObjects()
     // The threshold is 75%, not 90%. Slots hold objects mid-construction and freshly freed
     // pointers, and demanding near-perfection of a live heap is another way to reject a
     // correct answer.
-    uintptr_t bestAddr = 0; int bestOk = 0, bestChecked = 0; uint32_t bestCount = 0;
+    // ⚠️ Collect ALL candidates and choose; do not take the first that passes.
+    //
+    // First-match is order-dependent and .data contents vary between runs. One run picked
+    // 0x0204A344 (Count=113310, 64/64 vtables) and the next picked 0x01FFA644 (Count=57020,
+    // 58/64) purely because the latter sits at a lower address and happened to scrape past the
+    // threshold that day. Everything downstream then decoded garbage.
+    //
+    // The selection below is self-validating: the winner is the candidate for which a NAME
+    // OFFSET actually exists - one that decodes for nearly every object and varies across
+    // them. GObjects and the layout confirm each other, so neither is chosen on a threshold
+    // alone.
+    struct Cand { uintptr_t addr; uint32_t data, count, maxn; int ok, checked; };
+    Cand cands[32]; int ncand = 0;
     int candidates = 0;
 
     for (uintptr_t a = g_dataLo; a + 12 < g_dataHi; a += 4) {
@@ -1172,32 +1225,51 @@ static bool FindGObjects()
             uint32_t vtbl;
             if (SafeU32(obj, &vtbl) && InModule(vtbl)) vtblOk++;
         }
-        // Remembered even when it loses, so a failure reports the closest thing it saw
-        // instead of only "not found".
-        if (checked >= 8 && vtblOk * 100 / (checked ? checked : 1) >
-                            (bestChecked ? bestOk * 100 / bestChecked : 0)) {
-            bestAddr = a; bestOk = vtblOk; bestChecked = checked; bestCount = count;
+        if (checked >= 32 && vtblOk >= checked * 9 / 10 && ncand < 32)
+            cands[ncand++] = { a, data, count, maxn, vtblOk, checked };
+    }
+
+    if (!ncand) {
+        Log("[obj] GObjects NOT FOUND after %d TArray-shaped candidates", candidates);
+        return false;
+    }
+
+    // Best vtable ratio first, then largest Count - the real object array is the big one.
+    for (int i = 0; i < ncand; ++i)
+        for (int j = i + 1; j < ncand; ++j) {
+            const int ri = cands[i].ok * 1000 / cands[i].checked;
+            const int rj = cands[j].ok * 1000 / cands[j].checked;
+            if (rj > ri || (rj == ri && cands[j].count > cands[i].count)) {
+                Cand t = cands[i]; cands[i] = cands[j]; cands[j] = t;
+            }
         }
 
-        // Back to 90%. Every non-null slot in a real GObjects IS a UObject, so the honest
-        // expectation is near-perfect, and 75% was loosened to chase a failure whose actual
-        // cause was the .text-only vtable test.
-        if (checked >= 32 && vtblOk >= checked * 9 / 10) {
-            g_gobjAddr = a;
-            Log("*** [obj] GObjects at %p  Data=%p Count=%u Max=%u  (%d/%d sampled objects have"
-                " a vtable inside .text)", (void*)a, (void*)data, count, maxn, vtblOk, checked);
-            if (g_gnamesAddr)
-                Log("[obj]     GObjects - GNames = 0x%X   (was 0x30 in the Singularity build)",
-                    (unsigned)(a - g_gnamesAddr));
-            return true;
+    Log("[obj] %d GObjects candidate(s) passed the shape and vtable tests:", ncand);
+    for (int i = 0; i < ncand; ++i)
+        Log("[obj]     %p Data=%p Count=%-7u Max=%-10u %d/%d vtables", (void*)cands[i].addr,
+            (void*)cands[i].data, cands[i].count, cands[i].maxn, cands[i].ok, cands[i].checked);
+
+    for (int i = 0; i < ncand; ++i) {
+        const int off = FindNameOffsetFor(cands[i].data, cands[i].count);
+        if (off < 0) {
+            Log("[obj]     %p rejected: no offset decodes as a varying name",
+                (void*)cands[i].addr);
+            continue;
         }
+        g_gobjAddr = cands[i].addr;
+        g_offName  = off;
+        Log("*** [obj] GObjects at %p  Data=%p Count=%u Max=%u  (%d/%d vtables in module)",
+            (void*)cands[i].addr, (void*)cands[i].data, cands[i].count, cands[i].maxn,
+            cands[i].ok, cands[i].checked);
+        Log("*** [obj] confirmed by UObject::Name resolving at +0x%02X", off);
+        if (g_gnamesAddr)
+            Log("[obj]     GObjects - GNames = 0x%X   (adjacency does NOT transfer from"
+                " Singularity, which had 0x30)", (unsigned)(cands[i].addr - g_gnamesAddr));
+        return true;
     }
-    Log("[obj] GObjects NOT FOUND after %d TArray-shaped candidates", candidates);
-    if (bestAddr) {
-        Log("[obj]     closest was %p Count=%u with %d/%d vtables in .text",
-            (void*)bestAddr, bestCount, bestOk, bestChecked);
-        HexDump(bestAddr, 0x20, "cand");
-    }
+
+    Log("[obj] GObjects NOT FOUND - %d candidates passed the shape test, none produced a"
+        " usable Name offset", ncand);
     return false;
 }
 
