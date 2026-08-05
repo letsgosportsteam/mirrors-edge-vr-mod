@@ -48,10 +48,35 @@
 // A first attempt at that extraction mishandled the STDMETHOD_(type, name) form and came
 // out four slots low; it was caught precisely because it disagreed with the working values.
 
+// ---- rung 2: does OpenXR work inside this 32-bit process? ----
+//
+// Creates a session, a swapchain, and submits a QUAD layer filled with a solid colour that
+// CYCLES. Nothing of the game reaches the headset yet, and no engine behaviour is altered -
+// the game is still fullscreen and untouched.
+//
+// The colour cycles on purpose. A static quad cannot distinguish "we are submitting frames
+// continuously" from "we submitted one frame and the compositor is still showing it", and
+// the difference is the entire point of the rung. A cycling colour cannot false-pass that
+// way: if it is moving, the frame loop is live.
+//
+// Separated from putting the real frame on that quad (rung 3) because "OpenXR session works"
+// and "our frame grab is correct" are unrelated failure modes. A black headset that could be
+// either one is a wasted run.
+//
+// If no headset or runtime is present, initialisation fails once, says so, and the proxy
+// keeps forwarding normally. The game must never fail to run because VR is unavailable.
+
+#define XR_USE_GRAPHICS_API_D3D11
+
 #include <windows.h>
 #include <d3d9.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <openxr/openxr.h>
+#include <openxr/openxr_platform.h>
 #include <cstdio>
 #include <cstdarg>
+#include <cmath>
 
 // ---------------------------------------------------------------- vtable slots
 
@@ -81,6 +106,24 @@ static long  g_frames        = 0;
 static bool  g_describedBackbuffer = false;
 
 static LONG  g_poolDefault = 0, g_poolManaged = 0, g_poolSystemMem = 0, g_poolScratch = 0;
+
+// ---- OpenXR / D3D11 state ----
+static ID3D11Device*        g_dev11    = nullptr;
+static ID3D11DeviceContext* g_ctx11    = nullptr;
+static XrInstance           g_xrInstance = XR_NULL_HANDLE;
+static XrSystemId           g_xrSystem   = XR_NULL_SYSTEM_ID;
+static XrSession            g_xrSession  = XR_NULL_HANDLE;
+static XrSpace              g_xrSpace    = XR_NULL_HANDLE;
+static XrSwapchain          g_swapchain  = XR_NULL_HANDLE;
+static ID3D11Texture2D**    g_scImages   = nullptr;
+static uint32_t             g_scImageCount = 0;
+static uint32_t             g_scW = 0, g_scH = 0;
+static uint32_t             g_recEyeW = 0, g_recEyeH = 0;
+static bool                 g_xrReady   = false;   // session + space exist
+static bool                 g_xrRunning = false;   // xrBeginSession succeeded
+static bool                 g_xrTried   = false;   // init attempted; never retried
+static XrSessionState       g_xrState   = XR_SESSION_STATE_UNKNOWN;
+static long                 g_xrFrames  = 0;
 
 // ---------------------------------------------------------------- logging
 //
@@ -217,6 +260,268 @@ static void* PatchVTable(void* obj, int index, void* repl)
     return orig;
 }
 
+// ================================================================ OpenXR (rung 2)
+
+static bool InitXR()
+{
+    const char* exts[] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME };
+
+    // VirtualDesktopXR is OpenXR 1.0 ONLY and rejects a 1.1 instance with -4. Inherited from
+    // the Singularity project, where VDXR is also the only usable 32-bit runtime: Meta's own
+    // crashes in xrCreateSession, and SteamVR ships no 32-bit runtime at all. Try 1.0 first
+    // so the working case is not gated on the failing one.
+    XrVersion versions[] = { XR_MAKE_VERSION(1, 0, 34), XR_CURRENT_API_VERSION };
+    XrResult r = XR_ERROR_RUNTIME_FAILURE;
+    for (XrVersion v : versions) {
+        XrInstanceCreateInfo ici{ XR_TYPE_INSTANCE_CREATE_INFO };
+        strcpy_s(ici.applicationInfo.applicationName, "MirrorsEdgeVR");
+        ici.applicationInfo.apiVersion = v;
+        ici.enabledExtensionCount = 1;
+        ici.enabledExtensionNames  = exts;
+        r = xrCreateInstance(&ici, &g_xrInstance);
+        Log("[xr] xrCreateInstance apiVersion=%llu -> %d", (unsigned long long)v, (int)r);
+        if (XR_SUCCEEDED(r)) break;
+    }
+    if (XR_FAILED(r)) {
+        Log("[xr] no OpenXR instance. Is the headset connected and Virtual Desktop streaming?");
+        return false;
+    }
+
+    XrInstanceProperties ip{ XR_TYPE_INSTANCE_PROPERTIES };
+    if (XR_SUCCEEDED(xrGetInstanceProperties(g_xrInstance, &ip)))
+        Log("[xr] runtime: %s", ip.runtimeName);
+
+    XrSystemGetInfo sgi{ XR_TYPE_SYSTEM_GET_INFO };
+    sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+    if (XR_FAILED(xrGetSystem(g_xrInstance, &sgi, &g_xrSystem))) { Log("[xr] no HMD"); return false; }
+
+    // What the runtime wants per eye. Not used to drive anything yet, but it is the number
+    // the finished mod inherits its resolution from, and it already includes whatever
+    // render-scale is set in the platform's own slider.
+    {
+        uint32_t viewCount = 0;
+        xrEnumerateViewConfigurationViews(g_xrInstance, g_xrSystem,
+                                          XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                          0, &viewCount, nullptr);
+        if (viewCount >= 1 && viewCount <= 4) {
+            XrViewConfigurationView vcv[4]{};
+            for (uint32_t i = 0; i < viewCount; ++i) vcv[i] = { XR_TYPE_VIEW_CONFIGURATION_VIEW };
+            if (XR_SUCCEEDED(xrEnumerateViewConfigurationViews(
+                    g_xrInstance, g_xrSystem, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                    viewCount, &viewCount, vcv))) {
+                g_recEyeW = vcv[0].recommendedImageRectWidth;
+                g_recEyeH = vcv[0].recommendedImageRectHeight;
+                Log("[xr] headset wants %ux%u per eye (max %ux%u)", g_recEyeW, g_recEyeH,
+                    vcv[0].maxImageRectWidth, vcv[0].maxImageRectHeight);
+                Log("[xr] => side-by-side stereo would want -ResX=%u -ResY=%u",
+                    g_recEyeW * 2, g_recEyeH);
+            }
+        }
+    }
+
+    // The D3D11 device MUST be on the adapter the runtime names, not simply the default one.
+    PFN_xrGetD3D11GraphicsRequirementsKHR pfn = nullptr;
+    xrGetInstanceProcAddr(g_xrInstance, "xrGetD3D11GraphicsRequirementsKHR",
+                          (PFN_xrVoidFunction*)&pfn);
+    if (!pfn) { Log("[xr] xrGetD3D11GraphicsRequirementsKHR unavailable"); return false; }
+    XrGraphicsRequirementsD3D11KHR req{ XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR };
+    if (XR_FAILED(pfn(g_xrInstance, g_xrSystem, &req))) { Log("[xr] graphics requirements failed"); return false; }
+
+    IDXGIFactory1* fac = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&fac))) { Log("[xr] no DXGI factory"); return false; }
+    IDXGIAdapter1* ad = nullptr; IDXGIAdapter1* chosen = nullptr;
+    for (UINT i = 0; fac->EnumAdapters1(i, &ad) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 d{}; ad->GetDesc1(&d);
+        if (d.AdapterLuid.LowPart == req.adapterLuid.LowPart &&
+            d.AdapterLuid.HighPart == req.adapterLuid.HighPart) { chosen = ad; break; }
+        ad->Release();
+    }
+    fac->Release();
+    if (!chosen) { Log("[xr] no adapter matched the runtime's LUID"); return false; }
+
+    D3D_FEATURE_LEVEL want[] = { D3D_FEATURE_LEVEL_11_0 }, got{};
+    HRESULT hr = D3D11CreateDevice(chosen, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                                   D3D11_CREATE_DEVICE_BGRA_SUPPORT, want, 1,
+                                   D3D11_SDK_VERSION, &g_dev11, &got, &g_ctx11);
+    chosen->Release();
+    if (FAILED(hr)) { Log("[xr] D3D11CreateDevice failed hr=0x%08lX", (unsigned long)hr); return false; }
+
+    XrGraphicsBindingD3D11KHR bind{ XR_TYPE_GRAPHICS_BINDING_D3D11_KHR };
+    bind.device = g_dev11;
+    XrSessionCreateInfo sci{ XR_TYPE_SESSION_CREATE_INFO };
+    sci.next = &bind; sci.systemId = g_xrSystem;
+    XrResult sr = xrCreateSession(g_xrInstance, &sci, &g_xrSession);
+    if (XR_FAILED(sr)) { Log("[xr] xrCreateSession failed -> %d", (int)sr); return false; }
+
+    XrReferenceSpaceCreateInfo rs{ XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+    rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    rs.poseInReferenceSpace.orientation.w = 1.0f;
+    if (XR_FAILED(xrCreateReferenceSpace(g_xrSession, &rs, &g_xrSpace))) {
+        Log("[xr] xrCreateReferenceSpace failed"); return false;
+    }
+
+    Log("*** [xr] OpenXR session created. 32-bit OpenXR works in this process.");
+    g_xrReady = true;
+    return true;
+}
+
+// Actions only deliver data while FOCUSED, and frames may only be submitted while the session
+// is running. Without this the difference between "not focused" and "not working" is invisible.
+static void PumpXREvents()
+{
+    XrEventDataBuffer ev{ XR_TYPE_EVENT_DATA_BUFFER };
+    while (xrPollEvent(g_xrInstance, &ev) == XR_SUCCESS) {
+        if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+            auto* s = reinterpret_cast<XrEventDataSessionStateChanged*>(&ev);
+            g_xrState = s->state;
+            Log("[xr] session state -> %d", (int)s->state);
+            if (s->state == XR_SESSION_STATE_READY && !g_xrRunning) {
+                XrSessionBeginInfo bi{ XR_TYPE_SESSION_BEGIN_INFO };
+                bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+                if (XR_SUCCEEDED(xrBeginSession(g_xrSession, &bi))) {
+                    g_xrRunning = true;
+                    Log("*** [xr] session RUNNING - frames can now be submitted");
+                }
+            } else if (s->state == XR_SESSION_STATE_STOPPING) {
+                xrEndSession(g_xrSession);
+                g_xrRunning = false;
+                Log("[xr] session stopped");
+            }
+        }
+        ev = { XR_TYPE_EVENT_DATA_BUFFER };
+    }
+}
+
+static bool EnsureSwapchain(uint32_t w, uint32_t h)
+{
+    if (g_swapchain != XR_NULL_HANDLE && w == g_scW && h == g_scH) return true;
+    if (g_swapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(g_swapchain); g_swapchain = XR_NULL_HANDLE;
+        delete[] g_scImages; g_scImages = nullptr;
+    }
+
+    // Two-call enumeration, with the SECOND count clamped to what was actually allocated.
+    // The reference does not clamp, and /analyze is right that it need not be safe: nothing
+    // stops a runtime reporting a larger count on the second call than it did on the first.
+    uint32_t fmtCap = 0;
+    if (XR_FAILED(xrEnumerateSwapchainFormats(g_xrSession, 0, &fmtCap, nullptr)) || fmtCap == 0) {
+        Log("[xr] no swapchain formats reported"); return false;
+    }
+    int64_t* fmts = new int64_t[fmtCap];
+    uint32_t fmtCount = 0;
+    if (XR_FAILED(xrEnumerateSwapchainFormats(g_xrSession, fmtCap, &fmtCount, fmts)) || fmtCount == 0) {
+        delete[] fmts; Log("[xr] swapchain format enumeration failed"); return false;
+    }
+    if (fmtCount > fmtCap) fmtCount = fmtCap;
+
+    // Colour space matters and is not cosmetic. The game writes sRGB-ENCODED pixels. If the
+    // swapchain is declared linear, the compositor assumes linear data and encodes a second
+    // time, which reads as washed out and low contrast. B8G8R8A8_UNORM_SRGB is bit-identical
+    // to the D3D9 A8R8G8B8 layout measured in rung 1, so the eventual copy stays legal.
+    const int64_t prefer[] = { DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+                               DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                               DXGI_FORMAT_B8G8R8A8_UNORM };
+    int64_t chosen = fmts[0];
+    bool picked = false;
+    for (int p = 0; p < 3 && !picked; ++p)
+        for (uint32_t i = 0; i < fmtCount; ++i)
+            if (fmts[i] == prefer[p]) { chosen = fmts[i]; picked = true; break; }
+    Log("[xr] swapchain format %lld %s", (long long)chosen,
+        (chosen == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || chosen == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+            ? "(sRGB - correct for the game's output)" : "(LINEAR - expect washed out colours)");
+    delete[] fmts;
+
+    XrSwapchainCreateInfo sci{ XR_TYPE_SWAPCHAIN_CREATE_INFO };
+    sci.usageFlags  = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    sci.format      = chosen;
+    sci.sampleCount = 1;
+    sci.width = w; sci.height = h;
+    sci.faceCount = 1; sci.arraySize = 1; sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(g_xrSession, &sci, &g_swapchain))) {
+        Log("[xr] xrCreateSwapchain FAILED"); return false;
+    }
+
+    xrEnumerateSwapchainImages(g_swapchain, 0, &g_scImageCount, nullptr);
+    XrSwapchainImageD3D11KHR* imgs = new XrSwapchainImageD3D11KHR[g_scImageCount];
+    for (uint32_t i = 0; i < g_scImageCount; ++i) imgs[i] = { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR };
+    xrEnumerateSwapchainImages(g_swapchain, g_scImageCount, &g_scImageCount,
+                               reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs));
+    g_scImages = new ID3D11Texture2D*[g_scImageCount];
+    for (uint32_t i = 0; i < g_scImageCount; ++i) g_scImages[i] = imgs[i].texture;
+    delete[] imgs;
+
+    g_scW = w; g_scH = h;
+    Log("[xr] swapchain %ux%u images=%u", w, h, g_scImageCount);
+    return true;
+}
+
+// One XR frame: wait, begin, fill the quad with a cycling colour, submit, end.
+static void SubmitTestQuad()
+{
+    if (!g_xrRunning) return;
+
+    XrFrameState fs{ XR_TYPE_FRAME_STATE };
+    if (XR_FAILED(xrWaitFrame(g_xrSession, nullptr, &fs))) return;
+    xrBeginFrame(g_xrSession, nullptr);
+
+    long n = InterlockedIncrement(&g_xrFrames);
+    bool submitted = false;
+    XrCompositionLayerQuad quad{ XR_TYPE_COMPOSITION_LAYER_QUAD };
+
+    if (fs.shouldRender && EnsureSwapchain(1024, 1024)) {
+        uint32_t idx = 0;
+        XrSwapchainImageAcquireInfo ai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+        if (XR_SUCCEEDED(xrAcquireSwapchainImage(g_swapchain, &ai, &idx))) {
+            XrSwapchainImageWaitInfo wi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+            wi.timeout = XR_INFINITE_DURATION;
+            if (XR_SUCCEEDED(xrWaitSwapchainImage(g_swapchain, &wi))) {
+                // The colour CYCLES so a live loop cannot be mistaken for one frozen frame -
+                // see the note at the top of this file. Roughly a three-second period.
+                float t = (float)(n % 180) / 180.0f * 6.2831853f;
+                FLOAT rgba[4] = { 0.5f + 0.5f * sinf(t),
+                                  0.5f + 0.5f * sinf(t + 2.0944f),
+                                  0.5f + 0.5f * sinf(t + 4.1888f),
+                                  1.0f };
+                ID3D11RenderTargetView* rtv = nullptr;
+                if (SUCCEEDED(g_dev11->CreateRenderTargetView(g_scImages[idx], nullptr, &rtv))) {
+                    g_ctx11->ClearRenderTargetView(rtv, rgba);
+                    rtv->Release();
+                    submitted = true;
+                } else if (n == 1) {
+                    Log("[xr] CreateRenderTargetView FAILED - the quad will be blank");
+                }
+            }
+            XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+            xrReleaseSwapchainImage(g_swapchain, &ri);
+        }
+    }
+
+    const XrCompositionLayerBaseHeader* layers[1];
+    uint32_t layerCount = 0;
+    if (submitted) {
+        quad.space      = g_xrSpace;
+        quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        quad.subImage.swapchain = g_swapchain;
+        quad.subImage.imageRect = { {0, 0}, {(int32_t)g_scW, (int32_t)g_scH} };
+        quad.pose.orientation.w = 1.0f;
+        quad.pose.position      = { 0.0f, 0.0f, -2.0f };   // 2 m in front, LOCAL space
+        quad.size               = { 2.0f, 2.0f };           // 2 m square
+        layers[0] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad);
+        layerCount = 1;
+    }
+
+    XrFrameEndInfo fei{ XR_TYPE_FRAME_END_INFO };
+    fei.displayTime          = fs.predictedDisplayTime;
+    fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    fei.layerCount           = layerCount;
+    fei.layers               = layerCount ? layers : nullptr;
+    XrResult er = xrEndFrame(g_xrSession, &fei);
+
+    if (n == 1)        Log("*** [xr] first XR frame submitted, xrEndFrame -> %d", (int)er);
+    else if (n % 600 == 0) Log("[xr] frame %ld  state=%d  shouldRender=%d  endFrame=%d",
+                               n, (int)g_xrState, (int)fs.shouldRender, (int)er);
+}
+
 // ---------------------------------------------------------------- device hooks
 
 typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDirect3DDevice9*, const RECT*, const RECT*,
@@ -291,7 +596,27 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     if (f == 1) {
         Log("*** first Present - the game is rendering. This is the frame hook everything later hangs off.");
         DescribeBackbuffer(dev);
-    } else if (f % 600 == 0) {
+    }
+
+    // ---- rung 2: drive the XR frame loop from the game's Present ----
+    //
+    // Initialised once and never retried: a failed init is expensive, and repeating it every
+    // frame would turn "no headset" into a stutter. A failure here leaves the game entirely
+    // unaffected, which is the requirement.
+    //
+    // NOTE this paces the game to the headset's frame rate, because xrWaitFrame blocks until
+    // the compositor is ready. That is intended and is how the reference works, but it means
+    // frame-rate numbers taken from here are not comparable with an unmodded run.
+    if (!g_xrTried) {
+        g_xrTried = true;
+        if (!InitXR()) Log("[xr] VR unavailable this run - continuing as a plain pass-through");
+    }
+    if (g_xrReady) {
+        PumpXREvents();
+        SubmitTestQuad();
+    }
+
+    if (f > 1 && f % 600 == 0) {
         Log("[present] frame %ld   pools so far: DEFAULT=%ld MANAGED=%ld SYSTEMMEM=%ld other=%ld",
             f, g_poolDefault, g_poolManaged, g_poolSystemMem, g_poolScratch);
     }

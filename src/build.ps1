@@ -76,7 +76,9 @@ try {
     }
     $incArgs = "/I`"$mh\include`""
     if ($needsOpenXr) { $incArgs = "/I`"$inc`" $incArgs" }
-    $xrLib = if ($needsOpenXr) { "/LIBPATH:`"$libDir`" openxr_loader.lib" } else { "" }
+    # d3d11/dxgi come with OpenXR here: the XR_KHR_D3D11 binding needs a D3D11 device created
+    # on the adapter the runtime names, so they are never wanted independently of it.
+    $xrLib = if ($needsOpenXr) { "/LIBPATH:`"$libDir`" openxr_loader.lib d3d11.lib dxgi.lib" } else { "" }
 
     # ---- static analysis pass on d3d9.cpp, before the real build ----
     #
