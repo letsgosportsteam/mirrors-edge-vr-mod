@@ -398,8 +398,39 @@ also confirms the decompilation is faithful.
 `LinearDownward` by value. Order is taken from the declaration, not measured. It does not
 matter for zeroing both, but do not cite it as measured.
 
-**This is what unblocks the swan-neck experiment.** Writing `+0x60`, `+0x64`, `+0x68` and
-`+0x6C` to zero at runtime disables the lean with no file touched and no hash to defeat.
+### ✅✅ CONFIRMED IN THE GAME, 2026-08-05 — runtime property writes work
+
+Writing `+0x60`/`+0x64`/`+0x68`/`+0x6C` at runtime visibly changes the camera. Verified by an
+**exaggerated** value rather than by zeroing: at 8× (linear 200/200, quadratic 280/240) the
+lean on looking down is unmistakable, which zeroing could never have established.
+
+```
+[swan] live instance at 384D94C0 (search took 1474.6 ms over 114701 slots)
+[swan] original values: linear 25.0/25.0  quadratic 35.0/30.0
+*** [swan] EXAGGERATED 8x ... (linear 200.0/200.0 quadratic 280.0/240.0)
+```
+
+**The general result is much larger than the swan neck.** Any UnrealScript property in this
+game can now be read and written at runtime, located by class name, with **no file modified, no
+hash to defeat and no external patcher**. Everything the config check closed is reopened:
+`DefaultAnimation.ini`'s spring and limiter values, `TdPlayerController.FOVAngle`, and
+eventually the camera-animation attenuation that is the project's longest pole.
+
+Whether *zeroing* the swan neck is desirable for VR is a separate question and needs a headset.
+The mechanism is proven; the comfort judgement is not made.
+
+> **⚠️ Two costs recorded rather than glossed.**
+>
+> **A failed object search must arm a backoff.** The search walks ~115,000 objects with several
+> `ReadProcessMemory` calls each. Cached it is three reads a frame and free; uncached it is
+> hundreds of thousands of syscalls **per frame** on the render thread. With no instance present
+> the framerate collapsed *and* the hotkey appeared dead — one cause, two symptoms that look
+> unrelated. The Singularity project measured the identical failure at 69–82 ms/frame in its
+> run 35 and wrote down the fix; it was read during this port and not applied.
+>
+> **The successful search still costs 1474 ms**, one-off, on the render thread. Cached
+> afterwards, but a 1.5-second hitch. It should move to the background thread that already
+> walks every object, or be spread across frames.
 
 > **⚠️ Hit rate alone cannot find this offset, and it took a wasted run to see why.** In the
 > first scoring pass, `+0x18`, `+0x1C`, `+0x2C`, `+0x30`, `+0x40`, `+0x44` and `+0x48` all
