@@ -1660,11 +1660,18 @@ static bool DerivePropertyOffsets()
 
     // Known from the value search. If the walker cannot reproduce these it is wrong.
     struct Known { const char* name; uint32_t off; };
+    // LinearDownwardTranslation and the two pitch consts are included here even though the
+    // value search could not isolate them - their offsets follow from the declaration order in
+    // the decompiled class, and requiring the walker to agree with ALL of them is a stronger
+    // test than requiring it to agree with the five that were individually measured.
     const Known known[] = {
         { "LinearForwardTranslation",     0x60 },
+        { "LinearDownwardTranslation",    0x64 },
         { "QuadraticForwardTranslation",  0x68 },
         { "QuadraticDownwardTranslation", 0x6C },
         { "StartTranslateAtDegree",       0x70 },
+        { "ForwardPitchWorld",            0x74 },
+        { "DownwardPitchWorld",           0x78 },
         { "DegToUnDeg",                   0x7C },
     };
     const int NK = (int)(sizeof(known) / sizeof(known[0]));
@@ -1692,22 +1699,56 @@ static bool DerivePropertyOffsets()
     uint32_t head = 0;
     SafeU32(cls + g_offChildren, &head);
 
-    // ---- Next: a pointer from one property to another property of the same class ----
-    for (int no = 4; no <= 0xB0 && g_offNext < 0; no += 4) {
-        uint32_t nxt;
-        if (!SafeU32(head + no, &nxt) || nxt < 0x10000) continue;
-        uint32_t vt;
-        if (!SafeU32(nxt, &vt) || !InModule(vt)) continue;
-        char nm[96];
-        if (!ReadObjName(nxt, nm, sizeof(nm))) continue;
-        for (int k = 0; k < NK; ++k) {
-            if (strcmp(nm, known[k].name) != 0) continue;
-            g_offNext = no;
-            Log("[prop] UField::Next at +0x%02X -> \"%s\"", no, nm);
-            break;
+    // ---- Next: found STRUCTURALLY, by which offset yields a long chain ----
+    //
+    // The first version required the next link to be a name from the known list, and failed
+    // immediately: Children points at LinearForwardTranslation, whose Next is
+    // LinearDownwardTranslation - deliberately left out of that list because it shares the
+    // value 25.0 with LinearForward and so could not be told apart by value search.
+    //
+    // Matching names was the wrong test regardless. A linked list is identified by BEING a
+    // list: the right offset walks many distinct, well-named objects without cycling, and
+    // every wrong offset terminates within a step or two.
+    int bestLen = 0;
+    for (int no = 4; no <= 0xB0; no += 4) {
+        uintptr_t seen[96]; int nseen = 0; int len = 0;
+        uintptr_t p = head;
+        while (len < 96) {
+            uint32_t nxt;
+            if (!SafeU32(p + no, &nxt) || nxt < 0x10000) break;
+            uint32_t vt;
+            if (!SafeU32(nxt, &vt) || !InModule(vt)) break;
+            char nm[96];
+            if (!ReadObjName(nxt, nm, sizeof(nm))) break;
+            bool cycle = false;
+            for (int k = 0; k < nseen; ++k) if (seen[k] == nxt) { cycle = true; break; }
+            if (cycle) break;
+            if (nseen < 96) seen[nseen++] = nxt;
+            p = nxt; len++;
         }
+        if (len > bestLen) { bestLen = len; g_offNext = no; }
     }
-    if (g_offNext < 0) { Log("[prop] Next NOT FOUND"); return false; }
+    if (bestLen < 3) {
+        Log("[prop] Next NOT FOUND - longest chain from any offset was %d", bestLen);
+        g_offNext = -1;
+        return false;
+    }
+    Log("[prop] UField::Next at +0x%02X (chain of %d from the first field)", g_offNext, bestLen);
+    {
+        char line[512]; int n = 0;
+        n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE, "[prop]   chain:");
+        uintptr_t p = head; int shown = 0;
+        while (p && shown < 10) {
+            char nm[96];
+            if (!ReadObjName(p, nm, sizeof(nm))) break;
+            n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE, " %s", nm);
+            shown++;
+            uint32_t nxt;
+            if (!SafeU32(p + g_offNext, &nxt) || nxt < 0x10000) break;
+            p = nxt;
+        }
+        Log("%s", line);
+    }
 
     // ---- Offset: the dword in each UProperty that equals its MEASURED offset ----
     //
