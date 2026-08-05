@@ -1619,8 +1619,8 @@ static const uint32_t SWAN_QuadFwd     = 0x68;
 static const uint32_t SWAN_QuadDown    = 0x6C;
 
 static uintptr_t g_swanNeck = 0;
-static int  g_swanMode = 0;          // 0 = untouched, 1 = zeroed
-static bool g_swanApplied = false;
+static int  g_swanMode = 0;          // 0 = original, 1 = zeroed, 2 = exaggerated 8x
+static int  g_swanAppliedMode = -1;  // -1 = nothing written yet
 static float g_swanSaved[4] = { 0, 0, 0, 0 };
 static bool  g_swanSavedOk = false;
 
@@ -1647,7 +1647,7 @@ static uintptr_t FindSwanNeck()
 {
     if (LooksLikeSwanInstance(g_swanNeck)) return g_swanNeck;
     g_swanNeck = 0;
-    g_swanApplied = false;
+    g_swanAppliedMode = -1;   // the new instance holds its own defaults; re-apply on sight
     g_swanSavedOk = false;
 
     if (!g_gobjAddr || g_offName < 0) return 0;
@@ -1692,24 +1692,34 @@ static void ApplySwanNeck()
         }
     }
 
-    const bool want = (g_swanMode == 1);
-    if (want == g_swanApplied) return;
+    if (g_swanMode == g_swanAppliedMode) return;
+    if (!g_swanSavedOk) return;
 
-    if (want) {
-        const bool ok = WriteF32(obj + SWAN_LinearFwd,  0.0f) &&
-                        WriteF32(obj + SWAN_LinearDown, 0.0f) &&
-                        WriteF32(obj + SWAN_QuadFwd,    0.0f) &&
-                        WriteF32(obj + SWAN_QuadDown,   0.0f);
-        Log("*** [swan] ZEROED the translations (%s) - look down; the lean should be gone",
-            ok ? "all four written" : "A WRITE FAILED");
-    } else if (g_swanSavedOk) {
-        WriteF32(obj + SWAN_LinearFwd,  g_swanSaved[0]);
-        WriteF32(obj + SWAN_LinearDown, g_swanSaved[1]);
-        WriteF32(obj + SWAN_QuadFwd,    g_swanSaved[2]);
-        WriteF32(obj + SWAN_QuadDown,   g_swanSaved[3]);
-        Log("*** [swan] RESTORED the original translations");
-    }
-    g_swanApplied = want;
+    // ---- three states, not two, and the third is the one that proves anything ----
+    //
+    // Zeroing produces a subtle ABSENCE: the player is asked to notice that something they
+    // never consciously noticed has stopped. That is a test which struggles to fail, and this
+    // project has already lost runs to exactly that shape - it is why the ini experiment used
+    // an absurd value rather than zero.
+    //
+    // The exaggerated state makes the channel's existence unmistakable. Once an 8x lean is
+    // obviously there, "zeroed" becomes trustworthy, because the lever is known to reach the
+    // camera. Reporting "I could tell something happened" is honest and soft; this turns it
+    // into a yes or no.
+    const float mul = (g_swanMode == 1) ? 0.0f : (g_swanMode == 2 ? 8.0f : 1.0f);
+    const bool ok = WriteF32(obj + SWAN_LinearFwd,  g_swanSaved[0] * mul) &&
+                    WriteF32(obj + SWAN_LinearDown, g_swanSaved[1] * mul) &&
+                    WriteF32(obj + SWAN_QuadFwd,    g_swanSaved[2] * mul) &&
+                    WriteF32(obj + SWAN_QuadDown,   g_swanSaved[3] * mul);
+
+    const char* what = (g_swanMode == 1) ? "ZEROED - looking down should feel flat"
+                     : (g_swanMode == 2) ? "EXAGGERATED 8x - looking down should LURCH forward and down"
+                                         : "ORIGINAL values restored";
+    Log("*** [swan] %s  (linear %.1f/%.1f quadratic %.1f/%.1f) %s",
+        what, g_swanSaved[0] * mul, g_swanSaved[1] * mul,
+        g_swanSaved[2] * mul, g_swanSaved[3] * mul,
+        ok ? "" : "  <- A WRITE FAILED");
+    g_swanAppliedMode = g_swanMode;
 }
 
 // F7 toggles it. A raw key read, like PAUSE - this is a test lever, and an A/B the player can
@@ -1719,8 +1729,9 @@ static void CheckSwanHotkey()
     static bool wasDown = false;
     const bool down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
     if (down && !wasDown) {
-        g_swanMode = g_swanMode ? 0 : 1;
-        Log("[swan] F7 -> mode %d (%s)", g_swanMode, g_swanMode ? "zeroed" : "original");
+        g_swanMode = (g_swanMode + 1) % 3;
+        static const char* kNames[3] = { "original", "zeroed", "exaggerated 8x" };
+        Log("[swan] F7 -> mode %d (%s)", g_swanMode, kNames[g_swanMode]);
     }
     wasDown = down;
 }
