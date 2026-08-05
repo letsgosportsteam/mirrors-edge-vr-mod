@@ -76,6 +76,21 @@ encrypted** — the older SteamStub variant that only wraps the entry point. Fil
 purchase required, no unpacking step, and no "do these addresses hold on Steam" question — they
 provably do, because it is the same bytes.
 
+> ⚠️ **Unencrypted is not the same as runnable.** The Steam copy still carries the SteamStub
+> wrapper, and launching that executable outside Steam fails with **"Application load error"**
+> before reaching any game code. Confirmed here by cloning the Steam install to a standalone
+> folder and running it.
+>
+> So the two questions have different answers, and it is easy to conflate them:
+>
+> | question | Steam copy | GOG copy |
+> |---|---|---|
+> | Can Ghidra read the code? | ✅ yes, `.text` is plaintext | ✅ yes |
+> | Will it run from an arbitrary folder? | ❌ **no**, SteamStub refuses | ✅ yes |
+>
+> **The disposable dev copy must therefore come from the GOG install.** Keep the Steam install
+> for a final "does the shipped mod work for Steam users" check, launched through Steam.
+
 ### 2. ⭐ The shipped executable is an editor build
 
 This is the largest single difference from Singularity, and it changes what kind of project this is.
@@ -258,19 +273,23 @@ against a guess.
 
 UEVR still does not help — UE4/UE5 only.
 
-## ⚠️ Housekeeping: the GOG install is currently modified
+## The dev copy — resolved
 
-Two anomalies in the GOG copy's `Binaries\` folder, both worth resolving before it is used as a
-reference copy:
+The disposable dev copy is cloned from the **GOG** install, for the SteamStub reason above.
+Two anomalies in that install were checked rather than assumed:
 
-- **`PhysXCore.dll` is renamed to `PhysXCore.bak`** — present and correct in the Steam copy. This
-  is a known community workaround (forcing the system PhysX), but it means this install is not
-  pristine.
-- **`steam_api.dll` is present in a GOG install**, along with `PhysXLoader.dll`, which Steam's copy
-  lacks.
+- **`PhysXCore.dll` renamed to `PhysXCore.bak`.** Measured: the `.bak` is **byte-identical**
+  (sha256 `D10126C3…93BAE9`) to the Steam copy's working `PhysXCore.dll`. It is the intact file
+  under a different name — a known community workaround for forcing the system PhysX — so
+  renaming it back restores it with nothing lost. Done in the dev copy.
+- **`steam_api.dll` present in a GOG install**, alongside `PhysXLoader.dll` which Steam's copy
+  lacks. Harmless leftover; the GOG executable has no SteamStub section and does not import it.
 
-Since the `.text` sections are byte-identical, **either copy works for static analysis**. Pick one
-install to be the disposable dev copy, as `ENVIRONMENT.md` did last time.
+The dev copy's executable is verified byte-identical to the GOG original, five sections, no
+`.bind`.
+
+**Do not use the Steam-derived clone.** It was tried first and fails with "Application load
+error" — that mistake is what produced the table above.
 
 ## Recommended sequence
 
