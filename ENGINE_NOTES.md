@@ -167,6 +167,51 @@ This failed in a way worth remembering: the session was FOCUSED, `shouldRender` 
 frame and was simply empty.** Every indicator except the headset itself said the pipeline
 was healthy.
 
+### ✅ The CPU frame path costs ~4.4–5.0 ms at 2560×1440 — rung 3, 2026-08-04
+
+`backbuffer → GetRenderTargetData → SYSTEMMEM → lock → D3D11 dynamic texture → CopyResource`.
+Measured as a mean over each 600-frame window, during gameplay:
+
+```
+frame  600   4.94 ms      frame 1800   4.45 ms
+frame 1200   5.04 ms      frame 2400   4.36 ms
+```
+
+**This number cross-validates against the reference.** Singularity measured ~9.8 ms on the same
+path at 4K. 3840×2160 is 8.29 MP against 2560×1440's 3.69 MP — a ratio of 2.25 — and
+9.8 / 2.25 = 4.36 ms. The measurement lands on the prediction, so it is the real cost of the
+path rather than an artefact of how it is timed here.
+
+What it means for the D3D9Ex wrapper, which is the decision this number exists to inform:
+
+| target | budget | frame grab | share |
+|---|---|---|---|
+| 2560×1440 @ 90 Hz | 11.1 ms | 4.4 ms | 40% |
+| 2560×1440 @ 120 Hz | 8.33 ms | 4.4 ms | 53% |
+| **4992×2688 @ 90 Hz** (full parity stereo, 13.4 MP) | 11.1 ms | **~16 ms projected** | **untenable** |
+
+So the CPU path is **usable for the next several rungs and cannot survive full-resolution
+stereo**. Deferring the wrapper past stereo verification remains right; taking it on before
+that would have been premature. Zero-copy took the reference's frame copy to **0.00 ms**.
+
+The `LOCKABLE_BACKBUFFER` flag noted above is still an unmeasured third option that might
+avoid the wrapper entirely. Worth timing before committing to D3D9Ex.
+
+### ⚠️ `DLL_PROCESS_DETACH` logging is unreliable, and it is an instrument gap only
+
+The rung 1 run wrote `=== SUMMARY ===` and `=== detached ===`. Every run since — all of them
+with OpenXR active — ends at its last in-frame line with no detach output, including the
+rung 3 run that exited cleanly via the `WM_CLOSE` path.
+
+The exit itself is fine and independently confirmed: `TdEngine.ini` was rewritten at the
+moment of quit, which is the engine saving on its own shutdown path. Only our summary is
+missing. Likely a teardown route that skips `DllMain`, or the detach write racing process
+shutdown; not diagnosed, and low stakes because every figure in the summary is also reported
+in the running per-600-frame lines.
+
+**Do not treat a missing summary as evidence of an unclean exit.** Check whether the config
+file was rewritten instead.
+
 ---
 
 ## Save data
