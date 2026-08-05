@@ -78,6 +78,7 @@
 #include <cstdarg>
 #include <cmath>
 #include <vector>
+#include <psapi.h>
 
 // ---------------------------------------------------------------- vtable slots
 
@@ -850,41 +851,75 @@ static bool NameEntryIs(uintptr_t entry, uint32_t textOff, const char* expect)
 // Anchoring on the STRING instead assumes neither: wherever "ByteProperty" physically is, the
 // entry containing it is a fixed distance below, and something points at that entry.
 //
-// Returns up to `cap` addresses of the string data itself.
-static int FindStringInMemory(const void* pattern, size_t patLen, uintptr_t* out, int cap,
-                              size_t* scannedOut)
+// ⚠️ ONE pass for ALL patterns. The previous version took a single pattern and was called four
+// times, walking 1.1 GB each time - 22.8 seconds in total, which the player felt as a stalled
+// level load. Memory bandwidth is the cost here, not comparisons, so the number of passes is
+// the only thing that matters.
+//
+// ⚠️ Both encodings are ALWAYS searched. The previous version tried UTF-16 only when the ANSI
+// search returned zero hits, which sounded reasonable and was wrong: three ANSI hits turned up
+// from package name tables and from this DLL's own string literals, so the wide search - the
+// one that might have found the real entries - never ran.
+struct ScanPat { const void* data; size_t len; const char* label; };
+
+static const uintptr_t kMaxHitsPerPat = 24;
+
+static void ScanMemoryForPatterns(const ScanPat* pats, int npats,
+                                  std::vector<uintptr_t>* out, size_t* scannedOut)
 {
-    int found = 0;
     size_t scanned = 0;
     std::vector<uint8_t> buf;
 
+    // Our own module is excluded. Every literal searched for is also compiled into this DLL,
+    // so including it guarantees a self-hit that looks like a real find - one already showed up
+    // surrounded by our own printf format strings.
+    MODULEINFO mi{};
+    uintptr_t selfLo = 0, selfHi = 0;
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&ScanMemoryForPatterns, &self);
+    if (self && GetModuleInformation(GetCurrentProcess(), self, &mi, sizeof(mi))) {
+        selfLo = (uintptr_t)mi.lpBaseOfDll;
+        selfHi = selfLo + mi.SizeOfImage;
+    }
+
     MEMORY_BASIC_INFORMATION mbi{};
-    for (uintptr_t addr = 0x10000; addr < 0x7FFF0000 && found < cap; ) {
+    for (uintptr_t addr = 0x10000; addr < 0x7FFF0000; ) {
         if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) break;
-        uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        uintptr_t base = (uintptr_t)mbi.BaseAddress;
+        uintptr_t next = base + mbi.RegionSize;
         if (next <= addr) break;
 
         const bool readable = (mbi.State == MEM_COMMIT) &&
                               !(mbi.Protect & PAGE_GUARD) &&
                               (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY |
                                               PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE));
-        // 256 MB of one region is already far past anything plausible; the cap keeps a
-        // pathological mapping from turning a diagnostic into a hang.
-        if (readable && mbi.RegionSize <= (256u << 20)) {
+        const bool isSelf = (selfHi > selfLo) && (base < selfHi) && (next > selfLo);
+
+        if (readable && !isSelf && mbi.RegionSize <= (256u << 20)) {
             buf.resize(mbi.RegionSize);
             SIZE_T got = 0;
             if (ReadProcessMemory(GetCurrentProcess(), mbi.BaseAddress, buf.data(),
-                                  mbi.RegionSize, &got) && got >= patLen) {
+                                  mbi.RegionSize, &got) && got > 0) {
                 scanned += got;
-                for (size_t i = 0; i + patLen <= got && found < cap; ++i)
-                    if (memcmp(buf.data() + i, pattern, patLen) == 0)
-                        out[found++] = (uintptr_t)mbi.BaseAddress + i;
+                for (int p = 0; p < npats; ++p) {
+                    if (out[p].size() >= kMaxHitsPerPat) continue;
+                    const size_t L = pats[p].len;
+                    if (got < L) continue;
+                    const uint8_t first = *(const uint8_t*)pats[p].data;
+                    for (size_t i = 0; i + L <= got; ++i) {
+                        if (buf[i] != first) continue;                  // cheap reject
+                        if (memcmp(buf.data() + i, pats[p].data, L) != 0) continue;
+                        out[p].push_back(base + i);
+                        if (out[p].size() >= kMaxHitsPerPat) break;
+                    }
+                }
             }
         }
         addr = next;
     }
     if (scannedOut) *scannedOut = scanned;
-    return found;
 }
 
 static void HexDump(uintptr_t addr, int bytes, const char* label)
@@ -912,67 +947,78 @@ static void HexDump(uintptr_t addr, int bytes, const char* label)
 
 static bool FindGNames()
 {
-    // ---- step 1: where does the text "ByteProperty" physically live? ----
-    uintptr_t hits[16];
+    static const wchar_t wNone[] = L"None";
+    static const wchar_t wByte[] = L"ByteProperty";
+    static const wchar_t wInt[]  = L"IntProperty";
+
+    const ScanPat pats[] = {
+        { "None\0",         5,             "ansi None" },
+        { "ByteProperty\0", 13,            "ansi ByteProperty" },
+        { "IntProperty\0",  12,            "ansi IntProperty" },
+        { wNone,            sizeof(wNone), "wide None" },
+        { wByte,            sizeof(wByte), "wide ByteProperty" },
+        { wInt,             sizeof(wInt),  "wide IntProperty" },
+    };
+    const int NP = (int)(sizeof(pats) / sizeof(pats[0]));
+
+    std::vector<uintptr_t> hits[NP];
     size_t scanned = 0;
-    int n = FindStringInMemory("ByteProperty\0", 13, hits, 16, &scanned);
-    Log("[obj] scanned %.1f MB; found ANSI \"ByteProperty\" x%d", scanned / 1048576.0, n);
+    const double t0 = NowMs();
+    ScanMemoryForPatterns(pats, NP, hits, &scanned);
+    Log("[obj] scanned %.1f MB in %.0f ms (one pass, self excluded)",
+        scanned / 1048576.0, NowMs() - t0);
+    for (int p = 0; p < NP; ++p)
+        Log("[obj]     %-20s x%zu%s", pats[p].label, hits[p].size(),
+            hits[p].size() >= kMaxHitsPerPat ? " (capped)" : "");
 
-    // If the ANSI form is absent the names may be stored UTF-16, which the first scan could
-    // never have matched. Reported either way so the next step is not another guess.
-    if (n == 0) {
-        wchar_t wpat[] = L"ByteProperty";
-        int wn = FindStringInMemory(wpat, sizeof(wpat), hits, 16, &scanned);
-        Log("[obj] found UTF-16 \"ByteProperty\" x%d", wn);
-        if (wn > 0) {
-            Log("[obj] names are WIDE in this build - the ANSI assumption was wrong");
-            for (int i = 0; i < wn && i < 3; ++i) HexDump(hits[i] - 0x20, 0x40, "wide");
+    // Try both encodings. Which one the entries use is exactly what is unknown.
+    for (int enc = 0; enc < 2; ++enc) {
+        const int iNone = enc * 3 + 0, iByte = enc * 3 + 1, iInt = enc * 3 + 2;
+        if (hits[iByte].empty()) continue;
+
+        if (enc == 0) {
+            for (size_t i = 0; i < hits[iByte].size() && i < 3; ++i) {
+                Log("[obj] --- bytes around ANSI hit %zu (%p) ---", i, (void*)hits[iByte][i]);
+                HexDump(hits[iByte][i] - 0x18, 0x38, "a");
+            }
+        } else {
+            for (size_t i = 0; i < hits[iByte].size() && i < 3; ++i) {
+                Log("[obj] --- bytes around WIDE hit %zu (%p) ---", i, (void*)hits[iByte][i]);
+                HexDump(hits[iByte][i] - 0x18, 0x38, "w");
+            }
         }
-        return false;
-    }
 
-    for (int i = 0; i < n && i < 4; ++i) {
-        Log("[obj] --- candidate FNameEntry region around hit %d (%p) ---", i, (void*)hits[i]);
-        HexDump(hits[i] - 0x20, 0x50, "ansi");
-    }
+        // GNames.Data is an array of FNameEntry*, so three consecutive pointers land a fixed
+        // distance before None / ByteProperty / IntProperty. That gap IS the text offset.
+        for (uintptr_t a = g_dataLo; a + 12 < g_dataHi; a += 4) {
+            uint32_t data;
+            if (!SafeU32(a, &data) || data < 0x10000) continue;
+            uint32_t p0, p1, p2;
+            if (!SafeU32(data, &p0) || !SafeU32(data + 4, &p1) || !SafeU32(data + 8, &p2)) continue;
 
-    // ---- step 2: find something that POINTS at one of those entries ----
-    //
-    // GNames.Data is an array of FNameEntry*, so entry[1] holds a pointer landing a small
-    // fixed distance before the text. Finding three such pointers in a row - one per expected
-    // name, in order - identifies the array and yields the text offset at the same time.
-    uintptr_t noneHits[16], intHits[16];
-    int nn = FindStringInMemory("None\0", 5, noneHits, 16, nullptr);
-    int ni = FindStringInMemory("IntProperty\0", 12, intHits, 16, nullptr);
-    Log("[obj] \"None\" x%d, \"IntProperty\" x%d", nn, ni);
+            for (uintptr_t bh : hits[iByte]) {
+                if (p1 > bh || bh - p1 > 0x40) continue;
+                const uint32_t off = (uint32_t)(bh - p1);
+                bool okNone = false, okInt = false;
+                for (uintptr_t h : hits[iNone]) if (h == p0 + off) { okNone = true; break; }
+                for (uintptr_t h : hits[iInt])  if (h == p2 + off) { okInt  = true; break; }
+                if (!okNone || !okInt) continue;
 
-    for (uintptr_t a = g_dataLo; a + 12 < g_dataHi; a += 4) {
-        uint32_t data;
-        if (!SafeU32(a, &data) || data < 0x10000) continue;
-        uint32_t p0, p1, p2;
-        if (!SafeU32(data, &p0) || !SafeU32(data + 4, &p1) || !SafeU32(data + 8, &p2)) continue;
-
-        for (int b = 0; b < n; ++b) {
-            if (p1 > hits[b] || hits[b] - p1 > 0x40) continue;
-            uint32_t off = (uint32_t)(hits[b] - p1);
-            bool okNone = false, okInt = false;
-            for (int k = 0; k < nn; ++k) if (noneHits[k] == p0 + off) okNone = true;
-            for (int k = 0; k < ni; ++k) if (intHits[k]  == p2 + off) okInt  = true;
-            if (!okNone || !okInt) continue;
-
-            uint32_t count = 0, maxn = 0;
-            SafeU32(a + 4, &count); SafeU32(a + 8, &maxn);
-            g_gnamesAddr  = a;
-            g_nameTextOff = off;
-            Log("*** [obj] GNames at %p  Data=%p Count=%u Max=%u  FNameEntry text at +0x%02X",
-                (void*)a, (void*)data, count, maxn, off);
-            Log("[obj]     triangulated: entries 0/1/2 point at None / ByteProperty / IntProperty");
-            return true;
+                uint32_t count = 0, maxn = 0;
+                SafeU32(a + 4, &count); SafeU32(a + 8, &maxn);
+                g_gnamesAddr  = a;
+                g_nameTextOff = off;
+                Log("*** [obj] GNames at %p  Data=%p Count=%u Max=%u  text at +0x%02X (%s)",
+                    (void*)a, (void*)data, count, maxn, off, enc ? "UTF-16" : "ANSI");
+                return true;
+            }
         }
+        Log("[obj] %s: strings present, but no .data TArray points at three of them in order",
+            enc ? "UTF-16" : "ANSI");
     }
 
-    Log("[obj] the strings exist but no .data TArray points at them in order.");
-    Log("[obj] GNames may live outside .data, or the array may not be FNameEntry*.");
+    Log("[obj] GNames NOT FOUND. Either it lives outside .data, or the array does not hold");
+    Log("[obj] FNameEntry* directly. The hex dumps above are the evidence for the next step.");
     return false;
 }
 
@@ -1101,13 +1147,21 @@ static void ProbeKnownObjects()
         Log("[obj]     %-20s %s (%d)", wanted[w], found[w] ? "FOUND" : "not found", found[w]);
 }
 
-static void RunObjectModelScan()
+// ⚠️ Runs on its OWN THREAD, never on the render thread.
+//
+// The first version ran synchronously inside Present and took 22.8 seconds, which the player
+// experienced as the level refusing to load. A diagnostic that changes the thing it is
+// measuring is worse than no diagnostic - and this one is read-only, so there is no reason for
+// the game to wait on it.
+//
+// Safe to run concurrently: it only reads through ReadProcessMemory and writes to the log,
+// which is already guarded. It touches no D3D or OpenXR state. The object graph may shift
+// underneath it, which costs a missed candidate at worst, never a wrong one - every match is
+// validated against three exact strings before it is believed.
+static DWORD WINAPI ObjectModelThread(LPVOID)
 {
-    if (g_objModelDone) return;
-    g_objModelDone = true;
-
     Log("");
-    Log("======== object model scan (rung 4a) ========");
+    Log("======== object model scan (rung 4a, background thread) ========");
     const double t0 = NowMs();
     FindSections();
     if (FindGNames()) {
@@ -1119,8 +1173,18 @@ static void RunObjectModelScan()
             ProbeKnownObjects();
         }
     }
-    Log("======== scan took %.1f ms ========", NowMs() - t0);
+    Log("======== scan took %.1f ms (off the render thread) ========", NowMs() - t0);
     Log("");
+    return 0;
+}
+
+static void RunObjectModelScan()
+{
+    if (g_objModelDone) return;
+    g_objModelDone = true;
+    HANDLE h = CreateThread(nullptr, 0, ObjectModelThread, nullptr, 0, nullptr);
+    if (h) { CloseHandle(h); Log("[obj] scan started on a background thread"); }
+    else   { Log("[obj] CreateThread failed (%lu) - scan skipped", GetLastError()); }
 }
 
 // ================================================================ hold PAUSE to quit

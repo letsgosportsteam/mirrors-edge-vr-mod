@@ -112,7 +112,7 @@ try {
     $cmd = "`"$vcvars`" x86 && cl /nologo /LD /EHsc /W3 /Zi /MD /std:c++17 " +
            "$incArgs " +
            "/Fe:d3d9.dll d3d9.cpp $mhSrc " +
-           "/link /DEF:d3d9.def $xrLib user32.lib shell32.lib"
+           "/link /DEF:d3d9.def $xrLib user32.lib shell32.lib psapi.lib"
     cmd /c $cmd
     if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
     Write-Host ""
