@@ -1425,6 +1425,8 @@ static void ProbeKnownObjects()
 // than reordered.
 static void DetectPointerFields();
 static void ProbeSwanNeck();
+static bool DerivePropertyOffsets();
+static void DumpClassProperties(const char* className, int maxLines);
 
 static DWORD WINAPI ObjectModelThread(LPVOID)
 {
@@ -1441,6 +1443,14 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
             ProbeKnownObjects();
             DetectPointerFields();
             ProbeSwanNeck();
+            // Validated against TdSwanNeck's already-measured layout before anything reads
+            // from it, so a wrong derivation is caught here rather than surfacing later as a
+            // bad offset in the head-tracking path.
+            if (DerivePropertyOffsets()) {
+                DumpClassProperties("TdPlayerController", 40);
+                DumpClassProperties("TdPlayerPawn", 40);
+                DumpClassProperties("Actor", 24);
+            }
         }
     }
     Log("======== scan took %.1f ms (off the render thread) ========", NowMs() - t0);

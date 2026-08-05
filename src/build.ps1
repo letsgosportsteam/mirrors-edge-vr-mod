@@ -96,7 +96,7 @@ try {
     # stderr, and redirecting a native command's stderr inside PowerShell wraps each line in an
     # ErrorRecord - which $ErrorActionPreference = "Stop" then treats as fatal. cl writes its
     # warnings to stdout, so there is nothing to gain from the redirect anyway.
-    $an = "`"$vcvars`" x86 >nul && cl /nologo /EHsc /W3 /MD /std:c++17 /analyze:only " +
+    $an = "`"$vcvars`" x86 >nul && cl /nologo /EHsc /W3 /w34505 /MD /std:c++17 /analyze:only " +
           "$incArgs /c d3d9.cpp"
     $anOut = cmd /c $an
     $anOut | Write-Host
@@ -109,7 +109,17 @@ try {
     $fatal = $anOut | Select-String -Pattern "warning C6067|warning C6063|warning C6064|warning C6066|warning C6270|warning C6271|warning C6272|warning C6273|warning C6328"
     if ($fatal) { throw "static analysis found a format-string defect - fix it before building" }
 
-    $cmd = "`"$vcvars`" x86 && cl /nologo /LD /EHsc /W3 /Zi /MD /std:c++17 " +
+    # C4505 - a static function defined and never called. Normally level 4 and therefore
+    # invisible here, promoted to level 3 and made fatal because it has already cost a run:
+    # a whole subsystem was written, compiled and shipped without its call site, and the build
+    # was perfectly happy. In this file an uncalled static is a wiring mistake, not a spare.
+    $unused = $anOut | Select-String -Pattern "warning C4505"
+    if ($unused) {
+        $unused | ForEach-Object { Write-Host $_.Line }
+        throw "a static function is defined but never called - almost certainly a missing call site"
+    }
+
+    $cmd = "`"$vcvars`" x86 && cl /nologo /LD /EHsc /W3 /w34505 /Zi /MD /std:c++17 " +
            "$incArgs " +
            "/Fe:d3d9.dll d3d9.cpp $mhSrc " +
            "/link /DEF:d3d9.def $xrLib user32.lib shell32.lib psapi.lib"
