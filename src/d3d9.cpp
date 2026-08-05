@@ -1427,6 +1427,10 @@ static void DetectPointerFields();
 static void ProbeSwanNeck();
 static bool DerivePropertyOffsets();
 static void DumpClassProperties(const char* className, int maxLines);
+static int  LookupProp(const char* className, const char* propName, bool verbose);
+extern int g_offActorRotation;
+extern int g_offActorLocation;
+extern int g_offFOVAngle;
 
 static DWORD WINAPI ObjectModelThread(LPVOID)
 {
@@ -1447,9 +1451,17 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
             // from it, so a wrong derivation is caught here rather than surfacing later as a
             // bad offset in the head-tracking path.
             if (DerivePropertyOffsets()) {
-                DumpClassProperties("TdPlayerController", 40);
-                DumpClassProperties("TdPlayerPawn", 40);
-                DumpClassProperties("Actor", 24);
+                // Exactly what rung 5b needs, asked for by name. Rotation is the head-tracking
+                // write target; FOVAngle is the single FOV lever CalcCamera reads;
+                // PlayerCameraRotation is the value the pawn caches after composing the view,
+                // which is the read-back for checking what the engine actually used.
+                g_offActorRotation = LookupProp("TdPlayerController", "Rotation", true);
+                g_offActorLocation = LookupProp("TdPlayerController", "Location", true);
+                g_offFOVAngle      = LookupProp("TdPlayerController", "FOVAngle", true);
+                LookupProp("TdPlayerPawn", "PlayerCameraRotation", true);
+                LookupProp("TdPlayerPawn", "PlayerCameraLocation", true);
+                LookupProp("TdPlayerPawn", "SwanNeck1p", true);
+                DumpClassProperties("TdPlayerController", 60);
             }
         }
     }
@@ -1621,6 +1633,13 @@ static void RunObjectModelScan()
 // TdSwanNeck first, and the candidate for UProperty::Offset is the one that reports those
 // same numbers. Two independent methods have to agree before anything else uses the result.
 
+// Non-static deliberately: these are forward-declared `extern` further up, where the scan
+// body uses them. Declaring a name extern and then defining it static is ill-formed even
+// though MSVC accepted it here, and a latent linkage inconsistency in a file this size is not
+// worth leaving for someone to trip over later.
+int g_offActorRotation = -1;
+int g_offActorLocation = -1;
+int g_offFOVAngle      = -1;
 static int g_offChildren = -1;
 static int g_offNext     = -1;
 static int g_offPropOff  = -1;
@@ -1780,6 +1799,58 @@ static bool DerivePropertyOffsets()
         return false;
     }
     return true;
+}
+
+// Look up ONE property by name, walking the class and its superclasses. Returns -1 if absent.
+//
+// This replaces reading a bulk dump. The dump capped at 40 lines never reached Actor's
+// Rotation - it exhausted its budget inside TdPlayerController's own properties - and the
+// Actor dump came back empty, which a targeted query diagnoses instead of hiding: it reports
+// how many fields it walked, so "not found" and "the chain broke" stop looking alike.
+static int LookupProp(const char* className, const char* propName, bool verbose)
+{
+    if (g_offChildren < 0 || g_offNext < 0 || g_offPropOff < 0) return -1;
+    uintptr_t cls = FindClassByName(className);
+    if (!cls) { if (verbose) Log("[prop] class %s NOT FOUND", className); return -1; }
+
+    int walked = 0;
+    for (int depth = 0; cls && depth < 16; ++depth) {
+        char cn[96] = "?";
+        ReadObjName(cls, cn, sizeof(cn));
+        uint32_t head = 0;
+        if (SafeU32(cls + g_offChildren, &head) && head >= 0x10000) {
+            uintptr_t seen[512]; int nseen = 0;
+            for (uintptr_t p = head; p && nseen < 512; ) {
+                char nm[96];
+                if (!ReadObjName(p, nm, sizeof(nm))) break;
+                walked++;
+                if (strcmp(nm, propName) == 0) {
+                    uint32_t off;
+                    if (SafeU32(p + g_offPropOff, &off) && off < 0x8000) {
+                        Log("*** [prop] %s::%s at +0x%04X   (declared on %s, %d fields walked)",
+                            className, propName, off, cn, walked);
+                        return (int)off;
+                    }
+                }
+                bool cycle = false;
+                for (int k = 0; k < nseen; ++k) if (seen[k] == p) { cycle = true; break; }
+                if (cycle) break;
+                seen[nseen++] = p;
+                uint32_t nxt;
+                if (!SafeU32(p + g_offNext, &nxt) || nxt < 0x10000) break;
+                p = nxt;
+            }
+        } else if (verbose && depth == 0) {
+            Log("[prop] %s has no readable Children pointer at +0x%02X", cn, g_offChildren);
+        }
+        uint32_t super;
+        if (!SafeU32(cls + 0x3C, &super) || super < 0x10000) break;   // SuperField
+        cls = super;
+    }
+    if (verbose)
+        Log("[prop] %s::%s NOT FOUND after walking %d fields up the class chain",
+            className, propName, walked);
+    return -1;
 }
 
 // Walk a class and its superclasses, logging every property with its offset.
