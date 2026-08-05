@@ -185,9 +185,12 @@ plus `TdAnimNodeInAir`, `TdAnimNodeWallJump`, `TdAnimNodeLanding`, `TdAnimNodeMo
 FreeflightScale = 1.0
 ```
 
-**The good news is that this is a tunable, ini-exposed subsystem, not hardcoded.** Several comfort
-levers may be reachable without touching code at all — which is a cheap, early experiment worth
-running before any of the hard work.
+**The subsystem is ini-exposed, but reaching it is not free.** This originally read that several
+comfort levers "may be reachable without touching code at all", as a cheap early experiment.
+**Measured 2026-08-05: the game hash-checks its config files and refuses to start when they are
+modified** — see the retraction in `ENGINE_NOTES.md`. The values are still tunable, but only by
+writing the properties at runtime through the object model, or by defeating the config check the
+way MirrorsEdgeTweaks does. Nothing here is reachable by editing a file.
 
 **The bad news is that you cannot simply switch it off.** The animations drive the visible body,
 and traversal readability depends on them. Deciding *which* camera motion to suppress, which to
@@ -308,8 +311,9 @@ had to go first. Here it is solved, and the unknowns are engine offsets and came
 5. **Choose the camera-control route** — binary detour (Singularity's) vs custom UnrealScript
    package (Mirror's Edge-specific). Step 2 answers this; do not guess it in advance.
 6. **The camera-animation comfort policy.** The longest pole, and the one with no reference
-   implementation. Start with the free experiment: sweep `DefaultAnimation.ini`'s spring and
-   limiter values and see how much camera motion is suppressible without touching code.
+   implementation. Note that sweeping `DefaultAnimation.ini`'s spring and limiter values is
+   **not** the free experiment it looks like — the config hash check means any ini sweep needs
+   the object model first, so the values can be written in memory instead of on disk.
 
 Steps 1–3 are independent and can proceed in any order. None require the camera problem to be
 solved first.

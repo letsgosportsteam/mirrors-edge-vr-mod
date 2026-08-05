@@ -342,8 +342,41 @@ QuadraticDownwardTranslation = 30
 Type = ESNT_Quadratic
 ```
 
-**Zeroing the translations disables it with no code at all** — the cheapest comfort experiment
-available, and worth running before anything is written.
+> ### ⛔ RETRACTED: editing the ini is NOT free — the game hash-checks its config
+>
+> This section used to claim that zeroing the translations disables the swan neck "with no
+> code at all", and called it the cheapest comfort experiment available. **That is wrong**, and
+> it cost two runs to find out.
+>
+> **Measured 2026-08-05.** With a byte-faithful edit to `DefaultGame.ini` — only the digits
+> changed, CRLF count identical, no BOM — the game **refuses to start**. The mod log shows it
+> loading, calling `Direct3DCreate9` twice, and then exiting *before* `CreateDevice`. Not a
+> crash: a deliberate early exit during startup. Restoring the pristine file byte-for-byte and
+> the game starts normally, which is the control that pins it.
+>
+> The warning in every `Default*.ini` header — *"Don't modify this file. If you do, your game
+> may not start"* — is **literal**. Community sources agree: Mirror's Edge hash-checks its
+> config files, and the known workarounds are MirrorsEdgeTweaks' "Allow config mods" patch or
+> MEMLA.
+>
+> **Two runs were also wasted on my own edit faults before the real cause was visible**, and
+> both were invisible without a byte-level comparison:
+> - `Set-Content -Encoding utf8` wrote a **UTF-8 BOM**, so the first attempt tested "does a BOM
+>   break the parser".
+> - `(?m)...\s*$` consumed the `\r`, silently converting five lines from CRLF to LF.
+>
+> **Compare the bytes, not the text, after editing a file the game validates.** The check is
+> `pristine size + expected delta`, and an unchanged CRLF count.
+>
+> ### The route that avoids the problem entirely
+>
+> The hash is over the **file**. It says nothing about the values in memory. Since this mod
+> will have `GObjects`/`UProperty` access anyway, the swan neck can be neutralised by **writing
+> `TdSwanNeck`'s properties at runtime** — no file touched, no hash to defeat, no dependency on
+> an external patcher. Same applies to every other `config` value worth tuning.
+>
+> That makes the object-model work a prerequisite for *all* ini-level tuning, not just for
+> camera control. Worth knowing before planning around "just change the ini".
 
 ### ⚠️ `CameraAnimationEnabled=false` in `DefaultGame.ini` is a dead line
 
