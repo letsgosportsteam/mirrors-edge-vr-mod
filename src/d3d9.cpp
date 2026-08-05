@@ -146,31 +146,67 @@ static void BuildLogPath()
     _snwprintf_s(g_logPath, _TRUNCATE, L"%s\\mevr.log", dir);
 }
 
+// Rename an existing log out of the way, stamped with when that run STARTED.
+//
+// ⚠️ The stamp is parsed out of the file's OWN FIRST LINE, not taken from its creation time.
+// This is not a stylistic choice and the obvious version is broken: NTFS **file system
+// tunneling** reuses the creation timestamp when a file is recreated with the same name
+// shortly after the previous one was moved away. So every archive got the SAME name, the
+// second MoveFileW failed because the destination already existed, and runs silently
+// concatenated into one file instead of rotating.
+//
+// That was measured here: mevr.log carried four run headers, and its creation time matched
+// an archive already sitting beside it. A stale run was read as if it were the current one.
+// The header line is written by us, once, and cannot be rewritten by the filesystem.
 static void ArchivePreviousLog()
 {
     if (!g_logPath[0]) return;
 
     HANDLE h = CreateFileW(g_logPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
+    if (h == INVALID_HANDLE_VALUE) return;   // no previous run, nothing to preserve
 
-    FILETIME created{};
+    char head[256] = {};
+    DWORD got = 0;
+    if (!ReadFile(h, head, sizeof(head) - 1, &got, nullptr)) got = 0;
+    head[got] = 0;   // a failed read leaves an empty string, which falls through to the
+                     // creation-time path below rather than parsing uninitialised bytes
+
+    // Fall back to the file's creation time only if the header cannot be parsed - an
+    // unreadable stamp should still produce a uniquely named archive rather than none.
     SYSTEMTIME st{};
-    if (GetFileTime(h, &created, nullptr, nullptr)) {
-        FILETIME local{};
-        FileTimeToLocalFileTime(&created, &local);
-        FileTimeToSystemTime(&local, &st);
+    unsigned y = 0, mo = 0, d = 0, hh = 0, mm = 0, ss = 0;
+    const char* at = strstr(head, "attached ");
+    if (at && sscanf_s(at + 9, "%u-%u-%u %u:%u:%u", &y, &mo, &d, &hh, &mm, &ss) == 6) {
+        st.wYear = (WORD)y; st.wMonth = (WORD)mo; st.wDay = (WORD)d;
+        st.wHour = (WORD)hh; st.wMinute = (WORD)mm; st.wSecond = (WORD)ss;
+    } else {
+        FILETIME created{}, local{};
+        if (GetFileTime(h, &created, nullptr, nullptr)) {
+            FileTimeToLocalFileTime(&created, &local);
+            FileTimeToSystemTime(&local, &st);
+        }
     }
     CloseHandle(h);
 
-    wchar_t archived[MAX_PATH] = L"";
-    wchar_t dir[MAX_PATH]      = L"";
+    wchar_t dir[MAX_PATH] = L"";
     wcscpy_s(dir, g_logPath);
     wchar_t* slash = wcsrchr(dir, L'\\');
     if (slash) *slash = 0;
 
-    _snwprintf_s(archived, _TRUNCATE, L"%s\\mevr_%04u-%02u-%02u_%02u-%02u-%02u.log",
-                 dir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    // Even with a correct stamp, two runs can start inside the same second. A collision must
+    // never silently fall through to "append to the live log" again.
+    wchar_t archived[MAX_PATH] = L"";
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        if (attempt == 0)
+            _snwprintf_s(archived, _TRUNCATE, L"%s\\mevr_%04u-%02u-%02u_%02u-%02u-%02u.log",
+                         dir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        else
+            _snwprintf_s(archived, _TRUNCATE, L"%s\\mevr_%04u-%02u-%02u_%02u-%02u-%02u_%d.log",
+                         dir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+                         attempt + 1);
+        if (GetFileAttributesW(archived) == INVALID_FILE_ATTRIBUTES) break;
+    }
     MoveFileW(g_logPath, archived);
 }
 
@@ -564,6 +600,65 @@ static void SubmitTestQuad()
                                n, (int)g_xrState, (int)fs.shouldRender, (int)er);
 }
 
+// ================================================================ hold PAUSE to quit
+//
+// Ported from the Singularity mod, where it earned its place. Inside a headset you cannot
+// see the monitor, and reaching the game's own quit menu by feel is worse than the test it
+// is interrupting. PAUSE is one key, top right, findable without looking.
+//
+// ---- WM_CLOSE, not ExitProcess ----
+//
+// This is the same shutdown path as clicking the window's X, so the engine saves and exits
+// normally. It matters more here than it looks: ENGINE_NOTES records that every copy of
+// Mirror's Edge - Steam, GOG and the dev clone - reads and writes ONE save file, outside the
+// install. Killing the process mid-write is a real way to lose it.
+//
+// ---- a HOLD, not a tap ----
+//
+// SCROLL LOCK sits directly beside PAUSE, so a mis-hit while wearing a headset is likely,
+// and an accidental quit costs a whole run.
+//
+// ---- not gated behind any debug flag ----
+//
+// One of the few places a raw GetAsyncKeyState is legitimate. Quitting cleanly is not
+// developer scaffolding: gate it and killing the process becomes the only way out from
+// inside a headset, which is the exact failure this exists to prevent.
+//
+// Known tradeoff, inherited deliberately: GetAsyncKeyState is global, so holding PAUSE for a
+// second while some other window has focus will also quit the game. The reference accepts
+// this rather than add a foreground check, because a quit that silently stops working is a
+// worse failure than one that occasionally fires when unwanted.
+
+static HWND         g_gameWnd   = nullptr;
+static volatile LONG g_quitPosted = 0;
+static const ULONGLONG kQuitHoldMs = 1000;
+
+static void CheckQuitHotkey()
+{
+    static ULONGLONG heldSince = 0;
+
+    const bool down = (GetAsyncKeyState(VK_PAUSE) & 0x8000) != 0;
+    if (!down) { heldSince = 0; return; }
+
+    const ULONGLONG now = GetTickCount64();
+    if (heldSince == 0) { heldSince = now; return; }
+    if (now - heldSince < kQuitHoldMs) return;
+
+    if (InterlockedExchange(&g_quitPosted, 1) != 0) return;   // once only
+
+    if (g_gameWnd && IsWindow(g_gameWnd)) {
+        Log("*** PAUSE held %llu ms - posting WM_CLOSE to %p so the engine saves and exits cleanly",
+            (unsigned long long)(now - heldSince), (void*)g_gameWnd);
+        PostMessageW(g_gameWnd, WM_CLOSE, 0, 0);
+    } else {
+        // Deliberately does NOT fall back to ExitProcess. If the window is gone, an abrupt
+        // exit is exactly the thing this feature exists to avoid.
+        Log("*** PAUSE held, but no valid game window (%p) - NOT quitting. Nothing was killed.",
+            (void*)g_gameWnd);
+        InterlockedExchange(&g_quitPosted, 0);
+    }
+}
+
 // ---------------------------------------------------------------- device hooks
 
 typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDirect3DDevice9*, const RECT*, const RECT*,
@@ -658,6 +753,9 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
         SubmitTestQuad();
     }
 
+    // After the XR work, so a quit still gets posted on a frame where XR failed or stalled.
+    CheckQuitHotkey();
+
     if (f > 1 && f % 600 == 0) {
         Log("[present] frame %ld   pools so far: DEFAULT=%ld MANAGED=%ld SYSTEMMEM=%ld other=%ld",
             f, g_poolDefault, g_poolManaged, g_poolSystemMem, g_poolScratch);
@@ -746,6 +844,12 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT adapte
     // The engine may have had its request adjusted. Log what came back as well as what was asked.
     if (SUCCEEDED(hr)) {
         LogPresentParams("granted", pp);
+        // The window WM_CLOSE will be posted to. hDeviceWindow is preferred because that is
+        // the surface the device actually presents to; focus is the fallback. Measured here
+        // they are the same handle, but they are not required to be.
+        g_gameWnd = (pp && pp->hDeviceWindow) ? pp->hDeviceWindow : focus;
+        Log("[quit] hold PAUSE for %llu ms to close the game cleanly (window %p)",
+            (unsigned long long)kQuitHoldMs, (void*)g_gameWnd);
         if (out && *out) PatchDeviceOnce(*out);
     }
     return hr;

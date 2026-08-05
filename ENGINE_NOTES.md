@@ -48,20 +48,29 @@ allocator handed back the same slot. So two consequences, and the second is the 
   seen this object" test would merge two genuinely distinct objects in the first run's pattern.
   Identity must come from the wrapper instance, not the address it happens to occupy.
 
-**Why it is created twice is still not known, and rung 1 FAILED to settle it.** The plan was to
-log `self` inside `CreateDevice` and see which instance it was. In the rung-1 run both
-`Direct3DCreate9` calls returned `0278D960` and `CreateDevice` arrived on `0278D960` — so the
-address identifies nothing. The aliasing described above is precisely what defeated the
-instrument.
+### ✅ It is the SECOND instance that receives `CreateDevice` — settled 2026-08-04 (rung 2 run)
 
-Settling it would need identity that survives reallocation: a counter assigned at creation
-time, or hooking `AddRef`/`Release` to watch the first object die. **Not worth doing unless
-something later depends on it.** Vtable patching means nothing currently does — which is the
-second time that choice has paid for itself here.
+Rung 1 could not settle this: both calls returned `0278D960` and `CreateDevice` arrived on
+`0278D960`, so the address identified nothing. A later run happened not to alias:
 
-Recorded as a method note: *an instrument that reads an address cannot distinguish objects that
-share one.* The trap was written down before the test was built and the test was still built
-around it.
+```
+Direct3DCreate9 (call #1) -> IDirect3D9* 02717260
+Direct3DCreate9 (call #2) -> IDirect3D9* 07539EC0
+CreateDevice on IDirect3D9* 07539EC0        <- the second one
+```
+
+So the first instance is a throwaway — consistent with the standing guess of adapter and
+display-mode enumeration for the video options — and the second is the real one.
+
+**Do not build on this without keeping the aliasing in mind.** The answer arrived from a run
+where the allocator did not reuse the slot; in a run where it does, no address-based test can
+tell the two apart. Nothing currently depends on the distinction, because vtable patching
+covers every instance regardless.
+
+Method note worth keeping: *an instrument that reads an address cannot distinguish objects
+that share one.* The trap was written down before the test was designed, and the test was
+still built around reading an address. Repeating the run under different allocator conditions
+is what answered it — not a better instrument.
 
 ### ✅ Device parameters — measured, rung 1, 2026-08-04
 
@@ -120,6 +129,43 @@ Two resolution changes, both `hr=0`, backbuffer re-measured correctly each time
 (2560×1440 → 1920×1200 → 2560×1440). `DEFAULT`-pool allocations rose across each reset as
 resources were recreated. Reset is a path the VR frame plumbing must survive, and it is now
 known to be exercised by an ordinary video-options change rather than only by alt-tab.
+
+---
+
+## OpenXR
+
+### ✅ 32-bit OpenXR works in this process — rung 2, 2026-08-04
+
+| Fact | Value |
+|---|---|
+| Runtime | **VirtualDesktopXR** (`virtualdesktop-openxr-32.json`) |
+| API version | **1.0 only.** VDXR rejects a 1.1 instance with `-4`, so 1.0.34 is tried first |
+| Recommended per eye | **2496×2688** (max 16384×16384) — identical to the Singularity figure |
+| Side-by-side stereo would want | `-ResX=4992 -ResY=2688` |
+| Session states reached | IDLE → READY → SYNCHRONIZED → VISIBLE → **FOCUSED** |
+| Swapchain format chosen | `91` = `DXGI_FORMAT_B8G8R8A8_UNORM_SRGB` |
+
+The 32-bit runtime situation is unchanged from the Singularity project: SteamVR ships no
+32-bit runtime at all, and Meta's own crashes in `xrCreateSession`. **VDXR is the only usable
+one, so Virtual Desktop must be streaming before the game is launched.**
+
+### ⚠️ Swapchain textures are TYPELESS — name the view format explicitly
+
+```
+[xr] swapchain texture: 1024x1024 DXGI format=90 bind=0x000000A8  (requested 91)
+```
+
+`90` is `DXGI_FORMAT_B8G8R8A8_TYPELESS`; `91` is what was requested. The runtime allocates
+typeless so the image can be viewed as either sRGB or UNORM.
+
+**Consequence:** `CreateRenderTargetView(tex, nullptr, &rtv)` **fails**, because a null
+description means "use the resource's own format" and a typeless format cannot be a view
+format. The RTV description must name the format explicitly.
+
+This failed in a way worth remembering: the session was FOCUSED, `shouldRender` was 1, and
+`xrEndFrame` returned success for 3,000 consecutive frames. **A quad was submitted every
+frame and was simply empty.** Every indicator except the headset itself said the pipeline
+was healthy.
 
 ---
 
