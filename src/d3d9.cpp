@@ -1148,8 +1148,19 @@ static bool FindGObjects()
         uint32_t data, count, maxn;
         if (!SafeU32(a, &data) || !SafeU32(a + 4, &count) || !SafeU32(a + 8, &maxn)) continue;
         if (data < 0x10000) continue;
-        if (count < 1000 || count > 4000000) continue;
+        if (count < 5000 || count > 4000000) continue;
         if (maxn < count) continue;
+        // ⚠️ Max must be a PLAUSIBLE allocation count, not merely >= Count.
+        //
+        // The previous version removed the invented `Max <= Count*4+1024` rule and put nothing
+        // in its place, which is an over-correction: it then accepted Max = 0xFFFFFFFF and
+        // reported a static .data structure as GObjects. Rejecting a made-up rule is not a
+        // reason to stop sanity-checking the field.
+        if (maxn > 50000000) continue;
+        // GObjects.Data is a HEAP allocation. A "Data" pointer landing inside the module image
+        // - as the false positive's did, 332 bytes from its own header - is a static structure
+        // being read as an array.
+        if (InModule(data)) continue;
         candidates++;
 
         int checked = 0, vtblOk = 0;
@@ -1168,7 +1179,10 @@ static bool FindGObjects()
             bestAddr = a; bestOk = vtblOk; bestChecked = checked; bestCount = count;
         }
 
-        if (checked >= 32 && vtblOk >= checked * 3 / 4) {
+        // Back to 90%. Every non-null slot in a real GObjects IS a UObject, so the honest
+        // expectation is near-perfect, and 75% was loosened to chase a failure whose actual
+        // cause was the .text-only vtable test.
+        if (checked >= 32 && vtblOk >= checked * 9 / 10) {
             g_gobjAddr = a;
             Log("*** [obj] GObjects at %p  Data=%p Count=%u Max=%u  (%d/%d sampled objects have"
                 " a vtable inside .text)", (void*)a, (void*)data, count, maxn, vtblOk, checked);
@@ -1227,12 +1241,53 @@ static void DetectUObjectLayout()
         if (hits[off / 4] > 0)
             Log("[obj]     +0x%02X decoded as a name %d/%d", off, hits[off / 4], sampled);
 
-    if (bestOff > 0 && best >= sampled * 9 / 10 && best > second) {
+    // ⚠️ "decodes as a name" is a WEAK test on its own, and the first scoring run showed why:
+    // twenty offsets scored 40-70% and nothing was decisive. Any small integer below the name
+    // count indexes SOME valid entry, and real structures are full of small integers - counts,
+    // flags, indices, near-zero floats. The test does not distinguish a name from a number.
+    //
+    // So dump the actual names the leading offsets produce. A human can tell "Class",
+    // "Function", "Package", "Default__..." from a list of unrelated words instantly, and no
+    // statistic here does that as reliably.
+    int ranked[3] = { -1, -1, -1 };
+    for (int r = 0; r < 3; ++r) {
+        int bh = -1;
+        for (int off = 4; off < kMaxOff; off += 4) {
+            bool already = false;
+            for (int k = 0; k < r; ++k) if (ranked[k] == off) already = true;
+            if (already) continue;
+            if (hits[off / 4] > bh) { bh = hits[off / 4]; ranked[r] = off; }
+        }
+    }
+    for (int r = 0; r < 3 && ranked[r] > 0; ++r) {
+        const int off = ranked[r];
+        char line[512]; int n = 0;
+        n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE,
+                         "[obj]   +0x%02X sample names:", off);
+        int shown = 0;
+        for (uint32_t i = 0; i < count && shown < 10; ++i) {
+            uint32_t obj;
+            if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+            uint32_t vtbl;
+            if (!SafeU32(obj, &vtbl) || !InModule(vtbl)) continue;
+            uint32_t v; char nm[64];
+            if (!SafeU32(obj + off, &v) || !NameOf(v, nm, sizeof(nm))) continue;
+            n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE, " %s", nm);
+            shown++;
+        }
+        Log("%s", line);
+    }
+
+    // 95%, not 90%. The real Name offset decodes for essentially every object; anything less
+    // is a coincidence that happens to be common.
+    if (bestOff > 0 && best >= sampled * 95 / 100 && best >= second + sampled / 10) {
         g_offName = bestOff;
         Log("*** [obj] UObject::Name at +0x%02X (%d/%d, next best %d)", bestOff, best, sampled, second);
     } else {
-        Log("[obj] Name offset NOT decisive (best +0x%02X %d/%d, second %d) - do not trust it",
+        Log("[obj] Name offset NOT decisive (best +0x%02X %d/%d, second %d) - do not trust it.",
             bestOff, best, sampled, second);
+        Log("[obj] Read the sample names above: the right offset produces class and package");
+        Log("[obj] names, not an assortment of unrelated words.");
     }
 }
 
