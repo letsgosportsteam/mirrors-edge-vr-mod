@@ -120,6 +120,24 @@ static uint32_t             g_scImageCount = 0;
 static uint32_t             g_scW = 0, g_scH = 0;
 static int64_t              g_scFormat = 0;      // the format we ASKED for; the texture may be typeless
 static bool                 g_rtvFailLogged = false;
+
+// ---- rung 3: the frame grab (CPU path) ----
+static IDirect3DSurface9*   g_sysSurf  = nullptr;   // SYSTEMMEM copy of the backbuffer
+static ID3D11Texture2D*     g_upload   = nullptr;   // DYNAMIC D3D11 texture the frame lands in
+static UINT                 g_capW = 0, g_capH = 0;
+static D3DFORMAT            g_capFmt = D3DFMT_UNKNOWN;
+static bool                 g_haveFrame = false;    // a real frame is sitting in g_upload
+static bool                 g_captureFailLogged = false;
+static double               g_capMsTotal = 0.0;
+static long                 g_capSamples = 0;
+static double               g_qpcFreq = 0.0;
+
+static double NowMs()
+{
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / g_qpcFreq;
+}
 static uint32_t             g_recEyeW = 0, g_recEyeH = 0;
 static bool                 g_xrReady   = false;   // session + space exist
 static bool                 g_xrRunning = false;   // xrBeginSession succeeded
@@ -517,7 +535,125 @@ static bool EnsureSwapchain(uint32_t w, uint32_t h)
     return true;
 }
 
-// One XR frame: wait, begin, fill the quad with a cycling colour, submit, end.
+// ================================================================ rung 3: the frame grab
+//
+// The SLOW path on purpose: backbuffer -> GetRenderTargetData -> SYSTEMMEM -> lock -> D3D11
+// dynamic texture -> CopyResource into the XR swapchain image.
+//
+// It cost the Singularity project roughly 9.8 ms of a 16 ms frame at 4K, and it is still the
+// right thing to build first. The fast route needs a D3D9Ex device, and D3D9Ex does not
+// support D3DPOOL_MANAGED at all - so it drags in translating the 11,084 MANAGED allocations
+// rung 1 counted, with a SYSTEMMEM shadow behind each one. That wrapper was a live source of
+// bugs for a hundred runs in the reference. Proving the pipe end to end without it means any
+// problem that shows up later has one plausible cause instead of two.
+//
+// Formats line up without conversion, which is why this is a copy and not a shader:
+// D3D9 A8R8G8B8 is BGRA byte order, i.e. exactly DXGI_FORMAT_B8G8R8A8_UNORM.
+
+static void ReleaseFrameCapture()
+{
+    if (g_sysSurf) { g_sysSurf->Release(); g_sysSurf = nullptr; }
+    if (g_upload)  { g_upload->Release();  g_upload  = nullptr; }
+    g_capW = g_capH = 0;
+    g_capFmt = D3DFMT_UNKNOWN;
+    g_haveFrame = false;
+}
+
+static bool EnsureCapture(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt)
+{
+    if (g_sysSurf && g_upload && w == g_capW && h == g_capH && fmt == g_capFmt) return true;
+    ReleaseFrameCapture();
+
+    // GetRenderTargetData requires the destination to be an offscreen plain surface in
+    // SYSTEMMEM with IDENTICAL format and dimensions. A mismatched format is the documented
+    // D3DERR_INVALIDCALL here, which is why rung 1 read the format off the surface rather
+    // than trusting the present parameters.
+    HRESULT hr = dev->CreateOffscreenPlainSurface(w, h, fmt, D3DPOOL_SYSTEMMEM, &g_sysSurf, nullptr);
+    if (FAILED(hr)) {
+        Log("[cap] CreateOffscreenPlainSurface %ux%u fmt=%s FAILED hr=0x%08lX",
+            w, h, FormatName(fmt), (unsigned long)hr);
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DYNAMIC;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;   // required for DYNAMIC
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = g_dev11->CreateTexture2D(&td, nullptr, &g_upload);
+    if (FAILED(hr)) {
+        Log("[cap] CreateTexture2D (upload) FAILED hr=0x%08lX", (unsigned long)hr);
+        ReleaseFrameCapture();
+        return false;
+    }
+
+    g_capW = w; g_capH = h; g_capFmt = fmt;
+    Log("[cap] capture chain ready: %ux%u %s -> B8G8R8A8_UNORM", w, h, FormatName(fmt));
+    return true;
+}
+
+// Called from Present, BEFORE the real Present runs - the backbuffer holds the finished frame.
+static bool CaptureFrame(IDirect3DDevice9* dev)
+{
+    if (!g_dev11) return false;
+    const double t0 = NowMs();
+
+    IDirect3DSurface9* bb = nullptr;
+    if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return false;
+
+    D3DSURFACE_DESC d{};
+    if (FAILED(bb->GetDesc(&d))) { bb->Release(); return false; }
+    if (!EnsureCapture(dev, d.Width, d.Height, d.Format)) { bb->Release(); return false; }
+
+    HRESULT hr = dev->GetRenderTargetData(bb, g_sysSurf);
+    bb->Release();
+    if (FAILED(hr)) {
+        if (!g_captureFailLogged) {
+            g_captureFailLogged = true;
+            Log("[cap] GetRenderTargetData FAILED hr=0x%08lX - quad falls back to the test colour",
+                (unsigned long)hr);
+        }
+        return false;
+    }
+
+    D3DLOCKED_RECT lr{};
+    if (FAILED(g_sysSurf->LockRect(&lr, nullptr, D3DLOCK_READONLY))) return false;
+
+    D3D11_MAPPED_SUBRESOURCE ms{};
+    hr = g_ctx11->Map(g_upload, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
+    if (FAILED(hr)) { g_sysSurf->UnlockRect(); return false; }
+
+    // Row by row: the two pitches are independent and are usually NOT equal.
+    const BYTE* src = (const BYTE*)lr.pBits;
+    BYTE*       dst = (BYTE*)ms.pData;
+    if (!src || !dst) {
+        // Both calls reported success, so this is not expected - but memcpy from a null
+        // source is an access violation inside the game's render thread, and a guard is
+        // cheaper than the minidump.
+        g_ctx11->Unmap(g_upload, 0);
+        g_sysSurf->UnlockRect();
+        if (!g_captureFailLogged) {
+            g_captureFailLogged = true;
+            Log("[cap] lock succeeded but a pointer was NULL (src=%p dst=%p) - skipping frame",
+                (void*)src, (void*)dst);
+        }
+        return false;
+    }
+    const size_t rowBytes = (size_t)g_capW * 4;
+    for (UINT y = 0; y < g_capH; ++y)
+        memcpy(dst + (size_t)y * ms.RowPitch, src + (size_t)y * lr.Pitch, rowBytes);
+
+    g_ctx11->Unmap(g_upload, 0);
+    g_sysSurf->UnlockRect();
+
+    g_capMsTotal += NowMs() - t0;
+    g_capSamples++;
+    return true;
+}
+
+// One XR frame: wait, begin, put the captured frame (or the test colour) on the quad, submit.
 static void SubmitTestQuad()
 {
     if (!g_xrRunning) return;
@@ -530,13 +666,25 @@ static void SubmitTestQuad()
     bool submitted = false;
     XrCompositionLayerQuad quad{ XR_TYPE_COMPOSITION_LAYER_QUAD };
 
-    if (fs.shouldRender && EnsureSwapchain(1024, 1024)) {
+    // Sized to the captured frame once there is one, so the game's pixels map 1:1 into the
+    // swapchain and no scaling happens on this path. Falls back to a square while there is
+    // nothing to show.
+    const uint32_t wantW = g_haveFrame ? g_capW : 1024;
+    const uint32_t wantH = g_haveFrame ? g_capH : 1024;
+
+    if (fs.shouldRender && EnsureSwapchain(wantW, wantH)) {
         uint32_t idx = 0;
         XrSwapchainImageAcquireInfo ai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
         if (XR_SUCCEEDED(xrAcquireSwapchainImage(g_swapchain, &ai, &idx))) {
             XrSwapchainImageWaitInfo wi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
             wi.timeout = XR_INFINITE_DURATION;
             if (XR_SUCCEEDED(xrWaitSwapchainImage(g_swapchain, &wi))) {
+              if (g_haveFrame && g_upload) {
+                // Legal despite the swapchain texture being TYPELESS: B8G8R8A8_UNORM and
+                // B8G8R8A8_TYPELESS share a type group, so CopyResource is a raw bit copy.
+                g_ctx11->CopyResource(g_scImages[idx], g_upload);
+                submitted = true;
+              } else {
                 // The colour CYCLES so a live loop cannot be mistaken for one frozen frame -
                 // see the note at the top of this file. Roughly a three-second period.
                 float t = (float)(n % 180) / 180.0f * 6.2831853f;
@@ -568,6 +716,7 @@ static void SubmitTestQuad()
                     Log("[xr] CreateRenderTargetView FAILED hr=0x%08lX (view format %lld) - quad blank",
                         (unsigned long)rvhr, (long long)g_scFormat);
                 }
+              }
             }
             XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
             xrReleaseSwapchainImage(g_swapchain, &ri);
@@ -583,7 +732,9 @@ static void SubmitTestQuad()
         quad.subImage.imageRect = { {0, 0}, {(int32_t)g_scW, (int32_t)g_scH} };
         quad.pose.orientation.w = 1.0f;
         quad.pose.position      = { 0.0f, 0.0f, -2.0f };   // 2 m in front, LOCAL space
-        quad.size               = { 2.0f, 2.0f };           // 2 m square
+        // Height follows the frame's aspect, so a 16:9 image is not stretched into a square.
+        const float aspect = (g_scH > 0) ? ((float)g_scW / (float)g_scH) : 1.0f;
+        quad.size               = { 2.0f, 2.0f / aspect };
         layers[0] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad);
         layerCount = 1;
     }
@@ -596,8 +747,15 @@ static void SubmitTestQuad()
     XrResult er = xrEndFrame(g_xrSession, &fei);
 
     if (n == 1)        Log("*** [xr] first XR frame submitted, xrEndFrame -> %d", (int)er);
-    else if (n % 600 == 0) Log("[xr] frame %ld  state=%d  shouldRender=%d  endFrame=%d",
-                               n, (int)g_xrState, (int)fs.shouldRender, (int)er);
+    else if (n % 600 == 0) {
+        // The capture cost is the number that decides whether the D3D9Ex wrapper is worth
+        // taking on. Reported as a mean over the window, and reset, so it tracks the current
+        // scene rather than being flattened by the menu at startup.
+        const double mean = g_capSamples ? (g_capMsTotal / g_capSamples) : 0.0;
+        Log("[xr] frame %ld  state=%d shouldRender=%d endFrame=%d  |  frame grab %.2f ms mean over %ld",
+            n, (int)g_xrState, (int)fs.shouldRender, (int)er, mean, g_capSamples);
+        g_capMsTotal = 0.0; g_capSamples = 0;
+    }
 }
 
 // ================================================================ hold PAUSE to quit
@@ -750,6 +908,11 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     }
     if (g_xrReady) {
         PumpXREvents();
+        // Capture BEFORE the real Present: at this point the backbuffer holds the finished
+        // frame. If it fails, g_haveFrame goes false and the quad shows the cycling test
+        // colour instead - which makes success and failure distinguishable from inside the
+        // headset, without reading the log.
+        g_haveFrame = CaptureFrame(dev);
         SubmitTestQuad();
     }
 
@@ -770,6 +933,10 @@ static HRESULT STDMETHODCALLTYPE Hook_Reset(IDirect3DDevice9* dev, D3DPRESENT_PA
     // eventual VR path has to care about it. For now it is only worth seeing.
     Log("--- Reset requested ---");
     LogPresentParams("reset", pp);
+    // Released before the Reset, not after. SYSTEMMEM does not block a Reset the way DEFAULT
+    // does, but the backbuffer size is exactly what tends to change here, and a stale capture
+    // chain sized to the old one is a format/size mismatch waiting to happen.
+    ReleaseFrameCapture();
     HRESULT hr = g_origReset(dev, pp);
     Log("--- Reset returned hr=0x%08lX ---", (unsigned long)hr);
     if (SUCCEEDED(hr)) {
@@ -1017,6 +1184,11 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID)
         DisableThreadLibraryCalls(mod);
         InitializeCriticalSection(&g_lock);
         g_lockReady = true;
+        {
+            LARGE_INTEGER f;
+            QueryPerformanceFrequency(&f);
+            g_qpcFreq = (double)f.QuadPart;
+        }
         BuildLogPath();
         ArchivePreviousLog();
         LogHeader();
