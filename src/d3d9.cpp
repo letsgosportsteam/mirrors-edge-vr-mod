@@ -118,6 +118,8 @@ static XrSwapchain          g_swapchain  = XR_NULL_HANDLE;
 static ID3D11Texture2D**    g_scImages   = nullptr;
 static uint32_t             g_scImageCount = 0;
 static uint32_t             g_scW = 0, g_scH = 0;
+static int64_t              g_scFormat = 0;      // the format we ASKED for; the texture may be typeless
+static bool                 g_rtvFailLogged = false;
 static uint32_t             g_recEyeW = 0, g_recEyeH = 0;
 static bool                 g_xrReady   = false;   // session + space exist
 static bool                 g_xrRunning = false;   // xrBeginSession succeeded
@@ -374,7 +376,19 @@ static void PumpXREvents()
         if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
             auto* s = reinterpret_cast<XrEventDataSessionStateChanged*>(&ev);
             g_xrState = s->state;
-            Log("[xr] session state -> %d", (int)s->state);
+            const char* nm = "?";
+            switch (s->state) {
+                case XR_SESSION_STATE_IDLE:         nm = "IDLE";         break;
+                case XR_SESSION_STATE_READY:        nm = "READY";        break;
+                case XR_SESSION_STATE_SYNCHRONIZED: nm = "SYNCHRONIZED"; break;
+                case XR_SESSION_STATE_VISIBLE:      nm = "VISIBLE";      break;
+                case XR_SESSION_STATE_FOCUSED:      nm = "FOCUSED";      break;
+                case XR_SESSION_STATE_STOPPING:     nm = "STOPPING";     break;
+                case XR_SESSION_STATE_LOSS_PENDING: nm = "LOSS_PENDING"; break;
+                case XR_SESSION_STATE_EXITING:      nm = "EXITING";      break;
+                default: break;
+            }
+            Log("[xr] session state -> %d %s", (int)s->state, nm);
             if (s->state == XR_SESSION_STATE_READY && !g_xrRunning) {
                 XrSessionBeginInfo bi{ XR_TYPE_SESSION_BEGIN_INFO };
                 bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -450,8 +464,20 @@ static bool EnsureSwapchain(uint32_t w, uint32_t h)
     for (uint32_t i = 0; i < g_scImageCount; ++i) g_scImages[i] = imgs[i].texture;
     delete[] imgs;
 
-    g_scW = w; g_scH = h;
+    g_scW = w; g_scH = h; g_scFormat = chosen;
     Log("[xr] swapchain %ux%u images=%u", w, h, g_scImageCount);
+
+    // What the runtime ACTUALLY allocated, which is not necessarily what was asked for.
+    // Recorded because the difference between the requested format and the resource format
+    // is the whole reason the render-target view has to name its format explicitly.
+    if (g_scImageCount > 0 && g_scImages[0]) {
+        D3D11_TEXTURE2D_DESC td{};
+        g_scImages[0]->GetDesc(&td);
+        Log("[xr] swapchain texture: %ux%u DXGI format=%d bind=0x%08lX  (requested %lld)",
+            td.Width, td.Height, (int)td.Format, (unsigned long)td.BindFlags, (long long)chosen);
+        if ((int)td.Format != (int)chosen)
+            Log("[xr] note: resource format differs from the requested one - typeless, as expected");
+    }
     return true;
 }
 
@@ -482,13 +508,29 @@ static void SubmitTestQuad()
                                   0.5f + 0.5f * sinf(t + 2.0944f),
                                   0.5f + 0.5f * sinf(t + 4.1888f),
                                   1.0f };
+                // The view format MUST be named explicitly. Runtimes commonly allocate the
+                // swapchain texture as *_TYPELESS so it can be viewed as either sRGB or
+                // UNORM, and a null description means "use the resource's own format" -
+                // which is invalid for a typeless resource, and is why this failed on VDXR
+                // with the quad submitting successfully every frame while staying empty.
+                D3D11_RENDER_TARGET_VIEW_DESC rd{};
+                rd.Format        = (DXGI_FORMAT)g_scFormat;
+                rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+
                 ID3D11RenderTargetView* rtv = nullptr;
-                if (SUCCEEDED(g_dev11->CreateRenderTargetView(g_scImages[idx], nullptr, &rtv))) {
+                HRESULT rvhr = g_dev11->CreateRenderTargetView(g_scImages[idx], &rd, &rtv);
+                if (SUCCEEDED(rvhr)) {
                     g_ctx11->ClearRenderTargetView(rtv, rgba);
                     rtv->Release();
                     submitted = true;
-                } else if (n == 1) {
-                    Log("[xr] CreateRenderTargetView FAILED - the quad will be blank");
+                } else if (!g_rtvFailLogged) {
+                    // Reported on FIRST OCCURRENCE, not on frame 1. The swapchain is only
+                    // created once shouldRender is true, which may be several frames in - so
+                    // a frame-1 guard can miss the failure entirely and report nothing at
+                    // all. That is exactly what happened in the 22:27 run.
+                    g_rtvFailLogged = true;
+                    Log("[xr] CreateRenderTargetView FAILED hr=0x%08lX (view format %lld) - quad blank",
+                        (unsigned long)rvhr, (long long)g_scFormat);
                 }
             }
             XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
