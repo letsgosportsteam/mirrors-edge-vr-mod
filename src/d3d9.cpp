@@ -788,6 +788,17 @@ static void SubmitTestQuad()
 // killing the game's render thread.
 
 static uintptr_t g_imgBase = 0, g_textLo = 0, g_textHi = 0, g_dataLo = 0, g_dataHi = 0;
+static uintptr_t g_imgLo = 0, g_imgHi = 0;
+
+// A UObject's vtable points into the GAME MODULE, not specifically into .text.
+//
+// The first GObjects scan tested `.text` only, and MSVC emits vtables into .rdata - which in
+// this image sits ABOVE .text, so every real object was rejected. It reported 20/64 on a
+// wxWidgets RTTI table, which is noise that happened to hold a few code-shaped pointers.
+//
+// Testing the whole image is also the more honest question: "does this dword point at
+// something in the executable" is what actually distinguishes an object array.
+static bool InModule(uint32_t a) { return a >= g_imgLo && a < g_imgHi; }
 static uintptr_t g_gnamesAddr = 0;
 static uint32_t  g_nameTextOff = 0;
 static bool      g_nameWide = false;      // offset of the char data inside FNameEntry
@@ -833,8 +844,9 @@ static void FindSections()
         if (!strcmp(name, ".text")) { g_textLo = lo; g_textHi = hi; }
         if (!strcmp(name, ".data")) { g_dataLo = lo; g_dataHi = hi; }
     }
-    Log("[obj] image base %p  .text %p-%p  .data %p-%p",
-        (void*)g_imgBase, (void*)g_textLo, (void*)g_textHi, (void*)g_dataLo, (void*)g_dataHi);
+    g_imgLo = g_imgBase;
+    g_imgHi = g_imgBase + nt->OptionalHeader.SizeOfImage;
+    Log("[obj] image %p-%p  .text %p-%p  .data %p-%p", (void*)g_imgLo, (void*)g_imgHi, (void*)g_textLo, (void*)g_textHi, (void*)g_dataLo, (void*)g_dataHi);
 }
 
 // Does the FNameEntry at `entry` hold `expect` when its text starts at `textOff`?
@@ -1147,7 +1159,7 @@ static bool FindGObjects()
             if (obj == 0) continue;             // UE3 leaves holes where objects were destroyed
             checked++;
             uint32_t vtbl;
-            if (SafeU32(obj, &vtbl) && vtbl >= g_textLo && vtbl < g_textHi) vtblOk++;
+            if (SafeU32(obj, &vtbl) && InModule(vtbl)) vtblOk++;
         }
         // Remembered even when it loses, so a failure reports the closest thing it saw
         // instead of only "not found".
@@ -1194,7 +1206,7 @@ static void DetectUObjectLayout()
         uint32_t obj;
         if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
         uint32_t vtbl;
-        if (!SafeU32(obj, &vtbl) || vtbl < g_textLo || vtbl >= g_textHi) continue;
+        if (!SafeU32(obj, &vtbl) || !InModule(vtbl)) continue;
         sampled++;
         for (int off = 4; off < kMaxOff; off += 4) {
             uint32_t v;
@@ -1241,7 +1253,7 @@ static void ProbeKnownObjects()
         uint32_t obj;
         if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
         uint32_t vtbl;
-        if (!SafeU32(obj, &vtbl) || vtbl < g_textLo || vtbl >= g_textHi) continue;
+        if (!SafeU32(obj, &vtbl) || !InModule(vtbl)) continue;
         live++;
         uint32_t nameIdx;
         if (!SafeU32(obj + g_offName, &nameIdx)) continue;
