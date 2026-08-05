@@ -304,9 +304,68 @@ Consequences to design around, in order of awkwardness:
 5. `bCinematicMode` already gates camera collision — a ready-made signal for cutscene handling,
    which the Singularity project had to discover the hard way.
 
-**Not yet read:** `GetCameraAnimation` itself, `SwanNeck1p.GetSwanNeckPos`, `GetViewRotation`,
-and `TdPlayerController.UpdateRotation` (line 1761 of the decompiled controller, which has
-several state-specific overrides). Those decide exactly which term carries which motion.
+### ⭐ Every channel that moves the view without the player asking — enumerated
+
+| # | channel | where | script? | notes |
+|---|---|---|---|---|
+| 1 | `GetCameraAnimation` | `TdPawn` | ❌ **`native final`, no body** | the bob and roll. Opaque. |
+| 2 | `Moves[MovementState].UpdateViewRotation` | `TdMove` + ~148 subclasses | ✅ | forced look-at, and per-move view clamping |
+| 3 | `CurrentForcedLookAtPoint` / `CurrentLookAtPoint` | `TdPlayerController` | ✅ | scripted view pulls |
+| 4 | `ViewShake(DeltaTime)` | `TdPlayerController` | ✅ | shakes |
+| 5 | `TdSwanNeck` | script maths, native getter | ✅ **and ini-configurable** | pitch-driven lean |
+| 6 | `bCinematicMode` | `TdPlayerController.UpdateRotation` | ✅ | forces the view to `Pawn.Rotation` |
+
+**⚠️ `GetCameraAnimation` is `native final` with no script body.** This is the one real limit
+the script route hit: the *source* of the bob and roll is C++ and cannot be read here. It does
+**not** block the work — `CalcCamera` shows the result arriving as a delta at exactly one site,
+so it can be scaled or dropped without knowing how it was computed — but understanding *why* a
+particular motion happens would need the binary.
+
+**Roll is contributed only by channel 1.** `TdPlayerController.UpdateRotation` sets
+`ViewRotation.Roll = 0` before writing it back, so the roll seen during a wall-run cannot come
+from the controller. That is a clean separation and a cheap thing to verify.
+
+### `TdSwanNeck` — a pitch-driven lean, and free to disable
+
+Fully readable, and driven **only by controller pitch** — it is not a bob. Look down past
+`StartTranslateAtDegree` and the camera translates forward and down, modelling leaning over to
+look at your feet. In a headset the player's real neck already does this, so the engine doing
+it too is likely to feel wrong.
+
+It is `config(Game)`, and `DefaultGame.ini` already carries the section:
+
+```ini
+[TdGame.TdSwanNeck]
+StartTranslateAtDegree = 15
+QuadraticForwardTranslation = 35
+QuadraticDownwardTranslation = 30
+Type = ESNT_Quadratic
+```
+
+**Zeroing the translations disables it with no code at all** — the cheapest comfort experiment
+available, and worth running before anything is written.
+
+### ⚠️ `CameraAnimationEnabled=false` in `DefaultGame.ini` is a dead line
+
+It appears under `[Engine.UIDataStore_GameResource]`, which is the wrong section for it, and
+the name has **zero occurrences** in `TdGame.u`. It is either an `Engine.u` property or
+vestigial. **Do not treat it as a working toggle** — it looked like a free win and is not one.
+
+### `TdPlayerController.UpdateRotation` — the other half of the picture
+
+Order of operations: take the controller's own `Rotation`; compute a speed modifier from the
+pitch difference against the pawn; apply stick delta *only* when
+`bRightThumbStickPassedDeadZone`; then either force the view to `Pawn.Rotation` when
+`bCinematicMode`, or run the look-at points, the per-move `UpdateViewRotation`,
+`ProcessViewRotation`, zero the roll, and write it back. `ViewShake` runs last.
+
+`bCinematicMode` forcing the view to the pawn is the cutscene head-lock. The Singularity
+project found the same behaviour by experiment and solved it at run 138; here it is visible in
+the source before any run.
+
+**Still not read:** `GetViewRotation` (inherited from `Engine.u`, a different package that also
+needs decompressing), `ProcessViewRotation`, and the individual `TdMove_*` overrides —
+`TdMove_WallRun` is dumped and unread.
 
 ### Consequence for the architecture choice
 
