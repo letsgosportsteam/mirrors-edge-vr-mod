@@ -664,6 +664,25 @@ there.
 > either. Do not tune toward depth in the distance — tune toward comfortable fusion up close,
 > which the measured 100 UU/m delivers by construction.
 
+> ### ⛔ NEVER judge stereo on the desktop mirror
+>
+> Under alternate-eye the monitor shows **every** frame, alternating left-eye and right-eye
+> renders. Those are offset from each other by design, so the flat image is *necessarily*
+> doubled. It has nothing to do with fusion, comfort or correctness — it is two viewpoints shown
+> in sequence.
+>
+> This cost real time. "Close objects double at 100%" was reported and taken as evidence that
+> full separation was uncomfortable; a theory was then built about alternate-eye temporal
+> disparity to explain it, and a test designed around that theory. The observation was from the
+> monitor, where doubling is the expected and correct output.
+>
+> **The stereo-strength default of 50% therefore rests on a contaminated observation and is not
+> yet justified.** It has to be re-judged in the headset with the monitor ignored entirely.
+>
+> The artefact disappears on its own once stereo becomes simultaneous rather than alternating,
+> so it is not worth engineering around — but until then, any judgement about depth, separation
+> or comfort made while looking at the screen is worthless.
+
 ### Judged in the headset too
 
 F11 swept 25/35/50/70/100/140 and **100 read as life-sized**. At a 6.3 cm IPD that is a
