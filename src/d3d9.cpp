@@ -720,6 +720,10 @@ float                    g_targetHalfFovY = 0.0f;
 bool                     g_fovForce = true;         // F8 toggles
 static bool              g_fovLogged = false;
 static long              g_fovWrites = 0;
+float                    g_camCache[3] = { 0, 0, 0 };
+bool                     g_camCacheValid = false;
+volatile LONG            g_vmAccepted = 0;
+volatile LONG            g_vmRejected = 0;
 static XrView            g_views[2]{};
 static bool              g_viewsValid = false;
 
@@ -2353,6 +2357,7 @@ extern int   g_stereoMode;
 extern float g_worldScale;
 bool      LooksLikePlayerPawn(uintptr_t obj);
 uintptr_t FindPlayerPawn();
+bool      GetCameraPose(float* loc, float* fwd);
 
 // ================================================================ rung 5b: head tracking
 //
@@ -2476,6 +2481,19 @@ static void ApplyHeadTracking(XrTime when)
     // Keeps the pawn pointer warm for the view-matrix scan, which needs the camera pose and
     // runs on the render thread inside a hot D3D hook where a full object walk is impossible.
     FindPlayerPawn();
+
+    // Cache the camera position once per frame. The injection hook re-validates every upload
+    // against it, and cannot afford a ReadProcessMemory per call - c0 is written thousands of
+    // times a frame.
+    {
+        float loc[3], fwd[3];
+        if (GetCameraPose(loc, fwd)) {
+            g_camCache[0] = loc[0]; g_camCache[1] = loc[1]; g_camCache[2] = loc[2];
+            g_camCacheValid = true;
+        } else {
+            g_camCacheValid = false;     // no pose means no way to tell the matrices apart
+        }
+    }
 
     if (!GetHeadYawPitch(when, &hy, &hp)) return;
 
@@ -2853,6 +2871,32 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
     if ((g_vmMode != 0 || g_stereoMode == 1) && g_vmReg >= 0 && data && count >= 4 &&
         startReg <= (UINT)g_vmReg && startReg + count >= (UINT)g_vmReg + 4 &&
         count <= 256) {
+        // ---- ⚠️ re-validate EVERY call. c0 carries more than one matrix ----
+        //
+        // Measured: the derived FOV alternates between 90.0 x 58.7 and 160.0 x 160.0 on
+        // consecutive uploads to the same register. Something other than the scene
+        // view-projection - a shadow or light transform - lands at c0 too, and injecting into
+        // it corrupts that pass while looking like a rendering bug somewhere else entirely.
+        //
+        // So the register is where to LOOK, never permission to modify. The same test that
+        // found the matrix decides each call: a world->clip matrix maps the camera position to
+        // clip.w ~ 0, and nothing else at this register does.
+        //
+        // Cheap enough for a hot path - four multiply-adds against a pose cached once per
+        // frame, no memory reads.
+        {
+            const float* q = data + (size_t)((UINT)g_vmReg - startReg) * 4;
+            const float w = g_camCache[0] * (g_vmRow ? q[3]  : q[12])
+                          + g_camCache[1] * (g_vmRow ? q[7]  : q[13])
+                          + g_camCache[2] * (g_vmRow ? q[11] : q[14])
+                          + (g_vmRow ? q[15] : q[15]);
+            if (!g_camCacheValid || fabsf(w) > 25.0f) {
+                InterlockedIncrement(&g_vmRejected);
+                return g_origSetVSConstF(dev, startReg, data, count);
+            }
+            InterlockedIncrement(&g_vmAccepted);
+        }
+
         float buf[256 * 4];
         memcpy(buf, data, sizeof(float) * 4 * count);
         float* m = buf + (size_t)((UINT)g_vmReg - startReg) * 4;
@@ -2952,8 +2996,10 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
         }
 
         if (++g_vmInjections == 1 || (g_vmInjections % 20000) == 0)
-            Log("[vm] injection #%ld  offset (%.0f, %.0f, %.0f) into c%d %s",
-                g_vmInjections, ox, oy, oz, g_vmReg, g_vmRow ? "ROW" : "COL");
+            Log("[vm] injection #%ld  offset (%.1f, %.1f, %.1f) eye %+.0f  accepted %ld rejected %ld",
+                g_vmInjections, ox, oy, oz, g_eyeInject,
+                InterlockedCompareExchange(&g_vmAccepted, 0, 0),
+                InterlockedCompareExchange(&g_vmRejected, 0, 0));
         return g_origSetVSConstF(dev, startReg, buf, count);
     }
 
