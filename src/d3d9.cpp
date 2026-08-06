@@ -2365,6 +2365,8 @@ static void CheckVMHotkey()
     }
 }
 
+extern bool g_overlay;
+
 static void CheckHeadHotkeys()
 {
     static bool p9 = false, p5 = false, p4 = false;
@@ -2378,6 +2380,10 @@ static void CheckHeadHotkeys()
     }
     if (d5 && !p5) { g_yawSign   = -g_yawSign;   Log("[head] F5 -> yaw sign %+d", g_yawSign); }
     if (d4 && !p4) { g_pitchSign = -g_pitchSign; Log("[head] F4 -> pitch sign %+d", g_pitchSign); }
+    static bool p3 = false;
+    const bool d3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
+    if (d3 && !p3) { g_overlay = !g_overlay; Log("[hud] F3 -> overlay %s", g_overlay ? "ON" : "OFF"); }
+    p3 = d3;
     p9 = d9; p5 = d5; p4 = d4;
 }
 
@@ -2599,6 +2605,168 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
     return g_origSetVSConstF(dev, startReg, data, count);
 }
 
+// ================================================================ the on-screen readout
+//
+// Ported from the Singularity mod, where it was added at run 127 for a reason this project has
+// now hit repeatedly: every mode and setting goes to a log file, so checking state while
+// wearing the headset means taking it off. That gap cost that project a run when "combo 2"
+// meant different things in two sessions and nothing on screen could say so.
+//
+// The Windows SDK ships no D3DX, so there is no DrawText. The glyphs are a 5x7 bitmap and each
+// run of set pixels in a row becomes one rectangle in a Clear() list. Merging adjacent pixels
+// keeps a line of text to a few dozen rectangles rather than one per pixel. No vertex buffer,
+// no shader, and the only device state touched is the scissor - saved and restored.
+//
+// Drawn BEFORE the frame is captured, which is what puts it in front of your eyes rather than
+// only on the desktop mirror.
+//
+// ⚠️ The rows are per-TEST and meant to be edited. Anything here that stops earning its space
+// should be deleted rather than left to accumulate - a readout nobody reads is worse than none,
+// because it costs pixels and implies it matters.
+
+static const int kGlyphW = 5, kGlyphH = 7;
+static const unsigned char kFont[][kGlyphH] = {
+    {0,0,0,0,0,0,0},                                    //  0 space
+    {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11},               //  1 A
+    {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E},               //    B
+    {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E},               //    C
+    {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E},               //    D
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F},               //    E
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10},               //    F
+    {0x0E,0x11,0x10,0x17,0x11,0x11,0x0F},               //    G
+    {0x11,0x11,0x11,0x1F,0x11,0x11,0x11},               //    H
+    {0x1F,0x04,0x04,0x04,0x04,0x04,0x1F},               //    I
+    {0x07,0x02,0x02,0x02,0x02,0x12,0x0C},               //    J
+    {0x11,0x12,0x14,0x18,0x14,0x12,0x11},               //    K
+    {0x10,0x10,0x10,0x10,0x10,0x10,0x1F},               //    L
+    {0x11,0x1B,0x15,0x15,0x11,0x11,0x11},               //    M
+    {0x11,0x19,0x15,0x13,0x11,0x11,0x11},               //    N
+    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E},               //    O
+    {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},               //    P
+    {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D},               //    Q
+    {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11},               //    R
+    {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E},               //    S
+    {0x1F,0x04,0x04,0x04,0x04,0x04,0x04},               //    T
+    {0x11,0x11,0x11,0x11,0x11,0x11,0x0E},               //    U
+    {0x11,0x11,0x11,0x11,0x11,0x0A,0x04},               //    V
+    {0x11,0x11,0x11,0x15,0x15,0x1B,0x11},               //    W
+    {0x11,0x0A,0x04,0x04,0x04,0x0A,0x11},               //    X
+    {0x11,0x0A,0x04,0x04,0x04,0x04,0x04},               //    Y
+    {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F},               // 26 Z
+    {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E},               // 27 0
+    {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},               //    1
+    {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F},               //    2
+    {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E},               //    3
+    {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02},               //    4
+    {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},               //    5
+    {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E},               //    6
+    {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},               //    7
+    {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E},               //    8
+    {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C},               // 36 9
+    {0x00,0x04,0x04,0x1F,0x04,0x04,0x00},               // 37 +
+    {0x00,0x00,0x00,0x1F,0x00,0x00,0x00},               // 38 -
+    {0x02,0x04,0x08,0x08,0x08,0x04,0x02},               // 39 (
+    {0x08,0x04,0x02,0x02,0x02,0x04,0x08},               // 40 )
+    {0x00,0x04,0x00,0x00,0x00,0x04,0x00},               // 41 :
+    {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C},               // 42 .
+    {0x01,0x02,0x02,0x04,0x08,0x08,0x10},               // 43 /
+    {0x00,0x00,0x1F,0x00,0x1F,0x00,0x00},               // 44 =
+    // 45: the fallback. ⚠️ The reference returns SPACE for an unknown character, and it cost
+    // that project two invisible arrows and a missing pair of asterisks before anyone noticed
+    // - a silently dropped glyph is indistinguishable from a typo in the string. A filled box
+    // is impossible to miss and says "add this glyph" rather than nothing at all.
+    {0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F},               // 45 unknown
+};
+
+static int GlyphIndex(char ch)
+{
+    if (ch == ' ') return 0;
+    if (ch >= 'A' && ch <= 'Z') return 1 + (ch - 'A');
+    if (ch >= 'a' && ch <= 'z') return 1 + (ch - 'a');
+    if (ch >= '0' && ch <= '9') return 27 + (ch - '0');
+    switch (ch) {
+        case '+': return 37;  case '-': return 38;
+        case '(': return 39;  case ')': return 40;
+        case ':': return 41;  case '.': return 42;
+        case '/': return 43;  case '=': return 44;
+        default:  return 45;                    // deliberately visible, see above
+    }
+}
+
+// Append the rectangles for one line. Adjacent set pixels in a row are merged, so a word costs
+// tens of rectangles rather than hundreds.
+static int TextRects(D3DRECT* r, int n, int cap, int x0, int y0, int px, const char* s)
+{
+    for (int ci = 0; s[ci]; ++ci) {
+        const unsigned char* g = kFont[GlyphIndex(s[ci])];
+        const int cx = x0 + ci * (kGlyphW + 1) * px;
+        for (int row = 0; row < kGlyphH; ++row) {
+            int col = 0;
+            while (col < kGlyphW) {
+                if (!(g[row] & (0x10 >> col))) { ++col; continue; }
+                int run = 0;
+                while (col + run < kGlyphW && (g[row] & (0x10 >> (col + run)))) ++run;
+                if (n < cap) {
+                    r[n].x1 = cx + col * px;
+                    r[n].y1 = y0 + row * px;
+                    r[n].x2 = cx + (col + run) * px;
+                    r[n].y2 = y0 + (row + 1) * px;
+                    ++n;
+                }
+                col += run;
+            }
+        }
+    }
+    return n;
+}
+
+static bool g_overlay = true;      // F3 toggles
+
+static void DrawOverlay(IDirect3DDevice9* dev)
+{
+    if (!g_overlay || !dev) return;
+
+    char lines[8][64];
+    int nl = 0;
+
+    // ---- rows for the CURRENT test. Delete freely; see the note at the top. ----
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "MEVR FPS %d GRAB %d MS",
+                (int)(g_capSamples ? (1000.0 / (g_capMsTotal / g_capSamples + 0.001)) : 0),
+                (int)(g_capSamples ? (g_capMsTotal / g_capSamples) : 0.0));
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "OBJ %s  PROP %s",
+                g_offName >= 0 ? "OK" : "NO", g_offPropOff >= 0 ? "OK" : "NO");
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "HEAD %s YAW %+d PITCH %+d",
+                g_headTracking ? "ON" : "OFF", g_yawSign, g_pitchSign);
+    if (g_vmReg >= 0)
+        _snprintf_s(lines[nl++], 64, _TRUNCATE, "VM C%d %s MODE %d",
+                    g_vmReg, g_vmRow ? "ROW" : "COL", g_vmMode);
+    else
+        _snprintf_s(lines[nl++], 64, _TRUNCATE, "VM NOT SCANNED  F6");
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "OFFSET %d %d %d",
+                (int)g_vmOffset[0], (int)g_vmOffset[1], (int)g_vmOffset[2]);
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "SWAN %d", g_swanMode);
+
+    // Static, not on the stack: 2048 D3DRECTs is 32 KB and this runs every frame on the
+    // render thread, which /analyze flagged as C6262. Safe because DrawOverlay is only ever
+    // called from Hook_Present, on one thread. TextRects stops at the cap rather than
+    // overflowing, so a long line truncates instead of corrupting anything.
+    static D3DRECT rects[2048];
+    int n = 0;
+    const int px = 3;                                   // pixel scale
+    for (int i = 0; i < nl; ++i)
+        n = TextRects(rects, n, 2048, 16, 16 + i * (kGlyphH + 2) * px, px, lines[i]);
+    if (n <= 0) return;
+
+    // Clear() honours the scissor, so a scissor left set by the engine would clip the text.
+    // Saved and restored rather than assumed - this runs mid-frame inside someone else's
+    // render state.
+    DWORD scissorWas = 0;
+    dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &scissorWas);
+    if (scissorWas) dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    dev->Clear((DWORD)n, rects, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 255, 96), 1.0f, 0);
+    if (scissorWas) dev->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
+}
+
 // ================================================================ hold PAUSE to quit
 //
 // Ported from the Singularity mod, where it earned its place. Inside a headset you cannot
@@ -2753,6 +2921,8 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
         // frame. If it fails, g_haveFrame goes false and the quad shows the cycling test
         // colour instead - which makes success and failure distinguishable from inside the
         // headset, without reading the log.
+        // BEFORE the capture, so the readout reaches the headset rather than only the mirror.
+        DrawOverlay(dev);
         g_haveFrame = CaptureFrame(dev);
         SubmitTestQuad();
     }
