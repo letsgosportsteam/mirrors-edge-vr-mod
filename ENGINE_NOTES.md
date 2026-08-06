@@ -789,12 +789,22 @@ Mode **AUTO** (override only while duplication is running) is the default, adopt
 reference: mono has no reason to pay for disabled culling, and the safe fallback keeps the
 engine's own.
 
-> **⚠️ Confirmed by observation, not yet by a clean A/B.** The flickering stopped, but the log
-> shows AUTO had already engaged the override when duplication started, and the keypress
-> credited with the fix never registered. The override was active either way — but *what changed
-> at that moment* is not established. A toggle that can only force the override further ON
-> cannot demonstrate anything; DELETE now cycles AUTO / ALWAYS / **NEVER**, and only NEVER can
-> bring the flickering back.
+> ### ✅ CONFIRMED by A/B, not by inference
+>
+> ```
+> 545: [occ] overriding to VISIBLE (mode 1, 380000 queries faked)
+> 546: *** [occ] DELETE -> mode 2: NEVER override - engine culling live
+>      <- no override lines at all here, and the flickering returned
+> 548: *** [occ] DELETE -> mode 0: AUTO
+> 549: [occ] overriding to VISIBLE (mode 0, 400000 queries faked)
+> ```
+>
+> The override provably stopped, the flickering came back, and it resumed. Cause established.
+>
+> The first attempt to confirm this could not have worked: AUTO had already engaged the override
+> when duplication started, and the toggle could only force it *further on*. A switch that
+> cannot turn the suspected cause **back on** cannot demonstrate anything — the failing state
+> has to be reachable, not just the working one.
 
 ### The shadow-map theory was wrong, and was nearly settled on
 
