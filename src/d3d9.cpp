@@ -2117,6 +2117,8 @@ extern uintptr_t g_playerPawn;
 extern int  g_vmCandidates;
 extern int  g_vmBestReg;
 extern bool g_vmBestRow;
+extern bool  g_vmBestWorld;
+extern float g_vmBestScore;
 extern volatile LONG g_vmScanArmed;
 extern volatile LONG g_vmWindowsTested;
 extern volatile LONG g_vmPoseFailures;
@@ -2291,7 +2293,7 @@ static void CheckVMHotkey()
         } else if (!LooksLikePlayerPawn(g_playerPawn)) {
             Log("[vm] no TdPlayerPawn resolved yet - the scan needs the camera pose");
         } else {
-            g_vmCandidates = 0; g_vmBestReg = -1;
+            g_vmCandidates = 0; g_vmBestReg = -1; g_vmBestScore = -1e9f;
             InterlockedExchange(&g_vmWindowsTested, 0);
             InterlockedExchange(&g_vmPoseFailures, 0);
             Log("");
@@ -2321,8 +2323,9 @@ static void CheckVMHotkey()
             Log("[vm] windows were tested but none matched - the matrix may not be uploaded as"
                 " vertex shader constants, or the probes/tolerances are wrong");
         else
-            Log("[vm] ---- %d candidate(s); first was c%d %s ----",
-                g_vmCandidates, g_vmBestReg, g_vmBestRow ? "ROW" : "COL");
+            Log("*** [vm] BEST: c%d %s in %s space  (score %.4f, %d candidates seen)",
+                g_vmBestReg, g_vmBestRow ? "ROW" : "COL",
+                g_vmBestWorld ? "WORLD" : "TRANSLATED-WORLD", g_vmBestScore, g_vmCandidates);
         Log("");
     }
 }
@@ -2422,6 +2425,8 @@ volatile LONG g_vmWindowsTested = 0;
 volatile LONG g_vmPoseFailures  = 0;
 static int  g_vmBestReg = -1;
 static bool g_vmBestRow = false;
+bool  g_vmBestWorld = false;
+float g_vmBestScore = -1e9f;
 static int  g_vmCandidates = 0;
 
 // Camera pose straight from the pawn's cached values - the same numbers CalcCamera produced.
@@ -2472,7 +2477,26 @@ static void TestWindow(int reg, const float* m, bool asRow,
     Log("[vm] c%-3d %s  w(cam)=%9.3f  w(origin)=%9.3f  dotFwd=%+.4f  %s",
         reg, asRow ? "ROW" : "COL", wCam, wOrg, dotFwd,
         originHit ? "<- TRANSLATED-WORLD" : "<- world space");
-    if (g_vmBestReg < 0) { g_vmBestReg = reg; g_vmBestRow = asRow; }
+
+    // ---- rank, do not take the first ----
+    //
+    // The first scan produced ~20 candidates a frame and the real one was not first. They are
+    // the degeneracy the reference project warned about, arriving from the opposite direction:
+    // there the ORIGIN probe was the noise-free one, because that engine renders
+    // translated-world. Mirror's Edge uploads WORLD-space matrices, so here it is the origin
+    // probe that admits a block of unrelated float3x4 transforms the sliding window straddles.
+    //
+    // The real matrix is not marginally better, it is exact: w on its own probe is 0.000 and
+    // dotFwd is 1.0000, against 0.90-0.98 and |w| in the hundreds of thousands for the noise.
+    // Scoring on both separates them by a wide margin rather than a threshold.
+    const float probeW = worldHit ? fabsf(wCam) : fabsf(wOrg);
+    const float score  = fabsf(dotFwd) - probeW * 0.01f;
+    if (score > g_vmBestScore) {
+        g_vmBestScore = score;
+        g_vmBestReg   = reg;
+        g_vmBestRow   = asRow;
+        g_vmBestWorld = worldHit;
+    }
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,

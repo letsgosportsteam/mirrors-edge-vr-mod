@@ -509,6 +509,49 @@ defaults are now `−1/−1`.
 
 ---
 
+## ⭐ The view matrix — found, and in a DIFFERENT SPACE from Singularity
+
+```
+[vm] c0  ROW  w(cam)=0.000  w(origin)=20669.789  dotFwd=+1.0000  <- world space
+```
+
+| Fact | Value |
+|---|---|
+| Where | `SetVertexShaderConstantF`, device vtable slot **94** |
+| Register | **`c0`**, a 4-register block |
+| Storage | **ROW** — registers are the rows of a row-vector matrix (`clip = v * M`) |
+| Space | **WORLD** — *not* translated-world |
+| Residual | `w(cam) = 0.000` exactly, `dotFwd = +1.0000` exactly |
+
+### ⚠️ The space differs, and it inverts which probe is trustworthy
+
+Singularity renders in **translated-world**: UE3 pre-subtracts the view origin on the CPU, so
+there the camera sits at the shader-space origin and only an origin probe finds the matrix. Its
+notes warn that the origin probe *degenerates* — `clip.w` at `(0,0,0)` collapses to `r[3].w`
+under both storage conventions, so it cannot separate ROW from COL and admits any matrix with a
+small `w` constant. That project saw 18 spurious candidates.
+
+**Mirror's Edge uploads WORLD-space matrices.** The camera's real world position is what maps to
+`w ≈ 0`, and the *origin* probe is now the noise generator — this scan produced ~20 candidates
+per frame, all origin hits at `dotFwd` 0.90–0.98 with `|w(cam)|` in the hundreds of thousands.
+They are a block of `float3x4` transforms the sliding 4-register window straddles.
+
+**The real matrix is not marginally better, it is exact.** `w` of 0.000 and `dotFwd` of 1.0000
+against 0.90–0.98 and enormous `w`. Candidates are therefore ranked on both rather than accepted
+on a threshold, and the first match is never taken — the real one was not first in the list.
+
+### What this changes, and what it does not
+
+- **The injection maths is unaffected.** To move the camera by a world offset `o`:
+  `row3 -= o.x*row0 + o.y*row1 + o.z*row2`. That is `M' = T(−o)·M` in row-vector form and holds
+  in either space; the space only decided which probe point finds the matrix.
+- **Per-eye offset, head roll and 6-DOF all come from this one interception**, exactly as in the
+  reference — roll in particular has nowhere else to go, since `UpdateRotation` zeroes
+  `ViewRotation.Roll` before writing it back.
+- Nothing is injected yet. This entry records the location only.
+
+---
+
 ## Save data
 
 Stored **outside the install**, keyed by the game's identity, so every copy — Steam, GOG, and the
