@@ -548,7 +548,65 @@ on a threshold, and the first match is never taken — the real one was not firs
 - **Per-eye offset, head roll and 6-DOF all come from this one interception**, exactly as in the
   reference — roll in particular has nowhere else to go, since `UpdateRotation` zeroes
   `ViewRotation.Roll` before writing it back.
-- Nothing is injected yet. This entry records the location only.
+### ✅✅ Injection CONFIRMED in the game, 2026-08-06
+
+`M' = T(−o)·M`, applied to the covering upload:
+`row3 -= o.x*row0 + o.y*row1 + o.z*row2`. Cycling a 300 UU offset through forward / right / up
+moves the camera visibly on every change, over 20,000 injections.
+
+```
+*** [vm] BEST: c0 ROW in WORLD space  (score 1.0000, 208 candidates seen)
+```
+
+**208 candidates, and the winner scored exactly 1.0000.** Ranking rather than first-match was
+load-bearing: the real matrix was not first in the list, so taking the first would have injected
+into an unrelated transform.
+
+The engine's buffer is `const` and belongs to it, so a covering call is copied, modified and
+forwarded. The guard ahead of that is two comparisons, so non-covering calls — the overwhelming
+majority — are untouched.
+
+**Everything stereo needs now exists.** Per-eye parallax is this same offset at ±half IPD along
+the camera's right axis; head roll and 6-DOF are the same mechanism. The right axis should be
+read from the matrix itself rather than recomputed from the pawn's rotation — the matrix cannot
+disagree with itself.
+
+Expect a black band at the frame edges for large offsets: the engine culls on the CPU against
+its *original* frustum, so newly-visible geometry was never submitted. Singularity measured
+1.4–2.9% at 300 UU and **0 px at 100 UU and below**, and a real IPD is a few UU — so it does not
+apply to stereo, only to tests like this one.
+
+---
+
+## ⛔ Never issue D3D calls on a lost device
+
+**2026-08-06: a test run hard-froze the machine.** Kernel-Power 41, no TDR recorded, reboot
+required. The log ends at:
+
+```
+--- Reset requested ---
+--- Reset returned hr=0x8876086C ---      D3DERR_INVALIDCALL
+```
+
+An alt-tab out of exclusive fullscreen lost the device, `Reset` was rejected, and the game ran
+for roughly two more minutes before the system died.
+
+Nothing in the mod checked `TestCooperativeLevel`. For those two minutes it kept calling
+`Clear()`, `GetBackBuffer()`, `GetRenderTargetData()` and `LockRect()` on a **lost device**,
+every frame, while an OpenXR compositor held shared surfaces.
+
+**That this caused the freeze is not proven. That it is invalid is not in question** — every one
+of those calls has undefined behaviour on a lost device.
+
+Two changes, and the second is the one that matters:
+
+- The mod now checks first and, when the device is not operational, forwards `Present` and
+  touches nothing else. A failed `Reset` sets the same flag and says so loudly.
+- **Windowed mode is forced at `CreateDevice`.** Exclusive fullscreen loses the device on every
+  alt-tab; a windowed device never takes that path. This removes the hazard rather than
+  surviving it, and it was required eventually anyway since the desktop window is only a mirror.
+
+Verified in the next run: `Windowed=1` granted, no device loss, no failed reset.
 
 ---
 
