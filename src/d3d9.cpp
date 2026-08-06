@@ -672,6 +672,102 @@ static bool CaptureFrame(IDirect3DDevice9* dev)
 
 static void ApplyHeadTracking(XrTime when);   // defined with the rung 5b code
 
+// ================================================================ rung 6c: per-eye stereo
+//
+// ALTERNATE-EYE, deliberately, as the reference project's ladder does it. One eye is rendered
+// per frame and each eye's image is therefore one frame stale.
+//
+// Why that rather than true simultaneous stereo: the engine renders the scene once per frame,
+// so two genuinely different images need either draw-call duplication or engine re-entry -
+// both large, and both able to fail in ways that look like a geometry bug. Alternating proves
+// the per-eye offset, the two swapchains, the projection layer and the FOV maths first, and
+// costs no extra frame grab: still one backbuffer per frame.
+//
+// ---- the offset comes from the matrix itself ----
+//
+// Per-eye parallax is the rung 6b injection at +/- half IPD along the camera's RIGHT axis. That
+// axis is read from the incoming matrix in the same call that modifies it - for a row-vector
+// world->clip matrix, column 0 is the direction mapping to clip.x, so normalising it gives
+// world-space right. Recomputing it from the pawn's rotation would introduce a second source
+// that can disagree with the thing being modified; this one cannot.
+//
+// ---- world scale is a guess and is meant to be tuned ----
+//
+// OpenXR reports IPD in metres. UE3 units per metre is game-specific: the Singularity project
+// measured 3.32 UU for 6.3 cm, about 1.9 cm per unit. Mirror's Edge is unmeasured, so the
+// scale starts at 50 UU/m and F11 adjusts it. Too small reads as a flat cardboard cut-out;
+// too large as a miniature world.
+
+static XrSwapchain       g_eyeSwap[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
+static ID3D11Texture2D** g_eyeImages[2] = { nullptr, nullptr };
+static uint32_t          g_eyeImageCount[2] = { 0, 0 };
+static uint32_t          g_eyeW = 0, g_eyeH = 0;
+static bool              g_eyeFilled[2] = { false, false };
+static int               g_nextEye = 0;          // which eye the NEXT frame will render
+static int               g_renderedEye = -1;     // which eye the frame just finished IS
+int                      g_stereoMode = 0;       // 0 = mono quad, 1 = alternate-eye
+float                    g_worldScale = 50.0f;   // UE3 units per metre
+// Defined with the injection code further down; declared here because the eye is chosen at the
+// end of each frame, which happens above it.
+extern float             g_eyeInject;
+float                    g_halfIpdUU = 0.0f;     // filled from the located views
+static XrView            g_views[2]{};
+static bool              g_viewsValid = false;
+
+static bool EnsureEyeSwapchains(uint32_t w, uint32_t h)
+{
+    if (g_eyeSwap[0] != XR_NULL_HANDLE && w == g_eyeW && h == g_eyeH) return true;
+    for (int e = 0; e < 2; ++e) {
+        if (g_eyeSwap[e] != XR_NULL_HANDLE) { xrDestroySwapchain(g_eyeSwap[e]); g_eyeSwap[e] = XR_NULL_HANDLE; }
+        delete[] g_eyeImages[e]; g_eyeImages[e] = nullptr;
+        g_eyeFilled[e] = false;
+    }
+    if (!g_scFormat) return false;               // format chosen by the mono path already
+
+    for (int e = 0; e < 2; ++e) {
+        XrSwapchainCreateInfo sci{ XR_TYPE_SWAPCHAIN_CREATE_INFO };
+        sci.usageFlags  = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        sci.format      = g_scFormat;
+        sci.sampleCount = 1;
+        sci.width = w; sci.height = h;
+        sci.faceCount = 1; sci.arraySize = 1; sci.mipCount = 1;
+        if (XR_FAILED(xrCreateSwapchain(g_xrSession, &sci, &g_eyeSwap[e]))) {
+            Log("[eye] xrCreateSwapchain failed for eye %d", e); return false;
+        }
+        xrEnumerateSwapchainImages(g_eyeSwap[e], 0, &g_eyeImageCount[e], nullptr);
+        XrSwapchainImageD3D11KHR* imgs = new XrSwapchainImageD3D11KHR[g_eyeImageCount[e]];
+        for (uint32_t i = 0; i < g_eyeImageCount[e]; ++i) imgs[i] = { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR };
+        xrEnumerateSwapchainImages(g_eyeSwap[e], g_eyeImageCount[e], &g_eyeImageCount[e],
+                                   reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs));
+        g_eyeImages[e] = new ID3D11Texture2D*[g_eyeImageCount[e]];
+        for (uint32_t i = 0; i < g_eyeImageCount[e]; ++i) g_eyeImages[e][i] = imgs[i].texture;
+        delete[] imgs;
+    }
+    g_eyeW = w; g_eyeH = h;
+    Log("[eye] two swapchains %ux%u, %u images each", w, h, g_eyeImageCount[0]);
+    return true;
+}
+
+// Copy the captured frame into one eye's swapchain.
+static bool FillEye(int eye)
+{
+    if (eye < 0 || eye > 1 || g_eyeSwap[eye] == XR_NULL_HANDLE || !g_upload) return false;
+    uint32_t idx = 0;
+    XrSwapchainImageAcquireInfo ai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+    if (XR_FAILED(xrAcquireSwapchainImage(g_eyeSwap[eye], &ai, &idx))) return false;
+    XrSwapchainImageWaitInfo wi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+    wi.timeout = XR_INFINITE_DURATION;
+    bool ok = false;
+    if (XR_SUCCEEDED(xrWaitSwapchainImage(g_eyeSwap[eye], &wi))) {
+        g_ctx11->CopyResource(g_eyeImages[eye][idx], g_upload);
+        ok = true;
+    }
+    XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+    xrReleaseSwapchainImage(g_eyeSwap[eye], &ri);
+    if (ok) g_eyeFilled[eye] = true;
+    return ok;
+}
+
 // One XR frame: wait, begin, put the captured frame (or the test colour) on the quad, submit.
 static void SubmitTestQuad()
 {
@@ -742,9 +838,55 @@ static void SubmitTestQuad()
         }
     }
 
+    // ---- stereo: locate the eyes, fill the one this frame rendered, submit a projection ----
+    XrCompositionLayerProjection      proj{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+    XrCompositionLayerProjectionView  projViews[2]{};
+    bool stereoSubmitted = false;
+
+    if (g_stereoMode == 1 && g_haveFrame) {
+        uint32_t viewCount = 0;
+        XrViewState vs{ XR_TYPE_VIEW_STATE };
+        XrViewLocateInfo vli{ XR_TYPE_VIEW_LOCATE_INFO };
+        vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        vli.displayTime = fs.predictedDisplayTime;
+        vli.space = g_xrSpace;
+        for (int e = 0; e < 2; ++e) g_views[e] = { XR_TYPE_VIEW };
+        if (XR_SUCCEEDED(xrLocateViews(g_xrSession, &vli, &vs, 2, &viewCount, g_views)) &&
+            viewCount == 2 &&
+            (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
+            g_viewsValid = true;
+            // Half the real interpupillary distance, in metres, straight from the runtime -
+            // then into UE3 units by the tunable world scale.
+            const float dx = g_views[1].pose.position.x - g_views[0].pose.position.x;
+            const float dy = g_views[1].pose.position.y - g_views[0].pose.position.y;
+            const float dz = g_views[1].pose.position.z - g_views[0].pose.position.z;
+            g_halfIpdUU = 0.5f * sqrtf(dx*dx + dy*dy + dz*dz) * g_worldScale;
+        }
+
+        if (g_viewsValid && EnsureEyeSwapchains(g_capW, g_capH)) {
+            if (g_renderedEye >= 0) FillEye(g_renderedEye);
+            if (g_eyeFilled[0] && g_eyeFilled[1]) {
+                for (int e = 0; e < 2; ++e) {
+                    projViews[e] = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
+                    projViews[e].pose = g_views[e].pose;
+                    projViews[e].fov  = g_views[e].fov;
+                    projViews[e].subImage.swapchain = g_eyeSwap[e];
+                    projViews[e].subImage.imageRect = { {0,0}, {(int32_t)g_eyeW, (int32_t)g_eyeH} };
+                }
+                proj.space     = g_xrSpace;
+                proj.viewCount = 2;
+                proj.views     = projViews;
+                stereoSubmitted = true;
+            }
+        }
+    }
+
     const XrCompositionLayerBaseHeader* layers[1];
     uint32_t layerCount = 0;
-    if (submitted) {
+    if (stereoSubmitted) {
+        layers[0] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&proj);
+        layerCount = 1;
+    } else if (submitted) {
         // ---- head-locked, not world-locked ----
         //
         // The quad used to sit in LOCAL space, so it stayed put while the head turned - and
@@ -775,6 +917,21 @@ static void SubmitTestQuad()
     fei.layerCount           = layerCount;
     fei.layers               = layerCount ? layers : nullptr;
     XrResult er = xrEndFrame(g_xrSession, &fei);
+
+    // ---- choose the eye the NEXT frame will render ----
+    //
+    // The offset has to be in place before the engine draws, and the only place we run before
+    // that is here, at the end of the previous frame. So this Present decides what the next
+    // frame is, and the Present after it captures the result and assigns it to that eye.
+    // g_renderedEye is what the frame just captured actually was.
+    if (g_stereoMode == 1) {
+        g_renderedEye = g_nextEye;
+        g_nextEye = 1 - g_nextEye;
+        g_eyeInject = (g_nextEye == 0) ? -1.0f : +1.0f;   // eye 0 = left
+    } else {
+        g_renderedEye = -1;
+        g_eyeInject = 0.0f;
+    }
 
     if (n == 1)        Log("*** [xr] first XR frame submitted, xrEndFrame -> %d", (int)er);
     else if (n % 600 == 0) {
@@ -2116,6 +2273,7 @@ static void CheckSwanHotkey()
 // up front rather than reordering two large blocks.
 typedef HRESULT (STDMETHODCALLTYPE *PFN_SetVSConstF)(IDirect3DDevice9*, UINT, const float*, UINT);
 extern PFN_SetVSConstF g_origSetVSConstF;
+extern float g_eyeInject;
 extern uintptr_t g_playerPawn;
 extern int  g_vmCandidates;
 extern int  g_vmBestReg;
@@ -2129,6 +2287,9 @@ extern int   g_vmReg;
 extern bool  g_vmRow;
 extern int   g_vmMode;
 extern float g_vmOffset[3];
+extern float g_eyeInject;
+extern int   g_stereoMode;
+extern float g_worldScale;
 bool      LooksLikePlayerPawn(uintptr_t obj);
 uintptr_t FindPlayerPawn();
 
@@ -2369,6 +2530,8 @@ static void CheckVMHotkey()
 }
 
 extern bool g_overlay;
+extern int   g_renderedEye;
+extern float g_halfIpdUU;
 
 static void CheckHeadHotkeys()
 {
@@ -2387,6 +2550,35 @@ static void CheckHeadHotkeys()
     const bool d3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
     if (d3 && !p3) { g_overlay = !g_overlay; Log("[hud] F3 -> overlay %s", g_overlay ? "ON" : "OFF"); }
     p3 = d3;
+
+    // F1 toggles stereo. The mono quad path stays available on purpose: it is the known-good
+    // fallback, and this session has repeatedly needed one.
+    static bool p1 = false;
+    const bool d1 = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
+    if (d1 && !p1) {
+        if (g_vmReg < 0) {
+            Log("[eye] F1 ignored - no view matrix committed, press F6 first");
+        } else {
+            g_stereoMode = g_stereoMode ? 0 : 1;
+            g_eyeFilled[0] = g_eyeFilled[1] = false;
+            Log("*** [eye] F1 -> stereo %s", g_stereoMode ? "ON (alternate-eye)" : "OFF (mono quad)");
+        }
+    }
+    p1 = d1;
+
+    // F11 adjusts world scale. UE3 units per metre is game-specific and unmeasured here, and
+    // it is the one number that decides whether the world feels life-sized.
+    static bool p11 = false;
+    const bool d11 = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+    if (d11 && !p11) {
+        static const float kScales[] = { 25.0f, 35.0f, 50.0f, 70.0f, 100.0f, 140.0f };
+        static int si = 2;
+        si = (si + 1) % (int)(sizeof(kScales) / sizeof(kScales[0]));
+        g_worldScale = kScales[si];
+        Log("*** [eye] F11 -> world scale %.0f UU/m (half-IPD now %.2f UU)",
+            g_worldScale, g_halfIpdUU);
+    }
+    p11 = d11;
     p9 = d9; p5 = d5; p4 = d4;
 }
 
@@ -2559,7 +2751,8 @@ static void TestWindow(int reg, const float* m, bool asRow,
 
 int   g_vmReg = -1;              // committed after a successful scan
 bool  g_vmRow = true;
-int   g_vmMode = 0;              // 0 off, 1..3 fixed test offsets, 4 = 6-DOF from the headset
+int   g_vmMode = 0;              // 0 off, 1..3 fixed test offsets
+float g_eyeInject = 0.0f;        // -1 left eye, +1 right eye, 0 none - set per frame
 float g_vmOffset[3] = { 0, 0, 0 };
 static long g_vmInjections = 0;
 
@@ -2568,14 +2761,31 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                                                   const float* data, UINT count)
 {
     // ---- injection, before the scan block so a scan does not see our own modification ----
-    if (g_vmMode != 0 && g_vmReg >= 0 && data && count >= 4 &&
+    if ((g_vmMode != 0 || g_stereoMode == 1) && g_vmReg >= 0 && data && count >= 4 &&
         startReg <= (UINT)g_vmReg && startReg + count >= (UINT)g_vmReg + 4 &&
         count <= 256) {
         float buf[256 * 4];
         memcpy(buf, data, sizeof(float) * 4 * count);
         float* m = buf + (size_t)((UINT)g_vmReg - startReg) * 4;
 
-        const float ox = g_vmOffset[0], oy = g_vmOffset[1], oz = g_vmOffset[2];
+        float ox = g_vmOffset[0], oy = g_vmOffset[1], oz = g_vmOffset[2];
+
+        // ---- per-eye parallax, along the matrix's OWN right axis ----
+        //
+        // Column 0 of a row-vector world->clip matrix is the direction mapping to clip.x, so
+        // normalising it gives world-space right. Read from the UNMODIFIED incoming data in
+        // this same call, so it cannot be stale and cannot disagree with the matrix it is
+        // about to modify - which recomputing it from the pawn's rotation could.
+        if (g_stereoMode == 1 && g_eyeInject != 0 && g_halfIpdUU > 0.0f) {
+            const float rx = g_vmRow ? m[0] : m[0];
+            const float ry = g_vmRow ? m[4] : m[1];
+            const float rz = g_vmRow ? m[8] : m[2];
+            const float rl = sqrtf(rx*rx + ry*ry + rz*rz);
+            if (rl > 1e-6f) {
+                const float s = g_eyeInject * g_halfIpdUU / rl;
+                ox += rx * s; oy += ry * s; oz += rz * s;
+            }
+        }
         if (g_vmRow) {
             // Rows are m[0..3], m[4..7], m[8..11], m[12..15].
             for (int c = 0; c < 4; ++c)
@@ -2747,7 +2957,9 @@ static void DrawOverlay(IDirect3DDevice9* dev)
         _snprintf_s(lines[nl++], 64, _TRUNCATE, "VM NOT SCANNED  F6");
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "OFFSET %d %d %d",
                 (int)g_vmOffset[0], (int)g_vmOffset[1], (int)g_vmOffset[2]);
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "SWAN %d", g_swanMode);
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "STEREO %s EYE %d IPD %d/10",
+                g_stereoMode ? "ON" : "OFF", g_renderedEye, (int)(g_halfIpdUU * 20.0f));
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "SCALE %d UU/M", (int)g_worldScale);
 
     // Static, not on the stack: 2048 D3DRECTs is 32 KB and this runs every frame on the
     // render thread, which /analyze flagged as C6262. Safe because DrawOverlay is only ever
