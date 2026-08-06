@@ -630,12 +630,51 @@ x and y columns, which is exactly an FOV change and composes after the positiona
 demote the engine's own FOV to CPU culling, asked ~15% wider than what is rendered.
 `TdPlayerController::FOVAngle` is at **+0x030C** for that.
 
-### World scale is unmeasured
+### ✅ World scale — **100 UU per metre**, judged in the headset
 
-OpenXR reports IPD in metres; UE3 units per metre is game-specific. Singularity measured 3.32 UU
-for 6.3 cm (~1.9 cm/unit). Mirror's Edge starts at **50 UU/m** with F11 cycling
-25/35/50/70/100/140 — the one number that decides whether the world feels life-sized, so it is a
-dial rather than a silent guess.
+F11 swept 25/35/50/70/100/140 and **100 read as life-sized**. At a 6.3 cm IPD that is a
+half-offset of ~3.15 UU, close to the 3.32 UU Singularity measured for the same separation. The
+agreement is reassuring but was not the reason for the choice — this was judged by eye, which is
+the only test that answers "does this feel life-sized".
+
+### ✅ FOV forced to cover the eye
+
+```
+[fov] game renders 90.0 x 58.7 degrees (read from the matrix)
+[fov] headset wants 100.0 deg vertical; targeting 129.5 x 100.0 at 1.78 aspect
+```
+
+**The game natively renders 90° horizontal** — not the 65° `DefaultCamera.ini` implies, and not
+an estimate. Reading the frustum out of the matrix beat every guess available.
+
+Forced by rescaling the x and y columns, which is exactly a clip-space x/y scale and therefore
+exactly an FOV change, applied **after** the positional offset so the two compose. The forced
+constant is also what gets submitted to the compositor: following the observed value is what
+produced the reference's flicker, because a submitted frustum that tracks the engine inherits
+every wobble its interpolation produces.
+
+> **⛔ CORRECTION.** This was recorded for one round as *"the culling FOV write is not sticking —
+> reads back 90.0 every time."* **Wrong.** A later run shows the engine rendering at **148.9°**,
+> exactly the value asked for. The write lands; the reads simply happened to fall at moments the
+> engine had already interpolated back. That drift is precisely what the reference documents, and
+> it is harmless here **because the projection is forced in the matrix** rather than requested.
+> Diagnosing a value that oscillates by sampling it occasionally is how the wrong conclusion got
+> written down.
+
+### ⚠️ `c0` carries more than one matrix — re-validate every upload
+
+The derived FOV alternates between the scene view-projection and something at **160° × 160°** on
+consecutive uploads to the same register — a shadow or light transform. Injecting into it
+corrupts that pass, and does so *invisibly*: the symptom appears somewhere else entirely.
+
+**The register says where to look. It is never permission to modify.** Every upload is gated by
+the same test that found the matrix — a world→clip matrix maps the camera position to
+`clip.w ≈ 0`, and nothing else arriving there does. Four multiply-adds against a camera position
+cached once per frame; `c0` is written thousands of times a frame and a memory read per call
+would be absurd.
+
+Measured effect: **220,000 accepted against 91 rejected**. The foreign matrix is rare, which is
+exactly why this would have been so hard to find from the symptom.
 
 ### A large first head-tracking step must be dropped, not applied
 

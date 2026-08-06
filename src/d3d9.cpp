@@ -706,7 +706,11 @@ static bool              g_eyeFilled[2] = { false, false };
 static int               g_nextEye = 0;          // which eye the NEXT frame will render
 static int               g_renderedEye = -1;     // which eye the frame just finished IS
 int                      g_stereoMode = 0;       // 0 = mono quad, 1 = alternate-eye
-float                    g_worldScale = 50.0f;   // UE3 units per metre
+// 100 UU/m, judged in the headset rather than derived. F11 swept 25/35/50/70/100/140 and 100
+// was the one that read as life-sized. At a 6.3 cm IPD that is a half-offset of ~3.15 UU, close
+// to the 3.32 UU the Singularity project measured for the same separation - two different games
+// arriving at a similar world scale, which is reassuring but was not the reason for choosing it.
+float                    g_worldScale = 100.0f;  // UE3 units per metre
 // Defined with the injection code further down; declared here because the eye is chosen at the
 // end of each frame, which happens above it.
 extern float             g_eyeInject;
@@ -2679,7 +2683,7 @@ static void CheckHeadHotkeys()
     const bool d11 = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
     if (d11 && !p11) {
         static const float kScales[] = { 25.0f, 35.0f, 50.0f, 70.0f, 100.0f, 140.0f };
-        static int si = 2;
+        static int si = 4;   // index of 100.0f, the chosen default, so the sweep starts there
         si = (si + 1) % (int)(sizeof(kScales) / sizeof(kScales[0]));
         g_worldScale = kScales[si];
         Log("*** [eye] F11 -> world scale %.0f UU/m (half-IPD now %.2f UU)",
