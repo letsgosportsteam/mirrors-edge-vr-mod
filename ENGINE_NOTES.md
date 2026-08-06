@@ -664,24 +664,32 @@ there.
 > either. Do not tune toward depth in the distance — tune toward comfortable fusion up close,
 > which the measured 100 UU/m delivers by construction.
 
-> ### ⛔ NEVER judge stereo on the desktop mirror
+> ### The desktop mirror is doubled too, and that part IS expected
 >
-> Under alternate-eye the monitor shows **every** frame, alternating left-eye and right-eye
-> renders. Those are offset from each other by design, so the flat image is *necessarily*
-> doubled. It has nothing to do with fusion, comfort or correctness — it is two viewpoints shown
-> in sequence.
+> Under alternate-eye the monitor shows every frame, alternating left-eye and right-eye renders.
+> Those are offset by design, so the flat image is necessarily doubled — and the flicker is a
+> useful confirmation that alternate-eye is running at all. Nothing to read into it, and it
+> disappears once stereo becomes simultaneous.
 >
-> This cost real time. "Close objects double at 100%" was reported and taken as evidence that
-> full separation was uncomfortable; a theory was then built about alternate-eye temporal
-> disparity to explain it, and a test designed around that theory. The observation was from the
-> monitor, where doubling is the expected and correct output.
+> Distinct from the headset doubling below, which is a real finding.
+
+> ### ⚠️ IN THE HEADSET, close objects double at 100% separation
 >
-> **The stereo-strength default of 50% therefore rests on a contaminated observation and is not
-> yet justified.** It has to be re-judged in the headset with the monitor ignored entirely.
+> Measured in the headset, not on the mirror. 25–50% reads well; at 100% near objects fail to
+> fuse. That should not happen at a true 6.3 cm separation — real eyes fuse close objects
+> without effort — so something beyond the separation is consuming the fusion budget.
 >
-> The artefact disappears on its own once stereo becomes simultaneous rather than alternating,
-> so it is not worth engineering around — but until then, any judgement about depth, separation
-> or comfort made while looking at the screen is worthless.
+> **Leading explanation: alternate-eye temporal disparity.** Each eye's image is one frame
+> stale. Near objects sweep across the view fastest, so the inter-eye difference contains a
+> *time* offset as well as a spatial one. Add correct spatial disparity on top and the total
+> exceeds what the eyes can converge on — which is exactly "fine at 50%, doubles at 100%".
+>
+> If that is right, reducing strength is compensating for a timing problem with a spatial
+> correction. It works, and **50% is a justified interim default**, but the real fix is
+> simultaneous stereo. This is the strongest argument yet for doing that work.
+>
+> **Not yet ruled out and cheap to test: swapped eyes.** Inverted stereo also presents as
+> difficulty fusing. One toggle would settle it and it would be embarrassing to miss.
 
 ### Judged in the headset too
 
