@@ -723,6 +723,7 @@ extern float             g_eyeInject;
 // Rung 7 (draw duplication) likewise lives below but is consulted by the frame path here.
 extern bool              g_simulStereo;
 extern bool              g_sceneMatValid;
+extern bool              g_c0IsScene;
 extern float             g_sceneMat[16];
 extern volatile LONG     g_dupDraws;
 float                    g_halfIpdUU = 0.0f;     // filled from the located views
@@ -916,10 +917,12 @@ static void SubmitTestQuad()
             const float halfY = (up > dn) ? up : dn;
             if (halfY > 0.1f && g_capH > 0) {
                 g_targetHalfFovY = halfY;
-                // Square pixels: the horizontal follows from the backbuffer's own aspect, so
-                // nothing is stretched. The game renders wider than the eye can see and the
-                // surplus is simply discarded, which is the intended trade.
-                const float aspect = (float)g_capW / (float)g_capH;
+                // Square pixels: the horizontal follows from the aspect of what ONE EYE
+                // actually renders into. Under draw duplication that is half the backbuffer,
+                // so the aspect halves - and this single value is used both to force the
+                // matrix and to tell the compositor, which is the only way they can agree.
+                const float aspect = g_simulStereo ? ((float)g_capW * 0.5f / (float)g_capH)
+                                                   : ((float)g_capW / (float)g_capH);
                 g_targetHalfFovX = atanf(tanf(halfY) * aspect);
                 if (!g_fovLogged) {
                     g_fovLogged = true;
@@ -2959,7 +2962,9 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
             // upload at this register, foreign matrices included. Kept as a toggle rather than
             // reverted, so the two states can be compared in one run instead of across two
             // builds - and so the fix is not lost to answer a question about it.
-            if (g_vmValidate && (!g_camCacheValid || fabsf(w) > 25.0f)) {
+            const bool isScene = (g_camCacheValid && fabsf(w) <= 25.0f);
+            g_c0IsScene = isScene;   // tracked even when validation is off, for ShouldDuplicate
+            if (g_vmValidate && !isScene) {
                 InterlockedIncrement(&g_vmRejected);
                 return g_origSetVSConstF(dev, startReg, data, count);
             }
@@ -3134,6 +3139,8 @@ bool         g_simulStereo = false;          // F10 toggles; alternate-eye remai
 static bool  g_inDupDraw = false;            // re-entrancy guard
 float        g_sceneMat[16] = { 0 };         // last scene matrix seen at c0, UNMODIFIED
 bool         g_sceneMatValid = false;
+// True while c0 currently holds the scene view matrix rather than a foreign one.
+bool         g_c0IsScene = false;
 volatile LONG g_dupDraws = 0;
 
 typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawPrim)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT);
@@ -3158,12 +3165,14 @@ static void BuildEyeMatrix(float* out, int eye)
             m[12 + c] -= ox * m[0 + c] + oy * m[4 + c] + oz * m[8 + c];
     }
     if (g_fovForce && g_gameFovValid && g_targetHalfFovX > 0.0f) {
-        // ⚠️ The horizontal target must use the HALF-WIDTH aspect. Each eye now renders into
-        // half the backbuffer, so using the full-frame aspect here would stretch every eye by
-        // two - the kind of error that looks like a stereo fault rather than an aspect one.
-        const float aspectHalf = (g_capH > 0) ? ((float)g_capW * 0.5f / (float)g_capH) : 1.0f;
-        const float targetX = atanf(tanf(g_targetHalfFovY) * aspectHalf);
-        const float sx = tanf(g_gameHalfFovX) / tanf(targetX);
+        // ⚠️ Uses g_targetHalfFovX, the SAME number the projection layer submits.
+        //
+        // The first version computed its own horizontal target here from the half-width
+        // aspect, while the layer went on submitting one derived from the full-frame aspect.
+        // Rendering one frustum and declaring another is exactly the mistake that produced the
+        // original double vision, repeated in a second place - and it presented as "too zoomed
+        // in", which sounds like a scale problem rather than a frustum one.
+        const float sx = tanf(g_gameHalfFovX) / tanf(g_targetHalfFovX);
         const float sy = tanf(g_gameHalfFovY) / tanf(g_targetHalfFovY);
         for (int r = 0; r < 4; ++r) { m[r * 4 + 0] *= sx; m[r * 4 + 1] *= sy; }
     }
@@ -3197,9 +3206,18 @@ static HRESULT DuplicateDraw(IDirect3DDevice9* dev, FN issue)
     return hr;
 }
 
+// ⚠️ g_c0IsScene is the load-bearing condition, and leaving it out was a real defect.
+//
+// DuplicateDraw uploads the scene matrix to c0 before each draw it handles. Applied to a draw
+// that was using a DIFFERENT matrix - a shadow pass, a post-process, the HUD - that forces the
+// scene view onto geometry which never asked for it, and the pass renders as garbage.
+//
+// c0 provably carries more than one matrix here: the per-upload validation already rejects a
+// foreign one arriving at that register. The same signal says whether the CURRENT contents are
+// the scene view, so a draw is only duplicated while it is.
 static bool ShouldDuplicate()
 {
-    return g_simulStereo && !g_inDupDraw && g_sceneMatValid &&
+    return g_simulStereo && !g_inDupDraw && g_sceneMatValid && g_c0IsScene &&
            g_vmReg >= 0 && g_halfIpdUU > 0.0f && g_capW > 0;
 }
 
