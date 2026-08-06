@@ -1456,6 +1456,8 @@ static int  LookupProp(const char* className, const char* propName, bool verbose
 extern int g_offActorRotation;
 extern int g_offActorLocation;
 extern int g_offFOVAngle;
+extern int g_offCamLoc;
+extern int g_offCamRot;
 
 static DWORD WINAPI ObjectModelThread(LPVOID)
 {
@@ -1483,8 +1485,12 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                 g_offActorRotation = LookupProp("TdPlayerController", "Rotation", true);
                 g_offActorLocation = LookupProp("TdPlayerController", "Location", true);
                 g_offFOVAngle      = LookupProp("TdPlayerController", "FOVAngle", true);
-                LookupProp("TdPlayerPawn", "PlayerCameraRotation", true);
-                LookupProp("TdPlayerPawn", "PlayerCameraLocation", true);
+                // ⚠️ These two RETURN VALUES ARE USED. The first version called LookupProp
+                // and discarded them, so g_offCamLoc/g_offCamRot stayed -1, GetCameraPose
+                // refused, and the view-matrix scan tested zero windows while reporting only
+                // "no candidate matched".
+                g_offCamRot = LookupProp("TdPlayerPawn", "PlayerCameraRotation", true);
+                g_offCamLoc = LookupProp("TdPlayerPawn", "PlayerCameraLocation", true);
                 LookupProp("TdPlayerPawn", "SwanNeck1p", true);
                 DumpClassProperties("TdPlayerController", 60);
             }
@@ -2112,6 +2118,8 @@ extern int  g_vmCandidates;
 extern int  g_vmBestReg;
 extern bool g_vmBestRow;
 extern volatile LONG g_vmScanArmed;
+extern volatile LONG g_vmWindowsTested;
+extern volatile LONG g_vmPoseFailures;
 bool      LooksLikePlayerPawn(uintptr_t obj);
 uintptr_t FindPlayerPawn();
 
@@ -2284,6 +2292,8 @@ static void CheckVMHotkey()
             Log("[vm] no TdPlayerPawn resolved yet - the scan needs the camera pose");
         } else {
             g_vmCandidates = 0; g_vmBestReg = -1;
+            InterlockedExchange(&g_vmWindowsTested, 0);
+            InterlockedExchange(&g_vmPoseFailures, 0);
             Log("");
             Log("[vm] ---- scanning one frame of vertex shader constants ----");
             InterlockedExchange(&g_vmScanArmed, 1);
@@ -2294,9 +2304,22 @@ static void CheckVMHotkey()
 
     if (armCountdown > 0 && --armCountdown == 0) {
         InterlockedExchange(&g_vmScanArmed, 0);
-        if (g_vmCandidates == 0)
-            Log("[vm] no candidate matched. Either the matrix is not uploaded as vertex shader"
-                " constants, or the camera pose is stale.");
+        // These three numbers separate failures that previously all read the same. Zero
+        // windows tested means the scan never ran at all, which is a completely different
+        // problem from windows tested and none matching - and the first version reported both
+        // as "no candidate matched", which cost a run.
+        // Snapshotted through the interlocked path: they are written from the render thread's
+        // hook, and mixing a plain read with interlocked writes is what C28112 objects to.
+        const LONG tested = InterlockedCompareExchange(&g_vmWindowsTested, 0, 0);
+        const LONG poseFail = InterlockedCompareExchange(&g_vmPoseFailures, 0, 0);
+        Log("[vm] windows tested %ld, camera-pose failures %ld, candidates %d",
+            tested, poseFail, g_vmCandidates);
+        if (tested == 0)
+            Log("[vm] NOTHING WAS TESTED - the camera pose was unavailable (camLoc offset %d,"
+                " camRot offset %d, pawn %p)", g_offCamLoc, g_offCamRot, (void*)g_playerPawn);
+        else if (g_vmCandidates == 0)
+            Log("[vm] windows were tested but none matched - the matrix may not be uploaded as"
+                " vertex shader constants, or the probes/tolerances are wrong");
         else
             Log("[vm] ---- %d candidate(s); first was c%d %s ----",
                 g_vmCandidates, g_vmBestReg, g_vmBestRow ? "ROW" : "COL");
@@ -2395,6 +2418,8 @@ uintptr_t FindPlayerPawn()
 PFN_SetVSConstF g_origSetVSConstF = nullptr;
 
 static volatile LONG g_vmScanArmed = 0;
+volatile LONG g_vmWindowsTested = 0;
+volatile LONG g_vmPoseFailures  = 0;
 static int  g_vmBestReg = -1;
 static bool g_vmBestRow = false;
 static int  g_vmCandidates = 0;
@@ -2459,9 +2484,12 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
         if (GetCameraPose(camLoc, fwd)) {
             const UINT windows = count - 3;
             for (UINT i = 0; i < windows && i < 64; ++i) {
+                InterlockedIncrement(&g_vmWindowsTested);
                 TestWindow((int)(startReg + i), data + i * 4, true,  camLoc, fwd);
                 TestWindow((int)(startReg + i), data + i * 4, false, camLoc, fwd);
             }
+        } else {
+            InterlockedIncrement(&g_vmPoseFailures);
         }
     }
     return g_origSetVSConstF(dev, startReg, data, count);
