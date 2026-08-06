@@ -711,6 +711,9 @@ float                    g_worldScale = 50.0f;   // UE3 units per metre
 // end of each frame, which happens above it.
 extern float             g_eyeInject;
 float                    g_halfIpdUU = 0.0f;     // filled from the located views
+float                    g_gameHalfFovX = 0.0f;  // read out of the view matrix, radians
+float                    g_gameHalfFovY = 0.0f;
+bool                     g_gameFovValid = false;
 static XrView            g_views[2]{};
 static bool              g_viewsValid = false;
 
@@ -869,7 +872,20 @@ static void SubmitTestQuad()
                 for (int e = 0; e < 2; ++e) {
                     projViews[e] = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
                     projViews[e].pose = g_views[e].pose;
-                    projViews[e].fov  = g_views[e].fov;
+                    // Submit the frustum the game ACTUALLY rendered, not the headset's.
+                    // Symmetric, because that is what the engine produces. The image will not
+                    // fill the eye - the game renders 16:9 and an eye is nearly square - and a
+                    // correct rectangle inside black is the honest result. Widening the game's
+                    // own FOV to cover the eye is the next step, and FOVAngle is already
+                    // located at TdPlayerController +0x030C for it.
+                    if (g_gameFovValid) {
+                        projViews[e].fov.angleLeft  = -g_gameHalfFovX;
+                        projViews[e].fov.angleRight =  g_gameHalfFovX;
+                        projViews[e].fov.angleUp    =  g_gameHalfFovY;
+                        projViews[e].fov.angleDown  = -g_gameHalfFovY;
+                    } else {
+                        projViews[e].fov = g_views[e].fov;
+                    }
                     projViews[e].subImage.swapchain = g_eyeSwap[e];
                     projViews[e].subImage.imageRect = { {0,0}, {(int32_t)g_eyeW, (int32_t)g_eyeH} };
                 }
@@ -2332,6 +2348,7 @@ static int       g_yawSign = -1, g_pitchSign = -1;
 static bool      g_headPrimed = false;
 static int32_t   g_lastHeadYaw = 0, g_lastHeadPitch = 0;
 static long      g_headWrites = 0;
+static long      g_headJumpsRejected = 0;
 
 // The shortest signed path between two UE3 angles. Never subtract them raw.
 static inline int32_t YawDelta(int32_t a, int32_t b) { return (int16_t)((int32_t)(a - b)); }
@@ -2423,10 +2440,29 @@ static void ApplyHeadTracking(XrTime when)
         return;
     }
 
-    const int32_t dYaw   = YawDelta(hy, g_lastHeadYaw)   * g_yawSign;
-    const int32_t dPitch = YawDelta(hp, g_lastHeadPitch) * g_pitchSign;
+    int32_t dYaw   = YawDelta(hy, g_lastHeadYaw)   * g_yawSign;
+    int32_t dPitch = YawDelta(hp, g_lastHeadPitch) * g_pitchSign;
     g_lastHeadYaw = hy; g_lastHeadPitch = hp;
     if (dYaw == 0 && dPitch == 0) return;
+
+    // ---- reject an implausibly large single-frame delta ----
+    //
+    // Measured: "primed at pitch 2103" then "write #1 dPitch +4246" - about 23 degrees applied
+    // in one frame, which pointed the camera at the floor. The head had moved between priming
+    // and the first write, because the player was putting the headset on, and the whole
+    // accumulated movement arrived as a single step.
+    //
+    // No real head turns 23 degrees in one frame at 90 Hz. A delta that large means time
+    // passed, not that the head moved that fast, and applying it is always wrong. Dropped and
+    // counted rather than clamped: clamping would still inject a large bogus turn, just more
+    // slowly.
+    const int32_t kMaxStep = 2000;                  // ~11 degrees, far above any real frame
+    if (dYaw > kMaxStep || dYaw < -kMaxStep || dPitch > kMaxStep || dPitch < -kMaxStep) {
+        if (++g_headJumpsRejected <= 5 || (g_headJumpsRejected % 100) == 0)
+            Log("[head] rejected an implausible step (dYaw %+d dPitch %+d) - re-syncing, %ld so far",
+                dYaw, dPitch, g_headJumpsRejected);
+        return;                                     // lastHead is already updated, so we re-sync
+    }
 
     // FRotator is {Pitch, Yaw, Roll} as int32. Roll is deliberately untouched: the decompiled
     // UpdateRotation sets ViewRotation.Roll = 0 before writing back, so head roll cannot
@@ -2768,6 +2804,32 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
         memcpy(buf, data, sizeof(float) * 4 * count);
         float* m = buf + (size_t)((UINT)g_vmReg - startReg) * 4;
 
+        // ---- read the FOV the game is ACTUALLY rendering with ----
+        //
+        // For a row-vector world->clip matrix, column 0 is the right axis scaled by
+        // 1/tan(fovX/2) and column 3 is the unit forward axis. So tan(halfFov) = |col3|/|col0|,
+        // and the same for y with column 1. Nothing has to be assumed about UE3's FOVAngle
+        // convention or how it folds in aspect - the answer is read out of what came through.
+        //
+        // ⚠️ This is the fix for the double vision. The projection layer was submitting the
+        // HEADSET's per-eye FOV for an image rendered at the GAME's - about 65 degrees at 16:9
+        // against 95 at nearly square. That is a lie to the compositor, and the reference
+        // project records the same mistake: everything ends up stretched by one uniform factor,
+        // so nothing can be judged against anything else.
+        {
+            const float c0x = g_vmRow ? m[0] : m[0],  c0y = g_vmRow ? m[4] : m[1],  c0z = g_vmRow ? m[8] : m[2];
+            const float c1x = g_vmRow ? m[1] : m[4],  c1y = g_vmRow ? m[5] : m[5],  c1z = g_vmRow ? m[9] : m[6];
+            const float c3x = g_vmRow ? m[3] : m[12], c3y = g_vmRow ? m[7] : m[13], c3z = g_vmRow ? m[11] : m[14];
+            const float l0 = sqrtf(c0x*c0x + c0y*c0y + c0z*c0z);
+            const float l1 = sqrtf(c1x*c1x + c1y*c1y + c1z*c1z);
+            const float l3 = sqrtf(c3x*c3x + c3y*c3y + c3z*c3z);
+            if (l0 > 1e-6f && l1 > 1e-6f && l3 > 1e-6f) {
+                g_gameHalfFovX = atanf(l3 / l0);
+                g_gameHalfFovY = atanf(l3 / l1);
+                g_gameFovValid = true;
+            }
+        }
+
         float ox = g_vmOffset[0], oy = g_vmOffset[1], oz = g_vmOffset[2];
 
         // ---- per-eye parallax, along the matrix's OWN right axis ----
@@ -2959,7 +3021,8 @@ static void DrawOverlay(IDirect3DDevice9* dev)
                 (int)g_vmOffset[0], (int)g_vmOffset[1], (int)g_vmOffset[2]);
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "STEREO %s EYE %d IPD %d/10",
                 g_stereoMode ? "ON" : "OFF", g_renderedEye, (int)(g_halfIpdUU * 20.0f));
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "SCALE %d UU/M", (int)g_worldScale);
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "SCALE %d UU/M  FOV %d X %d",
+                (int)g_worldScale, (int)(g_gameHalfFovX * 114.59f), (int)(g_gameHalfFovY * 114.59f));
 
     // Static, not on the stack: 2048 D3DRECTs is 32 KB and this runs every frame on the
     // render thread, which /analyze flagged as C6262. Safe because DrawOverlay is only ever
