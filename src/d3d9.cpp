@@ -714,6 +714,7 @@ float                    g_halfIpdUU = 0.0f;     // filled from the located view
 float                    g_gameHalfFovX = 0.0f;  // read out of the view matrix, radians
 float                    g_gameHalfFovY = 0.0f;
 bool                     g_gameFovValid = false;
+static float             g_lastLoggedFovX = -1.0f;
 static XrView            g_views[2]{};
 static bool              g_viewsValid = false;
 
@@ -2826,6 +2827,16 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
             if (l0 > 1e-6f && l1 > 1e-6f && l3 > 1e-6f) {
                 g_gameHalfFovX = atanf(l3 / l0);
                 g_gameHalfFovY = atanf(l3 / l1);
+                // Logged as well as shown. The overlay carried this number and the log did
+                // not, so it could only be reported from memory after the headset came off -
+                // which is precisely the gap the overlay was added to close, reintroduced one
+                // value at a time. Anything worth putting on screen is worth a log line.
+                const float degX = g_gameHalfFovX * 114.5916f;
+                const float degY = g_gameHalfFovY * 114.5916f;
+                if (!g_gameFovValid || fabsf(degX - g_lastLoggedFovX) > 1.0f) {
+                    g_lastLoggedFovX = degX;
+                    Log("[fov] game renders %.1f x %.1f degrees (read from the matrix)", degX, degY);
+                }
                 g_gameFovValid = true;
             }
         }

@@ -578,6 +578,80 @@ apply to stereo, only to tests like this one.
 
 ---
 
+## ✅ Per-eye stereo — working, 2026-08-06
+
+Alternate-eye: one eye rendered per frame, each image one frame stale. Two swapchains, a
+projection layer with real per-eye poses from `xrLocateViews`, and the rung 6b injection applied
+at ±half IPD along the **matrix's own right axis** — read from the unmodified incoming data in
+the same call that modifies it, so it cannot be stale and cannot disagree with what it adjusts.
+
+Chosen over simultaneous stereo deliberately: the engine renders once per frame, so two genuinely
+different images need draw-call duplication or engine re-entry, both large and both able to fail
+in ways that look like a geometry bug. Alternating proves the offset, the swapchains, the layer
+and the FOV maths first — **and costs no extra frame grab**, so the ~4.4 ms copy is unchanged and
+the D3D9Ex wrapper stays deferred.
+
+### ⚠️ Submitting the headset's FOV for the game's image is a lie that shows as DOUBLE VISION
+
+The first attempt submitted `g_views[e].fov` — the headset's per-eye frustum — for an image the
+game rendered with its own. The compositor places and warps each eye by the frustum it is told,
+so two images rendered one way and described another **cannot fuse**. Reported as double vision.
+
+The reference project records the identical mistake with a different symptom: there it read as
+everything stretched by one uniform factor, so head movement, world scale and object size were
+all wrong together and none could be judged against another.
+
+**Read the FOV out of the matrix instead of assuming it.** For a row-vector world→clip matrix,
+column 0 is the right axis scaled by `1/tan(fovX/2)` and column 3 is the unit forward axis:
+
+```
+tan(halfFovX) = |col3| / |col0|        tan(halfFovY) = |col3| / |col1|
+```
+
+Nothing has to be assumed about UE3's `FOVAngle` convention or how it folds in aspect — the
+answer comes out of what actually reached the GPU. **Measured: roughly 84° horizontal**, which is
+notably *not* the 65° the config default would have suggested. That gap is the argument for
+reading rather than deriving.
+
+### The image is a correct rectangle inside black, and that is the honest state
+
+The game renders 16:9; a per-eye view is nearly square (2496×2688). At ~84×54° against a headset
+wanting ~95–100° on both axes, the vertical falls well short and shows as letterboxing.
+
+**Match the headset's VERTICAL FOV, not its horizontal** — the reference is explicit about this.
+Equal vertical leaves the game's horizontal comfortably wider than needed, so both axes are
+covered with the surplus falling outside the eye. Matching horizontally leaves top and bottom
+short, which is the visible half of the aspect mismatch.
+
+⚠️ And the engine **accepts a wide FOV but will not hold it** — it interpolates back toward its
+default every tick, which the reference measured as a 128°→80° swing producing a visible zoom and
+flickering black bars. The fix there was to force the projection **in the matrix** (rescaling the
+x and y columns, which is exactly an FOV change and composes after the positional offset) and
+demote the engine's own FOV to CPU culling, asked ~15% wider than what is rendered.
+`TdPlayerController::FOVAngle` is at **+0x030C** for that.
+
+### World scale is unmeasured
+
+OpenXR reports IPD in metres; UE3 units per metre is game-specific. Singularity measured 3.32 UU
+for 6.3 cm (~1.9 cm/unit). Mirror's Edge starts at **50 UU/m** with F11 cycling
+25/35/50/70/100/140 — the one number that decides whether the world feels life-sized, so it is a
+dial rather than a silent guess.
+
+### A large first head-tracking step must be dropped, not applied
+
+```
+[head] primed at yaw -719 pitch 2103
+[head] write #1  dYaw -749 dPitch +4246
+```
+
+~23° of pitch in one frame, which pointed the camera at the floor. The head moved between priming
+and the first write — the player was putting the headset on — and the whole accumulated movement
+arrived as one step. No real head turns that fast at 90 Hz, so a delta that large means *time
+passed*, not that the head moved. Steps beyond ~11° are dropped and counted. **Dropped rather
+than clamped**: clamping still injects a large bogus turn, only more slowly.
+
+---
+
 ## ⛔ Never issue D3D calls on a lost device
 
 **2026-08-06: a test run hard-froze the machine.** Kernel-Power 41, no TDR recorded, reboot
