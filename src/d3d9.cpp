@@ -93,6 +93,7 @@ enum {
     DEV_CreateVertexBuffer     = 26,
     DEV_CreateIndexBuffer      = 27,
     DEV_SetRenderTarget        = 37,
+    DEV_CreateQuery            = 118,
     DEV_DrawPrimitive          = 81,
     DEV_DrawIndexedPrimitive  = 82,
     DEV_SetVertexShaderConstantF = 94,
@@ -714,10 +715,11 @@ int                      g_stereoMode = 0;       // 0 = mono quad, 1 = alternate
 // to the 3.32 UU the Singularity project measured for the same separation - two different games
 // arriving at a similar world scale, which is reassuring but was not the reason for choosing it.
 float                    g_worldScale = 100.0f;  // UE3 units per metre - MEASURED, not tuned
-// Comfort preference, separate from world scale. Reported: 100% doubles close objects and
-// 25-50% reads better. Defaulting to 50% because that is what the build described as looking
-// decent was actually running at - measured, not recalled.
-float                    g_stereoStrength = 0.50f;
+// Comfort preference, separate from world scale. Now defaults to 100% - the true 6.3 cm IPD at
+// the measured 100 UU/m - because simultaneous stereo removed the doubling that made 50%
+// preferable under alternate-eye. Reported after that change: no doubling at ANY setting, which
+// is the confirmation that the doubling was temporal disparity rather than separation.
+float                    g_stereoStrength = 1.00f;
 // Defined with the injection code further down; declared here because the eye is chosen at the
 // end of each frame, which happens above it.
 extern float             g_eyeInject;
@@ -726,6 +728,11 @@ extern bool              g_simulStereo;
 extern bool              g_sceneMatValid;
 extern bool              g_c0IsScene;
 extern bool              g_rtIsScene;
+extern int               g_dupOnlyTarget;
+extern bool              g_forceVisible;
+struct RtSeen { IDirect3DSurface9* surf; UINT w, h; D3DFORMAT fmt; long draws; };
+extern RtSeen            g_rtSeen[16];
+extern int               g_rtSeenCount;
 extern float             g_sceneMat[16];
 extern volatile LONG     g_dupDraws;
 float                    g_halfIpdUU = 0.0f;     // filled from the located views
@@ -2740,6 +2747,28 @@ static void CheckHeadHotkeys()
     }
     p10 = d10;
 
+    // INSERT bisects which scene-sized target is duplicated; DELETE overrides occlusion
+    // queries. Two independent switches so one run separates the two hypotheses instead of
+    // confounding them - which is what "test rather than guess" actually requires.
+    static bool pIns = false, pDel = false;
+    const bool dIns = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
+    const bool dDel = (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0;
+    if (dIns && !pIns) {
+        g_dupOnlyTarget++;
+        if (g_dupOnlyTarget >= g_rtSeenCount) g_dupOnlyTarget = -1;
+        if (g_dupOnlyTarget < 0) Log("*** [dup] INSERT -> duplicating ALL scene-sized targets");
+        else Log("*** [dup] INSERT -> duplicating ONLY target %d (%p %ux%u fmt %d)",
+                 g_dupOnlyTarget, (void*)g_rtSeen[g_dupOnlyTarget].surf,
+                 g_rtSeen[g_dupOnlyTarget].w, g_rtSeen[g_dupOnlyTarget].h,
+                 (int)g_rtSeen[g_dupOnlyTarget].fmt);
+    }
+    if (dDel && !pDel) {
+        g_forceVisible = !g_forceVisible;
+        Log("*** [occ] DELETE -> occlusion queries %s",
+            g_forceVisible ? "OVERRIDDEN (everything reports visible)" : "normal");
+    }
+    pIns = dIns; pDel = dDel;
+
     // F11 adjusts world scale. UE3 units per metre is game-specific and unmeasured here, and
     // it is the one number that decides whether the world feels life-sized.
     static bool p11 = false;
@@ -2749,7 +2778,7 @@ static void CheckHeadHotkeys()
         // the measured 100 UU/m, and 1.5 is included so the hyperstereo failure is reachable -
         // being able to see what wrong looks like is what makes "is this right?" answerable.
         static const float kStrength[] = { 0.0f, 0.25f, 0.50f, 0.75f, 1.0f, 1.5f };
-        static int si = 2;   // 0.50, the default
+        static int si = 4;   // 1.00, the default
         si = (si + 1) % (int)(sizeof(kStrength) / sizeof(kStrength[0]));
         g_stereoStrength = kStrength[si];
         Log("*** [eye] F11 -> stereo strength %.0f%% (separation %.2f of %.2f UU, world scale fixed at %.0f)",
@@ -3169,10 +3198,10 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_SetRenderTarget)(IDirect3DDevice9*, DWOR
 static PFN_SetRenderTarget g_origSetRenderTarget = nullptr;
 bool  g_rtIsScene = true;
 
-struct RtSeen { IDirect3DSurface9* surf; UINT w, h; D3DFORMAT fmt; long draws; };
-static RtSeen g_rtSeen[16]{};
-static int    g_rtSeenCount = 0;
+RtSeen        g_rtSeen[16]{};
+int           g_rtSeenCount = 0;
 static RtSeen* g_rtCurrent = nullptr;
+int            g_dupOnlyTarget = -1;   // -1 = every scene-sized target; else an index
 
 static HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWORD idx,
                                                       IDirect3DSurface9* surf)
@@ -3210,6 +3239,92 @@ static void ReportRenderTargets()
                                                                  : "");
         g_rtSeen[i].draws = 0;
     }
+}
+
+// ---- hypothesis 2: OCCLUSION QUERIES, and why it is at least as likely as shadows ----
+//
+// UE3 wraps draws in occlusion queries and culls objects whose visible-pixel count comes back
+// at or near zero. Draw duplication changes what those queries measure: each object is now
+// rendered into two HALF-WIDTH viewports, so the count the engine reads is not the one it
+// would have got, and objects get culled that should not be. That reads as things flickering
+// in and out - which is the reported symptom, and it fits at least as well as the shadow-map
+// theory does.
+//
+// The reference hit this at run 30 and recorded the right way to test it:
+//
+//   "Override the answer, not the availability. Refusing to create the occlusion query crashed
+//    the game; patching GetData to lie ran the identical experiment with the engine's control
+//    flow untouched. Prefer the intervention that leaves the program on its normal path."
+//
+// So DELETE makes every occlusion query report a large visible count. Nothing is culled, the
+// engine's control flow is untouched, and if the flickering stops the cause is settled.
+//
+// All queries created by one device share a vtable, so a single patch covers every query the
+// game will ever make.
+typedef HRESULT (STDMETHODCALLTYPE *PFN_QueryGetData)(IDirect3DQuery9*, void*, DWORD, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateQuery)(IDirect3DDevice9*, D3DQUERYTYPE, IDirect3DQuery9**);
+static PFN_QueryGetData g_origQueryGetData = nullptr;
+static PFN_CreateQuery  g_origCreateQuery = nullptr;
+static bool  g_queryPatched = false;
+static long  g_queriesFaked = 0;
+
+// ---- the mode the reference settled on, adopted rather than rediscovered ----
+//
+//   0 = AUTO   override while draw duplication is running, normal otherwise   <- default
+//   1 = always report visible
+//   2 = never override; the engine's culling is always live
+//
+// AUTO because duplication is the configuration whose split frame invalidates the query, and
+// mono has no reason to pay for disabled culling. It also means the safe fallback keeps the
+// engine's own culling and its speed.
+//
+// The reference also records a mode 3 - refuse to create the queries at all - which CRASHED
+// that build. Not implemented here, deliberately, so it cannot be retried by accident.
+//
+// ⚠️ And it records that even with the override its real mechanism was never identified: the
+// leading hypothesis there is that occlusion boxes arrive via DrawPrimitiveUP, which is
+// unhooked, so they draw at FULL-FRAME coordinates against a depth buffer holding half-remapped
+// geometry. If forcing visible does not stop the flickering here, that is the next thing to
+// test - DrawPrimitiveUP is slot 83 and DrawIndexedPrimitiveUP is 84.
+int          g_occlusionMode = 0;
+bool         g_forceVisible = false;      // DELETE forces mode 1 for an A/B
+
+static bool OverrideOcclusion()
+{
+    if (g_forceVisible || g_occlusionMode == 1) return true;
+    if (g_occlusionMode == 2) return false;
+    return InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0;   // AUTO
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_QueryGetData(IDirect3DQuery9* q, void* pData,
+                                                   DWORD size, DWORD flags)
+{
+    const HRESULT hr = g_origQueryGetData(q, pData, size, flags);
+    // Only rewrite an answer the runtime actually produced: S_FALSE means "not ready" and
+    // carries no data. And ONLY for occlusion queries - all of a device's queries share one
+    // vtable, so EVENT queries (fences) come through here too, and the first version of this
+    // would have overwritten their results with a pixel count. The reference checks the type
+    // per call for exactly that reason.
+    if (OverrideOcclusion() && hr == S_OK && pData && size >= sizeof(DWORD) &&
+        q->GetType() == D3DQUERYTYPE_OCCLUSION) {
+        *(DWORD*)pData = 0x00100000;      // "plenty of pixels visible"
+        if (++g_queriesFaked == 1)
+            Log("*** [occ] occlusion queries are being overridden to report VISIBLE");
+    }
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_CreateQuery(IDirect3DDevice9* dev, D3DQUERYTYPE type,
+                                                  IDirect3DQuery9** out)
+{
+    const HRESULT hr = g_origCreateQuery(dev, type, out);
+    if (SUCCEEDED(hr) && out && *out && type == D3DQUERYTYPE_OCCLUSION && !g_queryPatched) {
+        g_queryPatched = true;
+        g_origQueryGetData = (PFN_QueryGetData)PatchVTable(*out, 7, (void*)&Hook_QueryGetData);
+        Log("[occ] occlusion query vtable patched (GetData slot 7), original=%p",
+            (void*)g_origQueryGetData);
+    }
+    return hr;
 }
 
 typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawPrim)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT);
@@ -3287,8 +3402,23 @@ static HRESULT DuplicateDraw(IDirect3DDevice9* dev, FN issue)
 static bool ShouldDuplicate()
 {
     if (g_rtCurrent) g_rtCurrent->draws++;
-    return g_simulStereo && !g_inDupDraw && g_sceneMatValid && g_c0IsScene && g_rtIsScene &&
-           g_vmReg >= 0 && g_halfIpdUU > 0.0f && g_capW > 0;
+    if (!(g_simulStereo && !g_inDupDraw && g_sceneMatValid && g_c0IsScene && g_rtIsScene &&
+          g_vmReg >= 0 && g_halfIpdUU > 0.0f && g_capW > 0)) return false;
+
+    // ---- INSERT bisects WHICH scene-sized target gets duplicated ----
+    //
+    // The census shows FOUR surfaces at 2560x1440 - two A8R8G8B8, two A16B16G16R16F - and two
+    // of them take heavy draw counts. A size test cannot separate them, which is exactly what
+    // the reference's run 27 records: UE3 allocates whole-scene dominant shadow maps at scene
+    // resolution, so a full-res offscreen target passes as the scene.
+    //
+    // Rather than guess which is the scene colour target, cycle. -1 duplicates all of them,
+    // which is the current behaviour; 0..N restricts it to one. Whichever setting stops the
+    // flickering identifies the target that must not be split, and the answer is measured
+    // rather than argued.
+    if (g_dupOnlyTarget >= 0)
+        return g_rtCurrent && g_rtCurrent == &g_rtSeen[g_dupOnlyTarget];
+    return true;
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type,
@@ -3901,6 +4031,7 @@ static void PatchDeviceOnce(IDirect3DDevice9* dev)
     g_origCreateVB  = (PFN_CreateVB)     PatchVTable(dev, DEV_CreateVertexBuffer,(void*)&Hook_CreateVB);
     g_origCreateIB  = (PFN_CreateIB)     PatchVTable(dev, DEV_CreateIndexBuffer, (void*)&Hook_CreateIB);
     g_origSetRenderTarget = (PFN_SetRenderTarget) PatchVTable(dev, DEV_SetRenderTarget, (void*)&Hook_SetRenderTarget);
+    g_origCreateQuery     = (PFN_CreateQuery)     PatchVTable(dev, DEV_CreateQuery, (void*)&Hook_CreateQuery);
     g_origDrawPrim    = (PFN_DrawPrim)    PatchVTable(dev, DEV_DrawPrimitive, (void*)&Hook_DrawPrim);
     g_origDrawIndexed = (PFN_DrawIndexed) PatchVTable(dev, DEV_DrawIndexedPrimitive, (void*)&Hook_DrawIndexed);
     // Slot 94, extracted from d3d9.h and cross-checked against the reference's working hooks.
