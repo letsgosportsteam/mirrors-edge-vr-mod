@@ -752,6 +752,62 @@ than clamped**: clamping still injects a large bogus turn, only more slowly.
 
 ---
 
+## ✅ Simultaneous stereo — draw duplication, 2026-08-06
+
+Every scene draw is issued twice, into each half of the backbuffer with that eye's matrix, so
+both eyes come from the same frame. Each eye gets 1280×1440.
+
+**Reported: depth perception "way better than it ever did in alternate eye rendering, on any
+setting", and no doubling at any separation.** That is the confirmation that the doubling under
+alternate-eye was **temporal disparity**, not separation — each eye's image was one frame stale,
+near objects sweep the view fastest, so the inter-eye difference carried a time offset. Stereo
+strength therefore goes back to **100%**, the geometrically correct 6.3 cm, which is now also
+the comfortable one.
+
+Costs no extra frame grab — still one backbuffer per frame — so the D3D9Ex wrapper stays
+deferred until per-eye resolution is restored by widening the backbuffer.
+
+### Occlusion queries must be overridden while duplicating
+
+UE3 wraps draws in occlusion queries and culls objects whose visible-pixel count returns near
+zero. Duplication renders each object into two half-width viewports, so the count the engine
+reads back is not the one it would have got, and objects are culled that should not be. That
+presents as **objects flickering in and out**.
+
+Overriding `IDirect3DQuery9::GetData` (slot 7) to report a large visible count stops it.
+
+> **Override the answer, not the availability.** The reference records that *refusing to create*
+> the queries crashed that build; patching `GetData` runs the same experiment with the engine's
+> control flow untouched. Its mode 3 is deliberately not implemented here so it cannot be
+> retried by accident.
+
+> **⚠️ All of a device's queries share one vtable**, so `EVENT` queries (fences) arrive at the
+> same hook. Check `GetType() == D3DQUERYTYPE_OCCLUSION` per call — a version that checked only
+> the data size would overwrite fence results with a pixel count.
+
+Mode **AUTO** (override only while duplication is running) is the default, adopted from the
+reference: mono has no reason to pay for disabled culling, and the safe fallback keeps the
+engine's own.
+
+> **⚠️ Confirmed by observation, not yet by a clean A/B.** The flickering stopped, but the log
+> shows AUTO had already engaged the override when duplication started, and the keypress
+> credited with the fix never registered. The override was active either way — but *what changed
+> at that moment* is not established. A toggle that can only force the override further ON
+> cannot demonstrate anything; DELETE now cycles AUTO / ALWAYS / **NEVER**, and only NEVER can
+> bring the flickering back.
+
+### The shadow-map theory was wrong, and was nearly settled on
+
+The render-target census showed four scene-sized surfaces, two taking heavy draw counts, and the
+obvious reading was that a whole-scene dominant shadow map was being split — the reference's own
+run 9 diagnosis. It was the wrong cause here. Occlusion was raised as a competing hypothesis and
+turned out to be it.
+
+INSERT still bisects which single target is duplicated, kept because the census genuinely cannot
+separate four same-sized surfaces and the question may return.
+
+---
+
 ## ⛔ Never issue D3D calls on a lost device
 
 **2026-08-06: a test run hard-froze the machine.** Kernel-Power 41, no TDR recorded, reboot

@@ -730,6 +730,7 @@ extern bool              g_c0IsScene;
 extern bool              g_rtIsScene;
 extern int               g_dupOnlyTarget;
 extern bool              g_forceVisible;
+extern int               g_occlusionMode;
 struct RtSeen { IDirect3DSurface9* surf; UINT w, h; D3DFORMAT fmt; long draws; };
 extern RtSeen            g_rtSeen[16];
 extern int               g_rtSeenCount;
@@ -2763,9 +2764,17 @@ static void CheckHeadHotkeys()
                  (int)g_rtSeen[g_dupOnlyTarget].fmt);
     }
     if (dDel && !pDel) {
-        g_forceVisible = !g_forceVisible;
-        Log("*** [occ] DELETE -> occlusion queries %s",
-            g_forceVisible ? "OVERRIDDEN (everything reports visible)" : "normal");
+        // Cycles all three modes, because a toggle that can only force the override ON cannot
+        // demonstrate anything: AUTO already overrides while duplication runs, so the previous
+        // version's "on" was indistinguishable from its "off". Mode 2 turns culling back on and
+        // is the only setting that can bring the flickering BACK - which is what makes this an
+        // A/B rather than an assertion.
+        g_occlusionMode = (g_occlusionMode + 1) % 3;
+        g_forceVisible = false;                     // superseded by the mode
+        static const char* kOcc[3] = { "AUTO (override while duplicating)",
+                                       "ALWAYS override",
+                                       "NEVER override - engine culling live" };
+        Log("*** [occ] DELETE -> mode %d: %s", g_occlusionMode, kOcc[g_occlusionMode]);
     }
     pIns = dIns; pDel = dDel;
 
@@ -3308,8 +3317,12 @@ static HRESULT STDMETHODCALLTYPE Hook_QueryGetData(IDirect3DQuery9* q, void* pDa
     if (OverrideOcclusion() && hr == S_OK && pData && size >= sizeof(DWORD) &&
         q->GetType() == D3DQUERYTYPE_OCCLUSION) {
         *(DWORD*)pData = 0x00100000;      // "plenty of pixels visible"
-        if (++g_queriesFaked == 1)
-            Log("*** [occ] occlusion queries are being overridden to report VISIBLE");
+        // Logged on the first override and then periodically, so the log can say whether it was
+        // active during any given stretch of a run. A once-only message cannot answer that,
+        // which is why the previous run could not establish what changed or when.
+        if (++g_queriesFaked == 1 || (g_queriesFaked % 20000) == 0)
+            Log("[occ] overriding to VISIBLE (mode %d, %ld queries faked)",
+                g_occlusionMode, g_queriesFaked);
     }
     return hr;
 }
@@ -3689,8 +3702,9 @@ static void DrawOverlay(IDirect3DDevice9* dev)
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "STEREO %s %s  STRENGTH %d PCT",
                 g_stereoMode ? "ON" : "OFF", g_simulStereo ? "SIMUL" : "ALT",
                 (int)(g_stereoStrength * 100.0f));
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "DUP %ld  RT %s",
-                InterlockedCompareExchange(&g_dupDraws, 0, 0), g_rtIsScene ? "SCENE" : "OTHER");
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "DUP %ld ONLY %d  OCC %s",
+                InterlockedCompareExchange(&g_dupDraws, 0, 0), g_dupOnlyTarget,
+                g_occlusionMode == 2 ? "REAL" : (g_occlusionMode == 1 ? "ALWAYS" : "AUTO"));
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "ANIM P%+d Y%+d R%+d ST%d",
                 (int)g_animNow[0], (int)g_animNow[1], (int)g_animNow[2], g_animState);
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "FOV %d X %d  IPD %d/100",
