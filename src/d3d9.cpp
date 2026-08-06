@@ -1687,6 +1687,7 @@ extern int g_offActorLocation;
 extern int g_offFOVAngle;
 extern int g_offCamLoc;
 extern int g_offCamRot;
+extern int g_offMoveState;
 
 static DWORD WINAPI ObjectModelThread(LPVOID)
 {
@@ -1721,6 +1722,7 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                 g_offCamRot = LookupProp("TdPlayerPawn", "PlayerCameraRotation", true);
                 g_offCamLoc = LookupProp("TdPlayerPawn", "PlayerCameraLocation", true);
                 LookupProp("TdPlayerPawn", "SwanNeck1p", true);
+                g_offMoveState = LookupProp("TdPlayerPawn", "MovementState", true);
                 DumpClassProperties("TdPlayerController", 60);
             }
         }
@@ -3024,6 +3026,106 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
     return g_origSetVSConstF(dev, startReg, data, count);
 }
 
+// ================================================================ camera-animation probe
+//
+// The feasibility assessment called Mirror's Edge's animated camera the project's longest pole
+// - wall-run roll, landing dips, vaults - and nothing has measured it. This does, before
+// anything is built to suppress it.
+//
+// ---- the signal is a subtraction ----
+//
+// TdPlayerPawn::CalcCamera composes the view as
+//
+//     out_Rotation  = GetViewRotation()            // the player's own look
+//     out_Rotation += GetCameraAnimation()         // swizzled, see ENGINE_NOTES
+//     PlayerCameraRotation = out_Rotation           // cached on the pawn
+//
+// and TdPlayerController::UpdateRotation writes the player's look into the controller's
+// Rotation, zeroing roll on the way. So:
+//
+//     PlayerCameraRotation - Controller.Rotation  ==  the animation contribution
+//
+// and ALL roll in it is animation by definition, because the controller's is always zero. That
+// makes roll the cleanest of the three axes and the one most likely to matter for comfort.
+//
+// ⚠️ Both sides go through YawDelta(). UE3 is 65536 units per turn and a raw int32 subtraction
+// of two headings 0.3 degrees apart reads as 360.3 - the defect that cost the Singularity
+// project months.
+
+int  g_offMoveState = -1;
+static float g_animPeak[3] = { 0, 0, 0 };       // degrees, |pitch| |yaw| |roll| since last report
+static float g_animNow[3]  = { 0, 0, 0 };       // live, for the overlay
+static int   g_animState   = -1;
+// From TdPawn.EMovement in the decompiled script. Named rather than numbered because the whole
+// point is to say WHICH moves throw the camera around, and "state 4 = 11.2 degrees" needs a
+// lookup table on the reader's side that a log line can just carry.
+static const char* kMoveNames[] = {
+    "None","Walking","Falling","Grabbing","WallRunRight","WallRunLeft","WallClimbing",
+    "SpringBoard","SpeedVault","VaultOver","GrabPullUp","Jump","WallRunJump","GrabJump",
+    "IntoGrab","Crouch","Slide","Melee","Snatch","Barge","Landing","Climb","IntoClimb",
+    "WallKick","180Turn","180TurnInAir","LayOnGround","IntoZipLine","ZipLine","Balance",
+    "LedgeWalk","GrabTransfer","MeleeAir","DodgeJump","WallRunDodgeJump","Stumble","Snatched",
+    "StepUp","RumpSlide","Interact","WallRun","BotStop","BotStartWalk","BotStartRun",
+    "BotTurnRun","BotTurnStand","ExitCover","Vertigo","MeleeSlide","WallClimbDodgeJump",
+    "WallClimb180Jump","WallClimbDodgeL","WallClimbDodgeR","MeleeVault","BotMelee2",
+    "StumbleHard","BotRoll","BotFlip",
+};
+static const int kMoveCount = (int)(sizeof(kMoveNames) / sizeof(kMoveNames[0]));
+static float g_statePeakRoll[64] = { 0 };       // worst roll seen in each movement state
+static float g_statePeakPitch[64] = { 0 };
+static long  g_animSamples = 0;
+
+static void ProbeCameraAnimation()
+{
+    if (g_offCamRot < 0 || g_offActorRotation < 0) return;
+    const uintptr_t pawn = g_playerPawn, ctl = g_playerCtl;
+    if (!pawn || !ctl) return;
+
+    int32_t camRot[3], ctlRot[3];
+    if (!SafeRead(pawn + g_offCamRot, camRot, sizeof(camRot))) return;
+    if (!SafeRead(ctl + g_offActorRotation, ctlRot, sizeof(ctlRot))) return;
+
+    const float kDeg = 360.0f / 65536.0f;
+    g_animNow[0] = YawDelta(camRot[0], ctlRot[0]) * kDeg;   // pitch
+    g_animNow[1] = YawDelta(camRot[1], ctlRot[1]) * kDeg;   // yaw
+    g_animNow[2] = YawDelta(camRot[2], ctlRot[2]) * kDeg;   // roll
+    g_animSamples++;
+
+    for (int i = 0; i < 3; ++i) {
+        const float a = fabsf(g_animNow[i]);
+        if (a > g_animPeak[i]) g_animPeak[i] = a;
+    }
+
+    // Attribute the worst roll to the movement state that produced it. Wall-running and
+    // landing are the states the assessment named; this says which actually move the view and
+    // by how much, instead of leaving it as a description.
+    if (g_offMoveState >= 0) {
+        uint8_t st = 0;
+        if (SafeRead(pawn + g_offMoveState, &st, 1) && st < 64) {
+            g_animState = st;
+            const float r = fabsf(g_animNow[2]);
+            const float p = fabsf(g_animNow[0]);
+            if (r > g_statePeakRoll[st])  g_statePeakRoll[st]  = r;
+            if (p > g_statePeakPitch[st]) g_statePeakPitch[st] = p;
+        }
+    }
+}
+
+static void ReportCameraAnimation()
+{
+    Log("[anim] peaks since last report: pitch %.1f  yaw %.1f  ROLL %.1f degrees (%ld samples)",
+        g_animPeak[0], g_animPeak[1], g_animPeak[2], g_animSamples);
+    // Cumulative across the whole run, never reset: the question is "what is the worst this
+    // move ever does", and a per-window peak would hide the one landing that mattered.
+    for (int s = 0; s < 64; ++s) {
+        if (g_statePeakRoll[s] < 0.5f && g_statePeakPitch[s] < 0.5f) continue;
+        Log("[anim]   %-18s roll %5.1f   pitch %5.1f  degrees",
+            s < kMoveCount ? kMoveNames[s] : "?", g_statePeakRoll[s], g_statePeakPitch[s]);
+    }
+    g_animPeak[0] = g_animPeak[1] = g_animPeak[2] = 0.0f;
+    g_animSamples = 0;
+}
+
 // ================================================================ the on-screen readout
 //
 // Ported from the Singularity mod, where it was added at run 127 for a reason this project has
@@ -3165,6 +3267,8 @@ static void DrawOverlay(IDirect3DDevice9* dev)
                 (int)g_vmOffset[0], (int)g_vmOffset[1], (int)g_vmOffset[2]);
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "STEREO %s EYE %d IPD %d/10",
                 g_stereoMode ? "ON" : "OFF", g_renderedEye, (int)(g_halfIpdUU * 20.0f));
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "ANIM P%+d Y%+d R%+d ST%d",
+                (int)g_animNow[0], (int)g_animNow[1], (int)g_animNow[2], g_animState);
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "SCALE %d UU/M  FOV %d X %d",
                 (int)g_worldScale, (int)(g_gameHalfFovX * 114.59f), (int)(g_gameHalfFovY * 114.59f));
 
@@ -3396,6 +3500,10 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     // Cheap once the object model is up: re-resolves only when the cached pointer stops
     // looking like a TdSwanNeck, which is on level transitions.
     if (g_offName >= 0) { CheckSwanHotkey(); ApplySwanNeck(); CheckHeadHotkeys(); CheckVMHotkey(); }
+
+    // Sampled every frame - the peaks are what matter and a landing lasts a few frames.
+    ProbeCameraAnimation();
+    if ((f % 900) == 0) ReportCameraAnimation();
 
     // ---- the engine's FOV now matters ONLY for CPU culling ----
     //
