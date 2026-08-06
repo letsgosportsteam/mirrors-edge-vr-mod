@@ -92,6 +92,7 @@ enum {
     DEV_CreateCubeTexture      = 25,
     DEV_CreateVertexBuffer     = 26,
     DEV_CreateIndexBuffer      = 27,
+    DEV_SetVertexShaderConstantF = 94,
 };
 
 // ---------------------------------------------------------------- state
@@ -741,7 +742,14 @@ static void SubmitTestQuad()
     const XrCompositionLayerBaseHeader* layers[1];
     uint32_t layerCount = 0;
     if (submitted) {
-        quad.space      = g_xrSpace;
+        // ---- head-locked, not world-locked ----
+        //
+        // The quad used to sit in LOCAL space, so it stayed put while the head turned - and
+        // once head tracking landed that became actively wrong: the game camera turned with
+        // the head while the screen slid out of view. In VIEW space the quad rides the head,
+        // so the image the game just rendered from the head's orientation is always in front
+        // of it. That is the reference project's "MonoTracked" rung.
+        quad.space      = (g_viewSpace != XR_NULL_HANDLE) ? g_viewSpace : g_xrSpace;
         quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
         quad.subImage.swapchain = g_swapchain;
         quad.subImage.imageRect = { {0, 0}, {(int32_t)g_scW, (int32_t)g_scH} };
@@ -2095,6 +2103,18 @@ static void CheckSwanHotkey()
     wasDown = down;
 }
 
+// Rung 6a lives below but is driven from here, so its handful of shared symbols are declared
+// up front rather than reordering two large blocks.
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetVSConstF)(IDirect3DDevice9*, UINT, const float*, UINT);
+extern PFN_SetVSConstF g_origSetVSConstF;
+extern uintptr_t g_playerPawn;
+extern int  g_vmCandidates;
+extern int  g_vmBestReg;
+extern bool g_vmBestRow;
+extern volatile LONG g_vmScanArmed;
+bool      LooksLikePlayerPawn(uintptr_t obj);
+uintptr_t FindPlayerPawn();
+
 // ================================================================ rung 5b: head tracking
 //
 // Writes the headset's orientation into TdPlayerController::Rotation (+0x00F4), which the
@@ -2213,6 +2233,10 @@ static void ApplyHeadTracking(XrTime when)
     if (!ctl) return;
 
     int32_t hy, hp;
+    // Keeps the pawn pointer warm for the view-matrix scan, which needs the camera pose and
+    // runs on the render thread inside a hot D3D hook where a full object walk is impossible.
+    FindPlayerPawn();
+
     if (!GetHeadYawPitch(when, &hy, &hp)) return;
 
     if (!g_headPrimed) {           // first sample defines the reference, no jump on connect
@@ -2242,6 +2266,44 @@ static void ApplyHeadTracking(XrTime when)
             g_headWrites, dYaw, dPitch, rot[0], rot[1]);
 }
 
+// F6 arms the view-matrix scan for exactly one frame of draw calls.
+//
+// One frame, not continuous: the hook sits on a call made thousands of times per frame, and
+// leaving the test live would be a permanent tax on the render thread for a question that
+// only needs answering once. It also keeps the log readable.
+static void CheckVMHotkey()
+{
+    static bool p6 = false;
+    static int  armCountdown = 0;
+    const bool d6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+
+    if (d6 && !p6) {
+        if (!g_origSetVSConstF) {
+            Log("[vm] SetVertexShaderConstantF is not hooked - cannot scan");
+        } else if (!LooksLikePlayerPawn(g_playerPawn)) {
+            Log("[vm] no TdPlayerPawn resolved yet - the scan needs the camera pose");
+        } else {
+            g_vmCandidates = 0; g_vmBestReg = -1;
+            Log("");
+            Log("[vm] ---- scanning one frame of vertex shader constants ----");
+            InterlockedExchange(&g_vmScanArmed, 1);
+            armCountdown = 2;                 // this Present, then the next frame's draws
+        }
+    }
+    p6 = d6;
+
+    if (armCountdown > 0 && --armCountdown == 0) {
+        InterlockedExchange(&g_vmScanArmed, 0);
+        if (g_vmCandidates == 0)
+            Log("[vm] no candidate matched. Either the matrix is not uploaded as vertex shader"
+                " constants, or the camera pose is stale.");
+        else
+            Log("[vm] ---- %d candidate(s); first was c%d %s ----",
+                g_vmCandidates, g_vmBestReg, g_vmBestRow ? "ROW" : "COL");
+        Log("");
+    }
+}
+
 static void CheckHeadHotkeys()
 {
     static bool p9 = false, p5 = false, p4 = false;
@@ -2256,6 +2318,153 @@ static void CheckHeadHotkeys()
     if (d5 && !p5) { g_yawSign   = -g_yawSign;   Log("[head] F5 -> yaw sign %+d", g_yawSign); }
     if (d4 && !p4) { g_pitchSign = -g_pitchSign; Log("[head] F4 -> pitch sign %+d", g_pitchSign); }
     p9 = d9; p5 = d5; p4 = d4;
+}
+
+// ================================================================ rung 6a: find the view matrix
+//
+// Stereo, head roll and 6-DOF all need the world->clip matrix on its way to the GPU. UE3
+// uploads it through SetVertexShaderConstantF; the Singularity project found it at register
+// c0, stored as ROWS, in TRANSLATED-WORLD space.
+//
+// None of that is assumed here. Every part is re-derived, because this project has already
+// been bitten by inherited facts twice - FNameEntry differed, and the controller-rotation
+// premise inverted outright.
+//
+// ---- the tests, and why two are needed ----
+//
+// 1. A world->clip matrix maps the CAMERA POSITION to clip.w ~ 0: the eye is at the near
+//    plane's origin. If UE3 renders in translated-world space the CPU has already subtracted
+//    the view origin, so the point that passes is (0,0,0) rather than the camera's world
+//    position. Testing BOTH says which space is in use.
+//
+// 2. ⚠️ At the origin the w test DEGENERATES. clip.w for p = (0,0,0) collapses to r[3].w under
+//    BOTH storage conventions, so it cannot tell ROW from COL and it admits any matrix whose w
+//    constant is near zero - which is most of them. The Singularity notes record 18 candidates
+//    from this test alone.
+//
+//    The discriminator is direction: for a genuine world->clip matrix the xyz of the w term IS
+//    the camera's forward axis, and ROW and COL read that from different components. We know
+//    the real forward vector independently, from TdPlayerPawn::PlayerCameraRotation.
+//
+// Nothing is injected yet. This run reports what is there.
+
+int g_offCamLoc = -1;
+int g_offCamRot = -1;
+
+uintptr_t g_playerPawn = 0;
+static long      g_pawnNextTry = 0;
+static bool      g_pawnMissLogged = false;
+
+// Non-static: declared above, where the rung 5b code drives the pawn search.
+bool LooksLikePlayerPawn(uintptr_t obj)
+{
+    if (!obj || g_offName < 0) return false;
+    uint32_t vt;
+    if (!SafeU32(obj, &vt) || !InModule(vt)) return false;
+    if (!ObjNameIs(obj, "TdPlayerPawn")) return false;
+    uint32_t cls;
+    if (!SafeU32(obj + 0x34, &cls) || cls < 0x10000) return false;
+    return ObjNameIs(cls, "TdPlayerPawn");
+}
+
+uintptr_t FindPlayerPawn()
+{
+    if (LooksLikePlayerPawn(g_playerPawn)) return g_playerPawn;
+    if (g_playerPawn) { g_playerPawn = 0; g_pawnNextTry = 0; }
+    if (g_frames < g_pawnNextTry) return 0;
+    if (!g_gobjAddr || g_offName < 0) { g_pawnNextTry = g_frames + 600; return 0; }
+
+    uint32_t data, count;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) {
+        g_pawnNextTry = g_frames + 600; return 0;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t obj;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+        if (!LooksLikePlayerPawn(obj)) continue;
+        g_playerPawn = obj;
+        g_pawnMissLogged = false;
+        Log("[vm] TdPlayerPawn instance at %p", (void*)obj);
+        return obj;
+    }
+    g_pawnNextTry = g_frames + 600;   // same backoff discipline as the other searches
+    if (!g_pawnMissLogged) { g_pawnMissLogged = true; Log("[vm] no live TdPlayerPawn yet"); }
+    return 0;
+}
+
+PFN_SetVSConstF g_origSetVSConstF = nullptr;
+
+static volatile LONG g_vmScanArmed = 0;
+static int  g_vmBestReg = -1;
+static bool g_vmBestRow = false;
+static int  g_vmCandidates = 0;
+
+// Camera pose straight from the pawn's cached values - the same numbers CalcCamera produced.
+static bool GetCameraPose(float* loc, float* fwd)
+{
+    if (g_offCamLoc < 0 || g_offCamRot < 0) return false;
+    if (!LooksLikePlayerPawn(g_playerPawn)) return false;
+    if (!SafeRead(g_playerPawn + g_offCamLoc, loc, 12)) return false;
+    int32_t rot[3];
+    if (!SafeRead(g_playerPawn + g_offCamRot, rot, 12)) return false;
+
+    const float kToRad = 3.14159265f / 32768.0f;
+    const float pitch = rot[0] * kToRad, yaw = rot[1] * kToRad;
+    fwd[0] = cosf(pitch) * cosf(yaw);
+    fwd[1] = cosf(pitch) * sinf(yaw);
+    fwd[2] = sinf(pitch);
+    return true;
+}
+
+// Evaluate one 4-register window under one storage convention.
+static void TestWindow(int reg, const float* m, bool asRow,
+                       const float* camLoc, const float* fwd)
+{
+    // Rows of a row-vector matrix, or columns of a column-vector one.
+    auto at = [&](int r, int c) { return asRow ? m[r * 4 + c] : m[c * 4 + r]; };
+
+    auto wOf = [&](float x, float y, float z) {
+        return x * at(0, 3) + y * at(1, 3) + z * at(2, 3) + at(3, 3);
+    };
+    const float wCam = wOf(camLoc[0], camLoc[1], camLoc[2]);
+    const float wOrg = wOf(0.0f, 0.0f, 0.0f);
+
+    // The xyz of the w term should be the camera forward axis.
+    float ax = at(0, 3), ay = at(1, 3), az = at(2, 3);
+    const float len = sqrtf(ax * ax + ay * ay + az * az);
+    if (len < 1e-6f) return;
+    ax /= len; ay /= len; az /= len;
+    const float dotFwd = ax * fwd[0] + ay * fwd[1] + az * fwd[2];
+
+    // The origin probe is pure matrix content - no camera reading to go stale - so it gets a
+    // tight tolerance. The world probe absorbs a frame of camera latency and gets a loose one.
+    const bool originHit = fabsf(wOrg) < 1.0f;
+    const bool worldHit  = fabsf(wCam) < 25.0f;
+    if (!originHit && !worldHit) return;
+    if (fabsf(dotFwd) < 0.9f) return;          // direction must agree, or it is not the view
+
+    g_vmCandidates++;
+    Log("[vm] c%-3d %s  w(cam)=%9.3f  w(origin)=%9.3f  dotFwd=%+.4f  %s",
+        reg, asRow ? "ROW" : "COL", wCam, wOrg, dotFwd,
+        originHit ? "<- TRANSLATED-WORLD" : "<- world space");
+    if (g_vmBestReg < 0) { g_vmBestReg = reg; g_vmBestRow = asRow; }
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
+                                                  const float* data, UINT count)
+{
+    // Hot path: thousands of calls a frame. Do nothing at all unless a scan is armed.
+    if (InterlockedCompareExchange(&g_vmScanArmed, 0, 0) && count >= 4 && data) {
+        float camLoc[3], fwd[3];
+        if (GetCameraPose(camLoc, fwd)) {
+            const UINT windows = count - 3;
+            for (UINT i = 0; i < windows && i < 64; ++i) {
+                TestWindow((int)(startReg + i), data + i * 4, true,  camLoc, fwd);
+                TestWindow((int)(startReg + i), data + i * 4, false, camLoc, fwd);
+            }
+        }
+    }
+    return g_origSetVSConstF(dev, startReg, data, count);
 }
 
 // ================================================================ hold PAUSE to quit
@@ -2427,7 +2636,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
 
     // Cheap once the object model is up: re-resolves only when the cached pointer stops
     // looking like a TdSwanNeck, which is on level transitions.
-    if (g_offName >= 0) { CheckSwanHotkey(); ApplySwanNeck(); CheckHeadHotkeys(); }
+    if (g_offName >= 0) { CheckSwanHotkey(); ApplySwanNeck(); CheckHeadHotkeys(); CheckVMHotkey(); }
 
     // After the XR work, so a quit still gets posted on a frame where XR failed or stalled.
     CheckQuitHotkey();
@@ -2481,6 +2690,7 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateIB(IDirect3DDevice9* dev, UINT len, 
     return g_origCreateIB(dev, len, usage, fmt, pool, out, shared);
 }
 
+
 static void PatchDeviceOnce(IDirect3DDevice9* dev)
 {
     if (g_devicePatched || !dev) return;
@@ -2491,6 +2701,9 @@ static void PatchDeviceOnce(IDirect3DDevice9* dev)
     g_origCreateTex = (PFN_CreateTexture)PatchVTable(dev, DEV_CreateTexture,     (void*)&Hook_CreateTexture);
     g_origCreateVB  = (PFN_CreateVB)     PatchVTable(dev, DEV_CreateVertexBuffer,(void*)&Hook_CreateVB);
     g_origCreateIB  = (PFN_CreateIB)     PatchVTable(dev, DEV_CreateIndexBuffer, (void*)&Hook_CreateIB);
+    // Slot 94, extracted from d3d9.h and cross-checked against the reference's working hooks.
+    g_origSetVSConstF = (PFN_SetVSConstF) PatchVTable(dev, DEV_SetVertexShaderConstantF,
+                                                      (void*)&Hook_SetVSConstF);
 
     Log("[patch] device vtable patched: Present=%d Reset=%d CreateTexture=%d CreateVB=%d CreateIB=%d",
         DEV_Present, DEV_Reset, DEV_CreateTexture, DEV_CreateVertexBuffer, DEV_CreateIndexBuffer);
