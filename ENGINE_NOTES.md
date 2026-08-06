@@ -630,7 +630,41 @@ x and y columns, which is exactly an FOV change and composes after the positiona
 demote the engine's own FOV to CPU culling, asked ~15% wider than what is rendered.
 `TdPlayerController::FOVAngle` is at **+0x030C** for that.
 
-### ✅ World scale — **100 UU per metre**, judged in the headset
+### ✅ World scale — **100 UU per metre**, and 1 UU = 1 cm
+
+**Confirmed independently of anything visual**, from the movement speeds the developers tuned in
+`DefaultAnimation.ini`:
+
+| setting | value | typical human | implies |
+|---|---|---|---|
+| `WalkVel` | 200 UU/s | 2.0 m/s brisk walk | **100 UU/m** |
+| `RunVel` | 380 UU/s | 3.8 m/s run | **100 UU/m** |
+| `FullSprint` | 700 UU/s | 7.0 m/s sprint | **100 UU/m** |
+
+Three numbers, tuned for feel rather than for scale, all landing on the same figure. That is a
+far stronger answer than any judgement in a headset, and it happens to agree with the one made
+there.
+
+> ### ⚠️ Raising the scale does NOT improve the stereo — it is hyperstereo
+>
+> Reported while sweeping F11 upward: *"I could see more depth in the distance, but things up
+> close looked doubled."* That is the correct and complete description of a widened
+> interocular baseline, and both halves are the same effect:
+>
+> - a wider baseline extends stereopsis further out — the principle behind long-baseline survey
+>   rigs;
+> - near objects then exceed what the eyes can converge on, and double.
+>
+> **The distant depth gained this way is the artefact, not the fix.** It also makes the world
+> read as a model village, because a human-sized brain interprets excess parallax as
+> small-and-close.
+>
+> **Flat distance at the correct scale is correct.** Human stereopsis gives out past roughly
+> 30 m; Mirror's Edge's skyline is hundreds of metres away and has no parallax in reality
+> either. Do not tune toward depth in the distance — tune toward comfortable fusion up close,
+> which the measured 100 UU/m delivers by construction.
+
+### Judged in the headset too
 
 F11 swept 25/35/50/70/100/140 and **100 read as life-sized**. At a 6.3 cm IPD that is a
 half-offset of ~3.15 UU, close to the 3.32 UU Singularity measured for the same separation. The
