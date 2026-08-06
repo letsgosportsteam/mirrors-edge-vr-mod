@@ -124,6 +124,9 @@ static uint32_t             g_scImageCount = 0;
 static uint32_t             g_scW = 0, g_scH = 0;
 static int64_t              g_scFormat = 0;      // the format we ASKED for; the texture may be typeless
 static bool                 g_rtvFailLogged = false;
+// Set whenever TestCooperativeLevel reports anything but D3D_OK, or a Reset fails. While it is
+// true the mod issues NO D3D calls at all - see the guard at the top of Hook_Present.
+static bool                 g_deviceLost = false;
 
 // ---- rung 3: the frame grab (CPU path) ----
 static IDirect3DSurface9*   g_sysSurf  = nullptr;   // SYSTEMMEM copy of the backbuffer
@@ -2896,11 +2899,48 @@ static void DescribeBackbuffer(IDirect3DDevice9* dev)
 static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT* src,
                                               const RECT* dst, HWND wnd, const RGNDATA* dirty)
 {
+    // ---- ⛔ do nothing at all on a device that is not operational ----
+    //
+    // 2026-08-06: a Reset failed with D3DERR_INVALIDCALL after an alt-tab out of exclusive
+    // fullscreen. Nothing here checked, so for the next two minutes this hook kept calling
+    // Clear(), GetBackBuffer(), GetRenderTargetData() and LockRect() on a LOST device every
+    // frame, while an OpenXR compositor held shared surfaces. The machine then hard-froze -
+    // Kernel-Power 41, no TDR recorded, reboot required.
+    //
+    // Whether that sequence caused the freeze is not proven. That it is invalid is not in
+    // question: every one of those calls has undefined behaviour on a lost device, and a mod
+    // has no business issuing them. Check first, and when the device is not ready, forward
+    // Present and touch nothing else.
+    {
+        const HRESULT coop = dev->TestCooperativeLevel();
+        if (coop != D3D_OK) {
+            if (!g_deviceLost) {
+                g_deviceLost = true;
+                Log("*** [dev] NOT OPERATIONAL (0x%08lX) - suspending all mod work until it"
+                    " recovers. No Clear, no capture, no XR submit.", (unsigned long)coop);
+            }
+            return g_origPresent(dev, src, dst, wnd, dirty);
+        }
+        if (g_deviceLost) {
+            g_deviceLost = false;
+            ReleaseFrameCapture();      // anything sized to the old backbuffer is now wrong
+            Log("*** [dev] operational again - resuming");
+        }
+    }
+
     long f = InterlockedIncrement(&g_frames);
     if (f == 1) {
         Log("*** first Present - the game is rendering. This is the frame hook everything later hangs off.");
         DescribeBackbuffer(dev);
     }
+
+    // ⚠️ OUTSIDE the XR block, and before the capture.
+    //
+    // It was inside `if (g_xrReady)`, so it only drew once an OpenXR session existed - which
+    // made "run it on the monitor, no headset needed" wrong, and sent the player into Virtual
+    // Desktop looking for a readout that could not appear there. A diagnostic that requires
+    // the subsystem it is diagnosing is not a diagnostic.
+    DrawOverlay(dev);
 
     // ---- rung 2: drive the XR frame loop from the game's Present ----
     //
@@ -2921,8 +2961,6 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
         // frame. If it fails, g_haveFrame goes false and the quad shows the cycling test
         // colour instead - which makes success and failure distinguishable from inside the
         // headset, without reading the log.
-        // BEFORE the capture, so the readout reaches the headset rather than only the mirror.
-        DrawOverlay(dev);
         g_haveFrame = CaptureFrame(dev);
         SubmitTestQuad();
     }
@@ -2963,6 +3001,15 @@ static HRESULT STDMETHODCALLTYPE Hook_Reset(IDirect3DDevice9* dev, D3DPRESENT_PA
     ReleaseFrameCapture();
     HRESULT hr = g_origReset(dev, pp);
     Log("--- Reset returned hr=0x%08lX ---", (unsigned long)hr);
+    if (FAILED(hr)) {
+        // Loud, because this is the state the freeze happened in and it was previously just
+        // another hex code in the log. A failed Reset leaves the device unusable, and the
+        // engine will keep calling Present regardless.
+        g_deviceLost = true;
+        Log("*** [dev] RESET FAILED (0x%08lX%s) - the device is unusable. All mod work is",
+            (unsigned long)hr, hr == D3DERR_INVALIDCALL ? " D3DERR_INVALIDCALL" : "");
+        Log("*** [dev] suspended. If the game does not recover, quit with PAUSE.");
+    }
     if (SUCCEEDED(hr)) {
         g_describedBackbuffer = false;   // re-measure, the surface is new
         DescribeBackbuffer(dev);
@@ -3032,6 +3079,23 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT adapte
     Log("*** CreateDevice on IDirect3D9* %p   adapter=%u DeviceType=%d BehaviorFlags=0x%08lX focus=%p",
         (void*)self, adapter, (int)type, (unsigned long)behavior, (void*)focus);
     LogPresentParams("requested", pp);
+
+    // ---- force WINDOWED ----
+    //
+    // Deferred at rung 2 as "an engine behaviour change we do not need yet". The freeze on
+    // 2026-08-06 is the argument for doing it now: exclusive fullscreen loses the device on
+    // every alt-tab, and this game's Reset then failed outright with D3DERR_INVALIDCALL. A
+    // windowed device does not take that path at all, so the whole class of problem goes away
+    // rather than being survived.
+    //
+    // It is also required eventually - the finished mod renders to the headset and the desktop
+    // window is only a mirror - so this is bringing forward work already on the list, not
+    // adding any.
+    if (pp && pp->Windowed == FALSE) {
+        pp->Windowed = TRUE;
+        pp->FullScreen_RefreshRateInHz = 0;      // must be 0 for a windowed device
+        Log("[dev] forcing WINDOWED (was exclusive fullscreen) - removes device loss on alt-tab");
+    }
 
     HRESULT hr = g_origCreateDevice(self, adapter, type, focus, behavior, pp, out);
     Log("*** CreateDevice returned hr=0x%08lX  device=%p", (unsigned long)hr, out ? (void*)*out : nullptr);
