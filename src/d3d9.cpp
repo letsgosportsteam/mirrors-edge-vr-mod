@@ -2127,7 +2127,10 @@ static uintptr_t g_playerCtl = 0;
 static long      g_ctlNextTry = 0;
 static bool      g_ctlMissLogged = false;
 static bool      g_headTracking = true;
-static int       g_yawSign = 1, g_pitchSign = 1;
+// Both negative, MEASURED rather than reasoned. OpenXR is right-handed with Y up and -Z
+// forward; UE3 is left-handed with Z up. Rather than argue the conversion out on paper, the
+// first run shipped +1/+1 with F5 and F4 to flip them, and both came back inverted.
+static int       g_yawSign = -1, g_pitchSign = -1;
 static bool      g_headPrimed = false;
 static int32_t   g_lastHeadYaw = 0, g_lastHeadPitch = 0;
 static long      g_headWrites = 0;

@@ -457,6 +457,58 @@ Run it off the render thread regardless — it is read-only, and nothing should 
 
 ---
 
+## ✅ Head tracking — working, 2026-08-05
+
+```
+TdPlayerController::Rotation        +0x00F4    the write target
+TdPlayerController::Location        +0x00E8
+TdPlayerController::FOVAngle        +0x030C
+TdPlayerPawn::PlayerCameraRotation  +0x09B8
+TdPlayerPawn::SwanNeck1p            +0x04F0
+```
+
+Found by walking `UProperty` chains, not by guessing. `Location` is an `FVector` ending exactly
+where `Rotation` begins, and `PlayerCameraRotation` reproduces the number a bulk dump reported
+by a different path.
+
+### ⭐ The Singularity premise does NOT transfer — no detour is needed here
+
+That project could not steer the view by writing the controller's rotation: a native source
+recomputed it every frame, and after seven failed attempts a hardware write breakpoint and a
+detour on `FUN_0104e390` were required.
+
+**In Mirror's Edge a plain write to `TdPlayerController::Rotation` is consumed by the engine.**
+The decompiled `UpdateRotation` opens with `ViewRotation = Rotation`, so the field is the base
+the engine reads each frame rather than an output it overwrites. Confirmed in play: writes land
+and the view follows.
+
+This is the single largest labour saving found so far, and it was only visible because the
+script was read first. Reading the source turned "seven failed guesses and a breakpoint
+session" into one function's opening line.
+
+### Sign convention — measured, not derived
+
+Both yaw and pitch are **inverted** relative to a naive OpenXR→UE3 conversion. OpenXR is
+right-handed, Y up, −Z forward; UE3 is left-handed, Z up. Rather than argue it out, the first
+build shipped `+1/+1` with F5 and F4 to flip them at runtime, and both came back wrong. The
+defaults are now `−1/−1`.
+
+### Design points worth keeping
+
+- **A delta is folded in, not an absolute pose.** An absolute write discards the engine's own
+  input delta each frame; adding only the change since the last frame lets head tracking and
+  mouse compose. Same conclusion the reference project reached.
+- **⚠️ The delta goes through an `int16` cast.** UE3 uses 65536 units per turn, so a raw
+  `int32` subtraction of two headings 0.3° apart reads as **360.3°**. That defect cost the
+  Singularity project months, with two sites carrying comments asserting the wrap was correct.
+  65536 *is* 2¹⁶, so truncation gives the shortest signed path for free.
+- **Roll cannot travel this path.** `UpdateRotation` sets `ViewRotation.Roll = 0` before writing
+  back. Head roll needs the view matrix.
+- The controller search carries the same failed-search backoff as the swan neck, for the reason
+  measured there.
+
+---
+
 ## Save data
 
 Stored **outside the install**, keyed by the game's identity, so every copy — Steam, GOG, and the
