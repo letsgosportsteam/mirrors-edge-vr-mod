@@ -710,7 +710,11 @@ int                      g_stereoMode = 0;       // 0 = mono quad, 1 = alternate
 // was the one that read as life-sized. At a 6.3 cm IPD that is a half-offset of ~3.15 UU, close
 // to the 3.32 UU the Singularity project measured for the same separation - two different games
 // arriving at a similar world scale, which is reassuring but was not the reason for choosing it.
-float                    g_worldScale = 100.0f;  // UE3 units per metre
+float                    g_worldScale = 100.0f;  // UE3 units per metre - MEASURED, not tuned
+// Comfort preference, separate from world scale. Reported: 100% doubles close objects and
+// 25-50% reads better. Defaulting to 50% because that is what the build described as looking
+// decent was actually running at - measured, not recalled.
+float                    g_stereoStrength = 0.50f;
 // Defined with the injection code further down; declared here because the eye is chosen at the
 // end of each frame, which happens above it.
 extern float             g_eyeInject;
@@ -2363,6 +2367,7 @@ extern float g_vmOffset[3];
 extern float g_eyeInject;
 extern int   g_stereoMode;
 extern float g_worldScale;
+extern float g_stereoStrength;
 bool      LooksLikePlayerPawn(uintptr_t obj);
 uintptr_t FindPlayerPawn();
 bool      GetCameraPose(float* loc, float* fwd);
@@ -2698,15 +2703,15 @@ static void CheckHeadHotkeys()
     static bool p11 = false;
     const bool d11 = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
     if (d11 && !p11) {
-        // Extended well past the plausible range in both directions. The complaint is about
-        // DEPTH, and a sweep that only spans sensible values cannot show what wrong looks
-        // like - which is what makes "is this right?" answerable rather than a matter of taste.
-        static const float kScales[] = { 25.0f, 50.0f, 100.0f, 200.0f, 400.0f, 800.0f };
-        static int si = 2;   // index of 100.0f, the current default
-        si = (si + 1) % (int)(sizeof(kScales) / sizeof(kScales[0]));
-        g_worldScale = kScales[si];
-        Log("*** [eye] F11 -> world scale %.0f UU/m (half-IPD now %.2f UU)",
-            g_worldScale, g_halfIpdUU);
+        // Stereo STRENGTH, not world scale. 0 is mono, 1.0 is the true 6.3 cm separation at
+        // the measured 100 UU/m, and 1.5 is included so the hyperstereo failure is reachable -
+        // being able to see what wrong looks like is what makes "is this right?" answerable.
+        static const float kStrength[] = { 0.0f, 0.25f, 0.50f, 0.75f, 1.0f, 1.5f };
+        static int si = 2;   // 0.50, the default
+        si = (si + 1) % (int)(sizeof(kStrength) / sizeof(kStrength[0]));
+        g_stereoStrength = kStrength[si];
+        Log("*** [eye] F11 -> stereo strength %.0f%% (separation %.2f of %.2f UU, world scale fixed at %.0f)",
+            g_stereoStrength * 100.0f, g_halfIpdUU * g_stereoStrength, g_halfIpdUU, g_worldScale);
     }
     p11 = d11;
     p9 = d9; p5 = d5; p4 = d4;
@@ -2976,13 +2981,17 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
         // normalising it gives world-space right. Read from the UNMODIFIED incoming data in
         // this same call, so it cannot be stale and cannot disagree with the matrix it is
         // about to modify - which recomputing it from the pawn's rotation could.
-        if (g_stereoMode == 1 && g_eyeInject != 0 && g_halfIpdUU > 0.0f) {
+        // g_stereoStrength scales the separation only. World scale stays at the MEASURED
+        // 100 UU/m, which is geometry and not a matter of taste - see ENGINE_NOTES for the
+        // derivation from the game's own movement speeds. Conflating the two is what made this
+        // confusing: one is a fact about the game, the other is a preference about comfort.
+        if (g_stereoMode == 1 && g_eyeInject != 0 && g_halfIpdUU > 0.0f && g_stereoStrength > 0.0f) {
             const float rx = g_vmRow ? m[0] : m[0];
             const float ry = g_vmRow ? m[4] : m[1];
             const float rz = g_vmRow ? m[8] : m[2];
             const float rl = sqrtf(rx*rx + ry*ry + rz*rz);
             if (rl > 1e-6f) {
-                const float s = g_eyeInject * g_halfIpdUU / rl;
+                const float s = g_eyeInject * g_halfIpdUU * g_stereoStrength / rl;
                 ox += rx * s; oy += ry * s; oz += rz * s;
             }
         }
