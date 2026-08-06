@@ -728,6 +728,7 @@ float                    g_camCache[3] = { 0, 0, 0 };
 bool                     g_camCacheValid = false;
 volatile LONG            g_vmAccepted = 0;
 volatile LONG            g_vmRejected = 0;
+bool                     g_vmValidate = true;   // F12 turns the per-upload filter off
 static XrView            g_views[2]{};
 static bool              g_viewsValid = false;
 
@@ -2354,6 +2355,7 @@ extern float g_vmBestScore;
 extern volatile LONG g_vmScanArmed;
 extern volatile LONG g_vmWindowsTested;
 extern volatile LONG g_vmPoseFailures;
+extern bool  g_vmValidate;
 extern int   g_vmReg;
 extern bool  g_vmRow;
 extern int   g_vmMode;
@@ -2662,6 +2664,18 @@ static void CheckHeadHotkeys()
             g_targetHalfFovX * 114.5916f, g_targetHalfFovY * 114.5916f);
     }
     p8 = d8;
+
+    // F12 restores the pre-fix injection: no per-upload validation, so every matrix arriving at
+    // the register is offset, foreign ones included. Provided so the two behaviours can be
+    // compared in one session rather than across two builds.
+    static bool p12 = false;
+    const bool d12 = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
+    if (d12 && !p12) {
+        g_vmValidate = !g_vmValidate;
+        Log("*** [vm] F12 -> per-upload validation %s%s", g_vmValidate ? "ON" : "OFF",
+            g_vmValidate ? "" : "  (pre-fix behaviour: foreign matrices are offset too)");
+    }
+    p12 = d12;
     p3 = d3;
 
     // F1 toggles stereo. The mono quad path stays available on purpose: it is the known-good
@@ -2684,8 +2698,11 @@ static void CheckHeadHotkeys()
     static bool p11 = false;
     const bool d11 = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
     if (d11 && !p11) {
-        static const float kScales[] = { 25.0f, 35.0f, 50.0f, 70.0f, 100.0f, 140.0f };
-        static int si = 4;   // index of 100.0f, the chosen default, so the sweep starts there
+        // Extended well past the plausible range in both directions. The complaint is about
+        // DEPTH, and a sweep that only spans sensible values cannot show what wrong looks
+        // like - which is what makes "is this right?" answerable rather than a matter of taste.
+        static const float kScales[] = { 25.0f, 50.0f, 100.0f, 200.0f, 400.0f, 800.0f };
+        static int si = 2;   // index of 100.0f, the current default
         si = (si + 1) % (int)(sizeof(kScales) / sizeof(kScales[0]));
         g_worldScale = kScales[si];
         Log("*** [eye] F11 -> world scale %.0f UU/m (half-IPD now %.2f UU)",
@@ -2896,7 +2913,11 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                           + g_camCache[1] * (g_vmRow ? q[7]  : q[13])
                           + g_camCache[2] * (g_vmRow ? q[11] : q[14])
                           + (g_vmRow ? q[15] : q[15]);
-            if (!g_camCacheValid || fabsf(w) > 25.0f) {
+            // g_vmValidate off reproduces the pre-fix behaviour exactly: inject into EVERY
+            // upload at this register, foreign matrices included. Kept as a toggle rather than
+            // reverted, so the two states can be compared in one run instead of across two
+            // builds - and so the fix is not lost to answer a question about it.
+            if (g_vmValidate && (!g_camCacheValid || fabsf(w) > 25.0f)) {
                 InterlockedIncrement(&g_vmRejected);
                 return g_origSetVSConstF(dev, startReg, data, count);
             }
@@ -3247,7 +3268,10 @@ static void DrawOverlay(IDirect3DDevice9* dev)
 {
     if (!g_overlay || !dev) return;
 
-    char lines[8][64];
+    // Sized with headroom and bounds-checked below. The rows are edited per test by design,
+    // and this array had silently grown to nine entries in an eight-row buffer - /analyze
+    // caught it, but the next row added would have been a stack overwrite in a Present hook.
+    char lines[16][64];
     int nl = 0;
 
     // ---- rows for the CURRENT test. Delete freely; see the note at the top. ----
@@ -3267,6 +3291,8 @@ static void DrawOverlay(IDirect3DDevice9* dev)
                 (int)g_vmOffset[0], (int)g_vmOffset[1], (int)g_vmOffset[2]);
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "STEREO %s EYE %d IPD %d/10",
                 g_stereoMode ? "ON" : "OFF", g_renderedEye, (int)(g_halfIpdUU * 20.0f));
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "VALIDATE %s  HALFIPD %d/100",
+                g_vmValidate ? "ON" : "OFF", (int)(g_halfIpdUU * 100.0f));
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "ANIM P%+d Y%+d R%+d ST%d",
                 (int)g_animNow[0], (int)g_animNow[1], (int)g_animNow[2], g_animState);
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "SCALE %d UU/M  FOV %d X %d",
@@ -3276,6 +3302,7 @@ static void DrawOverlay(IDirect3DDevice9* dev)
     // render thread, which /analyze flagged as C6262. Safe because DrawOverlay is only ever
     // called from Hook_Present, on one thread. TextRects stops at the cap rather than
     // overflowing, so a long line truncates instead of corrupting anything.
+    if (nl > 16) nl = 16;   // belt and braces: the rows are edited freely and this is a hook
     static D3DRECT rects[2048];
     int n = 0;
     const int px = 3;                                   // pixel scale
