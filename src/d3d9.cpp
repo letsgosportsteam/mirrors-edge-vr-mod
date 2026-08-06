@@ -92,6 +92,7 @@ enum {
     DEV_CreateCubeTexture      = 25,
     DEV_CreateVertexBuffer     = 26,
     DEV_CreateIndexBuffer      = 27,
+    DEV_SetRenderTarget        = 37,
     DEV_DrawPrimitive          = 81,
     DEV_DrawIndexedPrimitive  = 82,
     DEV_SetVertexShaderConstantF = 94,
@@ -724,6 +725,7 @@ extern float             g_eyeInject;
 extern bool              g_simulStereo;
 extern bool              g_sceneMatValid;
 extern bool              g_c0IsScene;
+extern bool              g_rtIsScene;
 extern float             g_sceneMat[16];
 extern volatile LONG     g_dupDraws;
 float                    g_halfIpdUU = 0.0f;     // filled from the located views
@@ -3143,6 +3145,73 @@ bool         g_sceneMatValid = false;
 bool         g_c0IsScene = false;
 volatile LONG g_dupDraws = 0;
 
+// ---- only duplicate draws aimed at a SCENE-SIZED render target ----
+//
+// From the reference's run 9, which diagnosed exactly this symptom:
+//
+//   "Splitting EVERY draw also split draws aimed at render targets that have nothing to do
+//    with the eyes: shadow maps above all. Rendering the shadow scene twice into two halves of
+//    a shadow map leaves it holding two squashed copies, each covering half its width. Objects
+//    then sample garbage shadow data, which reads exactly as distant surfaces going dark and
+//    recovering when the view changes and the cascade is rebuilt."
+//
+// The c0 gate added last round is necessary and not sufficient: a shadow pass can legitimately
+// use the scene matrix while rendering somewhere that is not the scene. The viewport we set is
+// also computed from the BACKBUFFER width, so aiming it at a differently-sized target is wrong
+// twice over.
+//
+// ⚠️ The reference's run 27 records that size equality alone is NOT enough - UE3 allocates
+// whole-scene dominant shadow maps at scene resolution, so a full-res offscreen target passes a
+// size test while being nothing of the kind. Keying on the surface pointer is the fix there.
+// This starts with size because it is cheap and catches the smaller maps; the census below
+// exists to show whether anything full-resolution is still slipping through.
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetRenderTarget)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
+static PFN_SetRenderTarget g_origSetRenderTarget = nullptr;
+bool  g_rtIsScene = true;
+
+struct RtSeen { IDirect3DSurface9* surf; UINT w, h; D3DFORMAT fmt; long draws; };
+static RtSeen g_rtSeen[16]{};
+static int    g_rtSeenCount = 0;
+static RtSeen* g_rtCurrent = nullptr;
+
+static HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWORD idx,
+                                                      IDirect3DSurface9* surf)
+{
+    if (idx == 0) {
+        g_rtIsScene = true;          // a null target restores the backbuffer
+        g_rtCurrent = nullptr;
+        if (surf) {
+            D3DSURFACE_DESC d{};
+            if (SUCCEEDED(surf->GetDesc(&d))) {
+                g_rtIsScene = (d.Width == g_capW && d.Height == g_capH);
+                // Census keyed on the SURFACE, not on its descriptor: several distinct targets
+                // can share a size and format, and merging them is what hid the problem in the
+                // reference for eighteen runs.
+                for (int i = 0; i < g_rtSeenCount; ++i)
+                    if (g_rtSeen[i].surf == surf) { g_rtCurrent = &g_rtSeen[i]; break; }
+                if (!g_rtCurrent && g_rtSeenCount < 16) {
+                    g_rtSeen[g_rtSeenCount] = { surf, d.Width, d.Height, d.Format, 0 };
+                    g_rtCurrent = &g_rtSeen[g_rtSeenCount++];
+                }
+            }
+        }
+    }
+    return g_origSetRenderTarget(dev, idx, surf);
+}
+
+static void ReportRenderTargets()
+{
+    Log("[rt] distinct render targets seen this window:");
+    for (int i = 0; i < g_rtSeenCount; ++i) {
+        Log("[rt]   %p  %4ux%-4u fmt %-3d  %8ld draws  %s",
+            (void*)g_rtSeen[i].surf, g_rtSeen[i].w, g_rtSeen[i].h, (int)g_rtSeen[i].fmt,
+            g_rtSeen[i].draws,
+            (g_rtSeen[i].w == g_capW && g_rtSeen[i].h == g_capH) ? "<- scene-sized, DUPLICATED"
+                                                                 : "");
+        g_rtSeen[i].draws = 0;
+    }
+}
+
 typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawPrim)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawIndexed)(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT,
                                                      UINT, UINT, UINT, UINT);
@@ -3217,7 +3286,8 @@ static HRESULT DuplicateDraw(IDirect3DDevice9* dev, FN issue)
 // the scene view, so a draw is only duplicated while it is.
 static bool ShouldDuplicate()
 {
-    return g_simulStereo && !g_inDupDraw && g_sceneMatValid && g_c0IsScene &&
+    if (g_rtCurrent) g_rtCurrent->draws++;
+    return g_simulStereo && !g_inDupDraw && g_sceneMatValid && g_c0IsScene && g_rtIsScene &&
            g_vmReg >= 0 && g_halfIpdUU > 0.0f && g_capW > 0;
 }
 
@@ -3481,14 +3551,21 @@ static void DrawOverlay(IDirect3DDevice9* dev)
         _snprintf_s(lines[nl++], 64, _TRUNCATE, "VM NOT SCANNED  F6");
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "OFFSET %d %d %d",
                 (int)g_vmOffset[0], (int)g_vmOffset[1], (int)g_vmOffset[2]);
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "STEREO %s EYE %d IPD %d/10",
-                g_stereoMode ? "ON" : "OFF", g_renderedEye, (int)(g_halfIpdUU * 20.0f));
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "VALIDATE %s  HALFIPD %d/100",
-                g_vmValidate ? "ON" : "OFF", (int)(g_halfIpdUU * 100.0f));
+    // ⚠️ This block showed SCALE 100 UU/M and no strength at all, because two edits to it were
+    // made with a string replace that silently did nothing when it failed to match. World
+    // scale is now a fixed measured constant, so that row could never change - reported as
+    // "stuck at 100 no matter how many times I press F11", which was the readout being wrong
+    // rather than the key. STRENGTH is what F11 moves and is what has to be on screen.
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "STEREO %s %s  STRENGTH %d PCT",
+                g_stereoMode ? "ON" : "OFF", g_simulStereo ? "SIMUL" : "ALT",
+                (int)(g_stereoStrength * 100.0f));
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "DUP %ld  RT %s",
+                InterlockedCompareExchange(&g_dupDraws, 0, 0), g_rtIsScene ? "SCENE" : "OTHER");
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "ANIM P%+d Y%+d R%+d ST%d",
                 (int)g_animNow[0], (int)g_animNow[1], (int)g_animNow[2], g_animState);
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "SCALE %d UU/M  FOV %d X %d",
-                (int)g_worldScale, (int)(g_gameHalfFovX * 114.59f), (int)(g_gameHalfFovY * 114.59f));
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "FOV %d X %d  IPD %d/100",
+                (int)(g_gameHalfFovX * 114.59f), (int)(g_gameHalfFovY * 114.59f),
+                (int)(g_halfIpdUU * g_stereoStrength * 100.0f));
 
     // Static, not on the stack: 2048 D3DRECTs is 32 KB and this runs every frame on the
     // render thread, which /analyze flagged as C6262. Safe because DrawOverlay is only ever
@@ -3722,7 +3799,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
 
     // Sampled every frame - the peaks are what matter and a landing lasts a few frames.
     ProbeCameraAnimation();
-    if ((f % 900) == 0) ReportCameraAnimation();
+    if ((f % 900) == 0) { ReportCameraAnimation(); if (g_simulStereo) ReportRenderTargets(); }
 
     // ---- the engine's FOV now matters ONLY for CPU culling ----
     //
@@ -3823,6 +3900,7 @@ static void PatchDeviceOnce(IDirect3DDevice9* dev)
     g_origCreateTex = (PFN_CreateTexture)PatchVTable(dev, DEV_CreateTexture,     (void*)&Hook_CreateTexture);
     g_origCreateVB  = (PFN_CreateVB)     PatchVTable(dev, DEV_CreateVertexBuffer,(void*)&Hook_CreateVB);
     g_origCreateIB  = (PFN_CreateIB)     PatchVTable(dev, DEV_CreateIndexBuffer, (void*)&Hook_CreateIB);
+    g_origSetRenderTarget = (PFN_SetRenderTarget) PatchVTable(dev, DEV_SetRenderTarget, (void*)&Hook_SetRenderTarget);
     g_origDrawPrim    = (PFN_DrawPrim)    PatchVTable(dev, DEV_DrawPrimitive, (void*)&Hook_DrawPrim);
     g_origDrawIndexed = (PFN_DrawIndexed) PatchVTable(dev, DEV_DrawIndexedPrimitive, (void*)&Hook_DrawIndexed);
     // Slot 94, extracted from d3d9.h and cross-checked against the reference's working hooks.
