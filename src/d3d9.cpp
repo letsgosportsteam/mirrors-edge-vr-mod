@@ -116,6 +116,7 @@ static XrInstance           g_xrInstance = XR_NULL_HANDLE;
 static XrSystemId           g_xrSystem   = XR_NULL_SYSTEM_ID;
 static XrSession            g_xrSession  = XR_NULL_HANDLE;
 static XrSpace              g_xrSpace    = XR_NULL_HANDLE;
+static XrSpace              g_viewSpace  = XR_NULL_HANDLE;   // head pose, located against LOCAL
 static XrSwapchain          g_swapchain  = XR_NULL_HANDLE;
 static ID3D11Texture2D**    g_scImages   = nullptr;
 static uint32_t             g_scImageCount = 0;
@@ -418,6 +419,16 @@ static bool InitXR()
         Log("[xr] xrCreateReferenceSpace failed"); return false;
     }
 
+    // A VIEW space located against LOCAL gives the head pose directly. Failing here disables
+    // head tracking and nothing else, so it is not treated as fatal.
+    XrReferenceSpaceCreateInfo vs{ XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+    vs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+    vs.poseInReferenceSpace.orientation.w = 1.0f;
+    if (XR_FAILED(xrCreateReferenceSpace(g_xrSession, &vs, &g_viewSpace))) {
+        g_viewSpace = XR_NULL_HANDLE;
+        Log("[xr] VIEW space failed - head tracking unavailable, rendering unaffected");
+    }
+
     Log("*** [xr] OpenXR session created. 32-bit OpenXR works in this process.");
     g_xrReady = true;
     return true;
@@ -655,6 +666,8 @@ static bool CaptureFrame(IDirect3DDevice9* dev)
     return true;
 }
 
+static void ApplyHeadTracking(XrTime when);   // defined with the rung 5b code
+
 // One XR frame: wait, begin, put the captured frame (or the test colour) on the quad, submit.
 static void SubmitTestQuad()
 {
@@ -740,6 +753,10 @@ static void SubmitTestQuad()
         layers[0] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad);
         layerCount = 1;
     }
+
+    // Head tracking uses the SAME predicted display time the frame is submitted for, so the
+    // pose the game renders from and the pose the compositor expects agree.
+    ApplyHeadTracking(fs.predictedDisplayTime);
 
     XrFrameEndInfo fei{ XR_TYPE_FRAME_END_INFO };
     fei.displayTime          = fs.predictedDisplayTime;
@@ -2078,6 +2095,166 @@ static void CheckSwanHotkey()
     wasDown = down;
 }
 
+// ================================================================ rung 5b: head tracking
+//
+// Writes the headset's orientation into TdPlayerController::Rotation (+0x00F4), which the
+// decompiled UpdateRotation uses as the base for every frame:
+//
+//     ViewRotation = Rotation;  ... input delta ...  SetRotation(ViewRotation);
+//
+// So a write there is read back rather than discarded. That is the OPPOSITE of what the
+// Singularity project found, where writes to the controller's rotation were overwritten each
+// frame by a native rotation source and a detour was needed. Worth stating plainly because it
+// is an inherited premise that does NOT transfer, and this rung is the test of it.
+//
+// ---- a DELTA is folded in, not an absolute pose ----
+//
+// Writing the head pose absolutely would fight mouse and stick input: the engine adds its own
+// delta to the same field, so an absolute write throws that away every frame. Adding only the
+// CHANGE in head orientation since the previous frame lets both compose - the reference
+// project reached the same design and describes it as "mouse and head tracking now add rather
+// than fight".
+//
+// ---- ⚠️ UE3 yaw does not wrap on int32 ----
+//
+// 65536 units is a full turn, so two headings 0.3 degrees apart differ by 65590 and a raw
+// subtraction reads as 360.3 degrees. The Singularity project lost months to exactly this,
+// with two sites carrying comments claiming the wrap was correct. Casting the difference to
+// int16 gives the shortest signed path for free, because 65536 IS 2^16.
+
+// g_viewSpace is declared up with the other XR handles, since InitXR creates it.
+static uintptr_t g_playerCtl = 0;
+static long      g_ctlNextTry = 0;
+static bool      g_ctlMissLogged = false;
+static bool      g_headTracking = true;
+static int       g_yawSign = 1, g_pitchSign = 1;
+static bool      g_headPrimed = false;
+static int32_t   g_lastHeadYaw = 0, g_lastHeadPitch = 0;
+static long      g_headWrites = 0;
+
+// The shortest signed path between two UE3 angles. Never subtract them raw.
+static inline int32_t YawDelta(int32_t a, int32_t b) { return (int16_t)((int32_t)(a - b)); }
+
+static bool LooksLikePlayerController(uintptr_t obj)
+{
+    if (!obj || g_offName < 0) return false;
+    uint32_t vt;
+    if (!SafeU32(obj, &vt) || !InModule(vt)) return false;
+    if (!ObjNameIs(obj, "TdPlayerController")) return false;
+    uint32_t cls;
+    if (!SafeU32(obj + 0x34, &cls) || cls < 0x10000) return false;
+    return ObjNameIs(cls, "TdPlayerController");   // the UClass's own Class is "Class"
+}
+
+static uintptr_t FindPlayerController()
+{
+    if (LooksLikePlayerController(g_playerCtl)) return g_playerCtl;
+    if (g_playerCtl) {
+        Log("[head] controller %p no longer valid, re-resolving", (void*)g_playerCtl);
+        g_playerCtl = 0;
+        g_headPrimed = false;
+        g_ctlNextTry = 0;
+    }
+    if (g_frames < g_ctlNextTry) return 0;
+    if (!g_gobjAddr || g_offName < 0) { g_ctlNextTry = g_frames + 600; return 0; }
+
+    uint32_t data, count;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) {
+        g_ctlNextTry = g_frames + 600; return 0;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t obj;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+        if (!LooksLikePlayerController(obj)) continue;
+        g_playerCtl = obj;
+        g_ctlMissLogged = false;
+        Log("[head] TdPlayerController instance at %p", (void*)obj);
+        return obj;
+    }
+    // Backoff, for the reason recorded at FindSwanNeck: an uncached full walk on the render
+    // thread costs hundreds of thousands of syscalls a frame.
+    g_ctlNextTry = g_frames + 600;
+    if (!g_ctlMissLogged) { g_ctlMissLogged = true; Log("[head] no live TdPlayerController yet"); }
+    return 0;
+}
+
+// Head orientation as UE3 rotator units. Yaw and pitch are taken from the forward vector
+// rather than an Euler decomposition, which avoids the ambiguity near vertical.
+static bool GetHeadYawPitch(XrTime when, int32_t* outYaw, int32_t* outPitch)
+{
+    if (g_viewSpace == XR_NULL_HANDLE || g_xrSpace == XR_NULL_HANDLE) return false;
+    XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
+    if (XR_FAILED(xrLocateSpace(g_viewSpace, g_xrSpace, when, &loc))) return false;
+    if (!(loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) return false;
+
+    const XrQuaternionf q = loc.pose.orientation;
+    // OpenXR is right-handed, Y up, -Z forward.
+    const float fx = -2.0f * (q.x * q.z + q.w * q.y);
+    const float fy =  2.0f * (q.y * q.z - q.w * q.x);
+    const float fz = -(1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+
+    const float yawRad   = atan2f(-fx, -fz);
+    const float len      = sqrtf(fx * fx + fz * fz);
+    const float pitchRad = atan2f(fy, len);
+
+    const float kToUE = 32768.0f / 3.14159265f;    // pi radians == 32768 UE3 units
+    *outYaw   = (int32_t)(yawRad   * kToUE);
+    *outPitch = (int32_t)(pitchRad * kToUE);
+    return true;
+}
+
+static void ApplyHeadTracking(XrTime when)
+{
+    if (!g_headTracking || g_offActorRotation < 0) return;
+    const uintptr_t ctl = FindPlayerController();
+    if (!ctl) return;
+
+    int32_t hy, hp;
+    if (!GetHeadYawPitch(when, &hy, &hp)) return;
+
+    if (!g_headPrimed) {           // first sample defines the reference, no jump on connect
+        g_lastHeadYaw = hy; g_lastHeadPitch = hp; g_headPrimed = true;
+        Log("[head] primed at yaw %d pitch %d", hy, hp);
+        return;
+    }
+
+    const int32_t dYaw   = YawDelta(hy, g_lastHeadYaw)   * g_yawSign;
+    const int32_t dPitch = YawDelta(hp, g_lastHeadPitch) * g_pitchSign;
+    g_lastHeadYaw = hy; g_lastHeadPitch = hp;
+    if (dYaw == 0 && dPitch == 0) return;
+
+    // FRotator is {Pitch, Yaw, Roll} as int32. Roll is deliberately untouched: the decompiled
+    // UpdateRotation sets ViewRotation.Roll = 0 before writing back, so head roll cannot
+    // travel this path at all and needs the view matrix instead.
+    int32_t rot[3];
+    if (!SafeRead(ctl + g_offActorRotation, rot, sizeof(rot))) return;
+    rot[0] += dPitch;
+    rot[1] += dYaw;
+    SIZE_T wrote = 0;
+    WriteProcessMemory(GetCurrentProcess(), (LPVOID)(ctl + g_offActorRotation), rot,
+                       sizeof(int32_t) * 2, &wrote);
+
+    if (++g_headWrites == 1 || (g_headWrites % 600) == 0)
+        Log("[head] write #%ld  dYaw %+d dPitch %+d -> pitch %d yaw %d",
+            g_headWrites, dYaw, dPitch, rot[0], rot[1]);
+}
+
+static void CheckHeadHotkeys()
+{
+    static bool p9 = false, p5 = false, p4 = false;
+    const bool d9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    const bool d5 = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
+    const bool d4 = (GetAsyncKeyState(VK_F4) & 0x8000) != 0;
+    if (d9 && !p9) {
+        g_headTracking = !g_headTracking;
+        g_headPrimed = false;      // re-prime so re-enabling does not apply a stale delta
+        Log("[head] F9 -> head tracking %s", g_headTracking ? "ON" : "OFF");
+    }
+    if (d5 && !p5) { g_yawSign   = -g_yawSign;   Log("[head] F5 -> yaw sign %+d", g_yawSign); }
+    if (d4 && !p4) { g_pitchSign = -g_pitchSign; Log("[head] F4 -> pitch sign %+d", g_pitchSign); }
+    p9 = d9; p5 = d5; p4 = d4;
+}
+
 // ================================================================ hold PAUSE to quit
 //
 // Ported from the Singularity mod, where it earned its place. Inside a headset you cannot
@@ -2247,7 +2424,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
 
     // Cheap once the object model is up: re-resolves only when the cached pointer stops
     // looking like a TdSwanNeck, which is on level transitions.
-    if (g_offName >= 0) { CheckSwanHotkey(); ApplySwanNeck(); }
+    if (g_offName >= 0) { CheckSwanHotkey(); ApplySwanNeck(); CheckHeadHotkeys(); }
 
     // After the XR work, so a quit still gets posted on a frame where XR failed or stalled.
     CheckQuitHotkey();
