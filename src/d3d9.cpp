@@ -2122,6 +2122,10 @@ extern float g_vmBestScore;
 extern volatile LONG g_vmScanArmed;
 extern volatile LONG g_vmWindowsTested;
 extern volatile LONG g_vmPoseFailures;
+extern int   g_vmReg;
+extern bool  g_vmRow;
+extern int   g_vmMode;
+extern float g_vmOffset[3];
 bool      LooksLikePlayerPawn(uintptr_t obj);
 uintptr_t FindPlayerPawn();
 
@@ -2304,6 +2308,31 @@ static void CheckVMHotkey()
     }
     p6 = d6;
 
+    // F2 cycles the injection. A 300 UU offset is far larger than any per-eye separation will
+    // ever be, on purpose: the point of this rung is an unmistakable yes or no, and a subtle
+    // change would repeat the mistake the swan-neck test made twice.
+    static bool p2 = false;
+    const bool d2 = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
+    if (d2 && !p2) {
+        if (g_vmReg < 0) {
+            Log("[vm] F2 ignored - no matrix committed yet, press F6 to scan first");
+        } else {
+            // UE3 world axes: X forward, Y right, Z up. Kept local rather than shared with the
+            // injection block, which sits further down the file - one small table duplicated
+            // beats another pair of extern declarations threaded through it.
+            static const float kOffsets[4][3] = {
+                { 0, 0, 0 }, { 300, 0, 0 }, { 0, 300, 0 }, { 0, 0, 300 }
+            };
+            g_vmMode = (g_vmMode + 1) % 4;
+            g_vmOffset[0] = kOffsets[g_vmMode][0];
+            g_vmOffset[1] = kOffsets[g_vmMode][1];
+            g_vmOffset[2] = kOffsets[g_vmMode][2];
+            static const char* kNames[4] = { "OFF", "forward 300", "right 300", "up 300" };
+            Log("*** [vm] F2 -> injection %s", kNames[g_vmMode]);
+        }
+    }
+    p2 = d2;
+
     if (armCountdown > 0 && --armCountdown == 0) {
         InterlockedExchange(&g_vmScanArmed, 0);
         // These three numbers separate failures that previously all read the same. Zero
@@ -2322,10 +2351,16 @@ static void CheckVMHotkey()
         else if (g_vmCandidates == 0)
             Log("[vm] windows were tested but none matched - the matrix may not be uploaded as"
                 " vertex shader constants, or the probes/tolerances are wrong");
-        else
+        else {
             Log("*** [vm] BEST: c%d %s in %s space  (score %.4f, %d candidates seen)",
                 g_vmBestReg, g_vmBestRow ? "ROW" : "COL",
                 g_vmBestWorld ? "WORLD" : "TRANSLATED-WORLD", g_vmBestScore, g_vmCandidates);
+            // Committed only on a successful scan, so injection can never run against a
+            // register nothing validated.
+            g_vmReg = g_vmBestReg;
+            g_vmRow = g_vmBestRow;
+            Log("[vm] committed. F2 cycles the injection: off / forward / right / up (300 UU)");
+        }
         Log("");
     }
 }
@@ -2499,9 +2534,54 @@ static void TestWindow(int reg, const float* m, bool asRow,
     }
 }
 
+// ---------------------------------------------------------------- rung 6b: injection
+//
+// Once the matrix is located, moving the camera is a pre-multiplied translation applied on the
+// way to the GPU:
+//
+//     M' = T(-o) . M      row-vector form, so   row3 -= o.x*row0 + o.y*row1 + o.z*row2
+//
+// Exact for any offset including forward, and it needs no knowledge of the projection. It also
+// holds in either space - world or translated-world - because a translation moves the origin,
+// not the axes. The space only ever mattered for finding the matrix.
+//
+// The game's buffer is const and belongs to the engine, so the covering call is copied,
+// modified and forwarded. Only calls that actually cover the matrix pay that cost.
+
+int   g_vmReg = -1;              // committed after a successful scan
+bool  g_vmRow = true;
+int   g_vmMode = 0;              // 0 off, 1..3 fixed test offsets, 4 = 6-DOF from the headset
+float g_vmOffset[3] = { 0, 0, 0 };
+static long g_vmInjections = 0;
+
+
 static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
                                                   const float* data, UINT count)
 {
+    // ---- injection, before the scan block so a scan does not see our own modification ----
+    if (g_vmMode != 0 && g_vmReg >= 0 && data && count >= 4 &&
+        startReg <= (UINT)g_vmReg && startReg + count >= (UINT)g_vmReg + 4 &&
+        count <= 256) {
+        float buf[256 * 4];
+        memcpy(buf, data, sizeof(float) * 4 * count);
+        float* m = buf + (size_t)((UINT)g_vmReg - startReg) * 4;
+
+        const float ox = g_vmOffset[0], oy = g_vmOffset[1], oz = g_vmOffset[2];
+        if (g_vmRow) {
+            // Rows are m[0..3], m[4..7], m[8..11], m[12..15].
+            for (int c = 0; c < 4; ++c)
+                m[12 + c] -= ox * m[0 + c] + oy * m[4 + c] + oz * m[8 + c];
+        } else {
+            // Columns: element (r,c) is m[c*4 + r]; the translation lives in column 3.
+            for (int r = 0; r < 4; ++r)
+                m[3 * 4 + r] -= ox * m[0 * 4 + r] + oy * m[1 * 4 + r] + oz * m[2 * 4 + r];
+        }
+        if (++g_vmInjections == 1 || (g_vmInjections % 20000) == 0)
+            Log("[vm] injection #%ld  offset (%.0f, %.0f, %.0f) into c%d %s",
+                g_vmInjections, ox, oy, oz, g_vmReg, g_vmRow ? "ROW" : "COL");
+        return g_origSetVSConstF(dev, startReg, buf, count);
+    }
+
     // Hot path: thousands of calls a frame. Do nothing at all unless a scan is armed.
     if (InterlockedCompareExchange(&g_vmScanArmed, 0, 0) && count >= 4 && data) {
         float camLoc[3], fwd[3];
