@@ -715,6 +715,11 @@ float                    g_gameHalfFovX = 0.0f;  // read out of the view matrix,
 float                    g_gameHalfFovY = 0.0f;
 bool                     g_gameFovValid = false;
 static float             g_lastLoggedFovX = -1.0f;
+float                    g_targetHalfFovX = 0.0f;   // forced frustum, radians
+float                    g_targetHalfFovY = 0.0f;
+bool                     g_fovForce = true;         // F8 toggles
+static bool              g_fovLogged = false;
+static long              g_fovWrites = 0;
 static XrView            g_views[2]{};
 static bool              g_viewsValid = false;
 
@@ -865,6 +870,34 @@ static void SubmitTestQuad()
             const float dy = g_views[1].pose.position.y - g_views[0].pose.position.y;
             const float dz = g_views[1].pose.position.z - g_views[0].pose.position.z;
             g_halfIpdUU = 0.5f * sqrtf(dx*dx + dy*dy + dz*dz) * g_worldScale;
+
+            // ---- the target frustum: match the headset's VERTICAL, derive the horizontal ----
+            //
+            // Vertical, not horizontal, and the reference is explicit about why: the game
+            // renders 16:9 while a per-eye view is nearly square, so equal VERTICAL leaves the
+            // horizontal comfortably wider than needed - both axes covered, surplus falling
+            // outside the eye. Matching horizontally instead leaves top and bottom short, which
+            // is the visible half of the aspect mismatch and exactly the letterboxing seen now.
+            float up = 0.0f, dn = 0.0f;
+            for (int e = 0; e < 2; ++e) {
+                if (g_views[e].fov.angleUp   >  up) up = g_views[e].fov.angleUp;
+                if (-g_views[e].fov.angleDown > dn) dn = -g_views[e].fov.angleDown;
+            }
+            const float halfY = (up > dn) ? up : dn;
+            if (halfY > 0.1f && g_capH > 0) {
+                g_targetHalfFovY = halfY;
+                // Square pixels: the horizontal follows from the backbuffer's own aspect, so
+                // nothing is stretched. The game renders wider than the eye can see and the
+                // surplus is simply discarded, which is the intended trade.
+                const float aspect = (float)g_capW / (float)g_capH;
+                g_targetHalfFovX = atanf(tanf(halfY) * aspect);
+                if (!g_fovLogged) {
+                    g_fovLogged = true;
+                    Log("[fov] headset wants %.1f deg vertical; targeting %.1f x %.1f at %.2f aspect",
+                        halfY * 114.5916f, g_targetHalfFovX * 114.5916f,
+                        g_targetHalfFovY * 114.5916f, aspect);
+                }
+            }
         }
 
         if (g_viewsValid && EnsureEyeSwapchains(g_capW, g_capH)) {
@@ -879,7 +912,18 @@ static void SubmitTestQuad()
                     // correct rectangle inside black is the honest result. Widening the game's
                     // own FOV to cover the eye is the next step, and FOVAngle is already
                     // located at TdPlayerController +0x030C for it.
-                    if (g_gameFovValid) {
+                    // ⚠️ When forcing, submit the FORCED constant - never the observed value.
+                    //
+                    // The reference project followed the observation and that WAS the flicker:
+                    // a submitted frustum that tracks the engine inherits every wobble the
+                    // engine's own interpolation produces. Forced and submitted from one
+                    // number, the two agree by construction and there is nothing left to drift.
+                    if (g_fovForce && g_targetHalfFovX > 0.0f) {
+                        projViews[e].fov.angleLeft  = -g_targetHalfFovX;
+                        projViews[e].fov.angleRight =  g_targetHalfFovX;
+                        projViews[e].fov.angleUp    =  g_targetHalfFovY;
+                        projViews[e].fov.angleDown  = -g_targetHalfFovY;
+                    } else if (g_gameFovValid) {
                         projViews[e].fov.angleLeft  = -g_gameHalfFovX;
                         projViews[e].fov.angleRight =  g_gameHalfFovX;
                         projViews[e].fov.angleUp    =  g_gameHalfFovY;
@@ -2586,6 +2630,14 @@ static void CheckHeadHotkeys()
     static bool p3 = false;
     const bool d3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
     if (d3 && !p3) { g_overlay = !g_overlay; Log("[hud] F3 -> overlay %s", g_overlay ? "ON" : "OFF"); }
+    static bool p8 = false;
+    const bool d8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    if (d8 && !p8) {
+        g_fovForce = !g_fovForce;
+        Log("*** [fov] F8 -> forcing %s (%.1f x %.1f target)", g_fovForce ? "ON" : "OFF",
+            g_targetHalfFovX * 114.5916f, g_targetHalfFovY * 114.5916f);
+    }
+    p8 = d8;
     p3 = d3;
 
     // F1 toggles stereo. The mono quad path stays available on purpose: it is the known-good
@@ -2842,6 +2894,10 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
         }
 
         float ox = g_vmOffset[0], oy = g_vmOffset[1], oz = g_vmOffset[2];
+        // Kept for the FOV forcing below, which needs the ORIGINAL scales to compute its
+        // factors and must not read them back after the translation has been applied.
+        const float oldTanX = (g_gameFovValid && g_gameHalfFovX > 0.0f) ? tanf(g_gameHalfFovX) : 0.0f;
+        const float oldTanY = (g_gameFovValid && g_gameHalfFovY > 0.0f) ? tanf(g_gameHalfFovY) : 0.0f;
 
         // ---- per-eye parallax, along the matrix's OWN right axis ----
         //
@@ -2868,6 +2924,33 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
             for (int r = 0; r < 4; ++r)
                 m[3 * 4 + r] -= ox * m[0 * 4 + r] + oy * m[1 * 4 + r] + oz * m[2 * 4 + r];
         }
+        // ---- force the projection IN THE MATRIX ----
+        //
+        // Rescaling the x and y columns is exactly a clip-space x/y scale, which is exactly an
+        // FOV change, and it composes correctly AFTER the positional offset - which is why it
+        // runs here rather than before.
+        //
+        // ⚠️ Why not simply ask the engine. The reference project measured that UE3 ACCEPTS a
+        // wide FOV and will not HOLD it: the camera update interpolates back toward its default
+        // every tick, producing a 128 -> 80 degree swing that reads as a zoom on the monitor and
+        // flickering black bars in the headset. The engine gets the last word before rendering,
+        // so asking politely cannot win. Setting it here, on every upload, is the one place
+        // nothing can argue.
+        //
+        // tan(halfFov) = |col3| / |col_n|, so scaling column n by tan(old)/tan(new) sets the new
+        // field exactly. All FOUR elements of the column scale, including the translation term
+        // the offset just wrote - the scale applies to the whole clip-x mapping, not part of it.
+        if (g_fovForce && oldTanX > 1e-6f && oldTanY > 1e-6f &&
+            g_targetHalfFovX > 0.0f && g_targetHalfFovY > 0.0f) {
+            const float sx = oldTanX / tanf(g_targetHalfFovX);
+            const float sy = oldTanY / tanf(g_targetHalfFovY);
+            if (g_vmRow) {
+                for (int r = 0; r < 4; ++r) { m[r * 4 + 0] *= sx; m[r * 4 + 1] *= sy; }
+            } else {
+                for (int i = 0; i < 4; ++i) { m[0 * 4 + i] *= sx; m[1 * 4 + i] *= sy; }
+            }
+        }
+
         if (++g_vmInjections == 1 || (g_vmInjections % 20000) == 0)
             Log("[vm] injection #%ld  offset (%.0f, %.0f, %.0f) into c%d %s",
                 g_vmInjections, ox, oy, oz, g_vmReg, g_vmRow ? "ROW" : "COL");
@@ -3263,6 +3346,33 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     // Cheap once the object model is up: re-resolves only when the cached pointer stops
     // looking like a TdSwanNeck, which is on level transitions.
     if (g_offName >= 0) { CheckSwanHotkey(); ApplySwanNeck(); CheckHeadHotkeys(); CheckVMHotkey(); }
+
+    // ---- the engine's FOV now matters ONLY for CPU culling ----
+    //
+    // The projection is forced in the matrix, so what the engine believes its FOV to be no
+    // longer decides what is drawn - but it still decides what is SUBMITTED. Geometry culled
+    // against a 84 degree frustum simply is not there to be seen in a 126 degree one, and
+    // widening the matrix cannot conjure draw calls that were never issued.
+    //
+    // So the engine is asked for ~15% more than we render with. Being roughly right is enough
+    // for culling, and its interpolation drift becomes harmless as long as it stays above what
+    // we draw. Written every frame because the camera update pulls it back toward the default
+    // each tick.
+    if (g_fovForce && g_offFOVAngle >= 0 && g_targetHalfFovX > 0.0f) {
+        const uintptr_t ctl = FindPlayerController();
+        if (ctl) {
+            const float want = g_targetHalfFovX * 2.0f * 57.29578f * 1.15f;
+            float cur = 0.0f;
+            if (SafeRead(ctl + g_offFOVAngle, &cur, sizeof(float)) && fabsf(cur - want) > 0.5f) {
+                SIZE_T wrote = 0;
+                WriteProcessMemory(GetCurrentProcess(), (LPVOID)(ctl + g_offFOVAngle),
+                                   &want, sizeof(float), &wrote);
+                if (++g_fovWrites == 1 || (g_fovWrites % 600) == 0)
+                    Log("[fov] culling FOV write #%ld: engine had %.1f, asked for %.1f "
+                        "(rendering %.1f)", g_fovWrites, cur, want, g_targetHalfFovX * 114.5916f);
+            }
+        }
+    }
 
     // After the XR work, so a quit still gets posted on a frame where XR failed or stalled.
     CheckQuitHotkey();
