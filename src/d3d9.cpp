@@ -740,6 +740,9 @@ float                    g_halfIpdUU = 0.0f;     // filled from the located view
 float                    g_gameHalfFovX = 0.0f;  // read out of the view matrix, radians
 float                    g_gameHalfFovY = 0.0f;
 bool                     g_gameFovValid = false;
+float                    g_headRoll = 0.0f;      // radians, sampled once per frame
+bool                     g_rollEnabled = true;   // HOME toggles
+int                      g_rollSign = 1;         // END flips
 static float             g_lastLoggedFovX = -1.0f;
 float                    g_targetHalfFovX = 0.0f;   // forced frustum, radians
 float                    g_targetHalfFovY = 0.0f;
@@ -2517,8 +2520,55 @@ static bool GetHeadYawPitch(XrTime when, int32_t* outYaw, int32_t* outPitch)
     return true;
 }
 
+// Head roll in radians: the signed angle, about the view's forward axis, between the headset's
+// own up vector and a level reference.
+//
+// Taken from vectors rather than an Euler decomposition, because an Euler order has to be
+// assumed and the wrong one silently mixes roll with yaw near vertical. This assumes nothing:
+// project world-up perpendicular to where the head is looking, and measure the angle to the
+// head's actual up.
+//
+// Degenerate when looking straight up or down, where "level" has no meaning - detected by the
+// projection collapsing, and the previous value is held rather than snapping to zero.
+static bool GetHeadRoll(XrTime when, float* outRoll)
+{
+    if (g_viewSpace == XR_NULL_HANDLE || g_xrSpace == XR_NULL_HANDLE) return false;
+    XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
+    if (XR_FAILED(xrLocateSpace(g_viewSpace, g_xrSpace, when, &loc))) return false;
+    if (!(loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) return false;
+
+    const XrQuaternionf q = loc.pose.orientation;
+    // Rotate the basis vectors by the quaternion. OpenXR: Y up, -Z forward.
+    const float fx = -2.0f * (q.x * q.z + q.w * q.y);
+    const float fy =  2.0f * (q.y * q.z - q.w * q.x);
+    const float fz = -(1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+    const float ux =  2.0f * (q.x * q.y - q.w * q.z);
+    const float uy =  1.0f - 2.0f * (q.x * q.x + q.z * q.z);
+    const float uz =  2.0f * (q.y * q.z + q.w * q.x);
+
+    // World up with the forward component removed: the "level up" for this facing.
+    const float d = fy;                       // dot(worldUp, forward), worldUp = (0,1,0)
+    float lx = -d * fx, ly = 1.0f - d * fy, lz = -d * fz;
+    const float ll = sqrtf(lx*lx + ly*ly + lz*lz);
+    if (ll < 0.05f) return false;             // looking near-vertical: level is undefined
+    lx /= ll; ly /= ll; lz /= ll;
+
+    // Signed angle from level-up to head-up, measured about forward.
+    const float cosA = lx*ux + ly*uy + lz*uz;
+    const float sinA = (ly*uz - lz*uy) * fx + (lz*ux - lx*uz) * fy + (lx*uy - ly*ux) * fz;
+    *outRoll = atan2f(sinA, cosA);
+    return true;
+}
+
 static void ApplyHeadTracking(XrTime when)
 {
+    // Sampled here rather than in the D3D hook: the hook runs thousands of times a frame and
+    // an xrLocateSpace per call would be absurd. One sample per frame, used by every upload.
+    {
+        float r = 0.0f;
+        if (GetHeadRoll(when, &r)) g_headRoll = r;
+    }
+
     if (!g_headTracking || g_offActorRotation < 0) return;
     const uintptr_t ctl = FindPlayerController();
     if (!ctl) return;
@@ -2778,6 +2828,22 @@ static void CheckHeadHotkeys()
     }
     pIns = dIns; pDel = dDel;
 
+    // HOME toggles head roll, END flips its sign. A sign toggle because the OpenXR-to-UE3
+    // handedness has already come out inverted for both yaw and pitch, and guessing a third
+    // time is worse than one keypress.
+    static bool pHome = false, pEnd = false;
+    const bool dHome = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
+    const bool dEnd  = (GetAsyncKeyState(VK_END)  & 0x8000) != 0;
+    if (dHome && !pHome) {
+        g_rollEnabled = !g_rollEnabled;
+        Log("*** [roll] HOME -> head roll %s", g_rollEnabled ? "ON" : "OFF");
+    }
+    if (dEnd && !pEnd) {
+        g_rollSign = -g_rollSign;
+        Log("*** [roll] END -> sign %+d", g_rollSign);
+    }
+    pHome = dHome; pEnd = dEnd;
+
     // F11 adjusts world scale. UE3 units per metre is game-specific and unmeasured here, and
     // it is the one number that decides whether the world feels life-sized.
     static bool p11 = false;
@@ -2964,6 +3030,8 @@ static void TestWindow(int reg, const float* m, bool asRow,
 // The game's buffer is const and belongs to the engine, so the covering call is copied,
 // modified and forwarded. Only calls that actually cover the matrix pay that cost.
 
+static void ApplyRoll(float* m, bool rowStorage);   // defined with the stereo code below
+
 int   g_vmReg = -1;              // committed after a successful scan
 bool  g_vmRow = true;
 int   g_vmMode = 0;              // 0 off, 1..3 fixed test offsets
@@ -3123,6 +3191,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                 for (int i = 0; i < 4; ++i) { m[0 * 4 + i] *= sx; m[1 * 4 + i] *= sy; }
             }
         }
+        ApplyRoll(m, g_vmRow);
 
         if (++g_vmInjections == 1 || (g_vmInjections % 20000) == 0)
             Log("[vm] injection #%ld  offset (%.1f, %.1f, %.1f) eye %+.0f  accepted %ld rejected %ld",
@@ -3346,6 +3415,55 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawIndexed)(IDirect3DDevice9*, D3DPRIMI
 static PFN_DrawPrim    g_origDrawPrim = nullptr;
 static PFN_DrawIndexed g_origDrawIndexed = nullptr;
 
+// ---- head ROLL, applied in clip space ----
+//
+// Roll is the one axis of the head pose that never reached the game: the controller write owns
+// pitch and yaw, and UpdateRotation zeroes ViewRotation.Roll before writing it back. Tilting
+// your head sideways left the horizon glued to the headset instead of staying level.
+//
+// ⚠️ AND IT CANNOT BE LEFT TO THE COMPOSITOR, which is the trap. The projection layer already
+// carries the head's full orientation, roll included, so it looks like the runtime should
+// rotate the image for us. It does not: a projection layer is reprojected by the DELTA between
+// the pose we claim and the pose the display is at. Claim a rolled pose for an unrolled render
+// while the head is at that same roll, the delta is zero, and the image presents straight.
+// Baking roll into the render is what makes the claimed pose true, and the two then agree.
+//
+// ⚠️ The frustum is NOT square - tanX and tanY differ, and under duplication tanX is the
+// half-width per-eye value. Rotating the raw clip columns would SHEAR. So convert to the
+// symmetric view-space direction, rotate there, and convert back:
+//
+//     x_v = clip.x * tanX,  y_v = clip.y * tanY      (aspect removed)
+//     rotate by theta
+//     clip.x' = x_v' / tanX,  clip.y' = y_v' / tanY
+//
+// which collapses to a mix of the two columns with the aspect ratio as the cross term.
+//
+// Applied AFTER the forced projection, so the tangents read here are the frustum the eye
+// actually sees rather than whatever the engine happened to send. It composes with the
+// positional offset in either order - an offset is a pre-multiplication in world space, a roll
+// is a post-multiplication in clip space, so they commute.
+static void ApplyRoll(float* m, bool rowStorage)
+{
+    if (!g_rollEnabled || fabsf(g_headRoll) < 1e-4f) return;
+    if (g_targetHalfFovX <= 0.0f || g_targetHalfFovY <= 0.0f) return;
+
+    const float tanX = tanf(g_targetHalfFovX), tanY = tanf(g_targetHalfFovY);
+    if (tanX < 1e-6f || tanY < 1e-6f) return;
+
+    const float th = g_headRoll * g_rollSign;
+    const float c = cosf(th), s = sinf(th);
+    const float k0 = (tanY / tanX) * s;     // how much of column 1 mixes into column 0
+    const float k1 = (tanX / tanY) * s;     // and column 0 into column 1
+
+    for (int i = 0; i < 4; ++i) {
+        const int i0 = rowStorage ? (i * 4 + 0) : (0 * 4 + i);
+        const int i1 = rowStorage ? (i * 4 + 1) : (1 * 4 + i);
+        const float a = m[i0], b = m[i1];
+        m[i0] = a * c - b * k0;
+        m[i1] = a * k1 + b * c;
+    }
+}
+
 // Build one eye's matrix from the cached scene matrix: offset along its own right axis, then
 // the FOV force. Same maths as the alternate-eye path, applied to a copy instead of in place.
 static void BuildEyeMatrix(float* out, int eye)
@@ -3373,6 +3491,7 @@ static void BuildEyeMatrix(float* out, int eye)
         const float sy = tanf(g_gameHalfFovY) / tanf(g_targetHalfFovY);
         for (int r = 0; r < 4; ++r) { m[r * 4 + 0] *= sx; m[r * 4 + 1] *= sy; }
     }
+    ApplyRoll(m, true);      // after the projection, so the tangents are the real frustum
 }
 
 // Issue one draw twice, once per eye, into its own half of the backbuffer.
@@ -3685,8 +3804,9 @@ static void DrawOverlay(IDirect3DDevice9* dev)
                 (int)(g_capSamples ? (g_capMsTotal / g_capSamples) : 0.0));
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "OBJ %s  PROP %s",
                 g_offName >= 0 ? "OK" : "NO", g_offPropOff >= 0 ? "OK" : "NO");
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "HEAD %s YAW %+d PITCH %+d",
-                g_headTracking ? "ON" : "OFF", g_yawSign, g_pitchSign);
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "HEAD %s Y%+d P%+d  ROLL %s %+d DEG",
+                g_headTracking ? "ON" : "OFF", g_yawSign, g_pitchSign,
+                g_rollEnabled ? "ON" : "OFF", (int)(g_headRoll * g_rollSign * 57.2958f));
     if (g_vmReg >= 0)
         _snprintf_s(lines[nl++], 64, _TRUNCATE, "VM C%d %s MODE %d",
                     g_vmReg, g_vmRow ? "ROW" : "COL", g_vmMode);
