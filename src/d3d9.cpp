@@ -2526,9 +2526,14 @@ static int       g_yawSign = -1, g_pitchSign = +1;
 // Pitch anchored to the head rather than accumulated. NUMPAD1 toggles, NUMPAD2 cycles how much
 // of the camera animation is kept. See the write site for why yaw is not treated the same way.
 bool             g_pitchAbsolute = true;
-// A plain on/off. The 50% middle setting is gone: it was the same motion at half size rather
-// than a third behaviour, and nothing about the choice needed a dial.
-bool             g_animFollow    = true;    // animations carry the view, as they do today
+// Per axis, because they are three different problems and turned out to need three different
+// answers. Pitch is the disorienting one and it goes through Controller.Rotation. Roll never
+// touches that field at all and has to be taken out of the matrix. Yaw has no switch on purpose:
+// an animation that turns the player - climbing round the side of a building - is carrying them
+// somewhere, and refusing to follow it would leave the body facing one way and the view another.
+// Both default to following, so the game behaves as it shipped until asked otherwise.
+bool             g_animFollow     = true;   // PITCH; NUMPAD2
+bool             g_animRollFollow = true;   // ROLL;  NUMPAD4
 extern float     g_animNow[3];              // camera animation contribution, degrees, P/Y/R
 static bool      g_headPrimed = false;
 static int32_t   g_lastHeadYaw = 0, g_lastHeadPitch = 0;
@@ -3130,15 +3135,21 @@ static void CheckHeadHotkeys()
             g_animFollow ? "CARRY" : "do NOT move",
             g_pitchAbsolute ? "" : "  (no effect while pitch is RELATIVE)");
     }
-    static bool pN3 = false;
+    static bool pN3 = false, pN4 = false;
     const bool dN3 = (GetAsyncKeyState(VK_NUMPAD3) & 0x8000) != 0;
+    const bool dN4 = (GetAsyncKeyState(VK_NUMPAD4) & 0x8000) != 0;
     if (dN3 && !pN3) {
         g_pitchFix = !g_pitchFix;
         Log("*** [head] NUMPAD3 -> matrix pitch correction %s", g_pitchFix
             ? "ON (the view's pitch is fixed in the matrix, no frame of lag)"
             : "OFF (pitch comes from the engine's Rotation alone, one frame behind)");
     }
-    pN1 = dN1; pN2 = dN2; pN3 = dN3;
+    if (dN4 && !pN4) {
+        g_animRollFollow = !g_animRollFollow;
+        Log("*** [head] NUMPAD4 -> camera animations %s the view",
+            g_animRollFollow ? "ROLL" : "do NOT roll");
+    }
+    pN1 = dN1; pN2 = dN2; pN3 = dN3; pN4 = dN4;
 
     if (d5 && !p5) { g_yawSign   = -g_yawSign;   Log("[head] F5 -> yaw sign %+d", g_yawSign); }
     if (d4 && !p4) { g_pitchSign = -g_pitchSign; Log("[head] F4 -> pitch sign %+d", g_pitchSign); }
@@ -3448,6 +3459,7 @@ static void TestWindow(int reg, const float* m, bool asRow,
 
 static void ApplyRoll(float* m, bool rowStorage);      // defined with the stereo code below
 static void ApplyPitchFix(float* m, bool rowStorage);  // likewise
+static void ApplyRollFix(float* m, bool rowStorage);   // likewise
 static void ApplySixDof(float* m, bool rowStorage);
 
 int   g_vmReg = -1;              // committed after a successful scan
@@ -3660,6 +3672,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
         // Same three, in the same order, as the duplication path's BuildEyeMatrix. Kept in step
         // deliberately: the two paths drifting apart is exactly how the FOV read ended up living
         // on only one of them, and that cost several runs to find.
+        ApplyRollFix(m, g_vmRow);
         ApplyPitchFix(m, g_vmRow);
         ApplySixDof(m, g_vmRow);
         ApplyRoll(m, g_vmRow);
@@ -4193,6 +4206,47 @@ static void ApplyPitchFix(float* m, bool rowStorage)
     ApplyCameraRotation(m, rowStorage, right, err, g_camCache);
 }
 
+// ---- lock the camera's own roll out of the view ----
+//
+// A separate mechanism from the pitch, and that is why locking the pitch left it behind. Roll
+// never travels through Controller.Rotation at all: the decompiled UpdateRotation sets
+// ViewRotation.Roll = 0 before writing back, so nothing written there can carry roll and nothing
+// written there can cancel it. The camera animation composes its roll further downstream, and
+// the first place it can be seen or touched is the matrix.
+//
+// Which makes it easy to measure exactly. The controller contributes no roll, so ANY roll in the
+// matrix is the animation's. A camera with no roll has a level right axis, so the z component of
+// the right axis is the whole signal - divided by cos(pitch), because a pitched camera's right
+// axis is level while its up axis is not, and the tilt has to be measured in the plane it
+// actually happens in.
+//
+// Cancelled by rotating about the camera's own forward axis, which leaves the forward direction
+// untouched - so this runs BEFORE the pitch correction and cannot disturb its measurement, while
+// the reverse order would have changed the cos(pitch) this depends on.
+static void ApplyRollFix(float* m, bool rowStorage)
+{
+    if (g_animRollFollow || !g_camCacheValid) return;
+
+    auto col = [&](int c, int i) { return rowStorage ? m[i * 4 + c] : m[c * 4 + i]; };
+
+    const float fx = col(3,0), fy = col(3,1), fz = col(3,2);
+    const float fl = sqrtf(fx*fx + fy*fy + fz*fz);
+    const float rx = col(0,0), ry = col(0,1), rz = col(0,2);
+    const float rl = sqrtf(rx*rx + ry*ry + rz*rz);
+    if (fl < 1e-6f || rl < 1e-6f) return;
+
+    const float sinP = fz / fl;
+    const float cosP = sqrtf(1.0f - sinP * sinP);
+    if (cosP < 0.05f) return;            // near vertical: roll and yaw are the same thing there
+
+    float s = (rz / rl) / cosP;
+    if (s >  1.0f) s =  1.0f;
+    if (s < -1.0f) s = -1.0f;
+
+    const float fwd[3] = { fx, fy, fz };
+    ApplyCameraRotation(m, rowStorage, fwd, asinf(s), g_camCache);
+}
+
 static void ApplyRoll(float* m, bool rowStorage)
 {
     if (!g_rollEnabled || fabsf(g_headRoll) < 1e-4f) return;
@@ -4230,9 +4284,11 @@ static void BuildEyeMatrix(float* out, int eye)
         for (int c = 0; c < 4; ++c)
             m[12 + c] -= ox * m[0 + c] + oy * m[4 + c] + oz * m[8 + c];
     }
-    // Both world-space pre-multiplications, so they belong together and ahead of the projection.
-    // The pitch fix goes first: it uses the matrix's own forward and right axes, and wants them
-    // as the engine left them rather than after an eye offset has moved the origin.
+    // All world-space pre-multiplications, so they belong together and ahead of the projection.
+    // Roll first: cancelling it turns about the forward axis, which leaves the forward direction
+    // alone, so the pitch measured next is unaffected. The other order would have moved the
+    // forward and changed the cos(pitch) the roll measurement divides by.
+    ApplyRollFix(m, true);
     ApplyPitchFix(m, true);
     ApplySixDof(m, true);   // a world-space offset, same stage as the per-eye one
     if (g_fovForce && g_gameFovValid && g_targetHalfFovX > 0.0f) {
