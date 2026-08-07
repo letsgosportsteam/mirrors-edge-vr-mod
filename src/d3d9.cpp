@@ -2516,9 +2516,21 @@ static bool GetHeadYawPitch(XrTime when, int32_t* outYaw, int32_t* outPitch)
     const float fy =  2.0f * (q.y * q.z - q.w * q.x);
     const float fz = -(1.0f - 2.0f * (q.x * q.x + q.y * q.y));
 
-    const float yawRad   = atan2f(-fx, -fz);
     const float len      = sqrtf(fx * fx + fz * fz);
     const float pitchRad = atan2f(fy, len);
+
+    // ⚠️ Near vertical the forward vector's horizontal part collapses and atan2 on it returns
+    // whatever the noise says - it can swing the full 360 between one frame and the next. Head
+    // tracking writes DELTAS, so a yaw that jumps 180 degrees is written as a 180 degree turn:
+    // the reported "look up or down far enough and the screen flips".
+    //
+    // Pitch is unaffected - it comes from fy, which is largest exactly where this fails - so the
+    // last good yaw is held while the view keeps pitching. Nothing is lost: at 87 degrees of
+    // pitch there is no meaningful facing to track anyway, and the held value is correct again
+    // the moment the head comes back down.
+    static float lastYaw = 0.0f;
+    if (len > 0.05f) lastYaw = atan2f(-fx, -fz);
+    const float yawRad = lastYaw;
 
     const float kToUE = 32768.0f / 3.14159265f;    // pi radians == 32768 UE3 units
     *outYaw   = (int32_t)(yawRad   * kToUE);
@@ -3600,19 +3612,41 @@ void UpdateSixDof(XrTime when)
 
     const float dx = p.x - g_centre[0], dy = p.y - g_centre[1], dz = p.z - g_centre[2];
 
-    // Into head-local coordinates: v' = conj(q) * v * q.
-    const XrQuaternionf q = loc.pose.orientation;
-    const float cx = -q.x, cy = -q.y, cz = -q.z, cw = q.w;
-    const float tx = 2.0f * (cy * dz - cz * dy);
-    const float ty = 2.0f * (cz * dx - cx * dz);
-    const float tz = 2.0f * (cx * dy - cy * dx);
-    const float lx = dx + cw * tx + (cy * tz - cz * ty);
-    const float ly = dy + cw * ty + (cz * tx - cx * tz);
-    const float lz = dz + cw * tz + (cx * ty - cy * tx);
+    // ---- decompose in a LEVEL, YAW-ONLY frame ----
+    //
+    // ⚠️ The first version rotated the delta by the conjugate of the full head orientation and
+    // applied the result on the camera's own right/up/forward. That is wrong twice, and both
+    // errors were visible:
+    //
+    //   ROLL. The head-local frame rolls with the head; the game camera does not - roll is an
+    //   image rotation applied later, so the matrix's axes stay level. Decomposing in a rolled
+    //   frame and recomposing on a level one rotates the whole offset by the roll angle, which
+    //   turns the small sideways motion of a head tilt into a vertical one. That is the reported
+    //   "roll right and the height goes up".
+    //
+    //   PITCH. Applying the vertical component along the CAMERA's up means crouching while
+    //   looking down moves the view down AND backwards. Standing up is vertical in the world no
+    //   matter where you are looking.
+    //
+    // So: strip head YAW only, keeping the horizontal plane horizontal, and let the apply site
+    // put the vertical component on the world's up axis. Yaw is the only part that has to be
+    // removed, because yaw is the only part the room and the game world disagree about.
+    static float hfx = 0.0f, hfz = -1.0f;      // head forward, levelled, room space
+    {
+        const XrQuaternionf q = loc.pose.orientation;
+        const float fx = -2.0f * (q.x * q.z + q.w * q.y);
+        const float fz = -(1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+        const float len = sqrtf(fx * fx + fz * fz);
+        // Looking straight up or down: the levelled forward collapses and its direction is
+        // meaningless. Hold the last good one rather than let it spin.
+        if (len > 0.05f) { hfx = fx / len; hfz = fz / len; }
+    }
+    // Right = forward x up, with OpenXR's up = (0,1,0). Levelled, so it carries no roll.
+    const float hrx = -hfz, hrz = hfx;
 
-    g_dofOffset[0] = lx * g_worldScale;    // right
-    g_dofOffset[1] = ly * g_worldScale;    // up
-    g_dofOffset[2] = lz * g_worldScale;    // OpenXR -Z is forward, handled at the apply site
+    g_dofOffset[0] = (dx * hrx + dz * hrz) * g_worldScale;   // right
+    g_dofOffset[1] =  dy                   * g_worldScale;   // up, true vertical
+    g_dofOffset[2] = (dx * hfx + dz * hfz) * g_worldScale;   // forward
 }
 
 // Offsets the matrix by the current 6-DOF translation, along the camera's OWN axes taken from
@@ -3624,21 +3658,21 @@ static void ApplySixDof(float* m, bool rowStorage)
     if (ax < 0.01f) return;
 
     auto col = [&](int c, int i) { return rowStorage ? m[i * 4 + c] : m[c * 4 + i]; };
-    auto norm3 = [](float& x, float& y, float& z) {
-        const float l = sqrtf(x*x + y*y + z*z);
-        if (l < 1e-6f) return false;
-        x /= l; y /= l; z /= l; return true;
-    };
 
-    float rx = col(0,0), ry = col(0,1), rz = col(0,2);       // right
-    float ux = col(1,0), uy = col(1,1), uz = col(1,2);       // up
-    float fx = col(3,0), fy = col(3,1), fz = col(3,2);       // forward
-    if (!norm3(rx,ry,rz) || !norm3(ux,uy,uz) || !norm3(fx,fy,fz)) return;
+    // Only the camera's RIGHT axis is read, and it is levelled before use. The camera's up and
+    // forward are deliberately not used: the up component belongs on the WORLD's up axis (UE3
+    // is Z-up, verified by the F2 injection test), and a levelled forward follows from right
+    // and up by a cross product. Reading fewer axes means fewer that can be pitched or rolled
+    // when they should not be.
+    float rx = col(0,0), ry = col(0,1);          // camera right, world space; z dropped = levelled
+    const float rl = sqrtf(rx*rx + ry*ry);
+    if (rl < 1e-6f) return;                      // looking straight along the world up axis
+    rx /= rl; ry /= rl;
 
-    // -Z is forward in OpenXR, so a head-local -z (moving forward) becomes +forward here.
-    const float ox = rx*g_dofOffset[0] + ux*g_dofOffset[1] - fx*g_dofOffset[2];
-    const float oy = ry*g_dofOffset[0] + uy*g_dofOffset[1] - fy*g_dofOffset[2];
-    const float oz = rz*g_dofOffset[0] + uz*g_dofOffset[1] - fz*g_dofOffset[2];
+    // forward = right x worldUp = (ry, -rx, 0)
+    const float ox = rx*g_dofOffset[0] + ry*g_dofOffset[2];
+    const float oy = ry*g_dofOffset[0] - rx*g_dofOffset[2];
+    const float oz =                          g_dofOffset[1];
 
     if (rowStorage) {
         for (int c = 0; c < 4; ++c)
