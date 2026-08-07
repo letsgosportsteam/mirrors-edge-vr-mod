@@ -697,7 +697,6 @@ static void ApplyHeadTracking(XrTime when);   // defined with the rung 5b code
 // the head turned and how far the rendered image turned are directly comparable, and the gap
 // between them is the size of the lie.
 static void ReportPacing();
-static void ReportPoseHonesty();
 static void TickPacing();
 
 // ---- do the two eyes agree, and does the roll get applied twice? ----
@@ -1097,8 +1096,12 @@ static void SubmitTestQuad()
     // pose the game renders from and the pose the compositor expects agree.
     ApplyHeadTracking(fs.predictedDisplayTime);
     TickPacing();
-    ReportPoseHonesty();
     ReportStereoGeometry();
+    // ReportPoseHonesty is gone. It compared the CHANGE in head yaw against the change in the
+    // image's yaw, which a constant lag leaves identical - so it read zero through the entire
+    // period when the view was sitting five degrees behind, and that zero was taken as an
+    // all-clear. The invariant measurement in the constant hook answers the same question
+    // without the blind spot, and reports the offset itself rather than its derivative.
 
     // Published for the render thread, which needs a time to ask the runtime about and has no
     // frame state of its own. The period comes with it because the correction is expressed as
@@ -3828,62 +3831,15 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
             }
             InterlockedIncrement(&g_vmAccepted);
 
-            // ---- do ALL the accepted matrices in a frame agree? ----
+            // ANSWERED, and removed: do all the accepted matrices in a frame agree? They do.
+            // 127896 accepted uploads across 600 frames, none disagreeing, worst 0.03 degrees.
+            // One view per frame, and the motion-blur matrix it was written to catch is either
+            // not uploaded to this register or does not pass the position test.
             //
-            // "Bouncing" is not the word for a lag or a stutter. It is the word for alternating
-            // between two states, and the cache below is overwritten by EVERY accepted upload -
-            // roughly two hundred per frame - with whichever arrived last. If they are not all
-            // the same matrix, then draws issued at different points in the frame are duplicated
-            // from different views, and geometry drawn in one pass sits where geometry drawn in
-            // another does not.
-            //
-            // There is a specific candidate. UE3 uploads the PREVIOUS frame's view-projection
-            // for motion blur, and that matrix passes every test here by construction: it is the
-            // same camera, one frame ago, so its position maps near zero and its direction is a
-            // frame of turning away from the current one. Sweeping the view is exactly when a
-            // frame of turning is largest - and exactly when the bouncing was reported.
-            //
-            // Measured as the angle between each accepted matrix's forward axis and the first
-            // one seen this frame. All zero means one view and this theory is dead.
-            {
-                static long  frameOf = -1;
-                static float firstF[3] = { 0, 0, 0 };
-                static bool  haveFirst = false;
-                static float worst = 0.0f;
-                static long  differing = 0, accepted = 0, frames = 0;
-
-                if (frameOf != g_frames) {
-                    frameOf = g_frames;
-                    haveFirst = false;
-                    if (++frames >= 600) {
-                        Log("[vm] over %ld frames: %ld accepted uploads, %ld disagreed with the"
-                            " frame's first matrix, worst %.2f deg apart"
-                            "  (0 = one view per frame)",
-                            frames, accepted, differing, worst * 57.29578f);
-                        frames = 0; differing = 0; accepted = 0; worst = 0.0f;
-                    }
-                }
-
-                const float ax = g_vmRow ? q[3] : q[12];
-                const float ay = g_vmRow ? q[7] : q[13];
-                const float az = g_vmRow ? q[11] : q[14];
-                const float al = sqrtf(ax*ax + ay*ay + az*az);
-                if (al > 1e-6f) {
-                    const float nx = ax / al, ny = ay / al, nz = az / al;
-                    accepted++;
-                    if (!haveFirst) {
-                        firstF[0] = nx; firstF[1] = ny; firstF[2] = nz;
-                        haveFirst = true;
-                    } else {
-                        float d = nx*firstF[0] + ny*firstF[1] + nz*firstF[2];
-                        if (d >  1.0f) d =  1.0f;
-                        if (d < -1.0f) d = -1.0f;
-                        const float ang = acosf(d);
-                        if (ang > 0.0017f) differing++;          // 0.1 degree
-                        if (ang > worst) worst = ang;
-                    }
-                }
-            }
+            // Removed rather than left in because it ran per accepted upload - a normalise and
+            // an acos roughly two hundred times a frame, in the hottest function in the program,
+            // to keep re-answering a settled question. With the frame budget now the thing
+            // standing between 60 fps and 120, a diagnostic past its answer is not free.
 
             // Cache the UNMODIFIED scene matrix for the draw-duplication path, which builds
             // both eyes from it. Taken here because this is the only point at which the
@@ -4750,50 +4706,21 @@ static void TickPacing()
     g_lastPresentMs = now;
 }
 
-// How far the head turned this frame, against how far the rendered image turned.
+// ⚠️ ReportPoseHonesty was here and is deliberately gone. Recorded because the mistake is worth
+// more than the function was.
 //
-// If the compositor is told the view moved 3 degrees and the picture only moved 1, it will
-// synthesise the missing 2 on every display frame it fills in - motion that was never rendered.
-// That is indistinguishable from judder, it scales with turn rate, and it vanishes when still.
-static void ReportPoseHonesty()
-{
-    if (!g_sceneMatValid || !g_predTime) return;
-
-    float headYaw = 0.0f;
-    if (!GetHeadYawRaw(g_predTime, &headYaw)) return;
-
-    // The rendered image's yaw, from the matrix the frame was actually drawn with.
-    const float fx = g_vmRow ? g_sceneMat[3] : g_sceneMat[12];
-    const float fy = g_vmRow ? g_sceneMat[7] : g_sceneMat[13];
-    if (fabsf(fx) + fabsf(fy) < 1e-6f) return;
-    const float matYaw = atan2f(fy, fx);
-
-    static bool  have = false;
-    static float pHead = 0.0f, pMat = 0.0f;
-    static float worst = 0.0f, sum = 0.0f;
-    static long  n = 0;
-    if (!have) { pHead = headYaw; pMat = matYaw; have = true; return; }
-
-    auto wrap = [](float a) {
-        while (a >  3.14159265f) a -= 6.28318531f;
-        while (a < -3.14159265f) a += 6.28318531f;
-        return a;
-    };
-    // Into a common sense: OpenXR yaw grows anticlockwise, UE3's clockwise.
-    const float dHead = wrap(headYaw - pHead) * (float)g_yawSign;
-    const float dMat  = wrap(matYaw  - pMat);
-    pHead = headYaw; pMat = matYaw;
-
-    const float gap = fabsf(dHead - dMat);
-    if (gap > worst) worst = gap;
-    sum += gap;
-    if (++n >= 600) {
-        Log("[xr] pose honesty over %ld frames: the image turned %.2f deg less than the"
-            " compositor was told, worst frame %.2f deg  (0 = the layer is truthful)",
-            n, (sum / (float)n) * 57.29578f, worst * 57.29578f);
-        n = 0; worst = 0.0f; sum = 0.0f;
-    }
-}
+// It compared the CHANGE in head yaw against the change in the image's yaw, and reported the
+// difference as "how much the compositor is being lied to". During a steady turn the head moves
+// two degrees and the image moves two degrees, one frame apart - identical changes - so it
+// reported zero while the view sat five degrees behind. It was measuring the derivative of the
+// error and being read as a measure of the error.
+//
+// It ran for three rounds and its zero was quoted as an all-clear each time, including by me,
+// while the thing it was supposed to detect was the actual fault. A metric that cannot see a
+// constant offset should not be phrased as though a zero means there is none.
+//
+// The invariant measurement in the constant hook answers the same question without the blind
+// spot: it reports the offset itself.
 
 static void ReportPacing()
 {

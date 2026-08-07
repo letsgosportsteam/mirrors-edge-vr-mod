@@ -1082,3 +1082,117 @@ The first-person camera is **UnrealScript, not native**, so both routes are live
   proven possible in this game by MirrorsEdgeTweaks.
 
 The second is now clearly worth pricing, because the whole camera is 40 readable lines.
+
+---
+
+## Head tracking, latency, and frame delivery â€” measured
+
+Findings from the judder investigation. Everything here is from a log line, not inference.
+
+### The head basis had a sign error, and it hid for four rounds
+
+The head's forward vector is the **negated** third column of the pose quaternion's rotation
+matrix, so its y component is `-2*(yz - wx)`. The code had `+2*(yz - wx)`.
+
+It survived that long because of where it did and did not matter:
+
+| Consumer | Effect | Why it hid |
+|---|---|---|
+| Pitch | Inverted | `g_pitchSign` had been flipped to `-1` to cancel it |
+| Yaw | None | Reads only x and z |
+| Roll | Fine when level, ~180Â° at steep pitch | The level-up reference is `worldUp` minus its forward component: at level pitch that is `(0,1,0)` either way |
+
+A defect cancelled by a setting chosen to make its symptom disappear is the expensive kind: the
+bug is paid for and kept. `g_pitchSign` is `+1` now; `g_yawSign` stays `-1`, which is the genuine
+handedness between OpenXR's anticlockwise yaw and UE3's clockwise one.
+
+The formula now lives in one place (`HeadBasis`). It had been pasted into three, and exactly one
+copy was wrong.
+
+### Two coordinate senses, and a diagnostic that could not see it
+
+UE3 has X forward and Y right, so from above `atan2(fwd.y, fwd.x)` grows **clockwise**. OpenXR
+has X right and -Z forward, so its yaw grows **anticlockwise**. One physical turn to the right
+raises one and lowers the other.
+
+Consequence: `matrixYaw + headYaw` is the invariant, not the difference. Its deviation from its
+own slow mean **is** the view's lag behind the head.
+
+A first attempt tracked `cam - head` and `cam + head`, intending the stable one to reveal
+handedness. It could not: two mirror-image conventions only ever agree on the sum, whichever way
+round the frames actually are.
+
+### Where each rotation axis comes from
+
+| Axis | Path | Corrected how |
+|---|---|---|
+| Pitch | `Controller.Rotation`, written absolutely from the head | Matrix rotation about the camera's right axis |
+| Yaw | `Controller.Rotation`, written as deltas so mouse and stick still accumulate | Matrix rotation about **world** up, driven by the invariant above |
+| Roll | Never reaches `Controller.Rotation` â€” `UpdateRotation` zeroes `ViewRotation.Roll` | Clip-space shear in the matrix only |
+
+That asymmetry is diagnostic. Pitch has an absolute anchor and never lagged; yaw has none and
+lagged 5-6Â°, which showed as background geometry bouncing while sweeping left and right, and as
+nothing at all while looking up and down.
+
+### The sampling site decides whether a correction works
+
+`Present` runs **after** the frame is drawn. Anything sampled there is a frame old before the next
+frame's draws use it â€” fine for a value that drifts, exactly wrong for one that steps.
+
+Three separate faults were all this:
+
+- the scene-acceptance test judged each matrix against **last frame's** camera position, with a
+  flat 25 unit tolerance. On a zip line the camera covers more than that per frame, so the real
+  scene matrix was rejected â€” and a rejected matrix silently leaves the previous one in
+  `g_sceneMat`, which every duplicated draw then renders from.
+- the animation contribution used by the pitch fix was a frame stale, worst exactly when the
+  animation moved fastest.
+- head roll was sampled in `Present`, so the image carried the previous frame's roll while the
+  pose submitted alongside carried the current one, and the compositor reprojected the difference.
+
+The one point that is both on the render thread and inside the frame is the vertex-constant hook.
+The controller rotation, the camera position and the head roll are all read there now.
+
+### Frame delivery
+
+- The game ships capped at **62 fps**. `Engine.MaxSmoothedFrameRate`, found by class name at
+  runtime; the ini is hash-checked but a float in memory has no hash.
+- Uncapped it reaches **75-80 fps**, with a 4-5 ms frame grab in every frame.
+- The headset asks for **120 Hz**.
+
+âš ï¸ **62 into 120 is worse than 60 into 120.** 120/60 is exactly 2, so every frame is shown for
+exactly two display periods. 120/62 is 1.935, so most are shown twice and roughly every fifteenth
+once â€” a beat of about two per second. Measured as a cadence histogram: 60 gives a single bucket,
+every other cap gives a near-even split between one and two periods.
+
+So the default is 60. Fewer unique images than the game can produce, and the only rate it can
+currently hold that divides 120.
+
+At 80 fps the frame is 12.5 ms with roughly a third of it in our own frame grab. Taking the grab
+off the critical path puts 8.3 ms â€” a true 120, one image per display period â€” inside what the
+engine already demonstrates it can do. That is the measured case for the D3D9Ex wrapper.
+
+### Settled by measurement, closed
+
+- **Eye cant** 0.02Â° â€” the runtime is not asking for per-eye orientations a single-matrix render
+  cannot give.
+- **Roll applied twice** â€” no. The image roll and the submitted pose roll both derive from the
+  same head orientation, so they are equal *by construction*; that equality was never evidence
+  either way.
+- **Multiple views per frame** â€” no. 127896 accepted uploads, none disagreeing, worst 0.03Â°.
+- **The compositor inventing motion from a dishonest pose** â€” no, once the poses are sampled in
+  step with the image.
+
+### A note on guard thresholds
+
+Two guards in the pitch correction had thresholds picked from an idea of what seemed reasonable
+rather than from measurement, and both eventually fired on the feature instead of the fault:
+
+- a 20Â° clamp, against a landing dip that measures 40Â°. It applied half the correction and left
+  the other half on screen.
+- a 45Â° plausibility bound, against a real 46Â° animation contribution â€” and its fallback set the
+  contribution to zero, which during a steep animation applies the *whole animation* as a
+  rotation. It yanked the view further than anything it was protecting against.
+
+Both now **bail out** rather than clamp. Leaving the engine's own view alone is never
+catastrophic; correcting on a value already judged untrustworthy always can be.
