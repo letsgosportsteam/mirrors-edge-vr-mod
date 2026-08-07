@@ -2587,7 +2587,7 @@ static bool GetHeadYawPitch(XrTime when, int32_t* outYaw, int32_t* outPitch)
 //
 // Degenerate when looking straight up or down, where "level" has no meaning - detected by the
 // projection collapsing, and the previous value is held rather than snapping to zero.
-static bool GetHeadRoll(XrTime when, float* outRoll)
+static bool GetHeadRoll(XrTime when, float* outRoll, float* outWeight)
 {
     if (g_viewSpace == XR_NULL_HANDLE || g_xrSpace == XR_NULL_HANDLE) return false;
     XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
@@ -2607,7 +2607,25 @@ static bool GetHeadRoll(XrTime when, float* outRoll)
     const float d = fy;                       // dot(worldUp, forward), worldUp = (0,1,0)
     float lx = -d * fx, ly = 1.0f - d * fy, lz = -d * fz;
     const float ll = sqrtf(lx*lx + ly*ly + lz*lz);
-    if (ll < 0.05f) return false;             // looking near-vertical: level is undefined
+
+    // ⚠️ ll is cos(pitch), and the cutoff has to TAPER rather than switch.
+    //
+    // A hard `ll < 0.05` cutoff only held the roll within 3 degrees of vertical, and that is far
+    // too late. The roll angle is already violently sensitive well before the reference actually
+    // collapses: near vertical a small turn of the head sweeps the level-up reference right
+    // around the forward axis, so the computed roll can swing most of a turn between frames. It
+    // presented as the image rotating when looking all the way up or down - the reported "flip",
+    // which is a roll and not a yaw.
+    //
+    // So the weight fades to zero over a band instead: full tracking below about 72 degrees of
+    // pitch, fading out to held by about 84. The cost is that roll is not tracked while staring
+    // at the ceiling or the floor, where "level" is barely meaningful anyway and there is no
+    // stable answer to track.
+    if (ll < 0.10f) return false;             // near-vertical: level is undefined, hold
+    float w = (ll - 0.10f) / 0.20f;
+    if (w > 1.0f) w = 1.0f;
+    *outWeight = w;
+
     lx /= ll; ly /= ll; lz /= ll;
 
     // Signed angle from level-up to head-up, measured about forward.
@@ -2629,8 +2647,17 @@ static void ApplyHeadTracking(XrTime when)
     // Sampled here rather than in the D3D hook: the hook runs thousands of times a frame and
     // an xrLocateSpace per call would be absurd. One sample per frame, used by every upload.
     {
-        float r = 0.0f;
-        if (GetHeadRoll(when, &r)) g_headRoll = r;
+        // Blended toward the measurement by the weight, not assigned. At weight 1 - anywhere
+        // below about 72 degrees of pitch - this is exactly the old assignment. Near vertical
+        // the weight falls to zero and the previous value simply holds, with no step at the
+        // boundary. Taken the short way round the circle so a wrap does not spin the image.
+        float r = 0.0f, w = 0.0f;
+        if (GetHeadRoll(when, &r, &w)) {
+            float d = r - g_headRoll;
+            while (d >  3.14159265f) d -= 6.28318531f;
+            while (d < -3.14159265f) d += 6.28318531f;
+            g_headRoll += w * d;
+        }
         UpdateSixDof(when);
     }
 
@@ -3686,6 +3713,45 @@ void UpdateSixDof(XrTime when)
     g_dofOffset[0] = (dx * hrx + dz * hrz) * g_worldScale;   // right
     g_dofOffset[1] =  dy                   * g_worldScale;   // up, true vertical
     g_dofOffset[2] = (dx * hfx + dz * hfz) * g_worldScale;   // forward
+
+    // ---- diagnostic: is the room-to-world yaw offset actually constant? ----
+    //
+    // The offset is decomposed on the HEAD's yaw and recomposed on the CAMERA's, so the net
+    // transform is a rotation by (cameraYaw - headYaw). That difference SHOULD be constant -
+    // the camera's yaw is driven by the head's - and everything about the scheme depends on it.
+    // If it wobbles while the head turns, a fixed physical offset sweeps through the world and
+    // the near floor visibly slides, which is the reported symptom.
+    //
+    // Both the difference AND the sum are tracked, because they answer different questions. A
+    // wobbling DIFFERENCE means lag between what is written and what the engine renders. A
+    // steady SUM instead would mean the two yaws run in opposite directions - a handedness
+    // mistake - and would produce the same symptom at double the size. Measuring both settles
+    // which, rather than picking one and rebuilding to find out.
+    if (g_sceneMatValid) {
+        const float crx = g_vmRow ? g_sceneMat[0] : g_sceneMat[0];
+        const float cry = g_vmRow ? g_sceneMat[4] : g_sceneMat[1];
+        if (fabsf(crx) + fabsf(cry) > 1e-6f) {
+            const float camYaw  = atan2f(-crx, cry);      // from forward = right x worldUp
+            const float headYaw = atan2f(hfx, hfz);
+            static float dMin =  1e9f, dMax = -1e9f, sMin = 1e9f, sMax = -1e9f;
+            static int   n = 0;
+            auto wrap = [](float a) {
+                while (a >  3.14159265f) a -= 6.28318531f;
+                while (a < -3.14159265f) a += 6.28318531f;
+                return a;
+            };
+            const float df = wrap(camYaw - headYaw), sm = wrap(camYaw + headYaw);
+            if (df < dMin) dMin = df;   if (df > dMax) dMax = df;
+            if (sm < sMin) sMin = sm;   if (sm > sMax) sMax = sm;
+            if (++n >= 600) {
+                Log("[6dof] over %d frames: cam-head spread %.1f deg, cam+head spread %.1f deg"
+                    "  (the STABLE one names the frame; offset now R%+.0f U%+.0f F%+.0f UU)",
+                    n, (dMax - dMin) * 57.29578f, (sMax - sMin) * 57.29578f,
+                    g_dofOffset[0], g_dofOffset[1], g_dofOffset[2]);
+                n = 0; dMin = sMin = 1e9f; dMax = sMax = -1e9f;
+            }
+        }
+    }
 }
 
 // Offsets the matrix by the current 6-DOF translation, along the camera's OWN axes taken from
