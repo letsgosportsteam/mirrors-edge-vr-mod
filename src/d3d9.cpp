@@ -2500,7 +2500,9 @@ static int       g_yawSign = -1, g_pitchSign = +1;
 // Pitch anchored to the head rather than accumulated. NUMPAD1 toggles, NUMPAD2 cycles how much
 // of the camera animation is kept. See the write site for why yaw is not treated the same way.
 bool             g_pitchAbsolute = true;
-float            g_animFollow    = 1.0f;    // 1 = animations carry the view, as they do today
+// A plain on/off. The 50% middle setting is gone: it was the same motion at half size rather
+// than a third behaviour, and nothing about the choice needed a dial.
+bool             g_animFollow    = true;    // animations carry the view, as they do today
 extern float     g_animNow[3];              // camera animation contribution, degrees, P/Y/R
 static bool      g_headPrimed = false;
 static int32_t   g_lastHeadYaw = 0, g_lastHeadPitch = 0;
@@ -2827,14 +2829,39 @@ static void ApplyHeadTracking(XrTime when)
         // so writing the head pitch here renders as head + animation: the animation still
         // carries the view, and it unwinds by itself because the anchor is absolute.
         //
-        // g_animFollow decides how much of that is kept. At 1.0 the animation carries the view,
-        // which is today's behaviour and worth keeping as the default - a vault or a roll that
-        // moves the camera is a large part of how this game reads. At 0 the measured
-        // contribution is subtracted back out and the view holds still through the animation
-        // while the body does whatever it likes.
+        // g_animFollow decides whether that is kept. ON is today's behaviour and the default -
+        // a vault or a roll that moves the camera is a large part of how this game reads. OFF
+        // takes the measured contribution back out, so the view holds still through the
+        // animation while the body does whatever it likes.
         int32_t want = hp * g_pitchSign;
-        if (g_animFollow < 0.999f)
-            want -= (int32_t)((1.0f - g_animFollow) * g_animNow[0] * (65536.0f / 360.0f));
+        if (!g_animFollow) {
+            // ⚠️ RELAXED, not subtracted outright. Subtracting the measured contribution in one
+            // step made the camera shake violently, and the loop is easy to see once written
+            // down.
+            //
+            // The contribution is PlayerCameraRotation - Controller.Rotation, and part of it -
+            // the swan neck - is a FUNCTION OF the controller's own pitch: TdSwanNeck pitches
+            // the camera by an amount driven by where the view is already pointing. So writing
+            // pitch minus the contribution changes the contribution, which changes what is
+            // written next frame. Closed loop, unity gain, one frame of delay. That oscillates,
+            // and it oscillates hard.
+            //
+            // A first-order approach breaks it: move a fraction of the way each frame, so the
+            // loop gain is scaled by that fraction and settles instead of ringing. It converges
+            // in about a fifth of a second, which is faster than any animation it has to cancel.
+            //
+            // Clamped as well, because a loop that can still misbehave under some pose should
+            // not be able to point the view at the sky - 25 degrees is far more than any
+            // contribution measured here.
+            static float corr = 0.0f;                      // UE3 units currently subtracted
+            const float kUnitsPerDeg = 65536.0f / 360.0f;
+            const float target = g_animNow[0] * kUnitsPerDeg;
+            corr += 0.15f * (target - corr);
+            const float kMax = 25.0f * kUnitsPerDeg;
+            if (corr >  kMax) corr =  kMax;
+            if (corr < -kMax) corr = -kMax;
+            want -= (int32_t)corr;
+        }
         rot[0] = want;
     } else {
         rot[0] += dPitch;
@@ -3060,12 +3087,9 @@ static void CheckHeadHotkeys()
             : "RELATIVE (accumulated deltas; the old behaviour, drift included)");
     }
     if (dN2 && !pN2) {
-        static const float kFollow[] = { 1.0f, 0.5f, 0.0f };
-        static int fi = 0;
-        fi = (fi + 1) % 3;
-        g_animFollow = kFollow[fi];
-        Log("*** [head] NUMPAD2 -> camera animations carry the view at %.0f%%%s",
-            g_animFollow * 100.0f,
+        g_animFollow = !g_animFollow;
+        Log("*** [head] NUMPAD2 -> camera animations %s the view in pitch%s",
+            g_animFollow ? "CARRY" : "do NOT move",
             g_pitchAbsolute ? "" : "  (no effect while pitch is RELATIVE)");
     }
     pN1 = dN1; pN2 = dN2;
