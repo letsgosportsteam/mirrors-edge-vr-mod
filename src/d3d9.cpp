@@ -746,6 +746,10 @@ float                    g_headRoll = 0.0f;      // radians, sampled once per fr
 float                    g_pitchTarget = 0.0f;
 bool                     g_pitchTargetValid = false;
 bool                     g_pitchFix = true;      // NUMPAD3 toggles, for the A/B
+// The controller's own pitch, sampled INSIDE the frame rather than in Present. See the read site.
+float                    g_liveCtlPitch = 0.0f;
+bool                     g_liveCtlValid = false;
+long                     g_liveCtlFrame = -1;
 bool                     g_rollEnabled = true;   // HOME toggles
 int                      g_rollSign = 1;         // END flips
 static float             g_lastLoggedFovX = -1.0f;
@@ -2886,12 +2890,16 @@ static void ApplyHeadTracking(XrTime when)
         }
         rot[0] = want;
 
-        // What the view is supposed to end up at, for the render thread to correct against.
-        // With animations followed that includes their contribution; with them cancelled it does
-        // not, which is the whole difference between the two settings expressed in one line.
+        // Where the HEAD is pointing, and nothing else. The animation's share used to be added
+        // here and that was the flaw: g_animNow is sampled in Present, so it described the
+        // previous frame. With animations cancelled the term is zero and the target was exact -
+        // which is why the mouse came right at 0% - but with them followed a stale term rode
+        // along, and it is largest exactly when the animation moves fastest. Hence a mouse that
+        // still juddered at 100%, and a hard landing that juddered worst of all.
+        //
+        // ApplyPitchFix derives the animation's share from live values instead.
         const float kRadPerUnit = 6.28318531f / 65536.0f;
-        g_pitchTarget = (float)(hp * g_pitchSign) * kRadPerUnit
-                      + (g_animFollow ? g_animNow[0] * (3.14159265f / 180.0f) : 0.0f);
+        g_pitchTarget = (float)(hp * g_pitchSign) * kRadPerUnit;
         g_pitchTargetValid = true;
     } else {
         rot[0] += dPitch;
@@ -3493,6 +3501,29 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
             // engine's own matrix is known to be both current and untouched.
             memcpy(g_sceneMat, q, sizeof(float) * 16);
             g_sceneMatValid = true;
+
+            // ---- the controller's pitch, read HERE and not in Present ----
+            //
+            // Present runs after the frame is rendered, so anything sampled there is a frame old
+            // by the time the next frame's draws use it. For a value that only drifts that is
+            // fine; for one that jumps with the mouse or with an animation it is exactly the
+            // error being corrected.
+            //
+            // This is the one point that is both on the render thread and inside the frame, so
+            // the controller's pitch read here belongs to the same frame as the matrix beside
+            // it. Once per frame, off the cached pointer - no walk, no validation, because
+            // ApplyHeadTracking revalidates it every frame anyway and a stale read here is
+            // caught by the clamp in ApplyPitchFix.
+            if (g_playerCtl && g_offActorRotation >= 0 && g_liveCtlFrame != g_frames) {
+                g_liveCtlFrame = g_frames;
+                int32_t cr = 0;
+                if (SafeRead(g_playerCtl + g_offActorRotation, &cr, sizeof(cr))) {
+                    int32_t p = cr & 0xFFFF;
+                    if (p > 32767) p -= 65536;
+                    g_liveCtlPitch = (float)p * (6.28318531f / 65536.0f);
+                    g_liveCtlValid = true;
+                }
+            }
 
             // ---- read the FOV the game is ACTUALLY rendering with ----
             //
@@ -4138,7 +4169,18 @@ static void ApplyPitchFix(float* m, bool rowStorage)
     if (sinP >  1.0f) sinP =  1.0f;
     if (sinP < -1.0f) sinP = -1.0f;
 
-    float err = g_pitchTarget - asinf(sinP);
+    // The animation's share, from two values that both belong to THIS frame: the pitch the
+    // matrix carries, and the controller's pitch read beside it. Their difference is by
+    // definition everything the engine added on top of what was written - the camera animation
+    // and the swan neck - with no sample from a previous frame anywhere in it.
+    //
+    // Followed, that share is part of where the view belongs, and the correction reduces to
+    // (head - controller): the mouse is cancelled and the animation is left alone. Cancelled,
+    // the target is the head alone and the correction is (head - matrix), which takes out the
+    // animation as well. Two exact expressions from one line, and neither can go stale.
+    const float matPitch = asinf(sinP);
+    const float anim = (g_animFollow && g_liveCtlValid) ? (matPitch - g_liveCtlPitch) : 0.0f;
+    float err = (g_pitchTarget + anim) - matPitch;
 
     // Clamped hard. A foreign matrix that slipped the scene test, or a target computed from a
     // stale sample, must not be able to throw the view somewhere the head is not - and a real
