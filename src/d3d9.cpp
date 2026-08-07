@@ -2496,6 +2496,12 @@ static bool      g_headTracking = true;
 // it reads only x and z, which were always correct, so its -1 is the genuine handedness between
 // OpenXR's anticlockwise yaw and UE3's clockwise one.
 static int       g_yawSign = -1, g_pitchSign = +1;
+
+// Pitch anchored to the head rather than accumulated. NUMPAD1 toggles, NUMPAD2 cycles how much
+// of the camera animation is kept. See the write site for why yaw is not treated the same way.
+bool             g_pitchAbsolute = true;
+float            g_animFollow    = 1.0f;    // 1 = animations carry the view, as they do today
+extern float     g_animNow[3];              // camera animation contribution, degrees, P/Y/R
 static bool      g_headPrimed = false;
 static int32_t   g_lastHeadYaw = 0, g_lastHeadPitch = 0;
 static long      g_headWrites = 0;
@@ -2766,7 +2772,10 @@ static void ApplyHeadTracking(XrTime when)
     int32_t dYaw   = YawDelta(hy, g_lastHeadYaw)   * g_yawSign;
     int32_t dPitch = YawDelta(hp, g_lastHeadPitch) * g_pitchSign;
     g_lastHeadYaw = hy; g_lastHeadPitch = hp;
-    if (dYaw == 0 && dPitch == 0) return;
+    // An absolute pitch has to be re-asserted every frame even when the head has not moved -
+    // that IS the correction, and it is the frames where something else moved the camera that
+    // need it most. Only the relative path can skip a still head.
+    if (dYaw == 0 && dPitch == 0 && !g_pitchAbsolute) return;
 
     // ---- reject an implausibly large single-frame delta ----
     //
@@ -2779,8 +2788,12 @@ static void ApplyHeadTracking(XrTime when)
     // passed, not that the head moved that fast, and applying it is always wrong. Dropped and
     // counted rather than clamped: clamping would still inject a large bogus turn, just more
     // slowly.
+    // dPitch only counts against this on the relative path. An absolute pitch cannot inject a
+    // bogus turn no matter how large the step is - it names a destination, not a movement - and
+    // letting it veto the write would block YAW as well, for a step that was harmless.
     const int32_t kMaxStep = 2000;                  // ~11 degrees, far above any real frame
-    if (dYaw > kMaxStep || dYaw < -kMaxStep || dPitch > kMaxStep || dPitch < -kMaxStep) {
+    const bool bigPitch = !g_pitchAbsolute && (dPitch > kMaxStep || dPitch < -kMaxStep);
+    if (dYaw > kMaxStep || dYaw < -kMaxStep || bigPitch) {
         if (++g_headJumpsRejected <= 5 || (g_headJumpsRejected % 100) == 0)
             Log("[head] rejected an implausible step (dYaw %+d dPitch %+d) - re-syncing, %ld so far",
                 dYaw, dPitch, g_headJumpsRejected);
@@ -2792,7 +2805,40 @@ static void ApplyHeadTracking(XrTime when)
     // travel this path at all and needs the view matrix instead.
     int32_t rot[3];
     if (!SafeRead(ctl + g_offActorRotation, rot, sizeof(rot))) return;
-    rot[0] += dPitch;
+
+    // ---- pitch is ABSOLUTE, yaw stays relative, and the asymmetry is deliberate ----
+    //
+    // A delta scheme has no memory of where the head actually points, so every disturbance it
+    // does not originate is permanent. A camera animation tilts the view, the player's neck does
+    // not follow it exactly, the animation ends - and the offset between the physical head and
+    // the rendered pitch stays for the rest of the session. That is the reported "annoying if
+    // the animation ends with me looking at a different up/down rotation".
+    //
+    // Writing pitch absolutely removes the whole class: the rendered pitch is a function of
+    // where the head is pointing now, so any disturbance corrects itself on the next frame,
+    // whatever caused it - animation, the clamp, a dropped frame.
+    //
+    // Yaw cannot have the same treatment and it is not an oversight. Yaw has to accumulate
+    // beyond the head's physical range or the player could never turn around, so mouse and stick
+    // input must survive, which means the field has to be free to hold whatever the engine and
+    // the player put there. Pitch has no such need - looking up is done by looking up.
+    if (g_pitchAbsolute) {
+        // The engine composes the camera as Controller.Rotation plus the animation contribution,
+        // so writing the head pitch here renders as head + animation: the animation still
+        // carries the view, and it unwinds by itself because the anchor is absolute.
+        //
+        // g_animFollow decides how much of that is kept. At 1.0 the animation carries the view,
+        // which is today's behaviour and worth keeping as the default - a vault or a roll that
+        // moves the camera is a large part of how this game reads. At 0 the measured
+        // contribution is subtracted back out and the view holds still through the animation
+        // while the body does whatever it likes.
+        int32_t want = hp * g_pitchSign;
+        if (g_animFollow < 0.999f)
+            want -= (int32_t)((1.0f - g_animFollow) * g_animNow[0] * (65536.0f / 360.0f));
+        rot[0] = want;
+    } else {
+        rot[0] += dPitch;
+    }
     rot[1] += dYaw;
 
     // ⚠️ CLAMP THE PITCH. This is the "look all the way up or down and the image rotates".
@@ -3002,6 +3048,28 @@ static void CheckHeadHotkeys()
         g_headPrimed = false;      // re-prime so re-enabling does not apply a stale delta
         Log("[head] F9 -> head tracking %s", g_headTracking ? "ON" : "OFF");
     }
+    // NUMPAD, not another F-key: the F row and the navigation cluster are full, and the numpad
+    // is one of the few blocks this game does not bind.
+    static bool pN1 = false, pN2 = false;
+    const bool dN1 = (GetAsyncKeyState(VK_NUMPAD1) & 0x8000) != 0;
+    const bool dN2 = (GetAsyncKeyState(VK_NUMPAD2) & 0x8000) != 0;
+    if (dN1 && !pN1) {
+        g_pitchAbsolute = !g_pitchAbsolute;
+        Log("*** [head] NUMPAD1 -> pitch %s", g_pitchAbsolute
+            ? "ABSOLUTE (anchored to the head; disturbances self-correct)"
+            : "RELATIVE (accumulated deltas; the old behaviour, drift included)");
+    }
+    if (dN2 && !pN2) {
+        static const float kFollow[] = { 1.0f, 0.5f, 0.0f };
+        static int fi = 0;
+        fi = (fi + 1) % 3;
+        g_animFollow = kFollow[fi];
+        Log("*** [head] NUMPAD2 -> camera animations carry the view at %.0f%%%s",
+            g_animFollow * 100.0f,
+            g_pitchAbsolute ? "" : "  (no effect while pitch is RELATIVE)");
+    }
+    pN1 = dN1; pN2 = dN2;
+
     if (d5 && !p5) { g_yawSign   = -g_yawSign;   Log("[head] F5 -> yaw sign %+d", g_yawSign); }
     if (d4 && !p4) { g_pitchSign = -g_pitchSign; Log("[head] F4 -> pitch sign %+d", g_pitchSign); }
     static bool p3 = false;
@@ -4052,7 +4120,7 @@ static HRESULT STDMETHODCALLTYPE Hook_DrawIndexed(IDirect3DDevice9* dev, D3DPRIM
 
 int  g_offMoveState = -1;
 static float g_animPeak[3] = { 0, 0, 0 };       // degrees, |pitch| |yaw| |roll| since last report
-static float g_animNow[3]  = { 0, 0, 0 };       // live, for the overlay
+float        g_animNow[3]  = { 0, 0, 0 };       // live, for the overlay and the pitch anchor
 static int   g_animState   = -1;
 // From TdPawn.EMovement in the decompiled script. Named rather than numbered because the whole
 // point is to say WHICH moves throw the camera around, and "state 4 = 11.2 degrees" needs a
