@@ -3831,6 +3831,63 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
             }
             InterlockedIncrement(&g_vmAccepted);
 
+            // ---- do ALL the accepted matrices in a frame agree? ----
+            //
+            // "Bouncing" is not the word for a lag or a stutter. It is the word for alternating
+            // between two states, and the cache below is overwritten by EVERY accepted upload -
+            // roughly two hundred per frame - with whichever arrived last. If they are not all
+            // the same matrix, then draws issued at different points in the frame are duplicated
+            // from different views, and geometry drawn in one pass sits where geometry drawn in
+            // another does not.
+            //
+            // There is a specific candidate. UE3 uploads the PREVIOUS frame's view-projection
+            // for motion blur, and that matrix passes every test here by construction: it is the
+            // same camera, one frame ago, so its position maps near zero and its direction is a
+            // frame of turning away from the current one. Sweeping the view is exactly when a
+            // frame of turning is largest - and exactly when the bouncing was reported.
+            //
+            // Measured as the angle between each accepted matrix's forward axis and the first
+            // one seen this frame. All zero means one view and this theory is dead.
+            {
+                static long  frameOf = -1;
+                static float firstF[3] = { 0, 0, 0 };
+                static bool  haveFirst = false;
+                static float worst = 0.0f;
+                static long  differing = 0, accepted = 0, frames = 0;
+
+                if (frameOf != g_frames) {
+                    frameOf = g_frames;
+                    haveFirst = false;
+                    if (++frames >= 600) {
+                        Log("[vm] over %ld frames: %ld accepted uploads, %ld disagreed with the"
+                            " frame's first matrix, worst %.2f deg apart"
+                            "  (0 = one view per frame)",
+                            frames, accepted, differing, worst * 57.29578f);
+                        frames = 0; differing = 0; accepted = 0; worst = 0.0f;
+                    }
+                }
+
+                const float ax = g_vmRow ? q[3] : q[12];
+                const float ay = g_vmRow ? q[7] : q[13];
+                const float az = g_vmRow ? q[11] : q[14];
+                const float al = sqrtf(ax*ax + ay*ay + az*az);
+                if (al > 1e-6f) {
+                    const float nx = ax / al, ny = ay / al, nz = az / al;
+                    accepted++;
+                    if (!haveFirst) {
+                        firstF[0] = nx; firstF[1] = ny; firstF[2] = nz;
+                        haveFirst = true;
+                    } else {
+                        float d = nx*firstF[0] + ny*firstF[1] + nz*firstF[2];
+                        if (d >  1.0f) d =  1.0f;
+                        if (d < -1.0f) d = -1.0f;
+                        const float ang = acosf(d);
+                        if (ang > 0.0017f) differing++;          // 0.1 degree
+                        if (ang > worst) worst = ang;
+                    }
+                }
+            }
+
             // Cache the UNMODIFIED scene matrix for the draw-duplication path, which builds
             // both eyes from it. Taken here because this is the only point at which the
             // engine's own matrix is known to be both current and untouched.
