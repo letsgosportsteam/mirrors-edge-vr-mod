@@ -1732,6 +1732,8 @@ static int  LookupProp(const char* className, const char* propName, bool verbose
 extern int g_offActorRotation;
 extern int g_offActorLocation;
 extern int g_offFOVAngle;
+extern int g_offDesiredFOV;
+extern int g_offDefaultFOV;
 extern int g_offCamLoc;
 extern int g_offCamRot;
 extern int g_offMoveState;
@@ -1800,6 +1802,19 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                 g_offActorRotation = LookupProp("TdPlayerController", "Rotation", true);
                 g_offActorLocation = LookupProp("TdPlayerController", "Location", true);
                 g_offFOVAngle      = LookupProp("TdPlayerController", "FOVAngle", true);
+                // ⚠️ FOVAngle alone is written straight back over every tick.
+                //
+                // Decompiled TdPlayerController.AdjustFOV ends with `FOVAngle = DesiredFOV` on
+                // the path taken whenever FOVZoomRate is 0, which is the default set at line
+                // 1381 of the same class. So FOVAngle is an OUTPUT, recomputed each frame, and
+                // writing it achieved nothing: the measurement said 100% of scene matrices still
+                // carried the engine's own 58.7 degree vertical.
+                //
+                // DesiredFOV is the input. DefaultFOV is taken as well because the class's own
+                // initialisation does `DesiredFOV = DefaultFOV`, so anything that re-runs that -
+                // a respawn, a checkpoint reload - would otherwise undo it.
+                g_offDesiredFOV    = LookupProp("TdPlayerController", "DesiredFOV", true);
+                g_offDefaultFOV    = LookupProp("TdPlayerController", "DefaultFOV", true);
                 // ⚠️ These two RETURN VALUES ARE USED. The first version called LookupProp
                 // and discarded them, so g_offCamLoc/g_offCamRot stayed -1, GetCameraPose
                 // refused, and the view-matrix scan tested zero windows while reporting only
@@ -1988,6 +2003,8 @@ static void RunObjectModelScan()
 int g_offActorRotation = -1;
 int g_offActorLocation = -1;
 int g_offFOVAngle      = -1;
+int g_offDesiredFOV    = -1;   // the INPUT; FOVAngle is recomputed from it every tick
+int g_offDefaultFOV    = -1;
 static int g_offChildren = -1;
 static int g_offNext     = -1;
 static int g_offPropOff  = -1;
@@ -4683,17 +4700,36 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
             const float needHorz = tanf(g_targetHalfFovX);               // to cover our horizontal
             const float t = ((needVert > needHorz) ? needVert : needHorz) * 1.15f;
             const float want = atanf(t) * 2.0f * 57.29578f;
+            // ⚠️ DesiredFOV first, and it is the one that matters.
+            //
+            // AdjustFOV runs every tick and ends with `FOVAngle = DesiredFOV` whenever
+            // FOVZoomRate is 0, which is its default. FOVAngle is an OUTPUT. Writing only that
+            // put the value in a field the engine overwrote before the view was built, which is
+            // why the measurement came back with 100% of scene matrices still at the engine's
+            // own 58.7 degree vertical while the write log happily reported success every frame.
+            //
+            // FOVAngle is still written, so the current frame does not have to wait a tick for
+            // AdjustFOV to propagate. DefaultFOV too, because the class initialises
+            // DesiredFOV from it and anything re-running that would undo this.
+            SIZE_T wrote = 0;
+            auto put = [&](int off) {
+                if (off >= 0)
+                    WriteProcessMemory(GetCurrentProcess(), (LPVOID)(ctl + off),
+                                       &want, sizeof(float), &wrote);
+            };
             float cur = 0.0f;
             if (SafeRead(ctl + g_offFOVAngle, &cur, sizeof(float)) && fabsf(cur - want) > 0.5f) {
-                SIZE_T wrote = 0;
-                WriteProcessMemory(GetCurrentProcess(), (LPVOID)(ctl + g_offFOVAngle),
-                                   &want, sizeof(float), &wrote);
+                put(g_offDesiredFOV);
+                put(g_offDefaultFOV);
+                put(g_offFOVAngle);
                 if (++g_fovWrites == 1 || (g_fovWrites % 600) == 0)
                     Log("[fov] culling FOV write #%ld: engine had %.1f, asked for %.1f -> culls"
-                        " %.1f vertical at %.2f aspect (we render %.1f x %.1f)",
+                        " %.1f vertical at %.2f aspect (we render %.1f x %.1f)"
+                        "  [DesiredFOV %+d DefaultFOV %+d]",
                         g_fovWrites, cur, want,
                         atanf(t / aspectFull) * 114.5916f, aspectFull,
-                        g_targetHalfFovX * 114.5916f, g_targetHalfFovY * 114.5916f);
+                        g_targetHalfFovX * 114.5916f, g_targetHalfFovY * 114.5916f,
+                        g_offDesiredFOV, g_offDefaultFOV);
             }
         }
     }
