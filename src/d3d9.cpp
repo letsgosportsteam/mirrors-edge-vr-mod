@@ -3933,54 +3933,73 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                     }
                 }
 
-                // ---- how much further will the head have turned by the time this is seen ----
+                // ---- how far the view is actually BEHIND the head, measured not predicted ----
                 //
-                // The write in Present used the head pose at the predicted display time for the
-                // frame BEFORE this one. This frame is displayed a period later, and the head
-                // kept moving - that gap is the judder, and it is proportional to how fast the
-                // player is turning, which is why it only shows during a turn.
+                // ⚠️ The previous version predicted one display period ahead and corrected that.
+                // It measured 0.7 degrees when the real lag is several times larger, and the
+                // reason is that it was answering the wrong question: it asked how far the head
+                // will move in one period, when what matters is how far the view has ALREADY
+                // fallen behind - which is the whole render pipeline, not one period of it.
                 //
-                // Asking the runtime the same question at two times measures it directly: no
-                // stored state, no cross-thread handoff, and the runtime's own prediction rather
-                // than a difference taken between frames and called a velocity.
+                // ⚠️ And the pose-honesty check could not see this either. It compares the CHANGE
+                // in head yaw against the CHANGE in the image's yaw, and a constant lag produces
+                // identical changes. During a steady sweep it reports zero while the view sits
+                // degrees behind. It rules out the compositor being lied to about acceleration,
+                // which it did, and says nothing about a standing offset. That is a real limit
+                // of that measurement and it was read as an all-clear.
+                //
+                // This measures the offset itself. (matrix yaw + head yaw) is invariant - the two
+                // conventions run in opposite senses, established when the 6-DOF frame was
+                // checked - so it holds still except when the player turns by other means. Its
+                // deviation from its own slow mean is precisely how far the engine has not caught
+                // up, whatever the cause: the frame of write latency, the render pipeline, any
+                // smoothing the engine applies to its own rotation.
+                //
+                // Pitch never had this problem because ApplyPitchFix anchors it to an absolute
+                // head pitch every frame. Yaw has no absolute reference - it must be free to
+                // accumulate past the head's range - so nothing has ever corrected it. That
+                // asymmetry predicts the symptom exactly: a bounce while sweeping LEFT AND
+                // RIGHT, and none while looking up and down.
                 g_yawLagRad = 0.0f;
-                if (g_yawLagFix && g_predTime && g_predPeriod) {
-                    float y0 = 0.0f, y1 = 0.0f;
-                    if (GetHeadYawRaw(g_predTime, &y0) &&
-                        GetHeadYawRaw(g_predTime + g_predPeriod, &y1)) {
-                        float d = y1 - y0;
-                        while (d >  3.14159265f) d -= 6.28318531f;
-                        while (d < -3.14159265f) d += 6.28318531f;
-                        // Into UE3's yaw sense, the same conversion the write uses.
-                        d *= (float)g_yawSign;
+                if (g_predTime && g_sceneMatValid) {
+                    float hy = 0.0f;
+                    const float mfx = g_vmRow ? g_sceneMat[3] : g_sceneMat[12];
+                    const float mfy = g_vmRow ? g_sceneMat[7] : g_sceneMat[13];
+                    if (GetHeadYawRaw(g_predTime, &hy) &&
+                        (fabsf(mfx) + fabsf(mfy) > 1e-6f)) {
+                        auto wrapf = [](float a) {
+                            while (a >  3.14159265f) a -= 6.28318531f;
+                            while (a < -3.14159265f) a += 6.28318531f;
+                            return a;
+                        };
+                        const float psi = wrapf(atan2f(mfy, mfx) + hy);
+                        static bool  have = false;
+                        static float mean = 0.0f;
+                        if (!have) { mean = psi; have = true; }
+                        float d = wrapf(psi - mean);
+                        // Slow enough that a sweep lasting under a second reads as deviation
+                        // rather than being absorbed as the new normal, fast enough that a
+                        // deliberate stick or mouse turn settles in well under a second.
+                        mean = wrapf(mean + 0.03f * d);
+
                         const float kMax = 20.0f * (3.14159265f / 180.0f);
                         if (d >  kMax) d =  kMax;
                         if (d < -kMax) d = -kMax;
+                        if (!g_yawLagFix) d = 0.0f;
 
-                        // ---- is this correction steady, or is it the snapping? ----
-                        //
-                        // A lag correction should track head SPEED: near zero when still,
-                        // growing smoothly with the turn. If instead it jumps frame to frame
-                        // while the head is barely moving, the runtime's two predictions
-                        // disagree by more than the head actually moved, and this rotates the
-                        // whole world by that disagreement every frame. That would show as
-                        // scenery snapping at slow head speeds - which is the report, and is
-                        // exactly what a lag fix should NOT do.
-                        //
-                        // So both the value and its frame-to-frame jump are reported. A large
-                        // jump against a small value is this; a small jump is not.
-                        static float prev = 0.0f;
-                        static float worstJump = 0.0f, worstVal = 0.0f;
+                        // Reported whether or not it is being applied, so NUMPAD6 off still
+                        // answers "how big is the lag" rather than only "does correcting help".
+                        static float worstVal = 0.0f, sumVal = 0.0f;
                         static long  n = 0;
-                        const float jump = fabsf(d - prev);
-                        prev = d;
-                        if (jump > worstJump) worstJump = jump;
-                        if (fabsf(d) > worstVal) worstVal = fabsf(d);
+                        const float raw = fabsf(wrapf(psi - mean));
+                        if (raw > worstVal) worstVal = raw;
+                        sumVal += raw;
                         if (++n >= 600) {
-                            Log("[head] turn-lag over %ld frames: worst correction %.2f deg,"
-                                " worst frame-to-frame jump %.2f deg", n,
-                                worstVal * 57.29578f, worstJump * 57.29578f);
-                            n = 0; worstJump = worstVal = 0.0f;
+                            Log("[head] view is behind the head by %.2f deg mean, %.2f deg worst,"
+                                " over %ld frames  (correction %s)",
+                                (sumVal / (float)n) * 57.29578f, worstVal * 57.29578f, n,
+                                g_yawLagFix ? "ON" : "OFF");
+                            n = 0; worstVal = 0.0f; sumVal = 0.0f;
                         }
                         g_yawLagRad = d;
                     }
@@ -4856,9 +4875,12 @@ static void ApplyYawLag(float* m, bool rowStorage)
     if (!g_yawLagFix || fabsf(g_yawLagRad) < 1e-5f) return;
     if (!g_livePivotValid && !g_camCacheValid) return;
     const float up[3] = { 0.0f, 0.0f, 1.0f };
-    // Negated for the same reason ApplyYawFix negates: a positive turn about world up in this
-    // primitive's sense LOWERS the rotator's yaw.
-    ApplyCameraRotation(m, rowStorage, up, -g_yawLagRad, RotationPivot());
+    // g_yawLagRad is the deviation of (matrix yaw + head yaw) from its own mean. A positive
+    // deviation means the matrix's yaw is that much too high for where the head now is, so the
+    // camera's yaw has to come DOWN by it - and a positive angle here lowers the rotator's yaw.
+    // Passed straight through, where the prediction version had to be negated because it named
+    // a head movement rather than a matrix error.
+    ApplyCameraRotation(m, rowStorage, up, g_yawLagRad, RotationPivot());
 }
 
 // ---- lock the animation's yaw out of the view ----
