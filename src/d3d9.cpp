@@ -1731,6 +1731,61 @@ static void DetectUObjectLayout()
 
 // Reports whether the classes we actually care about are present and findable by name.
 // A layout that scores well but cannot find TdPlayerPawn has not proven anything useful.
+// ---- the frame rate cap ----
+//
+// 62.0 fps, sixteen samples, not a digit of variation, against a headset asking for 120. That is
+// a CAP and not a performance limit - a game short of headroom varies, and this does not. 62 is
+// also UE3's own default for MaxSmoothedFrameRate, which names the mechanism outright.
+//
+// ⚠️ 62 into 120 is worse than 60 into 120, and that is the non-obvious part. 120/60 is exactly
+// 2, so every game frame is shown for exactly two display frames and the cadence never changes.
+// 120/62 is 1.935, so most frames are shown twice and roughly every fifteenth is shown once -
+// a beat of about two per second. A regular cadence reads as motion; an irregular one reads as
+// snapping, which is the report, and is why moving very slowly hides it: the beat is still
+// there, it just has too little image movement to carry it.
+//
+// So the cap is worth changing even if the game cannot go faster. Both directions are reachable
+// from one float.
+uintptr_t g_engineObj       = 0;
+int       g_offMaxSmoothFps = -1;
+float     g_fpsCap          = 120.0f;   // NUMPAD7 cycles; matches the headset by default
+static int LookupProp(const char* className, const char* propName, bool verbose);
+
+static void FindEngineObject()
+{
+    if (g_offName < 0 || !g_gobjAddr) return;
+    uint32_t data, count;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t obj;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+        uint32_t vtbl;
+        if (!SafeU32(obj, &vtbl) || !InModule(vtbl)) continue;
+
+        // Matched on the CLASS name, not the object's. The engine's own name varies by build and
+        // the class does not, and UObject::Class was already measured at +0x34.
+        uint32_t clsPtr, cn;
+        char cls[128];
+        if (!SafeU32(obj + 0x34, &clsPtr) || clsPtr < 0x10000) continue;
+        if (!SafeU32(clsPtr + g_offName, &cn) || !NameOf(cn, cls, sizeof(cls))) continue;
+        if (!strstr(cls, "GameEngine")) continue;
+
+        // The class default object carries every property at the right offsets and is not the
+        // live engine; writing to it changes nothing anybody reads.
+        uint32_t on; char onm[128];
+        if (SafeU32(obj + g_offName, &on) && NameOf(on, onm, sizeof(onm)) &&
+            !strncmp(onm, "Default__", 9)) continue;
+
+        g_engineObj       = obj;
+        g_offMaxSmoothFps = LookupProp(cls, "MaxSmoothedFrameRate", true);
+        Log("*** [fps] engine object %p, class %s, MaxSmoothedFrameRate at +0x%X",
+            (void*)obj, cls, g_offMaxSmoothFps);
+        return;
+    }
+    Log("[fps] no GameEngine object found - the frame cap cannot be moved from here");
+}
+
 static void ProbeKnownObjects()
 {
     if (g_offName < 0) return;
@@ -1872,6 +1927,7 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                 LookupProp("TdPlayerPawn", "SwanNeck1p", true);
                 g_offMoveState = LookupProp("TdPlayerPawn", "MovementState", true);
                 DumpClassProperties("TdPlayerController", 60);
+                FindEngineObject();
             }
         }
     }
@@ -3224,6 +3280,23 @@ static void CheckHeadHotkeys()
         Log("*** [head] NUMPAD5 -> camera animations %s the view",
             g_animYawFollow ? "TURN" : "do NOT turn");
     }
+    // NUMPAD7 cycles the frame cap. 60 is in the list ahead of the higher values on purpose: it
+    // is the only one that divides 120 exactly, so it is the smoothest CADENCE even though it is
+    // fewer frames than the 62 the game ships with. Whether smooth-and-fewer beats
+    // more-but-uneven is a question about eyes, not arithmetic, so it is a keypress.
+    static bool pN7 = false;
+    const bool dN7 = (GetAsyncKeyState(VK_NUMPAD7) & 0x8000) != 0;
+    if (dN7 && !pN7) {
+        static const float kCaps[] = { 120.0f, 60.0f, 90.0f, 250.0f, 62.0f };
+        static int ci = 0;
+        ci = (ci + 1) % (int)(sizeof(kCaps) / sizeof(kCaps[0]));
+        g_fpsCap = kCaps[ci];
+        Log("*** [fps] NUMPAD7 -> cap %.0f%s", g_fpsCap,
+            (g_fpsCap == 60.0f) ? "  (divides 120 exactly - even cadence)" :
+            (g_fpsCap == 62.0f) ? "  (the game's own default, for comparison)" : "");
+    }
+    pN7 = dN7;
+
     static bool pN6 = false;
     const bool dN6 = (GetAsyncKeyState(VK_NUMPAD6) & 0x8000) != 0;
     if (dN6 && !pN6) {
@@ -5346,6 +5419,28 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
                         g_targetHalfFovX * 114.5916f, g_targetHalfFovY * 114.5916f,
                         g_offDesiredFOV, g_offDefaultFOV);
             }
+        }
+    }
+
+    // ---- hold the frame cap where we want it ----
+    //
+    // Same shape as the FOV write and for the same reason: the config file is hash-checked and
+    // cannot be edited, but the value the engine actually reads is a float in memory, and a
+    // float in memory has no hash.
+    //
+    // Written every frame rather than once. Nothing observed pulls it back, but the FOV taught
+    // that a field can be recomputed from somewhere else without warning, and a once-only write
+    // is invisible when that happens - it reports success and then quietly stops being true.
+    if (g_engineObj && g_offMaxSmoothFps >= 0 && g_fpsCap > 0.0f) {
+        float cur = 0.0f;
+        if (SafeRead(g_engineObj + g_offMaxSmoothFps, &cur, sizeof(float)) &&
+            fabsf(cur - g_fpsCap) > 0.5f) {
+            SIZE_T wrote = 0;
+            WriteProcessMemory(GetCurrentProcess(), (LPVOID)(g_engineObj + g_offMaxSmoothFps),
+                               &g_fpsCap, sizeof(float), &wrote);
+            static long n = 0;
+            if (++n == 1 || (n % 60) == 0)
+                Log("*** [fps] cap %.0f -> %.0f (write %ld)", cur, g_fpsCap, n);
         }
     }
 
