@@ -3716,6 +3716,32 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                         const float kMax = 20.0f * (3.14159265f / 180.0f);
                         if (d >  kMax) d =  kMax;
                         if (d < -kMax) d = -kMax;
+
+                        // ---- is this correction steady, or is it the snapping? ----
+                        //
+                        // A lag correction should track head SPEED: near zero when still,
+                        // growing smoothly with the turn. If instead it jumps frame to frame
+                        // while the head is barely moving, the runtime's two predictions
+                        // disagree by more than the head actually moved, and this rotates the
+                        // whole world by that disagreement every frame. That would show as
+                        // scenery snapping at slow head speeds - which is the report, and is
+                        // exactly what a lag fix should NOT do.
+                        //
+                        // So both the value and its frame-to-frame jump are reported. A large
+                        // jump against a small value is this; a small jump is not.
+                        static float prev = 0.0f;
+                        static float worstJump = 0.0f, worstVal = 0.0f;
+                        static long  n = 0;
+                        const float jump = fabsf(d - prev);
+                        prev = d;
+                        if (jump > worstJump) worstJump = jump;
+                        if (fabsf(d) > worstVal) worstVal = fabsf(d);
+                        if (++n >= 600) {
+                            Log("[head] turn-lag over %ld frames: worst correction %.2f deg,"
+                                " worst frame-to-frame jump %.2f deg", n,
+                                worstVal * 57.29578f, worstJump * 57.29578f);
+                            n = 0; worstJump = worstVal = 0.0f;
+                        }
                         g_yawLagRad = d;
                     }
                 }
@@ -4388,19 +4414,33 @@ static void ApplyPitchFix(float* m, bool rowStorage)
     const float matPitch = asinf(sinP);
     float anim = (g_animFollow && g_liveCtlValid) ? (matPitch - g_liveCtlPitch) : 0.0f;
 
-    // A real contribution is tens of degrees at most. Anything past 45 means one of the two
-    // values does not describe the camera being corrected - a read that beat the validity check,
-    // or a matrix that slipped the scene test - and following it would rotate the view somewhere
-    // the player is not. Dropping to zero degrades to "no animation compensation", which is
-    // visible but harmless, rather than to a large wrong rotation, which is neither.
-    const float kAnimMax = 45.0f * (3.14159265f / 180.0f);
+    // ⚠️ This guard was CAUSING the failure it was written to prevent, and the fallback was the
+    // reason. Zeroing the term does not mean "do less"; with animations followed the correction
+    // is (target + anim - matrix), so setting anim to zero leaves (target - matrix) - which
+    // during a steep animation is the whole animation, forty or fifty degrees of it, applied as
+    // a rotation. The guard fired and then yanked the view further than anything it was
+    // protecting against.
+    //
+    // Bailing out is the correct degradation. It leaves the engine's own view alone, which is
+    // never catastrophic. Correcting on a value already judged untrustworthy always can be.
+    //
+    // The bound moves 45 -> 90 as well, for the same reason the pitch clamp moved 20 -> 60: it
+    // was set from an idea of what was reasonable rather than from measurement, and real
+    // contributions exceed it. This run recorded -46 degrees with the matrix and the camera
+    // rotation in agreement - the direction test now confirms they describe the same view, so a
+    // contribution that large is REAL, and the zip line is exactly where it showed.
+    const float kAnimMax = 90.0f * (3.14159265f / 180.0f);
     if (anim > kAnimMax || anim < -kAnimMax) {
-        static long dropped = 0;
-        if (++dropped == 1 || (dropped % 600) == 0)
-            Log("[head] implausible animation pitch %.1f deg (matrix %.1f, controller %.1f) -"
-                " ignoring, %ld so far", anim * 57.29578f, matPitch * 57.29578f,
-                g_liveCtlPitch * 57.29578f, dropped);
-        anim = 0.0f;
+        static long lastFrame = -1;
+        if (lastFrame != g_frames) {
+            lastFrame = g_frames;
+            static long frames = 0;
+            if (++frames == 1 || (frames % 60) == 0)
+                Log("[head] animation pitch %.1f deg beyond trust (matrix %.1f, controller %.1f)"
+                    " - correction SKIPPED, %ld frames so far", anim * 57.29578f,
+                    matPitch * 57.29578f, g_liveCtlPitch * 57.29578f, frames);
+        }
+        return;
     }
 
     float err = (g_pitchTarget + anim) - matPitch;
@@ -4418,21 +4458,27 @@ static void ApplyPitchFix(float* m, bool rowStorage)
     //
     // 60 clears the largest contribution seen with room to spare while still catching a garbage
     // matrix, which misses by a lot more than a landing does.
+    // Beyond this, SKIP rather than clamp - the same lesson as the guard above. Applying 60
+    // degrees of rotation because 75 was asked for is not a smaller version of the right answer,
+    // it is a large wrong one, and leaving the engine's view alone is the safe degradation.
+    //
+    // 60 still admits everything real: a hard landing needs about 40 with the animation locked,
+    // and with it followed the correction is only the frame of lag, a degree or two.
     const float kMax = 60.0f * (3.14159265f / 180.0f);
     if (err > kMax || err < -kMax) {
-        // Counted in FRAMES, not calls. This runs once per draw per eye, so the old per-call
-        // counter reported 10000 "occurrences" for a handful of frames and made a brief clamp
-        // look like a permanent one.
+        // Counted in FRAMES, not calls. This runs once per draw per eye, so a per-call counter
+        // reported ten thousand occurrences for a handful of frames and made a momentary event
+        // look permanent.
         static long lastFrame = -1;
         if (lastFrame != g_frames) {
             lastFrame = g_frames;
             static long frames = 0;
             if (++frames == 1 || (frames % 60) == 0)
-                Log("[head] pitch correction clamped: wanted %.1f deg (target %.1f, matrix %.1f,"
-                    " anim %.1f) - %ld frames so far", err * 57.29578f,
+                Log("[head] pitch correction %.1f deg beyond trust (target %.1f, matrix %.1f,"
+                    " anim %.1f) - SKIPPED, %ld frames so far", err * 57.29578f,
                     g_pitchTarget * 57.29578f, matPitch * 57.29578f, anim * 57.29578f, frames);
         }
-        err = (err > 0.0f) ? kMax : -kMax;
+        return;
     }
 
     const float right[3] = { col(0,0), col(0,1), col(0,2) };
