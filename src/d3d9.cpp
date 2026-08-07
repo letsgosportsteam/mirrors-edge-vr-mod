@@ -4599,22 +4599,49 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     // against a 84 degree frustum simply is not there to be seen in a 126 degree one, and
     // widening the matrix cannot conjure draw calls that were never issued.
     //
-    // So the engine is asked for ~15% more than we render with. Being roughly right is enough
-    // for culling, and its interpolation drift becomes harmless as long as it stays above what
-    // we draw. Written every frame because the camera update pulls it back toward the default
-    // each tick.
-    if (g_fovForce && g_offFOVAngle >= 0 && g_targetHalfFovX > 0.0f) {
+    // ⚠️ Derived from the VERTICAL, and the horizontal-only version was losing geometry.
+    //
+    // FOVAngle is HORIZONTAL. The engine turns it into a frustum using the aspect of the
+    // BACKBUFFER - it knows nothing about the half-width viewports the eyes are drawn into - so
+    // asking for 107.3 across a 16:9 frame culls against only 74.8 degrees vertically. We render
+    // 100. Everything between the two is culled before it is ever submitted, and it appears as
+    // scenery vanishing off the top and bottom of the view: "geometry disappearing from the top
+    // of the building when looking up".
+    //
+    // Confirmed in the log, which reported both halves of it and was not read together: the
+    // engine's own matrix measured 107.3 x 74.8, and 107.3/74.8 is 16:9 exactly.
+    //
+    // It is NOT the occlusion override, which is why forcing everything visible did nothing.
+    // Occlusion culling drops geometry that IS in the frustum but hidden behind something;
+    // frustum culling drops what is outside the frustum entirely. Different stage, different
+    // switch, and no setting of one can compensate for the other.
+    //
+    // So the requirement is stated as a tangent and the wider of the two axes wins: give the
+    // engine a horizontal FOV whose derived VERTICAL covers what we draw. At 100 degrees
+    // vertical on a 16:9 frame that is about 135 degrees horizontal, well beyond the 93.3 the
+    // horizontal alone would ask for. Margin is applied in tangent space, not to the angle,
+    // because 15% of an angle near the asymptote is not 15% of a frustum.
+    //
+    // Written every frame because the camera update pulls it back toward the default each tick.
+    if (g_fovForce && g_offFOVAngle >= 0 && g_targetHalfFovX > 0.0f && g_capH > 0) {
         const uintptr_t ctl = FindPlayerController();
         if (ctl) {
-            const float want = g_targetHalfFovX * 2.0f * 57.29578f * 1.15f;
+            const float aspectFull = (float)g_capW / (float)g_capH;
+            const float needVert = tanf(g_targetHalfFovY) * aspectFull;  // to cover our vertical
+            const float needHorz = tanf(g_targetHalfFovX);               // to cover our horizontal
+            const float t = ((needVert > needHorz) ? needVert : needHorz) * 1.15f;
+            const float want = atanf(t) * 2.0f * 57.29578f;
             float cur = 0.0f;
             if (SafeRead(ctl + g_offFOVAngle, &cur, sizeof(float)) && fabsf(cur - want) > 0.5f) {
                 SIZE_T wrote = 0;
                 WriteProcessMemory(GetCurrentProcess(), (LPVOID)(ctl + g_offFOVAngle),
                                    &want, sizeof(float), &wrote);
                 if (++g_fovWrites == 1 || (g_fovWrites % 600) == 0)
-                    Log("[fov] culling FOV write #%ld: engine had %.1f, asked for %.1f "
-                        "(rendering %.1f)", g_fovWrites, cur, want, g_targetHalfFovX * 114.5916f);
+                    Log("[fov] culling FOV write #%ld: engine had %.1f, asked for %.1f -> culls"
+                        " %.1f vertical at %.2f aspect (we render %.1f x %.1f)",
+                        g_fovWrites, cur, want,
+                        atanf(t / aspectFull) * 114.5916f, aspectFull,
+                        g_targetHalfFovX * 114.5916f, g_targetHalfFovY * 114.5916f);
             }
         }
     }
