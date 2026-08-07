@@ -2722,6 +2722,31 @@ static void ApplyHeadTracking(XrTime when)
     if (!SafeRead(ctl + g_offActorRotation, rot, sizeof(rot))) return;
     rot[0] += dPitch;
     rot[1] += dYaw;
+
+    // ⚠️ CLAMP THE PITCH. This is the "look all the way up or down and the image rotates".
+    //
+    // Measured: a write landed on pitch 16446, which is 90.3 degrees. Past 90 the camera has
+    // gone OVER THE TOP - it is looking backwards and upside down - and the picture inverts.
+    // That is the flip, and it is neither the roll nor the yaw singularity the previous two
+    // commits went after.
+    //
+    // The engine never gets a chance to stop it. UE3's PlayerController clamps pitch against
+    // ViewPitchMin/Max inside UpdateRotation; these writes go straight into the Rotation field
+    // and never pass through it. The head's own pitch cannot exceed 90 - it comes from
+    // atan2(fy, horizontal) - but this accumulates DELTAS on top of whatever else moves the
+    // camera, so the total drifts past what any single sample could reach.
+    //
+    // 16000 is 87.9 degrees: close enough to straight up that nothing is lost, far enough from
+    // the singularity that neither the roll reference nor the yaw can collapse there either.
+    // Read back as a signed 16-bit rotator first, because the field holds 58697 for -6839.
+    {
+        const int32_t kPitchMax = 16000;
+        int32_t p = rot[0] & 0xFFFF;
+        if (p > 32767) p -= 65536;
+        if (p >  kPitchMax) p =  kPitchMax;
+        if (p < -kPitchMax) p = -kPitchMax;
+        rot[0] = p;
+    }
     SIZE_T wrote = 0;
     WriteProcessMemory(GetCurrentProcess(), (LPVOID)(ctl + g_offActorRotation), rot,
                        sizeof(int32_t) * 2, &wrote);
@@ -3714,41 +3739,50 @@ void UpdateSixDof(XrTime when)
     g_dofOffset[1] =  dy                   * g_worldScale;   // up, true vertical
     g_dofOffset[2] = (dx * hfx + dz * hfz) * g_worldScale;   // forward
 
-    // ---- diagnostic: is the room-to-world yaw offset actually constant? ----
+    // ---- diagnostic: how much does the room-to-world yaw offset wobble? ----
     //
-    // The offset is decomposed on the HEAD's yaw and recomposed on the CAMERA's, so the net
-    // transform is a rotation by (cameraYaw - headYaw). That difference SHOULD be constant -
-    // the camera's yaw is driven by the head's - and everything about the scheme depends on it.
-    // If it wobbles while the head turns, a fixed physical offset sweeps through the world and
-    // the near floor visibly slides, which is the reported symptom.
+    // ⚠️ The first version of this measured the wrong thing, and its answer read as alarming
+    // when it was not. It tracked both (camYaw - headYaw) and (camYaw + headYaw) intending the
+    // stable one to reveal whether the two frames ran in opposite directions. The SUM came back
+    // stable - but that is the EXPECTED result for a correct frame, because the two angles were
+    // defined with opposite senses and the test could not have said otherwise.
     //
-    // Both the difference AND the sum are tracked, because they answer different questions. A
-    // wobbling DIFFERENCE means lag between what is written and what the engine renders. A
-    // steady SUM instead would mean the two yaws run in opposite directions - a handedness
-    // mistake - and would produce the same symptom at double the size. Measuring both settles
-    // which, rather than picking one and rebuilding to find out.
+    // UE3 lays out X forward and Y right, so seen from above atan2(fwd.y, fwd.x) grows CLOCKWISE.
+    // OpenXR has X right and -Z forward, so its yaw grows ANTICLOCKWISE. A single physical turn
+    // to the right raises one angle and lowers the other. Two mirror-image conventions cannot
+    // discriminate handedness; they only ever agree on the sum.
+    //
+    // The offsets themselves never go through angles - they are decomposed and recomposed on
+    // right/forward vectors, which carry their own sense - and that path checks out by hand:
+    // standing 20 cm right of centre while facing north puts the offset 20 cm along the camera's
+    // right. So the frame is correct, and what is left to measure is the WOBBLE.
+    //
+    // Which is what this now reports: the invariant against its own running mean, so a wrap
+    // through 180 degrees cannot masquerade as a 350 degree swing the way it did before.
     if (g_sceneMatValid) {
         const float crx = g_vmRow ? g_sceneMat[0] : g_sceneMat[0];
         const float cry = g_vmRow ? g_sceneMat[4] : g_sceneMat[1];
         if (fabsf(crx) + fabsf(cry) > 1e-6f) {
-            const float camYaw  = atan2f(-crx, cry);      // from forward = right x worldUp
-            const float headYaw = atan2f(hfx, hfz);
-            static float dMin =  1e9f, dMax = -1e9f, sMin = 1e9f, sMax = -1e9f;
-            static int   n = 0;
             auto wrap = [](float a) {
                 while (a >  3.14159265f) a -= 6.28318531f;
                 while (a < -3.14159265f) a += 6.28318531f;
                 return a;
             };
-            const float df = wrap(camYaw - headYaw), sm = wrap(camYaw + headYaw);
-            if (df < dMin) dMin = df;   if (df > dMax) dMax = df;
-            if (sm < sMin) sMin = sm;   if (sm > sMax) sMax = sm;
+            // Sum, not difference: the invariant for these two conventions, established above.
+            const float phi = wrap(atan2f(-crx, cry) + atan2f(hfx, hfz));
+            static bool  have = false;
+            static float mean = 0.0f, worst = 0.0f;
+            static int   n = 0;
+            if (!have) { mean = phi; have = true; }
+            const float err = wrap(phi - mean);
+            mean = wrap(mean + 0.02f * err);          // slow: the true value only moves on a turn
+            if (fabsf(err) > worst) worst = fabsf(err);
             if (++n >= 600) {
-                Log("[6dof] over %d frames: cam-head spread %.1f deg, cam+head spread %.1f deg"
-                    "  (the STABLE one names the frame; offset now R%+.0f U%+.0f F%+.0f UU)",
-                    n, (dMax - dMin) * 57.29578f, (sMax - sMin) * 57.29578f,
+                Log("[6dof] room-to-world yaw wobble: worst %.1f deg over %d frames"
+                    "  (offset R%+.0f U%+.0f F%+.0f UU - the sway it causes is |offset| x sin(wobble))",
+                    worst * 57.29578f, n,
                     g_dofOffset[0], g_dofOffset[1], g_dofOffset[2]);
-                n = 0; dMin = sMin = 1e9f; dMax = sMax = -1e9f;
+                n = 0; worst = 0.0f;
             }
         }
     }
