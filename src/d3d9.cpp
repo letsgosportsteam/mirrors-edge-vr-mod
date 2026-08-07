@@ -3562,9 +3562,54 @@ float g_vmOffset[3] = { 0, 0, 0 };
 static long g_vmInjections = 0;
 
 
+// ---- the camera position, read inside the frame, BEFORE anything is judged against it ----
+//
+// ⚠️ This has to run ahead of the acceptance test, not after it, and the ordering was the whole
+// zip-line fault.
+//
+// The test asks whether a matrix renders from where the camera is: it maps the camera position
+// through the matrix and requires the result to be near zero. The position it used came from
+// Present, so it described where the camera was a frame ago, and the tolerance was a flat 25
+// units. Standing still that is generous. On a zip line the camera covers far more than 25 units
+// in a frame, so the REAL scene matrix failed its own test and was rejected - and a rejected
+// matrix leaves g_sceneMat holding the previous frame's, which every duplicated draw then
+// renders from. The whole view is built from a stale camera, which is what "misaligned" is.
+//
+// It is also why widening the tolerance alone would be the wrong fix: the error is not that 25
+// is too small, it is that the reference was stale, and any tolerance loose enough to cover a
+// zip line would be loose enough to admit anything at walking pace.
+//
+// So the position is read here, once per frame, before the first matrix of the frame is judged.
+// The distance it moved since the last frame is kept as well, because that is exactly the
+// uncertainty between the game thread updating this and the render thread reading it - a bound
+// that comes from the measurement rather than from a number chosen in advance.
+static float g_pivotStep = 0.0f;      // how far the camera moved since the last frame
+
+static void SampleLivePivot()
+{
+    static long lastFrame = -1;
+    if (lastFrame == g_frames) return;
+    lastFrame = g_frames;
+
+    if (g_offCamLoc < 0 || !g_playerPawn) { g_livePivotValid = false; return; }
+    float cl[3];
+    if (!SafeRead(g_playerPawn + g_offCamLoc, cl, sizeof(cl))) { g_livePivotValid = false; return; }
+
+    if (g_livePivotValid) {
+        const float dx = cl[0] - g_livePivot[0];
+        const float dy = cl[1] - g_livePivot[1];
+        const float dz = cl[2] - g_livePivot[2];
+        g_pivotStep = sqrtf(dx*dx + dy*dy + dz*dz);
+    }
+    g_livePivot[0] = cl[0]; g_livePivot[1] = cl[1]; g_livePivot[2] = cl[2];
+    g_livePivotValid = true;
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
                                                   const float* data, UINT count)
 {
+    SampleLivePivot();
+
     // ---- injection, before the scan block so a scan does not see our own modification ----
     if ((g_vmMode != 0 || g_stereoMode == 1) && g_vmReg >= 0 && data && count >= 4 &&
         startReg <= (UINT)g_vmReg && startReg + count >= (UINT)g_vmReg + 4 &&
@@ -3622,8 +3667,39 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                 if (ml > 1e-6f)
                     dirOk = (mx*g_camFwd[0] + my*g_camFwd[1] + mz*g_camFwd[2]) / ml;
             }
-            const bool isScene = (g_camCacheValid && fabsf(w) <= 25.0f && dirOk >= 0.90f);
+            // Tolerance from the measurement rather than a fixed number: whatever distance the
+            // camera covered last frame bounds how far this frame's true position can be from
+            // the one just read. Standing still it collapses to the original 25 and rejects
+            // exactly what it always did; on a zip line it opens up by precisely the amount the
+            // camera is actually moving, and by nothing more.
+            const float tol = 25.0f + g_pivotStep * 1.5f;
+            const bool isScene = (g_camCacheValid && fabsf(w) <= tol && dirOk >= 0.90f);
             g_c0IsScene = isScene;   // tracked even when validation is off, for ShouldDuplicate
+
+            // ---- acceptance, reported where duplication can see it ----
+            //
+            // These counters existed and were only ever printed on the alternate-eye path, which
+            // simultaneous stereo returns before reaching. So under the mode this has been
+            // running in for the whole session, the single most important number - is the scene
+            // matrix being accepted at all - has been invisible. A rejected matrix is not a
+            // dropped frame, it silently leaves the previous one in place, and nothing said so.
+            {
+                static long lastFrame = -1;
+                static long acc = 0, rej = 0;
+                if (isScene) acc++; else rej++;
+                if (lastFrame != g_frames) {
+                    lastFrame = g_frames;
+                    static long frames = 0;
+                    if (++frames % 600 == 0) {
+                        Log("[vm] over 600 frames: %ld accepted, %ld rejected (%.1f%%)  |"
+                            " camera step %.0f UU/frame, tolerance %.0f",
+                            acc, rej, 100.0f * (float)rej / (float)((acc + rej) ? (acc + rej) : 1),
+                            g_pivotStep, tol);
+                        acc = rej = 0;
+                    }
+                }
+            }
+
             if (g_vmValidate && !isScene) {
                 InterlockedIncrement(&g_vmRejected);
                 return g_origSetVSConstF(dev, startReg, data, count);
@@ -3672,24 +3748,6 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                         g_liveCtlPitch = (float)signed16(cr[0]) * kRad;
                         g_liveCtlYaw   = (float)signed16(cr[1]) * kRad;
                         g_liveCtlValid = true;
-                    }
-                }
-
-                // ---- the pivot, read inside the frame too ----
-                //
-                // Every matrix rotation turns the camera about this point, and it was coming
-                // from g_camCache, which is sampled in Present - one frame stale. A stale pivot
-                // does not rotate wrongly, it TRANSLATES: turning about a point the camera has
-                // already left displaces the view by roughly the distance moved times the angle.
-                // Standing still that is nothing, which is why it never showed. On a zip line,
-                // moving fast with the camera pitched, it is a visible shift that comes and goes
-                // with the speed.
-                g_livePivotValid = false;
-                if (g_offCamLoc >= 0 && g_playerPawn) {
-                    float cl[3];
-                    if (SafeRead(g_playerPawn + g_offCamLoc, cl, sizeof(cl))) {
-                        g_livePivot[0] = cl[0]; g_livePivot[1] = cl[1]; g_livePivot[2] = cl[2];
-                        g_livePivotValid = true;
                     }
                 }
 
