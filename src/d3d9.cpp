@@ -804,8 +804,12 @@ bool                     g_livePivotValid = false;
 // Published by the XR frame loop for the render thread to ask the runtime about.
 XrTime                   g_predTime   = 0;
 XrDuration               g_predPeriod = 0;
-float                    g_yawLagRad  = 0.0f;    // head turn between the write and display
+float                    g_yawLagRad  = 0.0f;    // how far the view is behind the head
 bool                     g_yawLagFix  = true;    // NUMPAD6
+// Yaw we wrote ourselves since the render thread last looked. Anything the controller's yaw
+// moved BEYOND this came from somewhere else - the mouse, the stick, a scripted turn - and is
+// not lag. See the correction for why telling them apart matters.
+float                    g_writtenYawAccum = 0.0f;
 bool                     g_rollEnabled = true;   // HOME toggles
 int                      g_rollSign = 1;         // END flips
 static float             g_lastLoggedFovX = -1.0f;
@@ -3035,6 +3039,10 @@ static void ApplyHeadTracking(XrTime when)
     // FRotator is {Pitch, Yaw, Roll} as int32. Roll is deliberately untouched: the decompiled
     // UpdateRotation sets ViewRotation.Roll = 0 before writing back, so head roll cannot
     // travel this path at all and needs the view matrix instead.
+    // Every yaw delta we write is banked here for the lag correction to subtract. Accumulated
+    // rather than latched, so it cannot be lost to the render thread reading between two writes.
+    g_writtenYawAccum += (float)dYaw * (6.28318531f / 65536.0f);
+
     int32_t rot[3];
     if (!SafeRead(ctl + g_offActorRotation, rot, sizeof(rot))) return;
 
@@ -3999,11 +4007,43 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                         static bool  have = false;
                         static float mean = 0.0f;
                         if (!have) { mean = psi; have = true; }
+
+                        // ---- a mouse turn is not lag, and must not be corrected as one ----
+                        //
+                        // ⚠️ This is the drift after the mouse stops. The invariant moves for two
+                        // completely different reasons: the engine falling behind the head, which
+                        // is the error, and the player deliberately turning by other means, which
+                        // is not. The first version could not tell them apart and leaned on a
+                        // slow mean to absorb the second - so a mouse turn was treated as several
+                        // degrees of lag, fought while the mouse moved, and then released as the
+                        // mean caught up. Released over about a second, which is the camera
+                        // creeping left or right a beat after the mouse stops.
+                        //
+                        // They can be told apart exactly, because we know what WE wrote. Whatever
+                        // the controller's yaw moved beyond our own writes came from somewhere
+                        // else, and belongs in the reference immediately rather than being
+                        // mistaken for error and slowly forgiven.
+                        float external = 0.0f;
+                        {
+                            static bool  havePrev = false;
+                            static float prevCtl = 0.0f;
+                            if (g_liveCtlValid) {
+                                if (havePrev) {
+                                    const float dCtl = wrapf(g_liveCtlYaw - prevCtl);
+                                    external = wrapf(dCtl - g_writtenYawAccum);
+                                }
+                                prevCtl = g_liveCtlYaw;
+                                havePrev = true;
+                            }
+                            g_writtenYawAccum = 0.0f;
+                        }
+                        mean = wrapf(mean + external);
+
                         float d = wrapf(psi - mean);
-                        // Slow enough that a sweep lasting under a second reads as deviation
-                        // rather than being absorbed as the new normal, fast enough that a
-                        // deliberate stick or mouse turn settles in well under a second.
-                        mean = wrapf(mean + 0.03f * d);
+                        // Only a slow leak now, for accumulated numerical drift. The deliberate
+                        // turns it used to have to absorb are handled above, exactly, so this no
+                        // longer has to be a compromise between two jobs.
+                        mean = wrapf(mean + 0.01f * d);
 
                         const float kMax = 20.0f * (3.14159265f / 180.0f);
                         if (d >  kMax) d =  kMax;
