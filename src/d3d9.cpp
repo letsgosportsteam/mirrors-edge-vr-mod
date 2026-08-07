@@ -2647,32 +2647,47 @@ static void ApplyHeadTracking(XrTime when)
             g_headWrites, dYaw, dPitch, rot[0], rot[1]);
 }
 
-// F6 arms the view-matrix scan for exactly one frame of draw calls.
+// The view-matrix scan runs for exactly one frame of draw calls.
 //
 // One frame, not continuous: the hook sits on a call made thousands of times per frame, and
 // leaving the test live would be a permanent tax on the render thread for a question that
 // only needs answering once. It also keeps the log readable.
+//
+// Factored out of the F6 handler so the startup sequence can arm it too. Both callers need
+// the same prerequisites and the same countdown, and a second copy would be a second place
+// for them to drift.
+static int g_vmArmCountdown = 0;
+
+static bool ArmVMScan(bool quiet)
+{
+    if (!g_origSetVSConstF) {
+        if (!quiet) Log("[vm] SetVertexShaderConstantF is not hooked - cannot scan");
+        return false;
+    }
+    if (!LooksLikePlayerPawn(g_playerPawn)) {
+        if (!quiet) Log("[vm] no TdPlayerPawn resolved yet - the scan needs the camera pose");
+        return false;
+    }
+    g_vmCandidates = 0; g_vmBestReg = -1; g_vmBestScore = -1e9f;
+    InterlockedExchange(&g_vmWindowsTested, 0);
+    InterlockedExchange(&g_vmPoseFailures, 0);
+    Log("");
+    Log("[vm] ---- scanning one frame of vertex shader constants ----");
+    InterlockedExchange(&g_vmScanArmed, 1);
+    g_vmArmCountdown = 2;                 // this Present, then the next frame's draws
+    return true;
+}
+
+// Set by any manual press of the keys the startup sequence drives. Once the user has taken
+// the wheel the sequence stops, so it can never undo a deliberate toggle.
+static bool g_autoDone = false;
+
 static void CheckVMHotkey()
 {
     static bool p6 = false;
-    static int  armCountdown = 0;
     const bool d6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
 
-    if (d6 && !p6) {
-        if (!g_origSetVSConstF) {
-            Log("[vm] SetVertexShaderConstantF is not hooked - cannot scan");
-        } else if (!LooksLikePlayerPawn(g_playerPawn)) {
-            Log("[vm] no TdPlayerPawn resolved yet - the scan needs the camera pose");
-        } else {
-            g_vmCandidates = 0; g_vmBestReg = -1; g_vmBestScore = -1e9f;
-            InterlockedExchange(&g_vmWindowsTested, 0);
-            InterlockedExchange(&g_vmPoseFailures, 0);
-            Log("");
-            Log("[vm] ---- scanning one frame of vertex shader constants ----");
-            InterlockedExchange(&g_vmScanArmed, 1);
-            armCountdown = 2;                 // this Present, then the next frame's draws
-        }
-    }
+    if (d6 && !p6) { g_autoDone = true; ArmVMScan(false); }
     p6 = d6;
 
     // F2 cycles the injection. A 300 UU offset is far larger than any per-eye separation will
@@ -2700,7 +2715,7 @@ static void CheckVMHotkey()
     }
     p2 = d2;
 
-    if (armCountdown > 0 && --armCountdown == 0) {
+    if (g_vmArmCountdown > 0 && --g_vmArmCountdown == 0) {
         InterlockedExchange(&g_vmScanArmed, 0);
         // These three numbers separate failures that previously all read the same. Zero
         // windows tested means the scan never ran at all, which is a completely different
@@ -2730,6 +2745,65 @@ static void CheckVMHotkey()
         }
         Log("");
     }
+}
+
+// ---- startup sequence: what F6 -> F1 -> F10 used to do by hand ----
+//
+// Those three keys were a bring-up scaffold. Each rung needed its predecessor confirmed before
+// the next was worth switching on, so each got a key. All three are settled now, and typing
+// them into a game you cannot see - because the headset is already on by then - is not a test,
+// it is a chore.
+//
+// This is a sequence rather than a set of defaults because the steps have real prerequisites.
+// The scan needs a hooked device AND a resolved pawn AND a valid camera pose, none of which
+// exist at DLL load or at the main menu; stereo needs the register the scan commits. Flipping
+// the flags on at startup would just arrange for all three to fail in order.
+//
+// It retries rather than firing once: the pawn appears at level load, and the camera pose can
+// still be junk for a moment after that. Retrying costs a pointer read per attempt.
+static void AutoArm()
+{
+    if (g_autoDone) return;
+
+    static int stage = 0;         // 0 = waiting for the world, 1 = scan armed
+    static int wait = 0;
+    static int retries = 0;
+    static bool announced = false;
+
+    if (!g_xrReady) return;       // no session, nothing to be stereo on
+    if (wait > 0) { --wait; return; }
+
+    if (stage == 0) {
+        if (!ArmVMScan(true)) {   // quiet: at the main menu this fails every time by design
+            if (!announced) { Log("[auto] waiting for a player pawn before arming the scan"); announced = true; }
+            wait = 30;
+            return;
+        }
+        stage = 1;
+        wait = 10;                // the scan itself needs 2 frames; this is slack, not a poll
+        return;
+    }
+
+    if (g_vmReg >= 0) {
+        g_stereoMode = 1;
+        g_simulStereo = true;
+        g_eyeFilled[0] = g_eyeFilled[1] = false;
+        InterlockedExchange(&g_dupDraws, 0);
+        g_autoDone = true;
+        Log("*** [auto] ready - stereo ON, simultaneous. No keypresses needed.");
+        Log("[auto] F1 turns stereo off, F10 falls back to alternate-eye, F6 rescans.");
+        return;
+    }
+
+    // The scan ran and committed nothing. Almost always a camera pose that was not usable yet,
+    // which fixes itself a second later - so retry, and give up loudly rather than silently.
+    if (++retries >= 10) {
+        g_autoDone = true;
+        Log("[auto] the scan committed no register after %d attempts - press F6 by hand", retries);
+        return;
+    }
+    stage = 0;
+    wait = 120;
 }
 
 extern bool g_overlay;
@@ -2779,6 +2853,7 @@ static void CheckHeadHotkeys()
     static bool p1 = false;
     const bool d1 = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
     if (d1 && !p1) {
+        g_autoDone = true;
         if (g_vmReg < 0) {
             Log("[eye] F1 ignored - no view matrix committed, press F6 first");
         } else {
@@ -2794,6 +2869,7 @@ static void CheckHeadHotkeys()
     static bool p10 = false;
     const bool d10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     if (d10 && !p10) {
+        g_autoDone = true;
         if (g_stereoMode != 1) {
             Log("[eye] F10 ignored - turn stereo on with F1 first");
         } else {
@@ -4187,7 +4263,10 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
 
     // Cheap once the object model is up: re-resolves only when the cached pointer stops
     // looking like a TdSwanNeck, which is on level transitions.
-    if (g_offName >= 0) { CheckSwanHotkey(); ApplySwanNeck(); CheckHeadHotkeys(); CheckVMHotkey(); }
+    // AutoArm last, so a manual keypress on this frame is seen before the sequence acts on it.
+    if (g_offName >= 0) {
+        CheckSwanHotkey(); ApplySwanNeck(); CheckHeadHotkeys(); CheckVMHotkey(); AutoArm();
+    }
 
     // Sampled every frame - the peaks are what matter and a landing lasts a few frames.
     ProbeCameraAnimation();
