@@ -1738,15 +1738,53 @@ extern int g_offMoveState;
 
 static DWORD WINAPI ObjectModelThread(LPVOID)
 {
-    Log("");
-    Log("======== object model scan (rung 4a, background thread) ========");
+    // ⚠️ The scan RETRIES, and this is a correctness fix rather than caution.
+    //
+    // It ran exactly once, early, against a heap the game was still filling - and it is a
+    // sampling test on live data, so it can fail on a run where nothing is actually wrong. One
+    // run rejected the correct candidate (0x0204A344, 64/64 vtables, the same address every run
+    // has found) with "no offset decodes as a varying name", while an earlier run with the
+    // IDENTICAL Count=88227 Max=90128 accepted it. GNames was still growing at the time -
+    // Count=38211 against the ~50000 it settles at - so name indices beyond that count did not
+    // decode yet, and the 95% hit-rate threshold missed.
+    //
+    // The consequence was total: g_offName stayed -1, which gates the whole per-frame hotkey and
+    // tracking block, so there was no player controller, no view-matrix scan, no stereo. An
+    // intermittent startup heuristic was able to disable every rung above it with one bad roll.
+    //
+    // Only the LOCATION phase repeats. Everything after it derives from addresses that are
+    // already confirmed, and re-running it would just repeat its logging.
+    bool located = false;
+    for (int attempt = 1; attempt <= 20 && !located; ++attempt) {
+        Log("");
+        Log("======== object model scan (rung 4a, background thread) - attempt %d ========",
+            attempt);
+        const double t0 = NowMs();
+        FindSections();
+        located = FindGNames() && FindGObjects();
+        Log("======== attempt %d took %.1f ms (off the render thread) ========",
+            attempt, NowMs() - t0);
+        if (!located) {
+            // Longer waits after the first few: by then the game is at a menu rather than
+            // mid-load, and a 2 second scan every 5 seconds forever is not free.
+            const DWORD wait = (attempt < 5) ? 5000 : 15000;
+            Log("[obj] not located yet - retrying in %lu s (the heap is still settling)",
+                wait / 1000);
+            Sleep(wait);
+        }
+    }
+
+    if (!located) {
+        Log("[obj] GIVING UP after 20 attempts - no rung above the object model can run");
+        return 0;
+    }
+
     const double t0 = NowMs();
-    FindSections();
-    if (FindGNames()) {
+    {
         char nm[128];
         for (uint32_t i = 0; i < 5; ++i)
             if (NameOf(i, nm, sizeof(nm))) Log("[obj]     GNames[%u] = \"%s\"", i, nm);
-        if (FindGObjects()) {
+        {
             DetectUObjectLayout();
             ProbeKnownObjects();
             DetectPointerFields();
@@ -1774,7 +1812,8 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
             }
         }
     }
-    Log("======== scan took %.1f ms (off the render thread) ========", NowMs() - t0);
+    Log("======== layout derivation took %.1f ms (off the render thread) ========",
+        NowMs() - t0);
     Log("");
     return 0;
 }
