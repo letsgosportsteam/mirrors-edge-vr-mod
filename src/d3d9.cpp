@@ -700,6 +700,28 @@ static void ReportPacing();
 static void ReportPoseHonesty();
 static void TickPacing();
 
+// ---- do the two eyes agree, and does the roll get applied twice? ----
+//
+// Both eyes are rendered from ONE matrix with a lateral offset, so they carry identical
+// orientation by construction. The compositor is told something different for each: it is handed
+// g_views[0] and g_views[1] as submitted, orientation included. Anywhere those two disagree, the
+// image says one thing and the layer says another, per eye - and disagreement between the eyes
+// is not something the brain smooths over the way it does a lag. It fights it.
+//
+// Two ways that can happen, neither previously checked:
+//
+//   CANT. Some headsets angle their panels, and the runtime then reports two eye orientations
+//   that genuinely differ. Rendering both from one matrix ignores that. The error is fixed in
+//   size but it is a per-eye error, so it reads as the image refusing to fuse rather than as
+//   something being in the wrong place.
+//
+//   DOUBLE ROLL. The engine zeroes ViewRotation.Roll, so the game's image has no roll, and
+//   ApplyRoll puts the head's roll into the matrix. But the submitted pose ALSO carries the
+//   head's roll, and the compositor orients the layer by it. If both are live the roll is
+//   applied twice. That would grow with head tilt rather than head speed, so it has been
+//   invisible in every test that swept the view and left the head level.
+static void ReportStereoGeometry();
+
 // ================================================================ rung 6c: per-eye stereo
 //
 // ALTERNATE-EYE, deliberately, as the reference project's ladder does it. One eye is rendered
@@ -1072,6 +1094,7 @@ static void SubmitTestQuad()
     ApplyHeadTracking(fs.predictedDisplayTime);
     TickPacing();
     ReportPoseHonesty();
+    ReportStereoGeometry();
 
     // Published for the render thread, which needs a time to ask the runtime about and has no
     // frame state of its own. The period comes with it because the correction is expressed as
@@ -4621,6 +4644,60 @@ static void ApplyCameraRotation(float* m, bool rowStorage, const float axis[3], 
     }
     for (int i = 0; i < 3; ++i)
         for (int k = 0; k < 4; ++k) at(i,k) = nr[i][k];
+}
+
+static void ReportStereoGeometry()
+{
+    if (!g_viewsValid) return;
+
+    float f0[3], u0[3], f1[3], u1[3];
+    HeadBasis(g_views[0].pose.orientation, f0, u0);
+    HeadBasis(g_views[1].pose.orientation, f1, u1);
+
+    auto ang = [](const float a[3], const float b[3]) {
+        float d = a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+        if (d >  1.0f) d =  1.0f;
+        if (d < -1.0f) d = -1.0f;
+        return acosf(d);
+    };
+    const float cantFwd = ang(f0, f1);      // the eyes looking in different directions
+    const float cantUp  = ang(u0, u1);      // and rolled relative to each other
+
+    // The roll already present in what is SUBMITTED, measured the same way GetHeadRoll measures
+    // the head's: world up with the forward component removed, then the signed angle to the
+    // eye's own up, about forward.
+    float submittedRoll = 0.0f;
+    {
+        const float d = f0[1];
+        float lx = -d*f0[0], ly = 1.0f - d*f0[1], lz = -d*f0[2];
+        const float ll = sqrtf(lx*lx + ly*ly + lz*lz);
+        if (ll > 0.05f) {
+            lx /= ll; ly /= ll; lz /= ll;
+            const float cosA = lx*u0[0] + ly*u0[1] + lz*u0[2];
+            const float sinA = (ly*u0[2] - lz*u0[1]) * f0[0]
+                             + (lz*u0[0] - lx*u0[2]) * f0[1]
+                             + (lx*u0[1] - ly*u0[0]) * f0[2];
+            submittedRoll = atan2f(sinA, cosA);
+        }
+    }
+
+    static float worstCantF = 0.0f, worstCantU = 0.0f, worstRollGap = 0.0f;
+    static long  n = 0;
+    if (cantFwd > worstCantF) worstCantF = cantFwd;
+    if (cantUp  > worstCantU) worstCantU = cantUp;
+    // The image carries g_headRoll and the layer carries submittedRoll. If both are live and
+    // equal, the roll is being applied twice and this reads as the head roll itself.
+    const float bothRoll = fabsf(submittedRoll) + fabsf(g_headRoll);
+    if (bothRoll > worstRollGap) worstRollGap = bothRoll;
+
+    if (++n >= 600) {
+        Log("[eye] stereo geometry over %ld frames: eye cant fwd %.3f deg, up %.3f deg"
+            "  |  roll in submitted pose %.2f deg + roll in image %.2f deg"
+            "  (equal and both live = applied TWICE)",
+            n, worstCantF * 57.29578f, worstCantU * 57.29578f,
+            submittedRoll * 57.29578f, g_headRoll * 57.29578f);
+        n = 0; worstCantF = worstCantU = worstRollGap = 0.0f;
+    }
 }
 
 // Called once per Present. Buckets the interval since the last one by display periods.
