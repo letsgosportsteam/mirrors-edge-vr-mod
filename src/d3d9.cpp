@@ -751,6 +751,15 @@ float                    g_liveCtlPitch = 0.0f;
 float                    g_liveCtlYaw   = 0.0f;
 bool                     g_liveCtlValid = false;
 long                     g_liveCtlFrame = -1;
+// The camera position used as the pivot for every matrix rotation, read inside the frame. See
+// the read site for why the Present-sampled one was not good enough.
+float                    g_livePivot[3] = { 0, 0, 0 };
+bool                     g_livePivotValid = false;
+// Published by the XR frame loop for the render thread to ask the runtime about.
+XrTime                   g_predTime   = 0;
+XrDuration               g_predPeriod = 0;
+float                    g_yawLagRad  = 0.0f;    // head turn between the write and display
+bool                     g_yawLagFix  = true;    // NUMPAD6
 bool                     g_rollEnabled = true;   // HOME toggles
 int                      g_rollSign = 1;         // END flips
 static float             g_lastLoggedFovX = -1.0f;
@@ -1036,6 +1045,12 @@ static void SubmitTestQuad()
     // Head tracking uses the SAME predicted display time the frame is submitted for, so the
     // pose the game renders from and the pose the compositor expects agree.
     ApplyHeadTracking(fs.predictedDisplayTime);
+
+    // Published for the render thread, which needs a time to ask the runtime about and has no
+    // frame state of its own. The period comes with it because the correction is expressed as
+    // "how much further will the head have turned one frame from now".
+    g_predTime   = fs.predictedDisplayTime;
+    g_predPeriod = fs.predictedDisplayPeriod;
 
     XrFrameEndInfo fei{ XR_TYPE_FRAME_END_INFO };
     fei.displayTime          = fs.predictedDisplayTime;
@@ -2622,6 +2637,28 @@ static void HeadBasis(const XrQuaternionf& q, float fwd[3], float up[3])
     up[2]  =  2.0f * (q.y * q.z + q.w * q.x);
 }
 
+// The head's levelled yaw in radians, room space, with no state of its own.
+//
+// ⚠️ Deliberately NOT GetHeadYawPitch. That function holds its last good yaw in a static across
+// calls, to ride out the singularity when looking straight up - correct for the one caller that
+// drives the game's rotation, and wrong to share. The lag correction calls this twice per frame
+// at two different times, from a different thread; routing that through the same static would
+// have each caller's hold state overwriting the other's, and near vertical they would disagree
+// about what "last good" meant. Two callers, one static, is a bug waiting for a pose.
+static bool GetHeadYawRaw(XrTime when, float* outYaw)
+{
+    if (g_viewSpace == XR_NULL_HANDLE || g_xrSpace == XR_NULL_HANDLE) return false;
+    XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
+    if (XR_FAILED(xrLocateSpace(g_viewSpace, g_xrSpace, when, &loc))) return false;
+    if (!(loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) return false;
+
+    float f[3], u[3];
+    HeadBasis(loc.pose.orientation, f, u);
+    if (sqrtf(f[0]*f[0] + f[2]*f[2]) < 0.05f) return false;   // near vertical: no yaw to read
+    *outYaw = atan2f(f[0], f[2]);
+    return true;
+}
+
 // Head orientation as UE3 rotator units. Yaw and pitch are taken from the forward vector
 // rather than an Euler decomposition, which avoids the ambiguity near vertical.
 static bool GetHeadYawPitch(XrTime when, int32_t* outYaw, int32_t* outPitch)
@@ -3161,6 +3198,15 @@ static void CheckHeadHotkeys()
         Log("*** [head] NUMPAD5 -> camera animations %s the view",
             g_animYawFollow ? "TURN" : "do NOT turn");
     }
+    static bool pN6 = false;
+    const bool dN6 = (GetAsyncKeyState(VK_NUMPAD6) & 0x8000) != 0;
+    if (dN6 && !pN6) {
+        g_yawLagFix = !g_yawLagFix;
+        Log("*** [head] NUMPAD6 -> turn-lag compensation %s (last measured %.2f deg)",
+            g_yawLagFix ? "ON" : "OFF", g_yawLagRad * 57.29578f);
+    }
+    pN6 = dN6;
+
     // All three at once, because the useful question is which COMBINATION is set and reading it
     // off three separate lines scattered through the log is how a test gets mis-attributed.
     if ((dN2 && !pN2) || (dN4 && !pN4) || (dN5 && !pN5))
@@ -3479,6 +3525,7 @@ static void ApplyRoll(float* m, bool rowStorage);      // defined with the stere
 static void ApplyPitchFix(float* m, bool rowStorage);  // likewise
 static void ApplyRollFix(float* m, bool rowStorage);   // likewise
 static void ApplyYawFix(float* m, bool rowStorage);    // likewise
+static void ApplyYawLag(float* m, bool rowStorage);    // likewise
 static void ApplySixDof(float* m, bool rowStorage);
 
 int   g_vmReg = -1;              // committed after a successful scan
@@ -3569,6 +3616,51 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                         g_liveCtlPitch = (float)signed16(cr[0]) * kRad;
                         g_liveCtlYaw   = (float)signed16(cr[1]) * kRad;
                         g_liveCtlValid = true;
+                    }
+                }
+
+                // ---- the pivot, read inside the frame too ----
+                //
+                // Every matrix rotation turns the camera about this point, and it was coming
+                // from g_camCache, which is sampled in Present - one frame stale. A stale pivot
+                // does not rotate wrongly, it TRANSLATES: turning about a point the camera has
+                // already left displaces the view by roughly the distance moved times the angle.
+                // Standing still that is nothing, which is why it never showed. On a zip line,
+                // moving fast with the camera pitched, it is a visible shift that comes and goes
+                // with the speed.
+                g_livePivotValid = false;
+                if (g_offCamLoc >= 0 && g_playerPawn) {
+                    float cl[3];
+                    if (SafeRead(g_playerPawn + g_offCamLoc, cl, sizeof(cl))) {
+                        g_livePivot[0] = cl[0]; g_livePivot[1] = cl[1]; g_livePivot[2] = cl[2];
+                        g_livePivotValid = true;
+                    }
+                }
+
+                // ---- how much further will the head have turned by the time this is seen ----
+                //
+                // The write in Present used the head pose at the predicted display time for the
+                // frame BEFORE this one. This frame is displayed a period later, and the head
+                // kept moving - that gap is the judder, and it is proportional to how fast the
+                // player is turning, which is why it only shows during a turn.
+                //
+                // Asking the runtime the same question at two times measures it directly: no
+                // stored state, no cross-thread handoff, and the runtime's own prediction rather
+                // than a difference taken between frames and called a velocity.
+                g_yawLagRad = 0.0f;
+                if (g_yawLagFix && g_predTime && g_predPeriod) {
+                    float y0 = 0.0f, y1 = 0.0f;
+                    if (GetHeadYawRaw(g_predTime, &y0) &&
+                        GetHeadYawRaw(g_predTime + g_predPeriod, &y1)) {
+                        float d = y1 - y0;
+                        while (d >  3.14159265f) d -= 6.28318531f;
+                        while (d < -3.14159265f) d += 6.28318531f;
+                        // Into UE3's yaw sense, the same conversion the write uses.
+                        d *= (float)g_yawSign;
+                        const float kMax = 20.0f * (3.14159265f / 180.0f);
+                        if (d >  kMax) d =  kMax;
+                        if (d < -kMax) d = -kMax;
+                        g_yawLagRad = d;
                     }
                 }
             }
@@ -3711,6 +3803,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
         ApplyRollFix(m, g_vmRow);
         ApplyPitchFix(m, g_vmRow);
         ApplyYawFix(m, g_vmRow);
+        ApplyYawLag(m, g_vmRow);
         ApplySixDof(m, g_vmRow);
         ApplyRoll(m, g_vmRow);
 
@@ -4189,6 +4282,14 @@ static void ApplyCameraRotation(float* m, bool rowStorage, const float axis[3], 
         for (int k = 0; k < 4; ++k) at(i,k) = nr[i][k];
 }
 
+// The point every matrix rotation turns about. Prefers the position read inside the frame; falls
+// back to the Present-sampled one, which is a frame stale but better than the world origin.
+// Defined here, above all four users, rather than beside the one that needed it last.
+static const float* RotationPivot()
+{
+    return g_livePivotValid ? g_livePivot : g_camCache;
+}
+
 // ---- correct the pitch in the matrix instead of waiting for the engine ----
 //
 // Writing pitch into Controller.Rotation happens once, in Present, and the engine has already
@@ -4279,7 +4380,7 @@ static void ApplyPitchFix(float* m, bool rowStorage)
     }
 
     const float right[3] = { col(0,0), col(0,1), col(0,2) };
-    ApplyCameraRotation(m, rowStorage, right, err, g_camCache);
+    ApplyCameraRotation(m, rowStorage, right, err, RotationPivot());
 }
 
 // ---- lock the camera's own roll out of the view ----
@@ -4320,7 +4421,27 @@ static void ApplyRollFix(float* m, bool rowStorage)
     if (s < -1.0f) s = -1.0f;
 
     const float fwd[3] = { fx, fy, fz };
-    ApplyCameraRotation(m, rowStorage, fwd, asinf(s), g_camCache);
+    ApplyCameraRotation(m, rowStorage, fwd, asinf(s), RotationPivot());
+}
+
+// ---- take out the head turn the engine has not caught up with yet ----
+//
+// This is the judder. The game's camera is driven by writes made in Present, so the yaw it
+// renders with belongs to the previous frame's head pose; by the time the frame reaches the
+// headset the head has turned further, and the world appears to drag behind the turn. It scales
+// with turn rate, which is why it is invisible when still and obvious when looking around.
+//
+// The write cannot be made to arrive sooner. But the size of the gap is knowable - measured
+// above by asking the runtime for the head pose at two times - and the matrix can simply be
+// turned by it. Same primitive as the animation locks, about world up for the same reason.
+static void ApplyYawLag(float* m, bool rowStorage)
+{
+    if (!g_yawLagFix || fabsf(g_yawLagRad) < 1e-5f) return;
+    if (!g_livePivotValid && !g_camCacheValid) return;
+    const float up[3] = { 0.0f, 0.0f, 1.0f };
+    // Negated for the same reason ApplyYawFix negates: a positive turn about world up in this
+    // primitive's sense LOWERS the rotator's yaw.
+    ApplyCameraRotation(m, rowStorage, up, -g_yawLagRad, RotationPivot());
 }
 
 // ---- lock the animation's yaw out of the view ----
@@ -4354,7 +4475,7 @@ static void ApplyYawFix(float* m, bool rowStorage)
     // About the WORLD up axis, not the camera's. A yaw is a turn about vertical whatever the
     // camera is doing in pitch; turning about a pitched up axis would tilt the horizon.
     const float up[3] = { 0.0f, 0.0f, 1.0f };
-    ApplyCameraRotation(m, rowStorage, up, d, g_camCache);
+    ApplyCameraRotation(m, rowStorage, up, d, RotationPivot());
 }
 
 static void ApplyRoll(float* m, bool rowStorage)
@@ -4401,6 +4522,7 @@ static void BuildEyeMatrix(float* out, int eye)
     ApplyRollFix(m, true);
     ApplyPitchFix(m, true);
     ApplyYawFix(m, true);    // last: it turns about world up, which the other two do not touch
+    ApplyYawLag(m, true);
     ApplySixDof(m, true);   // a world-space offset, same stage as the per-eye one
     if (g_fovForce && g_gameFovValid && g_targetHalfFovX > 0.0f) {
         // ⚠️ Uses g_targetHalfFovX, the SAME number the projection layer submits.
