@@ -806,6 +806,42 @@ engine's own.
 > cannot turn the suspected cause **back on** cannot demonstrate anything — the failing state
 > has to be reachable, not just the working one.
 
+### ✅ Head roll — working first try, 2026-08-06
+
+Baked into the view matrix in clip space. Worked with no sign flip needed, unlike yaw and pitch
+which were both inverted — which follows: roll goes through the matrix directly rather than
+through the engine's `FRotator`, so it never passes the OpenXR→UE3 handedness conversion that
+inverted the other two.
+
+> **⛔ Roll CANNOT be left to the compositor.** The projection layer already carries the head's
+> full orientation, roll included, so it looks like the runtime should rotate the image. It does
+> not: a projection layer is reprojected by the **delta** between the pose claimed and the pose
+> the display is at. Claim a rolled pose for an unrolled render while the head is at that roll,
+> the delta is zero, and the image presents straight. Baking roll into the render is what makes
+> the claimed pose true.
+
+> **⚠️ Rotating the raw clip columns would SHEAR.** The frustum is not square — `tanX` and `tanY`
+> differ, and under duplication `tanX` is the half-width per-eye value. Convert to the symmetric
+> view-space direction, rotate there, convert back:
+> ```
+> x_v = clip.x * tanX,  y_v = clip.y * tanY     rotate     clip' = x_v'/tanX, y_v'/tanY
+> ```
+> Applied **after** the forced projection so the tangents are the frustum the eye actually sees.
+> Commutes with the positional offset: an offset pre-multiplies in world space, a roll
+> post-multiplies in clip space.
+
+**The angle comes from vectors, not an Euler decomposition** — an Euler order has to be assumed
+and the wrong one silently mixes roll into yaw near vertical. World-up is projected perpendicular
+to the facing and the signed angle to the head's own up is measured. Degenerate looking straight
+up or down, where the projection collapses; the previous value is held rather than snapped to
+zero.
+
+### Cost, measured with everything on
+
+Frame grab **3.6–4.1 ms** with draw duplication, stereo, roll and the occlusion override all
+running — no worse than the mono path, because the backbuffer is the same size and it is still
+grabbed once.
+
 ### The shadow-map theory was wrong, and was nearly settled on
 
 The render-target census showed four scene-sized surfaces, two taking heavy draw counts, and the
