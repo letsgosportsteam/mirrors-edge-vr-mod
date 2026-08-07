@@ -2560,6 +2560,13 @@ static bool GetHeadRoll(XrTime when, float* outRoll)
     return true;
 }
 
+// Defined with the stereo code below; driven from here because the head pose is sampled once
+// per frame in this function and both roll and 6-DOF read it.
+void UpdateSixDof(XrTime when);
+extern bool  g_sixDof;
+extern bool  g_haveCentre;
+extern float g_dofOffset[3];
+
 static void ApplyHeadTracking(XrTime when)
 {
     // Sampled here rather than in the D3D hook: the hook runs thousands of times a frame and
@@ -2567,6 +2574,7 @@ static void ApplyHeadTracking(XrTime when)
     {
         float r = 0.0f;
         if (GetHeadRoll(when, &r)) g_headRoll = r;
+        UpdateSixDof(when);
     }
 
     if (!g_headTracking || g_offActorRotation < 0) return;
@@ -2844,6 +2852,19 @@ static void CheckHeadHotkeys()
     }
     pHome = dHome; pEnd = dEnd;
 
+    // PAGE UP recentres 6-DOF, PAGE DOWN toggles it. Recentre matters because the origin is
+    // captured wherever the head happened to be at the first valid pose - typically mid-air
+    // while the headset is being put on.
+    static bool pPgUp = false, pPgDn = false;
+    const bool dPgUp = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
+    const bool dPgDn = (GetAsyncKeyState(VK_NEXT)  & 0x8000) != 0;
+    if (dPgUp && !pPgUp) { g_haveCentre = false; Log("*** [6dof] PAGE UP -> recentring"); }
+    if (dPgDn && !pPgDn) {
+        g_sixDof = !g_sixDof;
+        Log("*** [6dof] PAGE DOWN -> %s", g_sixDof ? "ON" : "OFF (decaying to neutral)");
+    }
+    pPgUp = dPgUp; pPgDn = dPgDn;
+
     // F11 adjusts world scale. UE3 units per metre is game-specific and unmeasured here, and
     // it is the one number that decides whether the world feels life-sized.
     static bool p11 = false;
@@ -3030,7 +3051,8 @@ static void TestWindow(int reg, const float* m, bool asRow,
 // The game's buffer is const and belongs to the engine, so the covering call is copied,
 // modified and forwarded. Only calls that actually cover the matrix pay that cost.
 
-static void ApplyRoll(float* m, bool rowStorage);   // defined with the stereo code below
+static void ApplyRoll(float* m, bool rowStorage);     // defined with the stereo code below
+static void ApplySixDof(float* m, bool rowStorage);
 
 int   g_vmReg = -1;              // committed after a successful scan
 bool  g_vmRow = true;
@@ -3191,6 +3213,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                 for (int i = 0; i < 4; ++i) { m[0 * 4 + i] *= sx; m[1 * 4 + i] *= sy; }
             }
         }
+        ApplySixDof(m, g_vmRow);
         ApplyRoll(m, g_vmRow);
 
         if (++g_vmInjections == 1 || (g_vmInjections % 20000) == 0)
@@ -3442,6 +3465,107 @@ static PFN_DrawIndexed g_origDrawIndexed = nullptr;
 // actually sees rather than whatever the engine happened to send. It composes with the
 // positional offset in either order - an offset is a pre-multiplication in world space, a roll
 // is a post-multiplication in clip space, so they commute.
+// ---- 6-DOF: the headset's physical translation, applied to the view matrix ----
+//
+// Same injection as the per-eye offset, from a different source. The subtlety is which frame
+// the translation is expressed in.
+//
+// OpenXR reports the head position in LOCAL space, which is fixed to the room and does not
+// rotate with the head. Applying that directly along the game's world axes would be wrong the
+// moment the player turns: leaning left would move the camera along a fixed world direction
+// rather than along the camera's own left.
+//
+// So the offset is converted into HEAD-LOCAL coordinates first - rotate the room-space delta by
+// the conjugate of the head orientation - and then applied along the camera's own right, up and
+// forward axes, read out of the matrix exactly as the per-eye offset reads its right axis. The
+// game camera's orientation tracks the head's, so head-local and camera-local coincide.
+//
+// Metres to UE3 units uses the measured 100 UU/m, so a 30 cm lean is 30 units. That figure is
+// derived from the game's own movement speeds and is not a taste setting.
+//
+// ⚠️ Failure must DECAY, not freeze. The reference records losing a run to this: positional
+// tracking dropped while orientation kept working - the IMU carries rotation, position needs
+// the cameras - the update was skipped, and the last offset persisted forever, leaving the view
+// about 0.9 m from where it belonged with no way back. Skipping looked like the safe choice and
+// was the worst one. Here the offset decays toward neutral whenever the position bit is clear.
+bool         g_sixDof = true;
+bool         g_haveCentre = false;
+static float g_centre[3] = { 0, 0, 0 };
+float        g_dofOffset[3] = { 0, 0, 0 };   // head-local, UE3 units
+
+void UpdateSixDof(XrTime when)
+{
+    if (g_viewSpace == XR_NULL_HANDLE || g_xrSpace == XR_NULL_HANDLE) return;
+    XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
+    if (XR_FAILED(xrLocateSpace(g_viewSpace, g_xrSpace, when, &loc))) return;
+
+    const bool posOk = (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
+                       (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
+    if (!posOk || !g_sixDof) {
+        // Decay home over roughly a second rather than holding a stale offset.
+        for (int i = 0; i < 3; ++i) g_dofOffset[i] *= 0.97f;
+        return;
+    }
+
+    const XrVector3f p = loc.pose.position;
+    if (!g_haveCentre) {
+        g_centre[0] = p.x; g_centre[1] = p.y; g_centre[2] = p.z;
+        g_haveCentre = true;
+        Log("[6dof] centre set at (%.3f, %.3f, %.3f) m", p.x, p.y, p.z);
+        return;
+    }
+
+    const float dx = p.x - g_centre[0], dy = p.y - g_centre[1], dz = p.z - g_centre[2];
+
+    // Into head-local coordinates: v' = conj(q) * v * q.
+    const XrQuaternionf q = loc.pose.orientation;
+    const float cx = -q.x, cy = -q.y, cz = -q.z, cw = q.w;
+    const float tx = 2.0f * (cy * dz - cz * dy);
+    const float ty = 2.0f * (cz * dx - cx * dz);
+    const float tz = 2.0f * (cx * dy - cy * dx);
+    const float lx = dx + cw * tx + (cy * tz - cz * ty);
+    const float ly = dy + cw * ty + (cz * tx - cx * tz);
+    const float lz = dz + cw * tz + (cx * ty - cy * tx);
+
+    g_dofOffset[0] = lx * g_worldScale;    // right
+    g_dofOffset[1] = ly * g_worldScale;    // up
+    g_dofOffset[2] = lz * g_worldScale;    // OpenXR -Z is forward, handled at the apply site
+}
+
+// Offsets the matrix by the current 6-DOF translation, along the camera's OWN axes taken from
+// the matrix - the same source the per-eye offset uses, so the two cannot disagree.
+static void ApplySixDof(float* m, bool rowStorage)
+{
+    if (!g_sixDof) return;
+    const float ax = fabsf(g_dofOffset[0]) + fabsf(g_dofOffset[1]) + fabsf(g_dofOffset[2]);
+    if (ax < 0.01f) return;
+
+    auto col = [&](int c, int i) { return rowStorage ? m[i * 4 + c] : m[c * 4 + i]; };
+    auto norm3 = [](float& x, float& y, float& z) {
+        const float l = sqrtf(x*x + y*y + z*z);
+        if (l < 1e-6f) return false;
+        x /= l; y /= l; z /= l; return true;
+    };
+
+    float rx = col(0,0), ry = col(0,1), rz = col(0,2);       // right
+    float ux = col(1,0), uy = col(1,1), uz = col(1,2);       // up
+    float fx = col(3,0), fy = col(3,1), fz = col(3,2);       // forward
+    if (!norm3(rx,ry,rz) || !norm3(ux,uy,uz) || !norm3(fx,fy,fz)) return;
+
+    // -Z is forward in OpenXR, so a head-local -z (moving forward) becomes +forward here.
+    const float ox = rx*g_dofOffset[0] + ux*g_dofOffset[1] - fx*g_dofOffset[2];
+    const float oy = ry*g_dofOffset[0] + uy*g_dofOffset[1] - fy*g_dofOffset[2];
+    const float oz = rz*g_dofOffset[0] + uz*g_dofOffset[1] - fz*g_dofOffset[2];
+
+    if (rowStorage) {
+        for (int c = 0; c < 4; ++c)
+            m[12 + c] -= ox * m[0 + c] + oy * m[4 + c] + oz * m[8 + c];
+    } else {
+        for (int r = 0; r < 4; ++r)
+            m[3 * 4 + r] -= ox * m[0 * 4 + r] + oy * m[1 * 4 + r] + oz * m[2 * 4 + r];
+    }
+}
+
 static void ApplyRoll(float* m, bool rowStorage)
 {
     if (!g_rollEnabled || fabsf(g_headRoll) < 1e-4f) return;
@@ -3479,6 +3603,7 @@ static void BuildEyeMatrix(float* out, int eye)
         for (int c = 0; c < 4; ++c)
             m[12 + c] -= ox * m[0 + c] + oy * m[4 + c] + oz * m[8 + c];
     }
+    ApplySixDof(m, true);   // a world-space offset, same stage as the per-eye one
     if (g_fovForce && g_gameFovValid && g_targetHalfFovX > 0.0f) {
         // ⚠️ Uses g_targetHalfFovX, the SAME number the projection layer submits.
         //
@@ -3825,6 +3950,9 @@ static void DrawOverlay(IDirect3DDevice9* dev)
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "DUP %ld ONLY %d  OCC %s",
                 InterlockedCompareExchange(&g_dupDraws, 0, 0), g_dupOnlyTarget,
                 g_occlusionMode == 2 ? "REAL" : (g_occlusionMode == 1 ? "ALWAYS" : "AUTO"));
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "6DOF %s  R%+d U%+d F%+d UU",
+                g_sixDof ? "ON" : "OFF", (int)g_dofOffset[0], (int)g_dofOffset[1],
+                (int)-g_dofOffset[2]);
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "ANIM P%+d Y%+d R%+d ST%d",
                 (int)g_animNow[0], (int)g_animNow[1], (int)g_animNow[2], g_animState);
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "FOV %d X %d  IPD %d/100",
