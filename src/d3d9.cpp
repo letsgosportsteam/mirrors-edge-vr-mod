@@ -3522,18 +3522,31 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
             // error being corrected.
             //
             // This is the one point that is both on the render thread and inside the frame, so
-            // the controller's pitch read here belongs to the same frame as the matrix beside
-            // it. Once per frame, off the cached pointer - no walk, no validation, because
-            // ApplyHeadTracking revalidates it every frame anyway and a stale read here is
-            // caught by the clamp in ApplyPitchFix.
-            if (g_playerCtl && g_offActorRotation >= 0 && g_liveCtlFrame != g_frames) {
+            // the controller's pitch read here belongs to the same frame as the matrix beside it.
+            //
+            // ⚠️ VALIDATED, not merely non-null. The first version reasoned that
+            // ApplyHeadTracking revalidates the pointer every frame so this could skip it - but
+            // that check runs in PRESENT, after the frame is drawn. Between the controller being
+            // destroyed and Present noticing, this reads a freed object, and the log shows the
+            // pointer going stale twice in a single run.
+            //
+            // The value read would still look like a plausible angle - any dword masked to 16
+            // bits does - so nothing downstream could tell, and it feeds a correction that
+            // ROTATES THE VIEW. That is the shape of an intermittent visual break during a jump
+            // that does not reproduce on reload.
+            //
+            // Once per frame is cheap enough to validate properly rather than argue about.
+            if (g_liveCtlFrame != g_frames && g_offActorRotation >= 0) {
                 g_liveCtlFrame = g_frames;
-                int32_t cr = 0;
-                if (SafeRead(g_playerCtl + g_offActorRotation, &cr, sizeof(cr))) {
-                    int32_t p = cr & 0xFFFF;
-                    if (p > 32767) p -= 65536;
-                    g_liveCtlPitch = (float)p * (6.28318531f / 65536.0f);
-                    g_liveCtlValid = true;
+                g_liveCtlValid = false;
+                if (LooksLikePlayerController(g_playerCtl)) {
+                    int32_t cr = 0;
+                    if (SafeRead(g_playerCtl + g_offActorRotation, &cr, sizeof(cr))) {
+                        int32_t p = cr & 0xFFFF;
+                        if (p > 32767) p -= 65536;
+                        g_liveCtlPitch = (float)p * (6.28318531f / 65536.0f);
+                        g_liveCtlValid = true;
+                    }
                 }
             }
 
@@ -4192,15 +4205,40 @@ static void ApplyPitchFix(float* m, bool rowStorage)
     // the target is the head alone and the correction is (head - matrix), which takes out the
     // animation as well. Two exact expressions from one line, and neither can go stale.
     const float matPitch = asinf(sinP);
-    const float anim = (g_animFollow && g_liveCtlValid) ? (matPitch - g_liveCtlPitch) : 0.0f;
+    float anim = (g_animFollow && g_liveCtlValid) ? (matPitch - g_liveCtlPitch) : 0.0f;
+
+    // A real contribution is tens of degrees at most. Anything past 45 means one of the two
+    // values does not describe the camera being corrected - a read that beat the validity check,
+    // or a matrix that slipped the scene test - and following it would rotate the view somewhere
+    // the player is not. Dropping to zero degrades to "no animation compensation", which is
+    // visible but harmless, rather than to a large wrong rotation, which is neither.
+    const float kAnimMax = 45.0f * (3.14159265f / 180.0f);
+    if (anim > kAnimMax || anim < -kAnimMax) {
+        static long dropped = 0;
+        if (++dropped == 1 || (dropped % 600) == 0)
+            Log("[head] implausible animation pitch %.1f deg (matrix %.1f, controller %.1f) -"
+                " ignoring, %ld so far", anim * 57.29578f, matPitch * 57.29578f,
+                g_liveCtlPitch * 57.29578f, dropped);
+        anim = 0.0f;
+    }
+
     float err = (g_pitchTarget + anim) - matPitch;
 
     // Clamped hard. A foreign matrix that slipped the scene test, or a target computed from a
     // stale sample, must not be able to throw the view somewhere the head is not - and a real
     // error is never more than a degree or two.
+    // ⚠️ Reaching this clamp is a REPORT, not a routine event. A correction is normally a
+    // degree or two - one frame of lag - so a clamped one means something upstream is wrong, and
+    // a silent clamp would hide exactly the intermittent break it is there to contain.
     const float kMax = 20.0f * (3.14159265f / 180.0f);
-    if (err >  kMax) err =  kMax;
-    if (err < -kMax) err = -kMax;
+    if (err > kMax || err < -kMax) {
+        static long clamped = 0;
+        if (++clamped == 1 || (clamped % 600) == 0)
+            Log("[head] pitch correction clamped: wanted %.1f deg (target %.1f, matrix %.1f,"
+                " anim %.1f) - %ld so far", err * 57.29578f, g_pitchTarget * 57.29578f,
+                matPitch * 57.29578f, anim * 57.29578f, clamped);
+        err = (err > 0.0f) ? kMax : -kMax;
+    }
 
     const float right[3] = { col(0,0), col(0,1), col(0,2) };
     ApplyCameraRotation(m, rowStorage, right, err, g_camCache);
