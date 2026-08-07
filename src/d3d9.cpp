@@ -2641,6 +2641,8 @@ void UpdateSixDof(XrTime when);
 extern bool  g_sixDof;
 extern bool  g_haveCentre;
 extern float g_dofOffset[3];
+extern float g_sceneMat[16];      // read by the steep-pitch trace below
+extern bool  g_sceneMatValid;
 
 static void ApplyHeadTracking(XrTime when)
 {
@@ -2659,6 +2661,44 @@ static void ApplyHeadTracking(XrTime when)
             g_headRoll += w * d;
         }
         UpdateSixDof(when);
+
+        // ---- trace the steep-pitch rotation, rather than guess at it a fourth time ----
+        //
+        // Three plausible causes have been fixed so far - the yaw singularity, the roll's
+        // sensitivity near vertical, and the written pitch going over the top - and the image
+        // still rotates when looking all the way up or down. Each of those was a real defect and
+        // none was this one, so this stops proposing mechanisms and records the state instead.
+        //
+        // The decisive column is matRightZ: the z component of the camera's right axis, taken
+        // from the ENGINE's own matrix before anything of ours touches it. UE3 is Z-up, so a
+        // camera with no roll has a level right axis and this reads ~0. If it stays at 0 through
+        // the event, the engine is not rolling and the rotation is ours - g_headRoll, applied by
+        // ApplyRoll. If it swings, the roll is coming from the game and no amount of work on the
+        // OpenXR side will touch it.
+        //
+        // headRoll and its weight are logged beside it so the two candidates can be told apart
+        // in one run instead of one per hypothesis.
+        {
+            static int decim = 0;
+            int32_t ty, tp;
+            if (GetHeadYawPitch(when, &ty, &tp)) {
+                const float pitchDeg = tp * (360.0f / 65536.0f);
+                if (fabsf(pitchDeg) > 55.0f && (++decim % 6) == 0) {
+                    float rz = 0.0f, fz = 0.0f, gamePitch = 0.0f;
+                    if (g_sceneMatValid) {
+                        const float rx = g_sceneMat[0], ry = g_sceneMat[4], rzz = g_sceneMat[8];
+                        const float rl = sqrtf(rx*rx + ry*ry + rzz*rzz);
+                        if (rl > 1e-6f) rz = rzz / rl;
+                        const float fx = g_sceneMat[3], fy = g_sceneMat[7], fzz = g_sceneMat[11];
+                        const float fl = sqrtf(fx*fx + fy*fy + fzz*fzz);
+                        if (fl > 1e-6f) { fz = fzz / fl; gamePitch = asinf(fz) * 57.29578f; }
+                    }
+                    Log("[tilt] headPitch %+6.1f  headRoll %+7.1f (w %.2f)  |  camPitch %+6.1f"
+                        "  matRightZ %+.4f  <- 0 means the ENGINE is not rolling",
+                        pitchDeg, g_headRoll * 57.29578f, w, gamePitch, rz);
+                }
+            }
+        }
     }
 
     if (!g_headTracking || g_offActorRotation < 0) return;
