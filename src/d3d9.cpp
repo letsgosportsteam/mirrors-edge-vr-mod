@@ -1785,7 +1785,22 @@ static void DetectUObjectLayout()
 // from one float.
 uintptr_t g_engineObj       = 0;
 int       g_offMaxSmoothFps = -1;
-float     g_fpsCap          = 120.0f;   // NUMPAD7 cycles; matches the headset by default
+// ⚠️ 60, not 120, and the measurement chose it rather than the arithmetic.
+//
+// The cap write works - raising it from 62 took the delivered rate to 75-80, so the game was
+// never short of headroom, it was held. But 75-80 against a 120 Hz display is the worst place to
+// be: each frame spans sometimes one display period and sometimes two, measured as a near even
+// split between the two buckets. The image holds for double the time on every miss, which is
+// visibly worse than holding for double the time EVERY frame.
+//
+// At 60 the cadence measured 600 frames in a single bucket, twice, exactly. It is fewer unique
+// images than the game can produce and it is the only rate it can hold that divides 120.
+//
+// This is a floor, not a destination. The game reaches 75-80 while spending 4-5 ms of every
+// frame in our own frame grab; at 80 fps that is 12.5 ms of which the grab is a third. Take the
+// grab off the critical path and 8.3 ms - a true 120, one image per display period - is within
+// reach of what the engine is already doing.
+float     g_fpsCap          = 60.0f;    // NUMPAD7 cycles
 static int LookupProp(const char* className, const char* propName, bool verbose);
 
 static void FindEngineObject()
@@ -3324,7 +3339,7 @@ static void CheckHeadHotkeys()
     static bool pN7 = false;
     const bool dN7 = (GetAsyncKeyState(VK_NUMPAD7) & 0x8000) != 0;
     if (dN7 && !pN7) {
-        static const float kCaps[] = { 120.0f, 60.0f, 90.0f, 250.0f, 62.0f };
+        static const float kCaps[] = { 60.0f, 120.0f, 90.0f, 250.0f, 62.0f };
         static int ci = 0;
         ci = (ci + 1) % (int)(sizeof(kCaps) / sizeof(kCaps[0]));
         g_fpsCap = kCaps[ci];
