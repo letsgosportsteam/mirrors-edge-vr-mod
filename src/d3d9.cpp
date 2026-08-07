@@ -5724,11 +5724,71 @@ static HRESULT STDMETHODCALLTYPE Hook_Reset(IDirect3DDevice9* dev, D3DPRESENT_PA
     return hr;
 }
 
+// ================================================================ rung 8a: the D3D9Ex device
+//
+// The frame grab costs 4-5 ms of every frame, and the measured case for removing it is now
+// concrete rather than assumed: uncapped the game reaches 75-80 fps, which is 12.5 ms a frame
+// with roughly a third of it ours. Take the grab off the critical path and 8.3 ms - a true 120,
+// one unique image per display period - is inside what the engine already demonstrates.
+//
+// Getting there needs the frame to stay on the GPU, which needs a SHARED surface, which needs a
+// D3D9Ex device. The game asks for a plain one: rung 0 measured Direct3DCreate9 called twice per
+// run and Direct3DCreate9Ex never.
+//
+// ---- ⚠️ the reason this was deferred for eight rungs ----
+//
+// D3D9Ex does not support D3DPOOL_MANAGED AT ALL. Every MANAGED create fails outright on an Ex
+// device, and rung 1 counted 5176 of them in a single run. The reference project translated them
+// and records the wrapper as a live source of bugs for a hundred runs.
+//
+// So this rung swaps the device and translates the pool, and CHANGES NOTHING ELSE. The frame grab
+// stays exactly as slow as it is. The only question it asks is whether the game runs at all on an
+// Ex device, because that is the risky half, and answering it while the payoff half is also new
+// would leave any failure with two plausible causes.
+//
+// ---- the translation ----
+//
+// MANAGED means "keep a system-memory copy and restore it for me when the device is lost". An Ex
+// device is NEVER lost - that is the point of Ex, and the reason the pool was dropped from it -
+// so the service MANAGED provides has no customer here. DEFAULT is the honest equivalent.
+//
+// Textures additionally need D3DUSAGE_DYNAMIC, because a DEFAULT texture cannot be locked and the
+// engine fills these by locking them. Vertex and index buffers in DEFAULT can be locked as they
+// are, so they get the pool change alone.
+//
+// Every translation that FAILS is logged with its format, usage and dimensions. If the game
+// misbehaves, the failures name the resource rather than leaving it to be guessed at from a
+// black texture.
+
+static IDirect3D9Ex* g_d3d9ExObj  = nullptr;   // non-null once we have swapped the factory
+static bool          g_devIsEx    = false;     // the DEVICE really is Ex
+static bool          g_wantEx     = true;      // cleared by the opt-out file
+static LONG          g_remapTex   = 0, g_remapVB = 0, g_remapIB = 0;
+static LONG          g_remapFails = 0;
+
 static HRESULT STDMETHODCALLTYPE Hook_CreateTexture(IDirect3DDevice9* dev, UINT w, UINT h, UINT levels,
                                                     DWORD usage, D3DFORMAT fmt, D3DPOOL pool,
                                                     IDirect3DTexture9** out, HANDLE* shared)
 {
     CountPool(pool);
+    if (g_devIsEx && pool == D3DPOOL_MANAGED) {
+        InterlockedIncrement(&g_remapTex);
+        HRESULT hr = g_origCreateTex(dev, w, h, levels, usage | D3DUSAGE_DYNAMIC, fmt,
+                                     D3DPOOL_DEFAULT, out, shared);
+        if (FAILED(hr)) {
+            // DYNAMIC is refused for some usage and format combinations - a render target, an
+            // auto-mip chain, some compressed formats on some drivers. A plain DEFAULT texture
+            // still works for anything the engine fills by other means, so try that before
+            // giving up, and only report the case where both are refused.
+            hr = g_origCreateTex(dev, w, h, levels, usage, fmt, D3DPOOL_DEFAULT, out, shared);
+            if (FAILED(hr)) {
+                if (InterlockedIncrement(&g_remapFails) <= 20)
+                    Log("[ex] texture remap FAILED hr=0x%08lX  %ux%u levels=%u usage=0x%08lX fmt=%d",
+                        (unsigned long)hr, w, h, levels, (unsigned long)usage, (int)fmt);
+            }
+        }
+        return hr;
+    }
     return g_origCreateTex(dev, w, h, levels, usage, fmt, pool, out, shared);
 }
 
@@ -5736,6 +5796,14 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateVB(IDirect3DDevice9* dev, UINT len, 
                                                D3DPOOL pool, IDirect3DVertexBuffer9** out, HANDLE* shared)
 {
     CountPool(pool);
+    if (g_devIsEx && pool == D3DPOOL_MANAGED) {
+        InterlockedIncrement(&g_remapVB);
+        HRESULT hr = g_origCreateVB(dev, len, usage, fvf, D3DPOOL_DEFAULT, out, shared);
+        if (FAILED(hr) && InterlockedIncrement(&g_remapFails) <= 20)
+            Log("[ex] vertex buffer remap FAILED hr=0x%08lX  len=%u usage=0x%08lX",
+                (unsigned long)hr, len, (unsigned long)usage);
+        return hr;
+    }
     return g_origCreateVB(dev, len, usage, fvf, pool, out, shared);
 }
 
@@ -5743,6 +5811,14 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateIB(IDirect3DDevice9* dev, UINT len, 
                                                D3DPOOL pool, IDirect3DIndexBuffer9** out, HANDLE* shared)
 {
     CountPool(pool);
+    if (g_devIsEx && pool == D3DPOOL_MANAGED) {
+        InterlockedIncrement(&g_remapIB);
+        HRESULT hr = g_origCreateIB(dev, len, usage, fmt, D3DPOOL_DEFAULT, out, shared);
+        if (FAILED(hr) && InterlockedIncrement(&g_remapFails) <= 20)
+            Log("[ex] index buffer remap FAILED hr=0x%08lX  len=%u usage=0x%08lX",
+                (unsigned long)hr, len, (unsigned long)usage);
+        return hr;
+    }
     return g_origCreateIB(dev, len, usage, fmt, pool, out, shared);
 }
 
@@ -5808,7 +5884,47 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT adapte
         Log("[dev] forcing WINDOWED (was exclusive fullscreen) - removes device loss on alt-tab");
     }
 
-    HRESULT hr = g_origCreateDevice(self, adapter, type, focus, behavior, pp, out);
+    // ---- Ex, if we swapped the factory ----
+    //
+    // ⚠️ The fallback CANNOT be a runtime toggle, and asking for one is reasonable but the
+    // hardware disagrees: a device's type is fixed when it is created and there is no way to
+    // change it later without destroying every resource in the game. So the choice is made here,
+    // once, and it falls back three ways instead:
+    //
+    //   * an opt-out file beside the DLL forces the old path with no rebuild
+    //   * CreateDeviceEx failing falls through to the plain call automatically
+    //   * the FRAME GRAB stays on its old path regardless, so this rung cannot change how the
+    //     picture is produced even if the device swap succeeds
+    //
+    // The last one is the important one. It keeps this rung answering exactly one question.
+    HRESULT hr = E_FAIL;
+    if (g_d3d9ExObj && self == (IDirect3D9*)g_d3d9ExObj && pp) {
+        // D3DSWAPEFFECT_COPY is not valid on Ex. DISCARD is what the engine would have been
+        // given anyway for a windowed swapchain of one buffer.
+        if (pp->SwapEffect == D3DSWAPEFFECT_COPY) {
+            pp->SwapEffect = D3DSWAPEFFECT_DISCARD;
+            Log("[ex] SwapEffect COPY is not valid on an Ex device - using DISCARD");
+        }
+        if (pp->BackBufferCount == 0) pp->BackBufferCount = 1;
+
+        IDirect3DDevice9Ex* exDev = nullptr;
+        // Windowed, so the display mode argument is NULL - and windowed is forced above, so
+        // there is no fullscreen case to get wrong here.
+        hr = g_d3d9ExObj->CreateDeviceEx(adapter, type, focus, behavior, pp, nullptr, &exDev);
+        if (SUCCEEDED(hr) && exDev) {
+            g_devIsEx = true;
+            if (out) *out = (IDirect3DDevice9*)exDev;
+            Log("*** [ex] CreateDeviceEx SUCCEEDED - device %p is D3D9Ex", (void*)exDev);
+            Log("[ex] MANAGED allocations will be translated to DEFAULT from here on");
+        } else {
+            Log("[ex] CreateDeviceEx FAILED hr=0x%08lX - falling back to a plain device",
+                (unsigned long)hr);
+        }
+    }
+
+    if (!g_devIsEx) {
+        hr = g_origCreateDevice(self, adapter, type, focus, behavior, pp, out);
+    }
     Log("*** CreateDevice returned hr=0x%08lX  device=%p", (unsigned long)hr, out ? (void*)*out : nullptr);
 
     // The engine may have had its request adjusted. Log what came back as well as what was asked.
@@ -5878,14 +5994,67 @@ typedef void        (WINAPI *pfn_SetOptions)(DWORD);
 typedef void        (WINAPI *pfn_SetRegion)(D3DCOLOR, LPCWSTR);
 typedef void        (WINAPI *pfn_DebugSetMute)(void);
 
+// The opt-out. A file beside this DLL, so the old path can be forced from a headset-side
+// keypress-free position: create the file, run, delete it. No rebuild, no ini - and the game's
+// own config is hash-checked, so a file of our own is the only place a startup switch can live.
+static void CheckExOptOut()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+
+    wchar_t path[MAX_PATH];
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&CheckExOptOut, &self);
+    DWORD n = GetModuleFileNameW(self, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (!slash) return;
+    _snwprintf_s(slash + 1, MAX_PATH - (slash + 1 - path), _TRUNCATE, L"mevr_noex.txt");
+
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+        g_wantEx = false;
+        Log("[ex] mevr_noex.txt found - staying on the plain D3D9 device");
+    }
+}
+
 extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion)
 {
-    pfn_Create9 fn = (pfn_Create9)Real("Direct3DCreate9");
-    IDirect3D9* d3d = fn ? fn(SDKVersion) : nullptr;
+    CheckExOptOut();
+
+    // ---- hand back an Ex factory in place of the plain one ----
+    //
+    // IDirect3D9Ex derives from IDirect3D9, so the game can hold it, call it and release it
+    // without knowing. The CreateDevice slot is at the same index in both vtables - Ex only
+    // appends - so the existing patch covers it unchanged, and CreateDeviceEx is reached through
+    // the stored interface pointer rather than through a second hook.
+    //
+    // Both factories the game creates get the same treatment. Which one is real is still
+    // reported by the `self` argument in the hook, exactly as before.
+    IDirect3D9* d3d = nullptr;
+    if (g_wantEx) {
+        pfn_Create9Ex fnEx = (pfn_Create9Ex)Real("Direct3DCreate9Ex");
+        IDirect3D9Ex* ex = nullptr;
+        if (fnEx && SUCCEEDED(fnEx(SDKVersion, &ex)) && ex) {
+            g_d3d9ExObj = ex;
+            d3d = (IDirect3D9*)ex;
+            Log("[ex] Direct3DCreate9Ex used in place of Direct3DCreate9 -> IDirect3D9Ex* %p",
+                (void*)ex);
+        } else {
+            Log("[ex] Direct3DCreate9Ex unavailable - using the plain factory");
+        }
+    }
+    if (!d3d) {
+        pfn_Create9 fn = (pfn_Create9)Real("Direct3DCreate9");
+        d3d = fn ? fn(SDKVersion) : nullptr;
+    }
 
     long call = InterlockedIncrement(&g_createCalls);
-    Log("*** Direct3DCreate9 CALLED (call #%ld) SDKVersion=%u -> IDirect3D9* %p",
-        call, SDKVersion, (void*)d3d);
+    Log("*** Direct3DCreate9 CALLED (call #%ld) SDKVersion=%u -> IDirect3D9* %p%s",
+        call, SDKVersion, (void*)d3d, g_d3d9ExObj ? "  (Ex)" : "");
 
     // Patched once. All IDirect3D9 instances share a vtable, so this covers both the
     // throwaway and the real one - and the `self` argument in the hook reports which is
@@ -6000,10 +6169,17 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID)
         Log("=== SUMMARY ===");
         Log("Direct3DCreate9 calls : %ld", g_createCalls);
         Log("frames presented      : %ld", g_frames);
-        Log("pool DEFAULT          : %ld   <- these die on a device Reset", g_poolDefault);
-        Log("pool MANAGED          : %ld   <- the wrapper would have to translate these", g_poolManaged);
+        Log("device                : %s", g_devIsEx ? "D3D9Ex" : "plain D3D9");
+        Log("pool DEFAULT          : %ld", g_poolDefault);
+        Log("pool MANAGED          : %ld   <- translated to DEFAULT on an Ex device", g_poolManaged);
         Log("pool SYSTEMMEM        : %ld", g_poolSystemMem);
         Log("pool other            : %ld", g_poolScratch);
+        if (g_devIsEx) {
+            Log("MANAGED translated    : %ld textures, %ld vertex buffers, %ld index buffers",
+                g_remapTex, g_remapVB, g_remapIB);
+            Log("translations REFUSED  : %ld   <- anything above zero is a resource the game"
+                " asked for and did not get", g_remapFails);
+        }
         Log("=== detached ===");
     }
     return TRUE;
