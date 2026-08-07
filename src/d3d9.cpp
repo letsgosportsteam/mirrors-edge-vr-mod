@@ -3466,6 +3466,30 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                     Log("[fov] game renders %.1f x %.1f degrees (read from the matrix)", degX, degY);
                 }
                 g_gameFovValid = true;
+
+                // ---- how often does the engine cull NARROWER than we draw? ----
+                //
+                // The log above only prints on a CHANGE, so its line counts are transitions and
+                // not frames - and read as frames they say nothing. What they did show is that
+                // the scene matrix alternates between the forced 135.4 and the engine's own
+                // 90.0, and a 90.0 matrix culls 58.7 degrees vertically against the 100 we
+                // render. Geometry outside that is dropped on those uploads and present on the
+                // others, which is what "disappearing" looks like from inside the headset.
+                //
+                // Counting it settles whether that is an occasional blip or half the frames,
+                // and those need different fixes: an occasional one is a write that loses a
+                // race, a persistent one means FOVAngle is not the field the view is built from.
+                if (g_targetHalfFovY > 0.0f) {
+                    static long narrow = 0, total = 0;
+                    if (g_gameHalfFovY < g_targetHalfFovY * 0.98f) narrow++;
+                    if (++total >= 2000) {
+                        Log("[fov] scene matrices culling NARROWER than we render: %ld of %ld"
+                            " (%.0f%%) - last narrow one was %.1f vertical against our %.1f",
+                            narrow, total, 100.0f * (float)narrow / (float)total,
+                            degY, g_targetHalfFovY * 114.5916f);
+                        narrow = 0; total = 0;
+                    }
+                }
             }
         }
 
@@ -3738,7 +3762,11 @@ static HRESULT STDMETHODCALLTYPE Hook_QueryGetData(IDirect3DQuery9* q, void* pDa
         // Logged on the first override and then periodically, so the log can say whether it was
         // active during any given stretch of a run. A once-only message cannot answer that,
         // which is why the previous run could not establish what changed or when.
-        if (++g_queriesFaked == 1 || (g_queriesFaked % 20000) == 0)
+        // 20000 was too fine: at ~1800 queries a second it filled the log with 180 identical
+        // lines in one run and buried the [fov] counts that mattered. The question it answers -
+        // is the override live, and for how much of the run - is answered just as well at
+        // 500000, and the log is a diagnostic tool only for as long as it can be read.
+        if (++g_queriesFaked == 1 || (g_queriesFaked % 500000) == 0)
             Log("[occ] overriding to VISIBLE (mode %d, %ld queries faked)",
                 g_occlusionMode, g_queriesFaked);
     }
