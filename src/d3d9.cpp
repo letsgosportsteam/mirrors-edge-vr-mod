@@ -676,6 +676,30 @@ static bool CaptureFrame(IDirect3DDevice9* dev)
 
 static void ApplyHeadTracking(XrTime when);   // defined with the rung 5b code
 
+// ---- two measurements aimed at what is left of the judder ----
+//
+// The mean frame rate cannot distinguish the two remaining explanations, and they need opposite
+// fixes, so each gets a number of its own.
+//
+// PACING: how many display periods each delivered frame actually spanned. One bucket means an
+// even cadence. Several means a ragged one, which is what snapping looks like regardless of what
+// the mean says - and the mean says the same thing either way.
+//
+// POSE HONESTY: the projection layer tells the compositor which pose the image was rendered
+// from, and it is told the CURRENT head pose. But the image was rendered by the game, from the
+// game's camera, which lags behind the head. So the claim is slightly false, by however much the
+// engine has not caught up - and the compositor reprojects on the claim. Every display frame it
+// synthesises is corrected toward a pose the image does not have. That produces motion the image
+// never contained, worst while turning and absent while still, and no frame rate fixes it.
+//
+// Measured as a difference of CHANGES rather than of absolutes, because the head pose is in room
+// space and the matrix is in world space and they have no common origin - but per frame, how far
+// the head turned and how far the rendered image turned are directly comparable, and the gap
+// between them is the size of the lie.
+static void ReportPacing();
+static void ReportPoseHonesty();
+static void TickPacing();
+
 // ================================================================ rung 6c: per-eye stereo
 //
 // ALTERNATE-EYE, deliberately, as the reference project's ladder does it. One eye is rendered
@@ -1046,6 +1070,8 @@ static void SubmitTestQuad()
     // Head tracking uses the SAME predicted display time the frame is submitted for, so the
     // pose the game renders from and the pose the compositor expects agree.
     ApplyHeadTracking(fs.predictedDisplayTime);
+    TickPacing();
+    ReportPoseHonesty();
 
     // Published for the render thread, which needs a time to ask the runtime about and has no
     // frame state of its own. The period comes with it because the correction is expressed as
@@ -1100,6 +1126,17 @@ static void SubmitTestQuad()
             Log("[xr] frame %ld  state=%d shouldRender=%d endFrame=%d  |  frame grab %.2f ms mean"
                 " over %ld  |  %.1f fps delivered, headset wants %.1f Hz",
                 n, (int)g_xrState, (int)fs.shouldRender, (int)er, mean, g_capSamples, fps, hz);
+            // ---- the CADENCE, which the mean hides completely ----
+            //
+            // A mean of 62 is the same number whether every frame took 16.1 ms or half took 8
+            // and half took 24. The eye cannot tell the difference between 60 and 62 fps; it can
+            // absolutely tell the difference between an even cadence and a ragged one, and a
+            // ragged one is what snapping looks like.
+            //
+            // So this counts how many DISPLAY periods each delivered frame ended up spanning.
+            // All in one bucket means the cadence is even and the remaining judder is not
+            // delivery. Spread across buckets means it is, whatever the mean says.
+            ReportPacing();
         } else {
             Log("[xr] frame %ld  state=%d shouldRender=%d endFrame=%d  |  frame grab %.2f ms mean over %ld",
                 n, (int)g_xrState, (int)fs.shouldRender, (int)er, mean, g_capSamples);
@@ -4493,6 +4530,81 @@ static void ApplyCameraRotation(float* m, bool rowStorage, const float axis[3], 
     }
     for (int i = 0; i < 3; ++i)
         for (int k = 0; k < 4; ++k) at(i,k) = nr[i][k];
+}
+
+// Called once per Present. Buckets the interval since the last one by display periods.
+static double g_lastPresentMs = 0.0;
+static long   g_pace[6] = { 0, 0, 0, 0, 0, 0 };   // 0 = <1 period, 5 = 5 or more
+
+static void TickPacing()
+{
+    const double now = NowMs();
+    if (g_lastPresentMs > 0.0 && g_predPeriod) {
+        const double periodMs = (double)g_predPeriod / 1.0e6;
+        if (periodMs > 0.1) {
+            int b = (int)((now - g_lastPresentMs) / periodMs + 0.5);
+            if (b < 0) b = 0;
+            if (b > 5) b = 5;
+            g_pace[b]++;
+        }
+    }
+    g_lastPresentMs = now;
+}
+
+// How far the head turned this frame, against how far the rendered image turned.
+//
+// If the compositor is told the view moved 3 degrees and the picture only moved 1, it will
+// synthesise the missing 2 on every display frame it fills in - motion that was never rendered.
+// That is indistinguishable from judder, it scales with turn rate, and it vanishes when still.
+static void ReportPoseHonesty()
+{
+    if (!g_sceneMatValid || !g_predTime) return;
+
+    float headYaw = 0.0f;
+    if (!GetHeadYawRaw(g_predTime, &headYaw)) return;
+
+    // The rendered image's yaw, from the matrix the frame was actually drawn with.
+    const float fx = g_vmRow ? g_sceneMat[3] : g_sceneMat[12];
+    const float fy = g_vmRow ? g_sceneMat[7] : g_sceneMat[13];
+    if (fabsf(fx) + fabsf(fy) < 1e-6f) return;
+    const float matYaw = atan2f(fy, fx);
+
+    static bool  have = false;
+    static float pHead = 0.0f, pMat = 0.0f;
+    static float worst = 0.0f, sum = 0.0f;
+    static long  n = 0;
+    if (!have) { pHead = headYaw; pMat = matYaw; have = true; return; }
+
+    auto wrap = [](float a) {
+        while (a >  3.14159265f) a -= 6.28318531f;
+        while (a < -3.14159265f) a += 6.28318531f;
+        return a;
+    };
+    // Into a common sense: OpenXR yaw grows anticlockwise, UE3's clockwise.
+    const float dHead = wrap(headYaw - pHead) * (float)g_yawSign;
+    const float dMat  = wrap(matYaw  - pMat);
+    pHead = headYaw; pMat = matYaw;
+
+    const float gap = fabsf(dHead - dMat);
+    if (gap > worst) worst = gap;
+    sum += gap;
+    if (++n >= 600) {
+        Log("[xr] pose honesty over %ld frames: the image turned %.2f deg less than the"
+            " compositor was told, worst frame %.2f deg  (0 = the layer is truthful)",
+            n, (sum / (float)n) * 57.29578f, worst * 57.29578f);
+        n = 0; worst = 0.0f; sum = 0.0f;
+    }
+}
+
+static void ReportPacing()
+{
+    long total = 0;
+    for (int i = 0; i < 6; ++i) total += g_pace[i];
+    if (!total) return;
+    Log("[xr] cadence over %ld frames - display periods per delivered frame:"
+        "  <1:%ld  1:%ld  2:%ld  3:%ld  4:%ld  5+:%ld   (one bucket = even)",
+        total, g_pace[0], g_pace[1], g_pace[2], g_pace[3], g_pace[4], g_pace[5]);
+    for (int i = 0; i < 6; ++i) g_pace[i] = 0;
 }
 
 // The point every matrix rotation turns about. Prefers the position read inside the frame; falls
