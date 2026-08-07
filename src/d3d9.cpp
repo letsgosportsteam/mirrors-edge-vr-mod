@@ -748,6 +748,7 @@ bool                     g_pitchTargetValid = false;
 bool                     g_pitchFix = true;      // NUMPAD3 toggles, for the A/B
 // The controller's own pitch, sampled INSIDE the frame rather than in Present. See the read site.
 float                    g_liveCtlPitch = 0.0f;
+float                    g_liveCtlYaw   = 0.0f;
 bool                     g_liveCtlValid = false;
 long                     g_liveCtlFrame = -1;
 bool                     g_rollEnabled = true;   // HOME toggles
@@ -2526,14 +2527,18 @@ static int       g_yawSign = -1, g_pitchSign = +1;
 // Pitch anchored to the head rather than accumulated. NUMPAD1 toggles, NUMPAD2 cycles how much
 // of the camera animation is kept. See the write site for why yaw is not treated the same way.
 bool             g_pitchAbsolute = true;
-// Per axis, because they are three different problems and turned out to need three different
-// answers. Pitch is the disorienting one and it goes through Controller.Rotation. Roll never
-// touches that field at all and has to be taken out of the matrix. Yaw has no switch on purpose:
-// an animation that turns the player - climbing round the side of a building - is carrying them
-// somewhere, and refusing to follow it would leave the body facing one way and the view another.
-// Both default to following, so the game behaves as it shipped until asked otherwise.
+// One switch per axis, independently settable, so any combination is reachable. They are three
+// different mechanisms underneath - pitch and yaw travel through Controller.Rotation and have to
+// be separated from the head's own contribution; roll never touches that field at all and is
+// read straight out of the matrix - but that is an implementation detail and not a reason to
+// give the player a coupled control.
+//
+// All default to following, so the game behaves as it shipped until asked otherwise. Yaw is the
+// one to leave alone in most cases: an animation that turns the player is carrying them
+// somewhere, and cancelling it leaves the body facing one way and the view another.
 bool             g_animFollow     = true;   // PITCH; NUMPAD2
 bool             g_animRollFollow = true;   // ROLL;  NUMPAD4
+bool             g_animYawFollow  = true;   // YAW;   NUMPAD5
 extern float     g_animNow[3];              // camera animation contribution, degrees, P/Y/R
 static bool      g_headPrimed = false;
 static int32_t   g_lastHeadYaw = 0, g_lastHeadPitch = 0;
@@ -3149,7 +3154,20 @@ static void CheckHeadHotkeys()
         Log("*** [head] NUMPAD4 -> camera animations %s the view",
             g_animRollFollow ? "ROLL" : "do NOT roll");
     }
-    pN1 = dN1; pN2 = dN2; pN3 = dN3; pN4 = dN4;
+    static bool pN5 = false;
+    const bool dN5 = (GetAsyncKeyState(VK_NUMPAD5) & 0x8000) != 0;
+    if (dN5 && !pN5) {
+        g_animYawFollow = !g_animYawFollow;
+        Log("*** [head] NUMPAD5 -> camera animations %s the view",
+            g_animYawFollow ? "TURN" : "do NOT turn");
+    }
+    // All three at once, because the useful question is which COMBINATION is set and reading it
+    // off three separate lines scattered through the log is how a test gets mis-attributed.
+    if ((dN2 && !pN2) || (dN4 && !pN4) || (dN5 && !pN5))
+        Log("[head] animation lock now: pitch %s  roll %s  yaw %s",
+            g_animFollow ? "follow" : "LOCKED", g_animRollFollow ? "follow" : "LOCKED",
+            g_animYawFollow ? "follow" : "LOCKED");
+    pN1 = dN1; pN2 = dN2; pN3 = dN3; pN4 = dN4; pN5 = dN5;
 
     if (d5 && !p5) { g_yawSign   = -g_yawSign;   Log("[head] F5 -> yaw sign %+d", g_yawSign); }
     if (d4 && !p4) { g_pitchSign = -g_pitchSign; Log("[head] F4 -> pitch sign %+d", g_pitchSign); }
@@ -3460,6 +3478,7 @@ static void TestWindow(int reg, const float* m, bool asRow,
 static void ApplyRoll(float* m, bool rowStorage);      // defined with the stereo code below
 static void ApplyPitchFix(float* m, bool rowStorage);  // likewise
 static void ApplyRollFix(float* m, bool rowStorage);   // likewise
+static void ApplyYawFix(float* m, bool rowStorage);    // likewise
 static void ApplySixDof(float* m, bool rowStorage);
 
 int   g_vmReg = -1;              // committed after a successful scan
@@ -3540,11 +3559,15 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                 g_liveCtlFrame = g_frames;
                 g_liveCtlValid = false;
                 if (LooksLikePlayerController(g_playerCtl)) {
-                    int32_t cr = 0;
-                    if (SafeRead(g_playerCtl + g_offActorRotation, &cr, sizeof(cr))) {
-                        int32_t p = cr & 0xFFFF;
-                        if (p > 32767) p -= 65536;
-                        g_liveCtlPitch = (float)p * (6.28318531f / 65536.0f);
+                    int32_t cr[2] = { 0, 0 };            // FRotator {Pitch, Yaw}
+                    if (SafeRead(g_playerCtl + g_offActorRotation, cr, sizeof(cr))) {
+                        auto signed16 = [](int32_t v) {
+                            int32_t s = v & 0xFFFF;
+                            return (s > 32767) ? (s - 65536) : s;
+                        };
+                        const float kRad = 6.28318531f / 65536.0f;
+                        g_liveCtlPitch = (float)signed16(cr[0]) * kRad;
+                        g_liveCtlYaw   = (float)signed16(cr[1]) * kRad;
                         g_liveCtlValid = true;
                     }
                 }
@@ -3687,6 +3710,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
         // on only one of them, and that cost several runs to find.
         ApplyRollFix(m, g_vmRow);
         ApplyPitchFix(m, g_vmRow);
+        ApplyYawFix(m, g_vmRow);
         ApplySixDof(m, g_vmRow);
         ApplyRoll(m, g_vmRow);
 
@@ -4227,16 +4251,30 @@ static void ApplyPitchFix(float* m, bool rowStorage)
     // Clamped hard. A foreign matrix that slipped the scene test, or a target computed from a
     // stale sample, must not be able to throw the view somewhere the head is not - and a real
     // error is never more than a degree or two.
-    // ⚠️ Reaching this clamp is a REPORT, not a routine event. A correction is normally a
-    // degree or two - one frame of lag - so a clamped one means something upstream is wrong, and
-    // a silent clamp would hide exactly the intermittent break it is there to contain.
-    const float kMax = 20.0f * (3.14159265f / 180.0f);
+    // ⚠️ 60 degrees, not 20, and the log is what corrected it.
+    //
+    // 20 was picked from "a real error is never more than a degree or two", which is true of the
+    // one-frame lag this started as and false of what it now has to cancel. A hard landing dips
+    // the camera about 40 degrees - measured: "wanted 39.6 deg (target -41.4, matrix -81.0)" -
+    // so the correction was cut in half and the remainder is exactly the split-second look-down
+    // that survived locking the pitch. The guard was eating the feature.
+    //
+    // 60 clears the largest contribution seen with room to spare while still catching a garbage
+    // matrix, which misses by a lot more than a landing does.
+    const float kMax = 60.0f * (3.14159265f / 180.0f);
     if (err > kMax || err < -kMax) {
-        static long clamped = 0;
-        if (++clamped == 1 || (clamped % 600) == 0)
-            Log("[head] pitch correction clamped: wanted %.1f deg (target %.1f, matrix %.1f,"
-                " anim %.1f) - %ld so far", err * 57.29578f, g_pitchTarget * 57.29578f,
-                matPitch * 57.29578f, anim * 57.29578f, clamped);
+        // Counted in FRAMES, not calls. This runs once per draw per eye, so the old per-call
+        // counter reported 10000 "occurrences" for a handful of frames and made a brief clamp
+        // look like a permanent one.
+        static long lastFrame = -1;
+        if (lastFrame != g_frames) {
+            lastFrame = g_frames;
+            static long frames = 0;
+            if (++frames == 1 || (frames % 60) == 0)
+                Log("[head] pitch correction clamped: wanted %.1f deg (target %.1f, matrix %.1f,"
+                    " anim %.1f) - %ld frames so far", err * 57.29578f,
+                    g_pitchTarget * 57.29578f, matPitch * 57.29578f, anim * 57.29578f, frames);
+        }
         err = (err > 0.0f) ? kMax : -kMax;
     }
 
@@ -4285,6 +4323,40 @@ static void ApplyRollFix(float* m, bool rowStorage)
     ApplyCameraRotation(m, rowStorage, fwd, asinf(s), g_camCache);
 }
 
+// ---- lock the animation's yaw out of the view ----
+//
+// Third axis, third mechanism. Yaw DOES travel through Controller.Rotation, like pitch, so what
+// the animation added is the difference between the yaw the matrix carries and the yaw the
+// controller holds - both read from this same frame, the same construction the pitch fix uses.
+//
+// Off by default and it should usually stay off. An animation that turns the player - climbing
+// round the side of a building - is carrying them somewhere, and cancelling it leaves the body
+// facing one way and the view another. It exists because it is the player's call, not because
+// there is a case for it.
+static void ApplyYawFix(float* m, bool rowStorage)
+{
+    if (g_animYawFollow || !g_liveCtlValid || !g_camCacheValid) return;
+
+    auto col = [&](int c, int i) { return rowStorage ? m[i * 4 + c] : m[c * 4 + i]; };
+    const float fx = col(3,0), fy = col(3,1);
+    if (fabsf(fx) + fabsf(fy) < 1e-6f) return;      // looking straight up or down: no yaw to read
+
+    // UE3 has X forward and Y right, so atan2(fwd.y, fwd.x) is the rotator's own yaw sense and
+    // the two are directly comparable without a conversion.
+    float d = atan2f(fy, fx) - g_liveCtlYaw;
+    while (d >  3.14159265f) d -= 6.28318531f;
+    while (d < -3.14159265f) d += 6.28318531f;
+
+    const float kMax = 60.0f * (3.14159265f / 180.0f);
+    if (d >  kMax) d =  kMax;
+    if (d < -kMax) d = -kMax;
+
+    // About the WORLD up axis, not the camera's. A yaw is a turn about vertical whatever the
+    // camera is doing in pitch; turning about a pitched up axis would tilt the horizon.
+    const float up[3] = { 0.0f, 0.0f, 1.0f };
+    ApplyCameraRotation(m, rowStorage, up, d, g_camCache);
+}
+
 static void ApplyRoll(float* m, bool rowStorage)
 {
     if (!g_rollEnabled || fabsf(g_headRoll) < 1e-4f) return;
@@ -4328,6 +4400,7 @@ static void BuildEyeMatrix(float* out, int eye)
     // forward and changed the cos(pitch) the roll measurement divides by.
     ApplyRollFix(m, true);
     ApplyPitchFix(m, true);
+    ApplyYawFix(m, true);    // last: it turns about world up, which the other two do not touch
     ApplySixDof(m, true);   // a world-space offset, same stage as the per-eye one
     if (g_fovForce && g_gameFovValid && g_targetHalfFovX > 0.0f) {
         // ⚠️ Uses g_targetHalfFovX, the SAME number the projection layer submits.
