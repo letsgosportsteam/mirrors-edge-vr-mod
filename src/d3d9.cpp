@@ -769,6 +769,7 @@ bool                     g_fovForce = true;         // F8 toggles
 static bool              g_fovLogged = false;
 static long              g_fovWrites = 0;
 float                    g_camCache[3] = { 0, 0, 0 };
+float                    g_camFwd[3]   = { 1, 0, 0 };   // where that camera is LOOKING
 bool                     g_camCacheValid = false;
 volatile LONG            g_vmAccepted = 0;
 volatile LONG            g_vmRejected = 0;
@@ -1080,8 +1081,30 @@ static void SubmitTestQuad()
         // taking on. Reported as a mean over the window, and reset, so it tracks the current
         // scene rather than being flattened by the menu at startup.
         const double mean = g_capSamples ? (g_capMsTotal / g_capSamples) : 0.0;
-        Log("[xr] frame %ld  state=%d shouldRender=%d endFrame=%d  |  frame grab %.2f ms mean over %ld",
-            n, (int)g_xrState, (int)fs.shouldRender, (int)er, mean, g_capSamples);
+        // ---- the delivered rate, and what the headset wanted ----
+        //
+        // Asked directly, because it decides whether any of the remaining judder is ours to fix.
+        // A game delivering fewer frames than the display asks for judders no matter how
+        // perfectly the poses are computed: the compositor has to show something on the frames
+        // that did not arrive, and an uneven ratio - 62 into 90 - never lands the same way twice.
+        // That is a different problem from a late pose, and no amount of matrix correction
+        // touches it.
+        //
+        // predictedDisplayPeriod is the runtime's own answer for the second number, rather than
+        // an assumption about the headset.
+        static double lastMs = 0.0;
+        const double nowMs = NowMs();
+        if (lastMs > 0.0) {
+            const double fps = 600000.0 / (nowMs - lastMs);
+            const double hz  = g_predPeriod ? (1.0e9 / (double)g_predPeriod) : 0.0;
+            Log("[xr] frame %ld  state=%d shouldRender=%d endFrame=%d  |  frame grab %.2f ms mean"
+                " over %ld  |  %.1f fps delivered, headset wants %.1f Hz",
+                n, (int)g_xrState, (int)fs.shouldRender, (int)er, mean, g_capSamples, fps, hz);
+        } else {
+            Log("[xr] frame %ld  state=%d shouldRender=%d endFrame=%d  |  frame grab %.2f ms mean over %ld",
+                n, (int)g_xrState, (int)fs.shouldRender, (int)er, mean, g_capSamples);
+        }
+        lastMs = nowMs;
         g_capMsTotal = 0.0; g_capSamples = 0;
     }
 }
@@ -2830,6 +2853,9 @@ static void ApplyHeadTracking(XrTime when)
         float loc[3], fwd[3];
         if (GetCameraPose(loc, fwd)) {
             g_camCache[0] = loc[0]; g_camCache[1] = loc[1]; g_camCache[2] = loc[2];
+            // The DIRECTION is cached too now. Position alone cannot tell the scene view from
+            // anything else rendered from the same point - see the acceptance test.
+            g_camFwd[0] = fwd[0]; g_camFwd[1] = fwd[1]; g_camFwd[2] = fwd[2];
             g_camCacheValid = true;
         } else {
             g_camCacheValid = false;     // no pose means no way to tell the matrices apart
@@ -3566,7 +3592,37 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
             // upload at this register, foreign matrices included. Kept as a toggle rather than
             // reverted, so the two states can be compared in one run instead of across two
             // builds - and so the fix is not lost to answer a question about it.
-            const bool isScene = (g_camCacheValid && fabsf(w) <= 25.0f);
+            // ⚠️ POSITION IS NOT ENOUGH, and the log named the gap outright.
+            //
+            // The w test only asks "is this matrix rendered from where the camera is". Anything
+            // else drawn from the same point passes it, whatever direction it faces - and things
+            // are. Measured this run: matrices arriving with a pitch of -90.0 and of -45, while
+            // the controller driving the real view sat at 1.2 degrees. A camera looking straight
+            // down is not the player's view by any reading.
+            //
+            // Those were being accepted, cached as g_sceneMat, and then handed to the eye
+            // offsets, the pitch and roll corrections and the draw duplication - all of which
+            // then operated on a matrix belonging to something else. The corrections would have
+            // rotated it by tens of degrees, which is the shape of a view that comes apart in
+            // one specific situation and is fine everywhere else.
+            //
+            // So the direction has to agree too. PlayerCameraRotation is the right reference
+            // because it is the COMPOSED camera rotation - animation included - so a legitimate
+            // 40 degree landing dip moves both it and the matrix together and still passes.
+            //
+            // 0.90 is about 25 degrees of slack: loose enough for the frame of lag on the cached
+            // pose during a fast turn, tight enough that the 45 and 90 degree impostors cannot
+            // get through.
+            float dirOk = 1.0f;
+            {
+                const float mx = g_vmRow ? q[3]  : q[12];
+                const float my = g_vmRow ? q[7]  : q[13];
+                const float mz = g_vmRow ? q[11] : q[14];
+                const float ml = sqrtf(mx*mx + my*my + mz*mz);
+                if (ml > 1e-6f)
+                    dirOk = (mx*g_camFwd[0] + my*g_camFwd[1] + mz*g_camFwd[2]) / ml;
+            }
+            const bool isScene = (g_camCacheValid && fabsf(w) <= 25.0f && dirOk >= 0.90f);
             g_c0IsScene = isScene;   // tracked even when validation is off, for ShouldDuplicate
             if (g_vmValidate && !isScene) {
                 InterlockedIncrement(&g_vmRejected);
