@@ -967,7 +967,13 @@ static void SubmitTestQuad()
                     // a submitted frustum that tracks the engine inherits every wobble the
                     // engine's own interpolation produces. Forced and submitted from one
                     // number, the two agree by construction and there is nothing left to drift.
-                    if (g_fovForce && g_targetHalfFovX > 0.0f) {
+                    // ⚠️ g_gameFovValid is in this condition because the RENDER side cannot force
+                    // without it - it needs the game's own tangents to compute the scale. Only
+                    // the submit side tested for it, so when the flag was false the layer
+                    // declared the forced frustum for an image rendered at the engine's. The two
+                    // conditions must be the same condition; that they were merely similar is
+                    // what let them come apart.
+                    if (g_fovForce && g_gameFovValid && g_targetHalfFovX > 0.0f) {
                         projViews[e].fov.angleLeft  = -g_targetHalfFovX;
                         projViews[e].fov.angleRight =  g_targetHalfFovX;
                         projViews[e].fov.angleUp    =  g_targetHalfFovY;
@@ -3181,6 +3187,43 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
             // engine's own matrix is known to be both current and untouched.
             memcpy(g_sceneMat, q, sizeof(float) * 16);
             g_sceneMatValid = true;
+
+            // ---- read the FOV the game is ACTUALLY rendering with ----
+            //
+            // For a row-vector world->clip matrix, column 0 is the right axis scaled by
+            // 1/tan(fovX/2) and column 3 is the unit forward axis. So tan(halfFov) =
+            // |col3|/|col0|, and the same for y with column 1. Nothing has to be assumed about
+            // UE3's FOVAngle convention or how it folds in aspect - the answer is read out of
+            // what came through.
+            //
+            // ⚠️ ABOVE the simultaneous-stereo early return, and that placement is the whole
+            // point. It used to sit below, so it only ran on the alternate-eye path - and the
+            // duplication path, which needs this number to force its eye matrices, could only
+            // get it if alternate-eye had happened to run first in the same session. The manual
+            // key order F1 then F10 always did, so it always worked; arming stereo straight into
+            // duplication never ran it at all, the force silently did nothing, and the layer
+            // went on submitting the forced frustum for an unforced render.
+            const float c0x = g_vmRow ? q[0] : q[0],  c0y = g_vmRow ? q[4] : q[1],  c0z = g_vmRow ? q[8]  : q[2];
+            const float c1x = g_vmRow ? q[1] : q[4],  c1y = g_vmRow ? q[5] : q[5],  c1z = g_vmRow ? q[9]  : q[6];
+            const float c3x = g_vmRow ? q[3] : q[12], c3y = g_vmRow ? q[7] : q[13], c3z = g_vmRow ? q[11] : q[14];
+            const float l0 = sqrtf(c0x*c0x + c0y*c0y + c0z*c0z);
+            const float l1 = sqrtf(c1x*c1x + c1y*c1y + c1z*c1z);
+            const float l3 = sqrtf(c3x*c3x + c3y*c3y + c3z*c3z);
+            if (l0 > 1e-6f && l1 > 1e-6f && l3 > 1e-6f) {
+                g_gameHalfFovX = atanf(l3 / l0);
+                g_gameHalfFovY = atanf(l3 / l1);
+                // Logged as well as shown. The overlay carried this number and the log did not,
+                // so it could only be reported from memory after the headset came off - which is
+                // precisely the gap the overlay was added to close, reintroduced one value at a
+                // time. Anything worth putting on screen is worth a log line.
+                const float degX = g_gameHalfFovX * 114.5916f;
+                const float degY = g_gameHalfFovY * 114.5916f;
+                if (!g_gameFovValid || fabsf(degX - g_lastLoggedFovX) > 1.0f) {
+                    g_lastLoggedFovX = degX;
+                    Log("[fov] game renders %.1f x %.1f degrees (read from the matrix)", degX, degY);
+                }
+                g_gameFovValid = true;
+            }
         }
 
         // Under simultaneous stereo the per-eye offset is applied per DRAW, not per upload, so
@@ -3191,42 +3234,6 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
         float buf[256 * 4];
         memcpy(buf, data, sizeof(float) * 4 * count);
         float* m = buf + (size_t)((UINT)g_vmReg - startReg) * 4;
-
-        // ---- read the FOV the game is ACTUALLY rendering with ----
-        //
-        // For a row-vector world->clip matrix, column 0 is the right axis scaled by
-        // 1/tan(fovX/2) and column 3 is the unit forward axis. So tan(halfFov) = |col3|/|col0|,
-        // and the same for y with column 1. Nothing has to be assumed about UE3's FOVAngle
-        // convention or how it folds in aspect - the answer is read out of what came through.
-        //
-        // ⚠️ This is the fix for the double vision. The projection layer was submitting the
-        // HEADSET's per-eye FOV for an image rendered at the GAME's - about 65 degrees at 16:9
-        // against 95 at nearly square. That is a lie to the compositor, and the reference
-        // project records the same mistake: everything ends up stretched by one uniform factor,
-        // so nothing can be judged against anything else.
-        {
-            const float c0x = g_vmRow ? m[0] : m[0],  c0y = g_vmRow ? m[4] : m[1],  c0z = g_vmRow ? m[8] : m[2];
-            const float c1x = g_vmRow ? m[1] : m[4],  c1y = g_vmRow ? m[5] : m[5],  c1z = g_vmRow ? m[9] : m[6];
-            const float c3x = g_vmRow ? m[3] : m[12], c3y = g_vmRow ? m[7] : m[13], c3z = g_vmRow ? m[11] : m[14];
-            const float l0 = sqrtf(c0x*c0x + c0y*c0y + c0z*c0z);
-            const float l1 = sqrtf(c1x*c1x + c1y*c1y + c1z*c1z);
-            const float l3 = sqrtf(c3x*c3x + c3y*c3y + c3z*c3z);
-            if (l0 > 1e-6f && l1 > 1e-6f && l3 > 1e-6f) {
-                g_gameHalfFovX = atanf(l3 / l0);
-                g_gameHalfFovY = atanf(l3 / l1);
-                // Logged as well as shown. The overlay carried this number and the log did
-                // not, so it could only be reported from memory after the headset came off -
-                // which is precisely the gap the overlay was added to close, reintroduced one
-                // value at a time. Anything worth putting on screen is worth a log line.
-                const float degX = g_gameHalfFovX * 114.5916f;
-                const float degY = g_gameHalfFovY * 114.5916f;
-                if (!g_gameFovValid || fabsf(degX - g_lastLoggedFovX) > 1.0f) {
-                    g_lastLoggedFovX = degX;
-                    Log("[fov] game renders %.1f x %.1f degrees (read from the matrix)", degX, degY);
-                }
-                g_gameFovValid = true;
-            }
-        }
 
         float ox = g_vmOffset[0], oy = g_vmOffset[1], oz = g_vmOffset[2];
         // Kept for the FOV forcing below, which needs the ORIGINAL scales to compute its
