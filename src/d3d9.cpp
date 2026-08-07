@@ -2920,56 +2920,22 @@ static void ApplyHeadTracking(XrTime when)
     // Sampled here rather than in the D3D hook: the hook runs thousands of times a frame and
     // an xrLocateSpace per call would be absurd. One sample per frame, used by every upload.
     {
-        // Blended toward the measurement by the weight, not assigned. At weight 1 - anywhere
-        // below about 72 degrees of pitch - this is exactly the old assignment. Near vertical
-        // the weight falls to zero and the previous value simply holds, with no step at the
-        // boundary. Taken the short way round the circle so a wrap does not spin the image.
-        float r = 0.0f, w = 0.0f;
-        if (GetHeadRoll(when, &r, &w)) {
-            float d = r - g_headRoll;
-            while (d >  3.14159265f) d -= 6.28318531f;
-            while (d < -3.14159265f) d += 6.28318531f;
-            g_headRoll += w * d;
-        }
+        // ⚠️ Roll is NOT sampled here any more. It moved to the render thread, inside the frame.
+        //
+        // Sampled in Present it described the PREVIOUS frame, and the image was drawn with that
+        // value while the pose submitted alongside carried the CURRENT roll. A projection layer
+        // reprojects by the difference between the pose it is handed and the pose at display, so
+        // a stale roll in the image gets corrected against as though it were current - the
+        // compositor faithfully removing a discrepancy that exists only because the two halves
+        // were sampled a frame apart.
+        //
+        // Same class as the yaw lag and the same fix: sample it where the frame is actually
+        // being drawn, for the time it will actually be seen.
+        //
+        // The steep-pitch trace that used to sit here is gone with it. It was written to find the
+        // rotation when looking straight up, it found it - the sign error in HeadBasis - and a
+        // diagnostic kept past its answer is just a slower build and a longer log.
         UpdateSixDof(when);
-
-        // ---- trace the steep-pitch rotation, rather than guess at it a fourth time ----
-        //
-        // Three plausible causes have been fixed so far - the yaw singularity, the roll's
-        // sensitivity near vertical, and the written pitch going over the top - and the image
-        // still rotates when looking all the way up or down. Each of those was a real defect and
-        // none was this one, so this stops proposing mechanisms and records the state instead.
-        //
-        // The decisive column is matRightZ: the z component of the camera's right axis, taken
-        // from the ENGINE's own matrix before anything of ours touches it. UE3 is Z-up, so a
-        // camera with no roll has a level right axis and this reads ~0. If it stays at 0 through
-        // the event, the engine is not rolling and the rotation is ours - g_headRoll, applied by
-        // ApplyRoll. If it swings, the roll is coming from the game and no amount of work on the
-        // OpenXR side will touch it.
-        //
-        // headRoll and its weight are logged beside it so the two candidates can be told apart
-        // in one run instead of one per hypothesis.
-        {
-            static int decim = 0;
-            int32_t ty, tp;
-            if (GetHeadYawPitch(when, &ty, &tp)) {
-                const float pitchDeg = tp * (360.0f / 65536.0f);
-                if (fabsf(pitchDeg) > 55.0f && (++decim % 6) == 0) {
-                    float rz = 0.0f, fz = 0.0f, gamePitch = 0.0f;
-                    if (g_sceneMatValid) {
-                        const float rx = g_sceneMat[0], ry = g_sceneMat[4], rzz = g_sceneMat[8];
-                        const float rl = sqrtf(rx*rx + ry*ry + rzz*rzz);
-                        if (rl > 1e-6f) rz = rzz / rl;
-                        const float fx = g_sceneMat[3], fy = g_sceneMat[7], fzz = g_sceneMat[11];
-                        const float fl = sqrtf(fx*fx + fy*fy + fzz*fzz);
-                        if (fl > 1e-6f) { fz = fzz / fl; gamePitch = asinf(fz) * 57.29578f; }
-                    }
-                    Log("[tilt] headPitch %+6.1f  headRoll %+7.1f (w %.2f)  |  camPitch %+6.1f"
-                        "  matRightZ %+.4f  <- 0 means the ENGINE is not rolling",
-                        pitchDeg, g_headRoll * 57.29578f, w, gamePitch, rz);
-                }
-            }
-        }
     }
 
     if (!g_headTracking || g_offActorRotation < 0) return;
@@ -3991,6 +3957,22 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                 // accumulate past the head's range - so nothing has ever corrected it. That
                 // asymmetry predicts the symptom exactly: a bounce while sweeping LEFT AND
                 // RIGHT, and none while looking up and down.
+                // ---- head roll, sampled for the moment this frame will be SEEN ----
+                //
+                // Moved off Present for the reason recorded there: the image and the pose
+                // submitted with it were a frame apart, and the compositor reprojects the
+                // difference. Asked for one period ahead, which is where this frame lands, so the
+                // roll drawn into the image is the roll the pose will claim.
+                if (g_predTime) {
+                    float rollNow = 0.0f, rollWeight = 0.0f;
+                    if (GetHeadRoll(g_predTime + g_predPeriod, &rollNow, &rollWeight)) {
+                        float d = rollNow - g_headRoll;
+                        while (d >  3.14159265f) d -= 6.28318531f;
+                        while (d < -3.14159265f) d += 6.28318531f;
+                        g_headRoll += rollWeight * d;
+                    }
+                }
+
                 g_yawLagRad = 0.0f;
                 if (g_predTime && g_sceneMatValid) {
                     float hy = 0.0f;
@@ -4731,11 +4713,20 @@ static void ReportStereoGeometry()
     if (bothRoll > worstRollGap) worstRollGap = bothRoll;
 
     if (++n >= 600) {
+        // ⚠️ The hint this line used to carry - "equal and both live = applied TWICE" - was
+        // wrong, and wrong in the worst way for a diagnostic: it proposed a conclusion the
+        // measurement could not reach. Both figures derive from the same head orientation, so
+        // they are equal BY CONSTRUCTION and would be equal whether or not anything was doubled.
+        // They say nothing about what the compositor does.
+        //
+        // What the pair IS good for is timing. The image carries the roll sampled when it was
+        // drawn; the pose carries the roll at submit. A projection layer reprojects by the
+        // difference, so a gap here is a frame of roll the compositor will correct against.
         Log("[eye] stereo geometry over %ld frames: eye cant fwd %.3f deg, up %.3f deg"
-            "  |  roll in submitted pose %.2f deg + roll in image %.2f deg"
-            "  (equal and both live = applied TWICE)",
+            "  |  roll: image %.2f deg, submitted pose %.2f deg  (these SHOULD match - a gap is"
+            " a frame of roll the compositor reprojects against)",
             n, worstCantF * 57.29578f, worstCantU * 57.29578f,
-            submittedRoll * 57.29578f, g_headRoll * 57.29578f);
+            g_headRoll * 57.29578f, submittedRoll * 57.29578f);
         n = 0; worstCantF = worstCantU = worstRollGap = 0.0f;
     }
 }
