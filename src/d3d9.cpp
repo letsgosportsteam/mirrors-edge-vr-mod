@@ -741,6 +741,11 @@ float                    g_gameHalfFovX = 0.0f;  // read out of the view matrix,
 float                    g_gameHalfFovY = 0.0f;
 bool                     g_gameFovValid = false;
 float                    g_headRoll = 0.0f;      // radians, sampled once per frame
+// The pitch the view SHOULD have, in radians, UE3 sense (positive is up). Set once per frame
+// beside the head sample; the render thread corrects the matrix against it. See ApplyPitchFix.
+float                    g_pitchTarget = 0.0f;
+bool                     g_pitchTargetValid = false;
+bool                     g_pitchFix = true;      // NUMPAD3 toggles, for the A/B
 bool                     g_rollEnabled = true;   // HOME toggles
 int                      g_rollSign = 1;         // END flips
 static float             g_lastLoggedFovX = -1.0f;
@@ -2880,6 +2885,14 @@ static void ApplyHeadTracking(XrTime when)
             want -= (int32_t)corr;
         }
         rot[0] = want;
+
+        // What the view is supposed to end up at, for the render thread to correct against.
+        // With animations followed that includes their contribution; with them cancelled it does
+        // not, which is the whole difference between the two settings expressed in one line.
+        const float kRadPerUnit = 6.28318531f / 65536.0f;
+        g_pitchTarget = (float)(hp * g_pitchSign) * kRadPerUnit
+                      + (g_animFollow ? g_animNow[0] * (3.14159265f / 180.0f) : 0.0f);
+        g_pitchTargetValid = true;
     } else {
         rot[0] += dPitch;
     }
@@ -3109,7 +3122,15 @@ static void CheckHeadHotkeys()
             g_animFollow ? "CARRY" : "do NOT move",
             g_pitchAbsolute ? "" : "  (no effect while pitch is RELATIVE)");
     }
-    pN1 = dN1; pN2 = dN2;
+    static bool pN3 = false;
+    const bool dN3 = (GetAsyncKeyState(VK_NUMPAD3) & 0x8000) != 0;
+    if (dN3 && !pN3) {
+        g_pitchFix = !g_pitchFix;
+        Log("*** [head] NUMPAD3 -> matrix pitch correction %s", g_pitchFix
+            ? "ON (the view's pitch is fixed in the matrix, no frame of lag)"
+            : "OFF (pitch comes from the engine's Rotation alone, one frame behind)");
+    }
+    pN1 = dN1; pN2 = dN2; pN3 = dN3;
 
     if (d5 && !p5) { g_yawSign   = -g_yawSign;   Log("[head] F5 -> yaw sign %+d", g_yawSign); }
     if (d4 && !p4) { g_pitchSign = -g_pitchSign; Log("[head] F4 -> pitch sign %+d", g_pitchSign); }
@@ -3417,7 +3438,8 @@ static void TestWindow(int reg, const float* m, bool asRow,
 // The game's buffer is const and belongs to the engine, so the covering call is copied,
 // modified and forwarded. Only calls that actually cover the matrix pay that cost.
 
-static void ApplyRoll(float* m, bool rowStorage);     // defined with the stereo code below
+static void ApplyRoll(float* m, bool rowStorage);      // defined with the stereo code below
+static void ApplyPitchFix(float* m, bool rowStorage);  // likewise
 static void ApplySixDof(float* m, bool rowStorage);
 
 int   g_vmReg = -1;              // committed after a successful scan
@@ -3604,6 +3626,10 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                 for (int i = 0; i < 4; ++i) { m[0 * 4 + i] *= sx; m[1 * 4 + i] *= sy; }
             }
         }
+        // Same three, in the same order, as the duplication path's BuildEyeMatrix. Kept in step
+        // deliberately: the two paths drifting apart is exactly how the FOV read ended up living
+        // on only one of them, and that cost several runs to find.
+        ApplyPitchFix(m, g_vmRow);
         ApplySixDof(m, g_vmRow);
         ApplyRoll(m, g_vmRow);
 
@@ -4031,6 +4057,100 @@ static void ApplySixDof(float* m, bool rowStorage)
     }
 }
 
+// ---- rotate the camera about one of its own axes, in the matrix ----
+//
+// A world-space pre-multiplication, exactly like the 6-DOF translation, and pivoted on the
+// camera position for the same reason: rotating about the world origin would swing the camera
+// through an arc instead of turning it on the spot.
+//
+// Not the clip-space shear ApplyRoll uses. Roll leaves clip.z alone so mixing two columns is
+// exact there; a pitch changes the view-space depth of everything, so the near/far mapping has
+// to come along or the depth buffer stops agreeing with the picture. Rotating the WORLD before
+// the projection gets that for free - the engine's own projection then does the depth mapping,
+// whatever convention it uses, and nothing here has to know what that convention is.
+//
+//   clip = v M, and replacing rows 0..2 with R*rows gives clip = (v R) M: the world turns, so
+//   the camera appears to turn the other way. Hence the transpose, which for a rotation is the
+//   inverse. Row 3 absorbs the pivot.
+static void ApplyCameraRotation(float* m, bool rowStorage, const float axis[3], float ang,
+                                const float pivot[3])
+{
+    if (fabsf(ang) < 1e-4f) return;
+    float ax = axis[0], ay = axis[1], az = axis[2];
+    const float al = sqrtf(ax*ax + ay*ay + az*az);
+    if (al < 1e-6f) return;
+    ax /= al; ay /= al; az /= al;
+
+    // Rodrigues at -ang, which is the transpose of the rotation by +ang.
+    const float c = cosf(-ang), s = sinf(-ang), t = 1.0f - c;
+    const float R[3][3] = {
+        { t*ax*ax + c,     t*ax*ay - s*az,  t*ax*az + s*ay },
+        { t*ax*ay + s*az,  t*ay*ay + c,     t*ay*az - s*ax },
+        { t*ax*az - s*ay,  t*ay*az + s*ax,  t*az*az + c    }
+    };
+
+    auto at = [&](int row, int k) -> float& {
+        return rowStorage ? m[row * 4 + k] : m[k * 4 + row];
+    };
+
+    float nr[3][4];
+    for (int i = 0; i < 3; ++i)
+        for (int k = 0; k < 4; ++k)
+            nr[i][k] = R[i][0]*at(0,k) + R[i][1]*at(1,k) + R[i][2]*at(2,k);
+
+    // Pivot: v' = (v - p)R + p, so row 3 takes p*M - p*(RM).
+    for (int k = 0; k < 4; ++k) {
+        float d = 0.0f;
+        for (int j = 0; j < 3; ++j) d += pivot[j] * (at(j,k) - nr[j][k]);
+        at(3,k) += d;
+    }
+    for (int i = 0; i < 3; ++i)
+        for (int k = 0; k < 4; ++k) at(i,k) = nr[i][k];
+}
+
+// ---- correct the pitch in the matrix instead of waiting for the engine ----
+//
+// Writing pitch into Controller.Rotation happens once, in Present, and the engine has already
+// rendered by then - so every disturbance shows for at least one frame before the write can
+// answer it, and with the animation cancellation relaxed for stability it takes a fifth of a
+// second more. That is the reported "rotates slightly before snapping back to the middle",
+// whether the disturbance came from the mouse or from an animation starting.
+//
+// The write cannot be made faster; there is no hook between the engine's camera update and its
+// render. But the matrix is read on the render thread, after all of it, so the error is knowable
+// exactly where it can still be fixed: compare the pitch the matrix actually carries against the
+// pitch it was supposed to have, and rotate away the difference.
+//
+// The write still happens and still matters - Controller.Rotation is what the GAME uses for
+// aiming, movement and everything else that reads where the player is looking. This corrects
+// only what is SEEN, which is the part that was a frame late.
+static void ApplyPitchFix(float* m, bool rowStorage)
+{
+    if (!g_pitchFix || !g_pitchTargetValid || !g_camCacheValid || !g_pitchAbsolute) return;
+
+    auto col = [&](int c, int i) { return rowStorage ? m[i * 4 + c] : m[c * 4 + i]; };
+
+    // Camera forward is column 3; UE3 is Z-up, so its z component is the sine of the pitch.
+    const float fx = col(3,0), fy = col(3,1), fz = col(3,2);
+    const float fl = sqrtf(fx*fx + fy*fy + fz*fz);
+    if (fl < 1e-6f) return;
+    float sinP = fz / fl;
+    if (sinP >  1.0f) sinP =  1.0f;
+    if (sinP < -1.0f) sinP = -1.0f;
+
+    float err = g_pitchTarget - asinf(sinP);
+
+    // Clamped hard. A foreign matrix that slipped the scene test, or a target computed from a
+    // stale sample, must not be able to throw the view somewhere the head is not - and a real
+    // error is never more than a degree or two.
+    const float kMax = 20.0f * (3.14159265f / 180.0f);
+    if (err >  kMax) err =  kMax;
+    if (err < -kMax) err = -kMax;
+
+    const float right[3] = { col(0,0), col(0,1), col(0,2) };
+    ApplyCameraRotation(m, rowStorage, right, err, g_camCache);
+}
+
 static void ApplyRoll(float* m, bool rowStorage)
 {
     if (!g_rollEnabled || fabsf(g_headRoll) < 1e-4f) return;
@@ -4068,6 +4188,10 @@ static void BuildEyeMatrix(float* out, int eye)
         for (int c = 0; c < 4; ++c)
             m[12 + c] -= ox * m[0 + c] + oy * m[4 + c] + oz * m[8 + c];
     }
+    // Both world-space pre-multiplications, so they belong together and ahead of the projection.
+    // The pitch fix goes first: it uses the matrix's own forward and right axes, and wants them
+    // as the engine left them rather than after an eye offset has moved the origin.
+    ApplyPitchFix(m, true);
     ApplySixDof(m, true);   // a world-space offset, same stage as the per-eye one
     if (g_fovForce && g_gameFovValid && g_targetHalfFovX > 0.0f) {
         // ⚠️ Uses g_targetHalfFovX, the SAME number the projection layer submits.
