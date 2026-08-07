@@ -2488,7 +2488,14 @@ static bool      g_headTracking = true;
 // Both negative, MEASURED rather than reasoned. OpenXR is right-handed with Y up and -Z
 // forward; UE3 is left-handed with Z up. Rather than argue the conversion out on paper, the
 // first run shipped +1/+1 with F5 and F4 to flip them, and both came back inverted.
-static int       g_yawSign = -1, g_pitchSign = -1;
+// ⚠️ pitch is +1 now, and that is a consequence of the HeadBasis fix rather than a taste change.
+//
+// It was -1 because the measured pitch came out inverted, and F4 was flipped to cancel it. The
+// inversion was the sign error on the forward vector's y component; with that corrected the
+// measurement is the right way up and a second negation would put it back. Yaw is untouched -
+// it reads only x and z, which were always correct, so its -1 is the genuine handedness between
+// OpenXR's anticlockwise yaw and UE3's clockwise one.
+static int       g_yawSign = -1, g_pitchSign = +1;
 static bool      g_headPrimed = false;
 static int32_t   g_lastHeadYaw = 0, g_lastHeadPitch = 0;
 static long      g_headWrites = 0;
@@ -2540,6 +2547,37 @@ static uintptr_t FindPlayerController()
     return 0;
 }
 
+// The head's forward and up axes in room space, from the pose quaternion.
+//
+// ⚠️ ONE copy, and that is the point. These lines were pasted into three places and one copy
+// carried a sign error on fwd[1] - `2*(yz - wx)` where the negated third column of the rotation
+// matrix is `-2*(yz - wx)`. The forward vector was reflected through the horizontal plane.
+//
+// It hid for four rounds because of where it does and does not matter:
+//
+//   * pitch came out negated, which the F4 sign toggle had already been flipped to absorb. A
+//     real defect cancelled by a setting chosen to make the symptom go away.
+//   * yaw uses only x and z, so it was never affected.
+//   * roll was fine at eye level and catastrophic when pitched. The level-up reference is
+//     worldUp minus its forward component, so at level pitch it is (0,1,0) either way, but as
+//     the head pitches up the reference lies down towards horizontal and the sign error flips
+//     its horizontal part - which by 68 degrees is nearly the whole vector. The measured roll
+//     read 180 degrees and the image turned upside down.
+//
+// Which is why this is now a function. Three copies of a formula is three chances to get it
+// wrong and one place where being wrong is obvious.
+static void HeadBasis(const XrQuaternionf& q, float fwd[3], float up[3])
+{
+    // Columns of the quaternion's rotation matrix. OpenXR is right-handed with Y up and -Z
+    // forward, so forward is the NEGATED third column and up is the second, unchanged.
+    fwd[0] = -2.0f * (q.x * q.z + q.w * q.y);
+    fwd[1] = -2.0f * (q.y * q.z - q.w * q.x);
+    fwd[2] = -(1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+    up[0]  =  2.0f * (q.x * q.y - q.w * q.z);
+    up[1]  =  1.0f - 2.0f * (q.x * q.x + q.z * q.z);
+    up[2]  =  2.0f * (q.y * q.z + q.w * q.x);
+}
+
 // Head orientation as UE3 rotator units. Yaw and pitch are taken from the forward vector
 // rather than an Euler decomposition, which avoids the ambiguity near vertical.
 static bool GetHeadYawPitch(XrTime when, int32_t* outYaw, int32_t* outPitch)
@@ -2549,11 +2587,9 @@ static bool GetHeadYawPitch(XrTime when, int32_t* outYaw, int32_t* outPitch)
     if (XR_FAILED(xrLocateSpace(g_viewSpace, g_xrSpace, when, &loc))) return false;
     if (!(loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) return false;
 
-    const XrQuaternionf q = loc.pose.orientation;
-    // OpenXR is right-handed, Y up, -Z forward.
-    const float fx = -2.0f * (q.x * q.z + q.w * q.y);
-    const float fy =  2.0f * (q.y * q.z - q.w * q.x);
-    const float fz = -(1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+    float f[3], u[3];
+    HeadBasis(loc.pose.orientation, f, u);
+    const float fx = f[0], fy = f[1], fz = f[2];
 
     const float len      = sqrtf(fx * fx + fz * fz);
     const float pitchRad = atan2f(fy, len);
@@ -2594,14 +2630,10 @@ static bool GetHeadRoll(XrTime when, float* outRoll, float* outWeight)
     if (XR_FAILED(xrLocateSpace(g_viewSpace, g_xrSpace, when, &loc))) return false;
     if (!(loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) return false;
 
-    const XrQuaternionf q = loc.pose.orientation;
-    // Rotate the basis vectors by the quaternion. OpenXR: Y up, -Z forward.
-    const float fx = -2.0f * (q.x * q.z + q.w * q.y);
-    const float fy =  2.0f * (q.y * q.z - q.w * q.x);
-    const float fz = -(1.0f - 2.0f * (q.x * q.x + q.y * q.y));
-    const float ux =  2.0f * (q.x * q.y - q.w * q.z);
-    const float uy =  1.0f - 2.0f * (q.x * q.x + q.z * q.z);
-    const float uz =  2.0f * (q.y * q.z + q.w * q.x);
+    float f[3], u[3];
+    HeadBasis(loc.pose.orientation, f, u);
+    const float fx = f[0], fy = f[1], fz = f[2];
+    const float ux = u[0], uy = u[1], uz = u[2];
 
     // World up with the forward component removed: the "level up" for this facing.
     const float d = fy;                       // dot(worldUp, forward), worldUp = (0,1,0)
@@ -3764,9 +3796,9 @@ void UpdateSixDof(XrTime when)
     // removed, because yaw is the only part the room and the game world disagree about.
     static float hfx = 0.0f, hfz = -1.0f;      // head forward, levelled, room space
     {
-        const XrQuaternionf q = loc.pose.orientation;
-        const float fx = -2.0f * (q.x * q.z + q.w * q.y);
-        const float fz = -(1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+        float f[3], u[3];
+        HeadBasis(loc.pose.orientation, f, u);
+        const float fx = f[0], fz = f[2];
         const float len = sqrtf(fx * fx + fz * fz);
         // Looking straight up or down: the levelled forward collapses and its direction is
         // meaningless. Hold the last good one rather than let it spin.
