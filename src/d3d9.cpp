@@ -4938,18 +4938,36 @@ static void ReportStereoGeometry()
 
 // Called once per Present. Buckets the interval since the last one by display periods.
 static double g_lastPresentMs = 0.0;
-static long   g_pace[6] = { 0, 0, 0, 0, 0, 0 };   // 0 = <1 period, 5 = 5 or more
+
+// ⚠️ This used to bucket the interval by whole display periods, and that measurement was lying
+// in the one direction that mattered.
+//
+// Rounding put everything from 0.5 to 1.5 periods into bucket 1 - 4.2 ms to 12.5 ms, which is
+// 80 fps through 240 fps. At 60 into 120 that was fine and it correctly showed one bucket. At the
+// 95-100 fps this now runs at, EVERY frame lands in bucket 1 whatever the jitter, and it printed
+// "one bucket = even" directly beside an fps line reading 95.9. Both cannot be true.
+//
+// And 100 into 120 is the bad case, not a good one: a ratio of 1.2 means four frames shown once
+// and every fifth shown twice, a beat at 20 Hz. That is worse than 60 into 120, and it was
+// invisible to the metric built to find exactly it.
+//
+// So the interval is reported directly now, in milliseconds, with the count of frames that
+// MISSED the display's cadence. No rounding, nothing to hide behind.
+static double g_paceMin = 1e9, g_paceMax = 0.0, g_paceSum = 0.0;
+static long   g_paceN = 0, g_paceLate = 0;
 
 static void TickPacing()
 {
     const double now = NowMs();
     if (g_lastPresentMs > 0.0 && g_predPeriod) {
+        const double dt = now - g_lastPresentMs;
         const double periodMs = (double)g_predPeriod / 1.0e6;
-        if (periodMs > 0.1) {
-            int b = (int)((now - g_lastPresentMs) / periodMs + 0.5);
-            if (b < 0) b = 0;
-            if (b > 5) b = 5;
-            g_pace[b]++;
+        if (dt > 0.0 && dt < 1000.0 && periodMs > 0.1) {
+            if (dt < g_paceMin) g_paceMin = dt;
+            if (dt > g_paceMax) g_paceMax = dt;
+            g_paceSum += dt;
+            g_paceN++;
+            if (dt > periodMs * 1.25) g_paceLate++;
         }
     }
     g_lastPresentMs = now;
@@ -4973,13 +4991,13 @@ static void TickPacing()
 
 static void ReportPacing()
 {
-    long total = 0;
-    for (int i = 0; i < 6; ++i) total += g_pace[i];
-    if (!total) return;
-    Log("[xr] cadence over %ld frames - display periods per delivered frame:"
-        "  <1:%ld  1:%ld  2:%ld  3:%ld  4:%ld  5+:%ld   (one bucket = even)",
-        total, g_pace[0], g_pace[1], g_pace[2], g_pace[3], g_pace[4], g_pace[5]);
-    for (int i = 0; i < 6; ++i) g_pace[i] = 0;
+    if (!g_paceN) return;
+    const double periodMs = g_predPeriod ? ((double)g_predPeriod / 1.0e6) : 0.0;
+    Log("[xr] pacing over %ld frames: %.2f ms mean, %.2f min, %.2f max  |  display period"
+        " %.2f ms  |  %ld frames LATE (%.1f%%)   <- late frames are the judder, 0%% is even",
+        g_paceN, g_paceSum / (double)g_paceN, g_paceMin, g_paceMax, periodMs,
+        g_paceLate, 100.0 * (double)g_paceLate / (double)g_paceN);
+    g_paceMin = 1e9; g_paceMax = 0.0; g_paceSum = 0.0; g_paceN = 0; g_paceLate = 0;
 }
 
 // The point every matrix rotation turns about. Prefers the position read inside the frame; falls
