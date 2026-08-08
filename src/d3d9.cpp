@@ -2986,6 +2986,22 @@ static bool GetHeadYawRaw(XrTime when, float* outYaw)
     return true;
 }
 
+// The head's pitch in radians, with no state of its own - the companion to GetHeadYawRaw, and
+// separate from GetHeadYawPitch for the same reason: that one holds a static across calls and
+// must not be shared with a caller on another thread asking about another time.
+static bool GetHeadPitchRaw(XrTime when, float* outPitch)
+{
+    if (g_viewSpace == XR_NULL_HANDLE || g_xrSpace == XR_NULL_HANDLE) return false;
+    XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
+    if (XR_FAILED(xrLocateSpace(g_viewSpace, g_xrSpace, when, &loc))) return false;
+    if (!(loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) return false;
+
+    float f[3], u[3];
+    HeadBasis(loc.pose.orientation, f, u);
+    *outPitch = atan2f(f[1], sqrtf(f[0]*f[0] + f[2]*f[2]));
+    return true;
+}
+
 // Head orientation as UE3 rotator units. Yaw and pitch are taken from the forward vector
 // rather than an Euler decomposition, which avoids the ambiguity near vertical.
 static bool GetHeadYawPitch(XrTime when, int32_t* outYaw, int32_t* outPitch)
@@ -3237,17 +3253,14 @@ static void ApplyHeadTracking(XrTime when)
         }
         rot[0] = want;
 
-        // Where the HEAD is pointing, and nothing else. The animation's share used to be added
-        // here and that was the flaw: g_animNow is sampled in Present, so it described the
-        // previous frame. With animations cancelled the term is zero and the target was exact -
-        // which is why the mouse came right at 0% - but with them followed a stale term rode
-        // along, and it is largest exactly when the animation moves fastest. Hence a mouse that
-        // still juddered at 100%, and a hard landing that juddered worst of all.
+        // ⚠️ The pitch TARGET is no longer set here. It is sampled on the render thread, inside
+        // the frame, for the time the frame will be seen - the same move roll made, for the same
+        // reason. Set here it described the previous frame, and ApplyPitchFix spent every frame
+        // correcting the view towards where the head used to be.
         //
-        // ApplyPitchFix derives the animation's share from live values instead.
-        const float kRadPerUnit = 6.28318531f / 65536.0f;
-        g_pitchTarget = (float)(hp * g_pitchSign) * kRadPerUnit;
-        g_pitchTargetValid = true;
+        // The write above still uses this frame's `hp`, and should: Controller.Rotation is what
+        // the GAME reads for aiming and movement, and a frame of latency there is invisible.
+        // What is SEEN is corrected in the matrix, where it can be done for the right instant.
     } else {
         rot[0] += dPitch;
     }
@@ -4107,6 +4120,25 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                         while (d >  3.14159265f) d -= 6.28318531f;
                         while (d < -3.14159265f) d += 6.28318531f;
                         g_headRoll += rollWeight * d;
+                    }
+
+                    // ---- and the pitch target, for the same reason ----
+                    //
+                    // The last axis still being sampled in Present. Yaw is measured against the
+                    // matrix on this thread, roll moved here a commit ago, and pitch was left
+                    // behind - so ApplyPitchFix has been correcting the view towards where the
+                    // head was one frame ago and calling it done.
+                    //
+                    // It hid because it was small next to everything else. The frame grab used
+                    // to take 4 ms of a 13 ms frame and the yaw lag was five degrees; a frame of
+                    // pitch error was in the noise. At 0.4 ms and 119 fps, with yaw and roll both
+                    // measured in fractions of a degree, it is what is left - which is exactly
+                    // when "judder looking up and down, but not left and right" becomes possible
+                    // to notice.
+                    float pitchNow = 0.0f;
+                    if (GetHeadPitchRaw(g_predTime + g_predPeriod, &pitchNow)) {
+                        g_pitchTarget = pitchNow * (float)g_pitchSign;
+                        g_pitchTargetValid = true;
                     }
                 }
 
