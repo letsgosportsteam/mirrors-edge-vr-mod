@@ -109,6 +109,9 @@ static long             g_createCalls = 0;
 
 static bool  g_d3d9Patched   = false;   // IDirect3D9 vtable patched (shared by all instances)
 static bool  g_devicePatched = false;   // IDirect3DDevice9 vtable patched
+// Declared up here rather than beside the rest of the rung 8a state, because the frame grab -
+// which sits far above that code - has to know which kind of device it is grabbing from.
+static bool  g_devIsEx       = false;   // the device really is D3D9Ex
 static long  g_frames        = 0;
 static bool  g_describedBackbuffer = false;
 
@@ -616,6 +619,116 @@ static bool EnsureCapture(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt)
 }
 
 // Called from Present, BEFORE the real Present runs - the backbuffer holds the finished frame.
+// ================================================================ rung 8b: the shared surface
+//
+// The whole point of the Ex device. The frame stays on the GPU: StretchRect from the backbuffer
+// into a surface D3D11 already has open, and no byte crosses the bus.
+//
+// The slow path is a GPU->CPU->GPU round trip. GetRenderTargetData blocks until the GPU has
+// finished, then 14.7 MB is copied by the CPU into a system-memory surface, then copied again
+// into a D3D11 dynamic texture. Measured at 3.7-4.6 ms of every frame.
+//
+// ---- format, and why the shared surface is not simply "the same as the backbuffer" ----
+//
+// A shared D3D9 surface opens in D3D11 with the DXGI format its D3D9 format maps to. X8R8G8B8
+// maps to B8G8R8X8_UNORM, and the XR swapchain images are in the B8G8R8A8 family -
+// CopySubresourceRegion between the two families is not legal, and would fail every frame after
+// succeeding at creation.
+//
+// So the shared surface is always created A8R8G8B8, whatever the backbuffer is, and StretchRect
+// converts on the way in. That is a GPU blit it is allowed to do, and it puts the result in the
+// family the swapchain wants.
+//
+// ---- synchronisation ----
+//
+// Two devices touching one surface with no keyed mutex. The D3D9 blit is queued, not finished,
+// when StretchRect returns, so D3D11 can read it mid-write and show a torn frame. An event query
+// flushed to completion is the documented way to order this, and it is a GPU-side wait for a
+// blit rather than a full readback - the thing being waited for is thousands of times cheaper
+// than the thing the slow path waited for.
+
+static IDirect3DSurface9* g_sharedRT   = nullptr;   // D3D9 side, shared
+static HANDLE             g_sharedH    = nullptr;
+static ID3D11Texture2D*   g_sharedTex  = nullptr;   // the same memory, D3D11 side
+static IDirect3DQuery9*   g_sharedSync = nullptr;
+static bool  g_fastCapture     = true;      // NUMPAD8 toggles
+static bool  g_fastCaptureOK   = false;     // the shared pair exists and works
+static bool  g_fastFailLogged  = false;
+
+static void ReleaseSharedCapture()
+{
+    if (g_sharedSync) { g_sharedSync->Release(); g_sharedSync = nullptr; }
+    if (g_sharedTex)  { g_sharedTex->Release();  g_sharedTex  = nullptr; }
+    if (g_sharedRT)   { g_sharedRT->Release();   g_sharedRT   = nullptr; }
+    g_sharedH = nullptr;
+    g_fastCaptureOK = false;
+}
+
+static bool EnsureSharedCapture(IDirect3DDevice9* dev, UINT w, UINT h)
+{
+    if (g_fastCaptureOK && w == g_capW && h == g_capH) return true;
+    ReleaseSharedCapture();
+    if (!g_devIsEx || !g_dev11) return false;
+
+    // pSharedHandle must point at a NULL handle going in; the runtime fills it. Lockable FALSE:
+    // nothing ever reads this from the CPU, which is the entire point.
+    g_sharedH = nullptr;
+    HRESULT hr = dev->CreateRenderTarget(w, h, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0,
+                                         FALSE, &g_sharedRT, &g_sharedH);
+    if (FAILED(hr) || !g_sharedRT || !g_sharedH) {
+        Log("[fast] CreateRenderTarget(shared) FAILED hr=0x%08lX handle=%p - staying on the slow path",
+            (unsigned long)hr, (void*)g_sharedH);
+        ReleaseSharedCapture();
+        return false;
+    }
+
+    hr = g_dev11->OpenSharedResource(g_sharedH, __uuidof(ID3D11Texture2D), (void**)&g_sharedTex);
+    if (FAILED(hr) || !g_sharedTex) {
+        // ⚠️ The most likely cause is the two devices being on different adapters. The D3D11
+        // device is created on the adapter the OpenXR runtime names; the D3D9 device is on
+        // whichever adapter the game asked for. On a single-GPU machine they agree.
+        Log("[fast] OpenSharedResource FAILED hr=0x%08lX - the D3D9 and D3D11 devices are"
+            " probably on different adapters; staying on the slow path", (unsigned long)hr);
+        ReleaseSharedCapture();
+        return false;
+    }
+
+    // EVENT, not OCCLUSION. This one is ours and is never seen by the game's own query hook,
+    // which filters on type for exactly this reason.
+    if (FAILED(dev->CreateQuery(D3DQUERYTYPE_EVENT, &g_sharedSync))) g_sharedSync = nullptr;
+
+    D3D11_TEXTURE2D_DESC td{};
+    g_sharedTex->GetDesc(&td);
+    Log("*** [fast] shared surface live: %ux%u, D3D11 sees DXGI format %d, sync query %s",
+        td.Width, td.Height, (int)td.Format, g_sharedSync ? "yes" : "NO (expect tearing)");
+    g_fastCaptureOK = true;
+    return true;
+}
+
+// The fast path. Returns false to mean "fall back this frame", never to mean "give up".
+static bool CaptureFrameShared(IDirect3DDevice9* dev, IDirect3DSurface9* bb, UINT w, UINT h)
+{
+    if (!EnsureSharedCapture(dev, w, h)) return false;
+
+    HRESULT hr = dev->StretchRect(bb, nullptr, g_sharedRT, nullptr, D3DTEXF_NONE);
+    if (FAILED(hr)) {
+        if (!g_fastFailLogged) {
+            g_fastFailLogged = true;
+            Log("[fast] StretchRect FAILED hr=0x%08lX - falling back to the slow path",
+                (unsigned long)hr);
+        }
+        return false;
+    }
+
+    // Wait for the blit, not for the frame. GetData spins until the queued work up to this point
+    // has retired; without it D3D11 can sample a surface D3D9 is still writing.
+    if (g_sharedSync) {
+        g_sharedSync->Issue(D3DISSUE_END);
+        while (g_sharedSync->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_FALSE) { /* spin */ }
+    }
+    return true;
+}
+
 static bool CaptureFrame(IDirect3DDevice9* dev)
 {
     if (!g_dev11) return false;
@@ -626,6 +739,25 @@ static bool CaptureFrame(IDirect3DDevice9* dev)
 
     D3DSURFACE_DESC d{};
     if (FAILED(bb->GetDesc(&d))) { bb->Release(); return false; }
+
+    // The fast path first. It needs the backbuffer and nothing else, so the slow path's system
+    // memory surface is not even allocated while it is working.
+    if (g_fastCapture && g_devIsEx) {
+        g_capW = d.Width; g_capH = d.Height;
+        const bool ok = CaptureFrameShared(dev, bb, d.Width, d.Height);
+        bb->Release();
+        if (ok) {
+            g_haveFrame = true;
+            g_capMsTotal += NowMs() - t0;
+            g_capSamples++;
+            return true;
+        }
+        // Fell back. Re-take the backbuffer and continue into the slow path below rather than
+        // dropping the frame - a fallback that skips frames is a worse failure than a slow one.
+        bb = nullptr;
+        if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return false;
+    }
+
     if (!EnsureCapture(dev, d.Width, d.Height, d.Format)) { bb->Release(); return false; }
 
     HRESULT hr = dev->GetRenderTargetData(bb, g_sysSurf);
@@ -871,16 +1003,22 @@ static bool FillEye(int eye)
     wi.timeout = XR_INFINITE_DURATION;
     bool ok = false;
     if (XR_SUCCEEDED(xrWaitSwapchainImage(g_eyeSwap[eye], &wi))) {
-        if (g_simulStereo) {
+        // One source or the other. The shared texture when the fast path produced this frame,
+        // the CPU-uploaded one when it did not - identical geometry either way, so the eye split
+        // below cannot drift between the two paths.
+        ID3D11Resource* src = (g_fastCaptureOK && g_fastCapture && g_devIsEx)
+                              ? (ID3D11Resource*)g_sharedTex : (ID3D11Resource*)g_upload;
+        if (!src) { ok = false; }
+        else if (g_simulStereo) {
             // Both eyes live in one frame side by side, so each swapchain takes its own half.
             D3D11_BOX box{};
             box.left  = (UINT)(eye == 0 ? 0 : g_capW / 2);
             box.right = box.left + g_capW / 2;
             box.top = 0; box.bottom = g_capH;
             box.front = 0; box.back = 1;
-            g_ctx11->CopySubresourceRegion(g_eyeImages[eye][idx], 0, 0, 0, 0, g_upload, 0, &box);
+            g_ctx11->CopySubresourceRegion(g_eyeImages[eye][idx], 0, 0, 0, 0, src, 0, &box);
         } else {
-            g_ctx11->CopyResource(g_eyeImages[eye][idx], g_upload);
+            g_ctx11->CopyResource(g_eyeImages[eye][idx], src);
         }
         ok = true;
     }
@@ -3364,6 +3502,19 @@ static void CheckHeadHotkeys()
     }
     pN7 = dN7;
 
+    // NUMPAD8 switches the frame grab between the shared surface and the old CPU round trip.
+    // THIS one can be a runtime toggle where the device type could not: the grab is chosen per
+    // frame and owns nothing the game can see.
+    static bool pN8 = false;
+    const bool dN8 = (GetAsyncKeyState(VK_NUMPAD8) & 0x8000) != 0;
+    if (dN8 && !pN8) {
+        g_fastCapture = !g_fastCapture;
+        Log("*** [fast] NUMPAD8 -> frame grab %s", g_fastCapture
+            ? "SHARED SURFACE (stays on the GPU)"
+            : "CPU round trip (the known-good path)");
+    }
+    pN8 = dN8;
+
     static bool pN6 = false;
     const bool dN6 = (GetAsyncKeyState(VK_NUMPAD6) & 0x8000) != 0;
     if (dN6 && !pN6) {
@@ -5783,8 +5934,8 @@ static HRESULT STDMETHODCALLTYPE Hook_Reset(IDirect3DDevice9* dev, D3DPRESENT_PA
 // black texture.
 
 static IDirect3D9Ex* g_d3d9ExObj  = nullptr;   // non-null once we have swapped the factory
-static bool          g_devIsEx    = false;     // the DEVICE really is Ex
-static bool          g_wantEx     = true;      // cleared by the opt-out file
+static bool          g_wantEx     = true;      // cleared by the opt-out file  (g_devIsEx is
+                                               // declared with the frame grab, which also needs it)
 static LONG          g_remapTex   = 0, g_remapVB = 0, g_remapIB = 0;
 static LONG          g_remapVol   = 0, g_remapCube = 0;
 static LONG          g_remapFails = 0;
