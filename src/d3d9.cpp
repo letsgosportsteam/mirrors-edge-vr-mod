@@ -3120,7 +3120,17 @@ static void ApplyHeadTracking(XrTime when)
         // The steep-pitch trace that used to sit here is gone with it. It was written to find the
         // rotation when looking straight up, it found it - the sign error in HeadBasis - and a
         // diagnostic kept past its answer is just a slower build and a longer log.
-        UpdateSixDof(when);
+        //
+        // ⚠️ 6-DOF moved out too, and it was the LAST thing still sampled here. Its offset is a
+        // TRANSLATION, so a stale one slides the world rather than turning it - and translation
+        // error reads as the picture swimming, which is what judder looks like from inside.
+        //
+        // Pitching the head moves the eyes further than yawing it does: they sit forward of the
+        // neck, so a nod swings them through a vertical arc while a turn swings them through a
+        // horizontal one about a nearer axis. A frame-old offset is therefore worst in pitch,
+        // which is where the judder is, and it is the only remaining value with that property
+        // now that the rotation path measures at half a degree on every axis.
+        (void)when;
     }
 
     if (!g_headTracking || g_offActorRotation < 0) return;
@@ -4139,6 +4149,32 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                     if (GetHeadPitchRaw(g_predTime + g_predPeriod, &pitchNow)) {
                         g_pitchTarget = pitchNow * (float)g_pitchSign;
                         g_pitchTargetValid = true;
+                    }
+
+                    // 6-DOF, for the same instant as everything else. Its offset is a
+                    // TRANSLATION - a stale one slides the world instead of turning it, and a
+                    // sliding world is what judder looks like from inside a headset.
+                    UpdateSixDof(g_predTime + g_predPeriod);
+
+                    // How much does that offset move between frames? A translation the size of
+                    // the offset itself is not the issue; a translation that JUMPS is. Reported
+                    // so a stale-sample artifact can be told from a correct one that simply
+                    // feels unfamiliar.
+                    {
+                        static float prev[3] = { 0, 0, 0 };
+                        static float worst = 0.0f;
+                        static long  n = 0;
+                        const float dx = g_dofOffset[0] - prev[0];
+                        const float dy = g_dofOffset[1] - prev[1];
+                        const float dz = g_dofOffset[2] - prev[2];
+                        const float step = sqrtf(dx*dx + dy*dy + dz*dz);
+                        prev[0] = g_dofOffset[0]; prev[1] = g_dofOffset[1]; prev[2] = g_dofOffset[2];
+                        if (step > worst) worst = step;
+                        if (++n >= 600) {
+                            Log("[6dof] offset moves at most %.1f UU per frame  (%.1f cm - at 120"
+                                " fps a real head cannot do much more than 2)", worst, worst);
+                            n = 0; worst = 0.0f;
+                        }
                     }
                 }
 
