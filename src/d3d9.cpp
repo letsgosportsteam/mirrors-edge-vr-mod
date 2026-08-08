@@ -1830,7 +1830,20 @@ int       g_offMaxSmoothFps = -1;
 // frame in our own frame grab; at 80 fps that is 12.5 ms of which the grab is a third. Take the
 // grab off the critical path and 8.3 ms - a true 120, one image per display period - is within
 // reach of what the engine is already doing.
-float     g_fpsCap          = 60.0f;    // NUMPAD7 cycles
+// ⚠️ Uncapped for the Ex bring-up, deliberately, and back to 60 once it is judged.
+//
+// 60 is the right setting to PLAY at - it is the only rate the game can hold that divides 120 -
+// and it is exactly the wrong setting to bring up the Ex device at, because it hides the number
+// this rung has to produce.
+//
+// The MANAGED translation is not free and could plausibly be negative. D3DUSAGE_DYNAMIC textures
+// are placed for fast CPU writes rather than fast GPU reads, and there are 5176 of them. If that
+// costs more than the frame grab saves, the whole approach is wrong and it is better to find out
+// before the shared surface is built on top of it. Capped at 60 the game hits 60 either way and
+// says nothing.
+//
+// The plain device measured 75-80 fps uncapped. That is the number the Ex device has to match.
+float     g_fpsCap          = 250.0f;   // NUMPAD7 cycles; first press returns to 60
 static int LookupProp(const char* className, const char* propName, bool verbose);
 
 static void FindEngineObject()
@@ -3339,7 +3352,9 @@ static void CheckHeadHotkeys()
     static bool pN7 = false;
     const bool dN7 = (GetAsyncKeyState(VK_NUMPAD7) & 0x8000) != 0;
     if (dN7 && !pN7) {
-        static const float kCaps[] = { 60.0f, 120.0f, 90.0f, 250.0f, 62.0f };
+        // Ordered so the first press leaves the bring-up setting for the playable one. The
+        // initial value at the top of the file is kCaps[0], so the two cannot disagree.
+        static const float kCaps[] = { 250.0f, 60.0f, 120.0f, 90.0f, 62.0f };
         static int ci = 0;
         ci = (ci + 1) % (int)(sizeof(kCaps) / sizeof(kCaps[0]));
         g_fpsCap = kCaps[ci];
