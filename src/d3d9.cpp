@@ -655,6 +655,23 @@ static bool  g_fastCapture     = true;      // NUMPAD8 toggles
 static bool  g_fastCaptureOK   = false;     // the shared pair exists and works
 static bool  g_fastFailLogged  = false;
 
+// ⚠️ ONE function decides where this frame's picture is, and every consumer asks it.
+//
+// The first version of rung 8b changed the copy in FillEye to read the shared texture and left
+// the guard three lines above it testing g_upload - which the fast path never allocates. So
+// FillEye returned false before reaching the copy, neither eye was ever filled, no projection
+// layer was submitted, and the headset fell back to the rung 2 test quad. Everything upstream
+// was working and reported so: the shared surface was live, stereo was armed, both swapchains
+// existed.
+//
+// Two places deciding the same thing, one of them by proxy, is how that happens. The quad path
+// had the same proxy guard.
+static ID3D11Resource* FrameSource()
+{
+    if (g_fastCapture && g_devIsEx && g_fastCaptureOK) return (ID3D11Resource*)g_sharedTex;
+    return (ID3D11Resource*)g_upload;
+}
+
 static void ReleaseSharedCapture()
 {
     if (g_sharedSync) { g_sharedSync->Release(); g_sharedSync = nullptr; }
@@ -995,7 +1012,10 @@ static bool EnsureEyeSwapchains(uint32_t w, uint32_t h)
 // Copy the captured frame into one eye's swapchain.
 static bool FillEye(int eye)
 {
-    if (eye < 0 || eye > 1 || g_eyeSwap[eye] == XR_NULL_HANDLE || !g_upload) return false;
+    // Asked once, up front, and the same answer is used by the guard and by the copy. Guarding
+    // on one texture and copying from another is what put the test quad in the headset.
+    ID3D11Resource* src = FrameSource();
+    if (eye < 0 || eye > 1 || g_eyeSwap[eye] == XR_NULL_HANDLE || !src) return false;
     uint32_t idx = 0;
     XrSwapchainImageAcquireInfo ai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
     if (XR_FAILED(xrAcquireSwapchainImage(g_eyeSwap[eye], &ai, &idx))) return false;
@@ -1003,13 +1023,7 @@ static bool FillEye(int eye)
     wi.timeout = XR_INFINITE_DURATION;
     bool ok = false;
     if (XR_SUCCEEDED(xrWaitSwapchainImage(g_eyeSwap[eye], &wi))) {
-        // One source or the other. The shared texture when the fast path produced this frame,
-        // the CPU-uploaded one when it did not - identical geometry either way, so the eye split
-        // below cannot drift between the two paths.
-        ID3D11Resource* src = (g_fastCaptureOK && g_fastCapture && g_devIsEx)
-                              ? (ID3D11Resource*)g_sharedTex : (ID3D11Resource*)g_upload;
-        if (!src) { ok = false; }
-        else if (g_simulStereo) {
+        if (g_simulStereo) {
             // Both eyes live in one frame side by side, so each swapchain takes its own half.
             D3D11_BOX box{};
             box.left  = (UINT)(eye == 0 ? 0 : g_capW / 2);
@@ -1054,10 +1068,11 @@ static void SubmitTestQuad()
             XrSwapchainImageWaitInfo wi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
             wi.timeout = XR_INFINITE_DURATION;
             if (XR_SUCCEEDED(xrWaitSwapchainImage(g_swapchain, &wi))) {
-              if (g_haveFrame && g_upload) {
+              ID3D11Resource* qsrc = FrameSource();
+              if (g_haveFrame && qsrc) {
                 // Legal despite the swapchain texture being TYPELESS: B8G8R8A8_UNORM and
                 // B8G8R8A8_TYPELESS share a type group, so CopyResource is a raw bit copy.
-                g_ctx11->CopyResource(g_scImages[idx], g_upload);
+                g_ctx11->CopyResource(g_scImages[idx], qsrc);
                 submitted = true;
               } else {
                 // The colour CYCLES so a live loop cannot be mistaken for one frozen frame -
