@@ -1983,20 +1983,24 @@ int       g_offMaxSmoothFps = -1;
 // frame in our own frame grab; at 80 fps that is 12.5 ms of which the grab is a third. Take the
 // grab off the critical path and 8.3 ms - a true 120, one image per display period - is within
 // reach of what the engine is already doing.
-// ⚠️ Uncapped for the Ex bring-up, deliberately, and back to 60 once it is judged.
+// Back to 60, the Ex bring-up having been judged: the device swap and the shared surface both
+// hold up, and rung 8 took the grab from 4 ms to 0.4 and the delivered rate from 75-80 to
+// 95-119.
 //
-// 60 is the right setting to PLAY at - it is the only rate the game can hold that divides 120 -
-// and it is exactly the wrong setting to bring up the Ex device at, because it hides the number
-// this rung has to produce.
+// 60 stays the default anyway, and the reason is not speed. Measured across a cap sweep:
 //
-// The MANAGED translation is not free and could plausibly be negative. D3DUSAGE_DYNAMIC textures
-// are placed for fast CPU writes rather than fast GPU reads, and there are 5176 of them. If that
-// costs more than the frame grab saves, the whole approach is wrong and it is better to find out
-// before the shared surface is built on top of it. Capped at 60 the game hits 60 either way and
-// says nothing.
+//   cap 60   ->  16.67 ms mean, the cap holding exactly
+//   cap 120  ->  13.12 ms mean, wandering between 7.5 and 18.8
 //
-// The plain device measured 75-80 fps uncapped. That is the number the Ex device has to match.
-float     g_fpsCap          = 250.0f;   // NUMPAD7 cycles; first press returns to 60
+// The second is faster and looks worse, which was confirmed by eye. 120 into a rate the game
+// cannot hold means four frames shown once and every fifth shown twice - a 20 Hz beat - while 60
+// divides 120 exactly and every frame is shown twice, forever. Evenness is what the eye reacts
+// to; speed only helps once it is even.
+//
+// Not a permanent verdict. The game reaches 95-119 in lighter scenes, so a 90 Hz headset mode
+// would be 1:1 almost everywhere and better than either. NUMPAD7 cycles for exactly that kind of
+// test.
+float     g_fpsCap          = 60.0f;    // NUMPAD7 cycles
 static int LookupProp(const char* className, const char* propName, bool verbose);
 
 static void FindEngineObject()
@@ -3528,9 +3532,9 @@ static void CheckHeadHotkeys()
     static bool pN7 = false;
     const bool dN7 = (GetAsyncKeyState(VK_NUMPAD7) & 0x8000) != 0;
     if (dN7 && !pN7) {
-        // Ordered so the first press leaves the bring-up setting for the playable one. The
-        // initial value at the top of the file is kCaps[0], so the two cannot disagree.
-        static const float kCaps[] = { 250.0f, 60.0f, 120.0f, 90.0f, 62.0f };
+        // kCaps[0] IS the initial value at the top of the file, so the two cannot disagree and
+        // the first press always moves somewhere.
+        static const float kCaps[] = { 60.0f, 90.0f, 120.0f, 250.0f, 62.0f };
         static int ci = 0;
         ci = (ci + 1) % (int)(sizeof(kCaps) / sizeof(kCaps[0]));
         g_fpsCap = kCaps[ci];
@@ -4967,7 +4971,19 @@ static void TickPacing()
             if (dt > g_paceMax) g_paceMax = dt;
             g_paceSum += dt;
             g_paceN++;
-            if (dt > periodMs * 1.25) g_paceLate++;
+            // ⚠️ UNEVEN, not "slower than the display", and the distinction is the whole point.
+            //
+            // The first version counted any frame longer than one display period. At a locked 60
+            // into 120 every frame is longer than one period, so it reported 100% - beside a
+            // setting that had just been confirmed as the SMOOTHEST available. It was flagging
+            // the good case as the worst one.
+            //
+            // Evenness is what the eye reacts to, not speed. A steady 16.67 ms is comfortable; a
+            // mean of 13 ms wandering between 7.5 and 18.8 is not, and it is faster. So this
+            // measures the deviation from the run's OWN recent mean, which is agnostic about
+            // what rate the game is holding and only asks whether it is holding it.
+            const double mean = g_paceSum / (double)g_paceN;
+            if (fabs(dt - mean) > periodMs * 0.25) g_paceLate++;
         }
     }
     g_lastPresentMs = now;
@@ -4993,9 +5009,11 @@ static void ReportPacing()
 {
     if (!g_paceN) return;
     const double periodMs = g_predPeriod ? ((double)g_predPeriod / 1.0e6) : 0.0;
-    Log("[xr] pacing over %ld frames: %.2f ms mean, %.2f min, %.2f max  |  display period"
-        " %.2f ms  |  %ld frames LATE (%.1f%%)   <- late frames are the judder, 0%% is even",
-        g_paceN, g_paceSum / (double)g_paceN, g_paceMin, g_paceMax, periodMs,
+    Log("[xr] pacing over %ld frames: %.2f ms mean (%.0f fps), spread %.2f to %.2f  |  display"
+        " period %.2f ms  |  %ld frames UNEVEN (%.1f%%)   <- unevenness is the judder; a steady"
+        " slow rate beats a wandering fast one",
+        g_paceN, g_paceSum / (double)g_paceN, 1000.0 / (g_paceSum / (double)g_paceN),
+        g_paceMin, g_paceMax, periodMs,
         g_paceLate, 100.0 * (double)g_paceLate / (double)g_paceN);
     g_paceMin = 1e9; g_paceMax = 0.0; g_paceSum = 0.0; g_paceN = 0; g_paceLate = 0;
 }
