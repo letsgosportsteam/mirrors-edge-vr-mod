@@ -1011,11 +1011,22 @@ static bool EnsureEyeSwapchains(uint32_t w, uint32_t h)
     // Against what the runtime asked for, because that is the number that says whether to raise
     // the supersample factor or lower it - and working it out by hand from two log lines written
     // hundreds of lines apart is how a tunable ends up never being tuned.
-    if (g_recEyeW && g_recEyeH)
+    if (g_recEyeW && g_recEyeH) {
         Log("[eye] that is %.0f%% of the width and %.0f%% of the height the headset asked for"
             " (%ux%u) - 100%% is native, above that is supersampling",
             100.0f * (float)w / (float)g_recEyeW, 100.0f * (float)h / (float)g_recEyeH,
             g_recEyeW, g_recEyeH);
+        // ⚠️ The lever is the GAME's resolution, not anything in here. Each eye gets half the
+        // width of whatever the engine renders, measured: the engine sizes its scene targets from
+        // its own config and upscales to the backbuffer, so forcing a bigger backbuffer buys an
+        // enlarged upscale and nothing else.
+        //
+        // Stated as the resolution to select, because "76% of native" tells the player they are
+        // short without telling them what to do about it, and the arithmetic is ours to do.
+        Log("[eye] to reach native, set the GAME's resolution to %ux%u (its options menu rewrites"
+            " the config with a valid hash, so the hash check is not in the way)",
+            g_recEyeW * 2, g_recEyeH);
+    }
     return true;
 }
 
@@ -6434,13 +6445,35 @@ typedef void        (WINAPI *pfn_DebugSetMute)(void);
 // derived from it to keep pixels square. Change the shape and the rendered field of view changes
 // with it. Change the size and nothing moves but the sampling.
 //
-// ---- why a factor and not a fixed size ----
+// ---- ⚠️ MEASURED AND WRONG: the backbuffer is not what the engine renders at ----
 //
-// This is a direct quality-for-frames trade and the person who can see both is the one holding
-// the headset. 1.25 doubles nothing and costs about 56% more pixels, which fits inside the
-// headroom rung 8 opened - 95-119 fps delivered against a 60 fps cap. Raising it is the obvious
-// next experiment and should not need a rebuild.
-static float g_superSample = 1.25f;
+// The whole premise above is false, and the render-target census says so outright. With the
+// backbuffer forced to 3200x1800:
+//
+//   2560x1440  fmt 113   579424 draws
+//   2560x1440  fmt 21    250961 draws
+//   3200x1800  fmt 21         0 draws   <- the backbuffer, "scene-sized", DUPLICATED
+//
+// The engine sizes its scene targets from its OWN configured resolution and upscales to whatever
+// backbuffer it is given at the end. Enlarging the backbuffer therefore buys no detail at all -
+// it enlarges an upscale - and it costs the copy, which now moves more pixels carrying the same
+// picture.
+//
+// It also broke the image, and the mechanism is worth recording. ShouldDuplicate identifies the
+// scene by matching the BACKBUFFER's dimensions, on the assumption that the engine renders at
+// backbuffer size. Once the two diverged nothing matched, no draw was duplicated, and both eyes
+// received halves of a single mono frame.
+//
+// So the factor defaults to 1.0 and the scaling is a no-op. It is kept rather than deleted for
+// one reason: it is exactly the right lever for an engine that DOES follow its backbuffer, and
+// the next person to have this idea should find the measurement rather than the idea.
+//
+// The real lever is the game's own resolution. Each eye receives half the width of whatever the
+// engine renders, so the game's options menu - which rewrites its config with a valid hash, and
+// so sidesteps the hash check entirely - is what raises per-eye resolution. At 2560x1440 each eye
+// gets 1280x1440; at 3840x2160 each eye gets 1920x2160, which is 91% of the 2112x2304 this
+// headset asks for.
+static float g_superSample = 1.0f;
 
 static void ApplyBackbufferScale(D3DPRESENT_PARAMETERS* pp, const char* why)
 {
@@ -6454,8 +6487,8 @@ static void ApplyBackbufferScale(D3DPRESENT_PARAMETERS* pp, const char* why)
     UINT h = (UINT)(oh * g_superSample + 0.5f); h &= ~1u;
     pp->BackBufferWidth = w;
     pp->BackBufferHeight = h;
-    Log("[ss] %s: backbuffer %ux%u -> %ux%u  (x%.2f)  per eye %ux%u -> %ux%u",
-        why, ow, oh, w, h, g_superSample, ow / 2, oh, w / 2, h);
+    Log("[ss] %s: backbuffer %ux%u -> %ux%u  (x%.2f)  ⚠️ this does NOT raise the engine's render"
+        " resolution - see the note at ApplyBackbufferScale", why, ow, oh, w, h, g_superSample);
 }
 
 // The opt-out. A file beside this DLL, so the old path can be forced from a headset-side
