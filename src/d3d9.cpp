@@ -112,8 +112,6 @@ static bool  g_devicePatched = false;   // IDirect3DDevice9 vtable patched
 // Declared up here rather than beside the rest of the rung 8a state, because the frame grab -
 // which sits far above that code - has to know which kind of device it is grabbing from.
 static bool  g_devIsEx       = false;   // the device really is D3D9Ex
-// Defined with the rung 9 code; called from both CreateDevice and Reset, which sit above it.
-static void  ApplyBackbufferScale(D3DPRESENT_PARAMETERS* pp, const char* why);
 static long  g_frames        = 0;
 static bool  g_describedBackbuffer = false;
 
@@ -1008,25 +1006,6 @@ static bool EnsureEyeSwapchains(uint32_t w, uint32_t h)
     }
     g_eyeW = w; g_eyeH = h;
     Log("[eye] two swapchains %ux%u, %u images each", w, h, g_eyeImageCount[0]);
-    // Against what the runtime asked for, because that is the number that says whether to raise
-    // the supersample factor or lower it - and working it out by hand from two log lines written
-    // hundreds of lines apart is how a tunable ends up never being tuned.
-    if (g_recEyeW && g_recEyeH) {
-        Log("[eye] that is %.0f%% of the width and %.0f%% of the height the headset asked for"
-            " (%ux%u) - 100%% is native, above that is supersampling",
-            100.0f * (float)w / (float)g_recEyeW, 100.0f * (float)h / (float)g_recEyeH,
-            g_recEyeW, g_recEyeH);
-        // ⚠️ The lever is the GAME's resolution, not anything in here. Each eye gets half the
-        // width of whatever the engine renders, measured: the engine sizes its scene targets from
-        // its own config and upscales to the backbuffer, so forcing a bigger backbuffer buys an
-        // enlarged upscale and nothing else.
-        //
-        // Stated as the resolution to select, because "76% of native" tells the player they are
-        // short without telling them what to do about it, and the arithmetic is ours to do.
-        Log("[eye] to reach native, set the GAME's resolution to %ux%u (its options menu rewrites"
-            " the config with a valid hash, so the hash check is not in the way)",
-            g_recEyeW * 2, g_recEyeH);
-    }
     return true;
 }
 
@@ -6054,19 +6033,10 @@ static HRESULT STDMETHODCALLTYPE Hook_Reset(IDirect3DDevice9* dev, D3DPRESENT_PA
     // eventual VR path has to care about it. For now it is only worth seeing.
     Log("--- Reset requested ---");
     LogPresentParams("reset", pp);
-
-    // The same scale, or a Reset silently undoes it. A resolution change in the game's options
-    // comes through here, and without this the eyes would quietly drop back to half-width for the
-    // rest of the session with nothing in the log to say why.
-    if (pp && pp->Windowed == FALSE) { pp->Windowed = TRUE; pp->FullScreen_RefreshRateInHz = 0; }
-    ApplyBackbufferScale(pp, "Reset");
-
     // Released before the Reset, not after. SYSTEMMEM does not block a Reset the way DEFAULT
     // does, but the backbuffer size is exactly what tends to change here, and a stale capture
     // chain sized to the old one is a format/size mismatch waiting to happen.
     ReleaseFrameCapture();
-    // And the shared pair, which is DEFAULT pool on the D3D9 side and would not survive anyway.
-    ReleaseSharedCapture();
     HRESULT hr = g_origReset(dev, pp);
     Log("--- Reset returned hr=0x%08lX ---", (unsigned long)hr);
     if (FAILED(hr)) {
@@ -6308,12 +6278,6 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT adapte
         Log("[dev] forcing WINDOWED (was exclusive fullscreen) - removes device loss on alt-tab");
     }
 
-    // After the windowed force, before the device is made. Windowed is what makes this safe to
-    // do at all: the backbuffer no longer has to match a display mode, so it can be any size and
-    // the desktop window simply scales it down. That window is a mirror; the headset gets the
-    // full resolution.
-    ApplyBackbufferScale(pp, "CreateDevice");
-
     // ---- Ex, if we swapped the factory ----
     //
     // ⚠️ The fallback CANNOT be a runtime toggle, and asking for one is reasonable but the
@@ -6424,73 +6388,6 @@ typedef void        (WINAPI *pfn_SetOptions)(DWORD);
 typedef void        (WINAPI *pfn_SetRegion)(D3DCOLOR, LPCWSTR);
 typedef void        (WINAPI *pfn_DebugSetMute)(void);
 
-// ================================================================ rung 9: per-eye resolution
-//
-// Each eye has been rendering at 1280x1440 - half the backbuffer's width - since rung 7. That
-// was not a choice about image quality, it was a choice about the frame grab: a wider backbuffer
-// meant more pixels to drag through system memory every frame, and the grab already cost 4 ms.
-//
-// Rung 8 removed that constraint. The grab is 0.4 ms and no longer scales with anything the CPU
-// touches, so the reason for the half-width buffer is gone.
-//
-// ---- what the numbers say to aim at ----
-//
-// The headset asks for roughly 2064x2208 per eye. At 1280x1440 we supply about 62% of its width
-// and 65% of its height, and the compositor upscales the difference. Both axes are short by
-// about the same amount, which is why this scales BOTH dimensions rather than only restoring the
-// width: doubling the width alone would oversample one axis while leaving the other exactly as
-// soft as it is now.
-//
-// Scaling both also keeps the buffer's aspect, and the aspect is load-bearing - the FOV target is
-// derived from it to keep pixels square. Change the shape and the rendered field of view changes
-// with it. Change the size and nothing moves but the sampling.
-//
-// ---- ⚠️ MEASURED AND WRONG: the backbuffer is not what the engine renders at ----
-//
-// The whole premise above is false, and the render-target census says so outright. With the
-// backbuffer forced to 3200x1800:
-//
-//   2560x1440  fmt 113   579424 draws
-//   2560x1440  fmt 21    250961 draws
-//   3200x1800  fmt 21         0 draws   <- the backbuffer, "scene-sized", DUPLICATED
-//
-// The engine sizes its scene targets from its OWN configured resolution and upscales to whatever
-// backbuffer it is given at the end. Enlarging the backbuffer therefore buys no detail at all -
-// it enlarges an upscale - and it costs the copy, which now moves more pixels carrying the same
-// picture.
-//
-// It also broke the image, and the mechanism is worth recording. ShouldDuplicate identifies the
-// scene by matching the BACKBUFFER's dimensions, on the assumption that the engine renders at
-// backbuffer size. Once the two diverged nothing matched, no draw was duplicated, and both eyes
-// received halves of a single mono frame.
-//
-// So the factor defaults to 1.0 and the scaling is a no-op. It is kept rather than deleted for
-// one reason: it is exactly the right lever for an engine that DOES follow its backbuffer, and
-// the next person to have this idea should find the measurement rather than the idea.
-//
-// The real lever is the game's own resolution. Each eye receives half the width of whatever the
-// engine renders, so the game's options menu - which rewrites its config with a valid hash, and
-// so sidesteps the hash check entirely - is what raises per-eye resolution. At 2560x1440 each eye
-// gets 1280x1440; at 3840x2160 each eye gets 1920x2160, which is 91% of the 2112x2304 this
-// headset asks for.
-static float g_superSample = 1.0f;
-
-static void ApplyBackbufferScale(D3DPRESENT_PARAMETERS* pp, const char* why)
-{
-    if (!pp || g_superSample <= 1.001f) return;
-    if (pp->BackBufferWidth == 0 || pp->BackBufferHeight == 0) return;
-
-    const UINT ow = pp->BackBufferWidth, oh = pp->BackBufferHeight;
-    // Rounded to even. The eye split is backbuffer width / 2 and an odd width would put half a
-    // pixel of one eye into the other.
-    UINT w = (UINT)(ow * g_superSample + 0.5f); w &= ~1u;
-    UINT h = (UINT)(oh * g_superSample + 0.5f); h &= ~1u;
-    pp->BackBufferWidth = w;
-    pp->BackBufferHeight = h;
-    Log("[ss] %s: backbuffer %ux%u -> %ux%u  (x%.2f)  ⚠️ this does NOT raise the engine's render"
-        " resolution - see the note at ApplyBackbufferScale", why, ow, oh, w, h, g_superSample);
-}
-
 // The opt-out. A file beside this DLL, so the old path can be forced from a headset-side
 // keypress-free position: create the file, run, delete it. No rebuild, no ini - and the game's
 // own config is hash-checked, so a file of our own is the only place a startup switch can live.
@@ -6515,23 +6412,6 @@ static void CheckExOptOut()
     if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
         g_wantEx = false;
         Log("[ex] mevr_noex.txt found - staying on the plain D3D9 device");
-    }
-
-    // Supersample factor, same folder, same idea: a number in mevr_ss.txt overrides the default.
-    // Read with the plain C runtime rather than anything clever - it runs once, before the device
-    // exists, and the failure mode of a missing or malformed file is simply the default.
-    _snwprintf_s(slash + 1, MAX_PATH - (slash + 1 - path), _TRUNCATE, L"mevr_ss.txt");
-    FILE* fp = nullptr;
-    if (_wfopen_s(&fp, path, L"r") == 0 && fp) {
-        float v = 0.0f;
-        if (fscanf_s(fp, "%f", &v) == 1 && v >= 0.5f && v <= 3.0f) {
-            g_superSample = v;
-            Log("[ss] mevr_ss.txt sets the supersample factor to %.2f", v);
-        } else {
-            Log("[ss] mevr_ss.txt unreadable or out of the 0.5-3.0 range - keeping %.2f",
-                g_superSample);
-        }
-        fclose(fp);
     }
 }
 
