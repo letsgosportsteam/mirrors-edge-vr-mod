@@ -5456,6 +5456,11 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDirect3DDevice9*, const RECT*,
 typedef HRESULT (STDMETHODCALLTYPE *PFN_Reset)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateTexture)(IDirect3DDevice9*, UINT, UINT, UINT, DWORD,
                                                        D3DFORMAT, D3DPOOL, IDirect3DTexture9**, HANDLE*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateVolTex)(IDirect3DDevice9*, UINT, UINT, UINT, UINT, DWORD,
+                                                      D3DFORMAT, D3DPOOL, IDirect3DVolumeTexture9**,
+                                                      HANDLE*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateCubeTex)(IDirect3DDevice9*, UINT, UINT, DWORD, D3DFORMAT,
+                                                       D3DPOOL, IDirect3DCubeTexture9**, HANDLE*);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateVB)(IDirect3DDevice9*, UINT, DWORD, DWORD, D3DPOOL,
                                                   IDirect3DVertexBuffer9**, HANDLE*);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateIB)(IDirect3DDevice9*, UINT, DWORD, D3DFORMAT, D3DPOOL,
@@ -5466,6 +5471,8 @@ static PFN_Reset         g_origReset   = nullptr;
 static PFN_CreateTexture g_origCreateTex = nullptr;
 static PFN_CreateVB      g_origCreateVB  = nullptr;
 static PFN_CreateIB      g_origCreateIB  = nullptr;
+static PFN_CreateVolTex  g_origCreateVolTex  = nullptr;
+static PFN_CreateCubeTex g_origCreateCubeTex = nullptr;
 
 static void LogPresentParams(const char* what, const D3DPRESENT_PARAMETERS* pp)
 {
@@ -5779,6 +5786,7 @@ static IDirect3D9Ex* g_d3d9ExObj  = nullptr;   // non-null once we have swapped 
 static bool          g_devIsEx    = false;     // the DEVICE really is Ex
 static bool          g_wantEx     = true;      // cleared by the opt-out file
 static LONG          g_remapTex   = 0, g_remapVB = 0, g_remapIB = 0;
+static LONG          g_remapVol   = 0, g_remapCube = 0;
 static LONG          g_remapFails = 0;
 
 static HRESULT STDMETHODCALLTYPE Hook_CreateTexture(IDirect3DDevice9* dev, UINT w, UINT h, UINT levels,
@@ -5805,6 +5813,62 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateTexture(IDirect3DDevice9* dev, UINT 
         return hr;
     }
     return g_origCreateTex(dev, w, h, levels, usage, fmt, pool, out, shared);
+}
+
+// ⚠️ Cube and volume textures take a pool too, and missing them is what crashed the first Ex run.
+//
+// The translation covered CreateTexture, CreateVertexBuffer and CreateIndexBuffer - the three
+// that were already hooked for pool COUNTING, which is the whole reason those three and no
+// others. The counting existed to size the problem, so it only ever needed to be representative;
+// the translation has to be exhaustive, and inheriting one list for the other job silently
+// changed what "complete" meant.
+//
+// A MANAGED cube or volume create on an Ex device fails outright and returns a null pointer. The
+// engine does not check, and dereferences it. That is a crash before the first Present, with 96
+// textures translated and none refused - which is exactly what the run reported.
+//
+// The complete set of pool-taking entry points in D3D9 is these five. CreateOffscreenPlainSurface
+// also takes a pool but MANAGED is invalid there on ANY device, so the engine cannot be asking
+// for it and there is nothing to translate.
+static HRESULT STDMETHODCALLTYPE Hook_CreateVolTex(IDirect3DDevice9* dev, UINT w, UINT h, UINT d,
+                                                   UINT levels, DWORD usage, D3DFORMAT fmt,
+                                                   D3DPOOL pool, IDirect3DVolumeTexture9** out,
+                                                   HANDLE* shared)
+{
+    CountPool(pool);
+    if (g_devIsEx && pool == D3DPOOL_MANAGED) {
+        InterlockedIncrement(&g_remapVol);
+        HRESULT hr = g_origCreateVolTex(dev, w, h, d, levels, usage | D3DUSAGE_DYNAMIC, fmt,
+                                        D3DPOOL_DEFAULT, out, shared);
+        if (FAILED(hr)) {
+            hr = g_origCreateVolTex(dev, w, h, d, levels, usage, fmt, D3DPOOL_DEFAULT, out, shared);
+            if (FAILED(hr) && InterlockedIncrement(&g_remapFails) <= 20)
+                Log("[ex] volume texture remap FAILED hr=0x%08lX  %ux%ux%u levels=%u usage=0x%08lX fmt=%d",
+                    (unsigned long)hr, w, h, d, levels, (unsigned long)usage, (int)fmt);
+        }
+        return hr;
+    }
+    return g_origCreateVolTex(dev, w, h, d, levels, usage, fmt, pool, out, shared);
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_CreateCubeTex(IDirect3DDevice9* dev, UINT edge, UINT levels,
+                                                    DWORD usage, D3DFORMAT fmt, D3DPOOL pool,
+                                                    IDirect3DCubeTexture9** out, HANDLE* shared)
+{
+    CountPool(pool);
+    if (g_devIsEx && pool == D3DPOOL_MANAGED) {
+        InterlockedIncrement(&g_remapCube);
+        HRESULT hr = g_origCreateCubeTex(dev, edge, levels, usage | D3DUSAGE_DYNAMIC, fmt,
+                                         D3DPOOL_DEFAULT, out, shared);
+        if (FAILED(hr)) {
+            hr = g_origCreateCubeTex(dev, edge, levels, usage, fmt, D3DPOOL_DEFAULT, out, shared);
+            if (FAILED(hr) && InterlockedIncrement(&g_remapFails) <= 20)
+                Log("[ex] cube texture remap FAILED hr=0x%08lX  edge=%u levels=%u usage=0x%08lX fmt=%d",
+                    (unsigned long)hr, edge, levels, (unsigned long)usage, (int)fmt);
+        }
+        return hr;
+    }
+    return g_origCreateCubeTex(dev, edge, levels, usage, fmt, pool, out, shared);
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_CreateVB(IDirect3DDevice9* dev, UINT len, DWORD usage, DWORD fvf,
@@ -5848,6 +5912,12 @@ static void PatchDeviceOnce(IDirect3DDevice9* dev)
     g_origCreateTex = (PFN_CreateTexture)PatchVTable(dev, DEV_CreateTexture,     (void*)&Hook_CreateTexture);
     g_origCreateVB  = (PFN_CreateVB)     PatchVTable(dev, DEV_CreateVertexBuffer,(void*)&Hook_CreateVB);
     g_origCreateIB  = (PFN_CreateIB)     PatchVTable(dev, DEV_CreateIndexBuffer, (void*)&Hook_CreateIB);
+    // The other two pool-taking creates. Hooked for the translation, not for counting - a MANAGED
+    // cube or volume texture returns null on an Ex device and the engine does not check.
+    g_origCreateVolTex  = (PFN_CreateVolTex) PatchVTable(dev, DEV_CreateVolumeTexture,
+                                                         (void*)&Hook_CreateVolTex);
+    g_origCreateCubeTex = (PFN_CreateCubeTex)PatchVTable(dev, DEV_CreateCubeTexture,
+                                                         (void*)&Hook_CreateCubeTex);
     g_origSetRenderTarget = (PFN_SetRenderTarget) PatchVTable(dev, DEV_SetRenderTarget, (void*)&Hook_SetRenderTarget);
     g_origCreateQuery     = (PFN_CreateQuery)     PatchVTable(dev, DEV_CreateQuery, (void*)&Hook_CreateQuery);
     g_origDrawPrim    = (PFN_DrawPrim)    PatchVTable(dev, DEV_DrawPrimitive, (void*)&Hook_DrawPrim);
@@ -6190,8 +6260,8 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID)
         Log("pool SYSTEMMEM        : %ld", g_poolSystemMem);
         Log("pool other            : %ld", g_poolScratch);
         if (g_devIsEx) {
-            Log("MANAGED translated    : %ld textures, %ld vertex buffers, %ld index buffers",
-                g_remapTex, g_remapVB, g_remapIB);
+            Log("MANAGED translated    : %ld textures, %ld cube, %ld volume, %ld VB, %ld IB",
+                g_remapTex, g_remapCube, g_remapVol, g_remapVB, g_remapIB);
             Log("translations REFUSED  : %ld   <- anything above zero is a resource the game"
                 " asked for and did not get", g_remapFails);
         }
