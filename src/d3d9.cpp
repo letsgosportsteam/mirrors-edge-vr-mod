@@ -5027,6 +5027,45 @@ static void ApplyPitchFix(float* m, bool rowStorage)
 
     float err = (g_pitchTarget + anim) - matPitch;
 
+    // ---- ⚠️ is this correction even looking at the rendered pitch? ----
+    //
+    // Substitute the definition of anim and the matrix cancels out:
+    //
+    //   err = (target + (matPitch - liveCtl)) - matPitch  =  target - liveCtl
+    //
+    // With animations followed - the default - this correction never reads what was RENDERED. It
+    // compares the head against the CONTROLLER, and the controller is written absolutely from the
+    // head every frame, so the two agree by construction and the correction is near zero whatever
+    // the picture is doing. Any lag between the controller and the matrix - the engine's own
+    // render pipeline, which is what yaw needed five degrees of correction for - is invisible to
+    // it.
+    //
+    // That is consistent with pitch juddering while yaw does not: yaw is measured against the
+    // matrix, pitch is measured against a value that cannot disagree with its target.
+    //
+    // Consistent is not proven, so this reports both. `rendered` is how far the view actually is
+    // from where the head points; `applied` is what the correction decided to do about it. If
+    // rendered is degrees and applied is nothing, the reasoning above is right and the fix is to
+    // measure pitch the way yaw is measured.
+    {
+        static long lastFrame = -1;
+        if (lastFrame != g_frames) {
+            lastFrame = g_frames;
+            static float wRend = 0.0f, wAppl = 0.0f, sRend = 0.0f;
+            static long  n = 0;
+            const float rendered = fabsf(g_pitchTarget - matPitch);
+            if (rendered > wRend) wRend = rendered;
+            if (fabsf(err) > wAppl) wAppl = fabsf(err);
+            sRend += rendered;
+            if (++n >= 600) {
+                Log("[head] pitch: view is %.2f deg from the head on average, %.2f worst;"
+                    " correction applied %.2f worst  (a big gap means the fix is blind)",
+                    (sRend / (float)n) * 57.29578f, wRend * 57.29578f, wAppl * 57.29578f);
+                n = 0; wRend = wAppl = sRend = 0.0f;
+            }
+        }
+    }
+
     // Clamped hard. A foreign matrix that slipped the scene test, or a target computed from a
     // stale sample, must not be able to throw the view somewhere the head is not - and a real
     // error is never more than a degree or two.
