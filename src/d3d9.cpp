@@ -3743,10 +3743,6 @@ static const int   kVMMinCandidates = 50;
 // w(origin)=19044 - within seconds of the level starting.
 static const float kVMMinCamDist = 1000.0f;
 
-// Logged once per armed sequence rather than per attempt: the startup sequence retries every
-// 30 frames, and this is the state it sits in for the whole time the menu is up.
-static bool g_vmOriginRefusalLogged = false;
-
 // Set when a scan ran but its answer was thrown away for lack of evidence. The startup sequence
 // reads it to tell "I looked and the world was not there yet" from "I looked at the world and
 // found nothing" - only the second is a real failure, and only it should burn a retry.
@@ -3774,13 +3770,11 @@ static bool ArmVMScan(bool quiet)
         }
         const float dist = sqrtf(loc[0] * loc[0] + loc[1] * loc[1] + loc[2] * loc[2]);
         if (dist < kVMMinCamDist) {
-            if (!g_vmOriginRefusalLogged) {
-                g_vmOriginRefusalLogged = true;
+            if (!quiet)
                 Log("[vm] camera is %.0f UU from the world origin, under the %.0f needed to tell"
                     " the two probes apart - not scanning. This is the menu, or a level that has"
                     " not placed the player yet; either way it clears as soon as they move.",
                     dist, kVMMinCamDist);
-            }
             return false;
         }
     }
@@ -3804,14 +3798,7 @@ static void CheckVMHotkey()
     static bool p6 = false;
     const bool d6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
 
-    // The refusal flags are cleared first so a deliberate keypress always gets an answer. They
-    // exist to keep the startup sequence's 30-frame polling out of the log, and a key pressed
-    // by hand that appears to do nothing at all is the opposite of what they are for.
-    if (d6 && !p6) {
-        g_autoDone = true;
-        g_vmOriginRefusalLogged = false;
-        ArmVMScan(false);
-    }
+    if (d6 && !p6) { g_autoDone = true; ArmVMScan(false); }
     p6 = d6;
 
     // F2 cycles the injection. A 300 UU offset is far larger than any per-eye separation will
@@ -3907,15 +3894,19 @@ static void AutoArm()
     static int stage = 0;         // 0 = waiting for the world, 1 = scan armed
     static int wait = 0;
     static int retries = 0;
-    static bool announced = false;
+    static int attempts = 0;      // every 20th stage-0 poll reports its reason
 
     if (!g_xrReady) return;       // no session, nothing to be stereo on
     if (wait > 0) { --wait; return; }
 
     if (stage == 0) {
         g_vmScanRefused = false;
-        if (!ArmVMScan(true)) {   // quiet: at the main menu this fails every time by design
-            if (!announced) { Log("[auto] waiting for a player pawn before arming the scan"); announced = true; }
+        // ⚠️ Every twentieth attempt is LOUD, and the one-shot announcement it replaces cost a
+        // run. The sequence polls every 30 frames and cannot report each one, but a single line
+        // at the top of the log left "never armed at all" indistinguishable from "blocked on the
+        // pawn" and from "blocked at the origin" - three different faults, one silence.
+        const bool loud = (attempts++ % 20) == 0;
+        if (!ArmVMScan(!loud)) {
             wait = 30;
             return;
         }
