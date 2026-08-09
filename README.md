@@ -58,7 +58,7 @@ If Virtual Desktop is not streaming when the game starts, the log says so in as 
 
 ## Set these before you play
 
-Four settings decide whether the first session goes well.
+Three to change before you start, and one to keep in your back pocket.
 
 **Set the game's resolution as high as it goes, and keep it 16:9.** The mod does not take its
 resolution from the headset yet — it splits the game's own frame down the middle, one half per
@@ -74,11 +74,14 @@ the division: a frame held for two display periods *every* time looks smoother t
 rate held for two, then three. Uneven pacing shows up as judder, most obviously when you look
 up and down.
 
-**For comfort, set `LockAnimPitch` and `LockAnimRoll` on.** They stop the game's own camera
-animations — wall-run roll, landing dips, vaults — from moving your view on those axes, which
-helps considerably with motion sickness. Leave `LockAnimYaw` off: an animation that turns the
-player is carrying them somewhere, and cancelling it leaves your body facing one way and your
-view another.
+**If you feel motion sick, try `LockAnimPitch` and `LockAnimRoll`.** Both ship off, so the
+game's own camera animations — wall-run roll, landing dips, vaults — play as it intended.
+Turning them on stops those animations moving your view on those axes, which may help a lot.
+Worth reaching for if the first session is uncomfortable, rather than something to change
+before you have played.
+
+Leave `LockAnimYaw` off either way: an animation that turns the player is carrying them
+somewhere, and cancelling it leaves your body facing one way and your view another.
 
 ## Controls
 

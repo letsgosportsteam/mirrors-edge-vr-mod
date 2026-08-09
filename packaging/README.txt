@@ -105,7 +105,7 @@ Delete those three files. Nothing else was touched.
 
 
 --------------------------------------------------------------------------------
-  READ THIS FIRST - four settings that decide how the first session goes
+  READ THIS FIRST - three to set now, and one to keep in your back pocket
 --------------------------------------------------------------------------------
 
 1. SET THE GAME'S RESOLUTION AS HIGH AS IT GOES, AND KEEP IT 16:9.
@@ -129,15 +129,18 @@ Delete those three files. Nothing else was touched.
    then three. Uneven pacing shows up as judder, most obviously when you look
    up and down.
 
-4. FOR COMFORT, SET LockAnimPitch AND LockAnimRoll ON.
+4. IF YOU FEEL MOTION SICK, TRY LockAnimPitch AND LockAnimRoll.
 
-   They stop the game's own camera animations - wall-run roll, landing dips,
-   vaults - from moving your view on those axes, which helps considerably with
-   motion sickness.
+   Both ship OFF, so the game's own camera animations - wall-run roll, landing
+   dips, vaults - play as it intended. Turning them on stops those animations
+   moving your view on those axes, which may help a lot.
 
-   Leave LockAnimYaw OFF. An animation that turns the player is carrying them
-   somewhere, and cancelling it leaves your body facing one way and your view
-   another.
+   Worth reaching for if the first session is uncomfortable, rather than
+   something to change before you have played.
+
+   Leave LockAnimYaw OFF either way. An animation that turns the player is
+   carrying them somewhere, and cancelling it leaves your body facing one way
+   and your view another.
 
 
 --------------------------------------------------------------------------------
