@@ -99,6 +99,10 @@ enum {
     DEV_CreateQuery            = 118,
     DEV_DrawPrimitive          = 81,
     DEV_DrawIndexedPrimitive  = 82,
+    // The user-pointer draws. UE3's Canvas issues 2D geometry through these rather than through
+    // a vertex buffer, so anything the HUD or a menu draws arrives here and NOWHERE ELSE.
+    DEV_DrawPrimitiveUP        = 83,
+    DEV_DrawIndexedPrimitiveUP = 84,
     DEV_SetVertexShaderConstantF = 94,
 };
 
@@ -4096,6 +4100,7 @@ static void CheckVMWatchdog()
 }
 
 extern bool g_overlay;
+extern bool g_dupUI;   // NUMPAD0; defined with the user-pointer draw hooks
 extern int   g_renderedEye;
 extern float g_halfIpdUU;
 
@@ -4200,6 +4205,17 @@ static void CheckHeadHotkeys()
             g_yawLagFix ? "ON" : "OFF", g_yawLagRad * 57.29578f);
     }
     pN6 = dN6;
+
+    // A render-path change that touches the HUD wants an A/B from inside the headset, not a
+    // relaunch: with it off the HUD goes back to one full-width draw, half per eye.
+    static bool pN0 = false;
+    const bool dN0 = (GetAsyncKeyState(VK_NUMPAD0) & 0x8000) != 0;
+    if (dN0 && !pN0) {
+        g_dupUI = !g_dupUI;
+        Log("*** [up] NUMPAD0 -> HUD duplication %s", g_dupUI ? "ON (both eyes)"
+                                                              : "OFF (one full-width draw)");
+    }
+    pN0 = dN0;
 
     // All three at once, because the useful question is which COMBINATION is set and reading it
     // off three separate lines scattered through the log is how a test gets mis-attributed.
@@ -6318,6 +6334,275 @@ static bool ShouldDuplicate()
     return true;
 }
 
+// ================================================================ diag: the user-pointer draws
+//
+// The HUD and the in-game menus are unreadable in the headset - each eye gets half of them - and
+// the first attempt to find out why measured nothing at all. That silence IS the finding.
+//
+// It hooked DrawPrimitive and DrawIndexedPrimitive, and the census had already shown 1.7M draws
+// on the scene target with plenty carrying the scene matrix and ZERO undoubled candidates. Not
+// "the HUD resembles a post-process pass" - the HUD never came through that door.
+//
+// DrawPrimitiveUP and DrawIndexedPrimitiveUP, slots 83 and 84, are not hooked. They appear once
+// in this file, in a note wondering whether the occlusion boxes arrive that way. UE3's Canvas
+// draws dynamic 2D geometry through exactly those calls, which would explain both symptoms with
+// one cause: the probe cannot see them, and neither can duplication, so they are issued once at
+// full width across both eyes' halves.
+//
+// This counts, and does nothing else. If the totals track the HUD being on screen then the fix
+// is viewport-only duplication on these two entry points - both halves, without touching c0,
+// because this geometry has its own matrix. Counting first because the last guess about where
+// these draws came from was wrong, and a wrong guess here means splitting a pass that must not
+// be split.
+static volatile LONG g_upDraws      = 0;   // every UP draw
+static volatile LONG g_uiDupDraws   = 0;   // ...that were duplicated into both eyes
+static volatile LONG g_upOnScene    = 0;   // ...landing on the scene target while stereo is live
+typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawPrimUP)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT,
+                                                    const void*, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawIndexedUP)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT,
+                                                       UINT, UINT, const void*, D3DFORMAT,
+                                                       const void*, UINT);
+static PFN_DrawPrimUP    g_origDrawPrimUP    = nullptr;
+static PFN_DrawIndexedUP g_origDrawIndexedUP = nullptr;
+
+// ---- and now: which of them does the player actually SEE? ----
+//
+// 650 user-pointer draws a frame is not a HUD. Something far larger shares this path, and the
+// candidate is named in this file already: the occlusion boxes, suspected of arriving here and
+// drawing at full-frame coordinates against half-remapped geometry.
+//
+// COLORWRITEENABLE separates them, and does it by definition rather than by heuristic. An
+// occlusion box writes NO colour - that is the whole point of it, geometry submitted only to be
+// counted. The HUD writes colour or it would not be a HUD. So "does this draw put pixels on the
+// screen" is exactly the question "must this be in both eyes", and it needs no guessing about
+// what the geometry is for.
+//
+// Sampled one frame in 600: a GetRenderState per draw is 650 calls a frame, fine once and absurd
+// continuously.
+static bool  g_upSample = false;
+static long  g_upSeenColour = 0, g_upSeenNoColour = 0;
+static long  g_upPrimColour = 0, g_upPrimNoColour = 0;
+
+// The colour-writing group, split by the states most likely to separate a HUD quad from a
+// full-screen composite: blending (a HUD element is composited over the scene, a blit replaces
+// it), depth, and the primitive count - a full-screen quad is exactly 2 triangles, and 12 was
+// enough to identify the occlusion boxes outright.
+struct UpBucket { DWORD blend, z; UINT prims; long count; long firstOrd, lastOrd; };
+static UpBucket g_upB[12]{};
+static int      g_upBCount = 0;
+static long     g_upOrdinal = 0;
+
+static inline void NoteUpDraw(IDirect3DDevice9* dev, UINT primCount)
+{
+    InterlockedIncrement(&g_upDraws);
+    // The same filter the old probe used: on the scene target, while duplication is actually
+    // running this frame. That is precisely the population being stretched across both eyes.
+    const bool onScene = g_rtIsScene && !g_inDupDraw &&
+                         InterlockedCompareExchange(&g_dupFrameDraws, 0, 0) > 0;
+    if (!onScene) return;
+    InterlockedIncrement(&g_upOnScene);
+
+    if (!g_upSample) return;
+    g_upOrdinal++;
+    DWORD cw = 0;
+    if (FAILED(dev->GetRenderState(D3DRS_COLORWRITEENABLE, &cw))) return;
+    if (!cw) { g_upSeenNoColour++; g_upPrimNoColour += primCount; return; }
+
+    g_upSeenColour++; g_upPrimColour += primCount;
+    DWORD ab = 0, z = 0;
+    dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &ab);
+    dev->GetRenderState(D3DRS_ZENABLE, &z);
+    for (int i = 0; i < g_upBCount; ++i) {
+        if (g_upB[i].blend == ab && g_upB[i].z == z && g_upB[i].prims == primCount) {
+            g_upB[i].count++; g_upB[i].lastOrd = g_upOrdinal; return;
+        }
+    }
+    if (g_upBCount < 12)
+        g_upB[g_upBCount++] = { ab, z, primCount, 1, g_upOrdinal, g_upOrdinal };
+}
+
+// ---- and the fix the measurement earned ----
+//
+// The split is not a judgement call. Six sampled frames, and EVERY no-colour draw was exactly
+// 12 primitives - a cube, six times out of six. Those are axis-aligned bounding boxes submitted
+// to be counted by an occlusion query, and they must not be touched: they write nothing the
+// player sees, and splitting them would change what the query measures.
+//
+//     33-47 draws WRITE COLOUR, 494-946 prims   <- the HUD. Variable size, quads and text.
+//     460-658 write none, exactly 12 prims each <- occlusion boxes. Leave alone.
+//
+// So the colour-writing ones are issued twice, once into each half viewport, and c0 is NOT
+// touched. That last part matters: this geometry is in screen space with its own transform, and
+// forcing the scene view onto it is the exact failure ShouldDuplicate's comment describes.
+//
+// ⚠️ KNOWN AND ACCEPTED: a screen-space overlay drawn into a half-width viewport is compressed
+// 2:1 horizontally. The scene does not suffer this because its projection is rebuilt per eye to
+// match; the HUD has no projection we control. So the HUD will read as narrow. That is a
+// legible HUD in both eyes instead of half of one in each, which is the trade being made
+// deliberately - undoing the squeeze needs the overlay's own transform and is its own rung.
+//
+// ⚠️ DEFAULT OFF, and colour-write alone is NOT the rule. Measured: with every colour-writing
+// UP draw duplicated, the HUD became readable and THE WORLD TILED - eight or more copies instead
+// of two. ~35 draws a frame were duplicated, exactly the group aimed at, so the rule fired as
+// designed and the group is simply not only the HUD.
+//
+// The shape of that failure names the cause. A full-screen pass that RESAMPLES the scene - a
+// composite or post-process blit, two triangles from a user pointer, colour writes on - is
+// indistinguishable from a HUD quad by colour writes. Duplicating it draws the whole frame,
+// which already holds two eyes side by side, squeezed into each half: four copies from one such
+// pass, eight from two.
+//
+// So the group needs splitting again, and the breakdown below is there to do it rather than to
+// guess a third time. NUMPAD0 turns duplication on for an A/B in the meantime - the HUD becomes
+// readable and the world tiles, which is the trade until the composite passes can be excluded.
+bool g_dupUI = false;   // ⚠️ see below - the filter approach did not converge; NUMPAD0 to try it
+
+// ---- ⚠️ does this draw READ something the engine rendered into? ----
+//
+// The test that colour-writing could not make. An overlay samples a UI atlas; a composite or a
+// post-process pass samples a RENDER TARGET - it is re-presenting the frame rather than drawing
+// on top of it. That is exactly the distinction between "must appear in both eyes" and "must not
+// be touched", and it is a property of the draw rather than a guess about its purpose.
+//
+// It is also the only rule that would have caught the eight-fold tiling: a two-triangle,
+// depth-off, colour-writing draw at the very END of the frame - by every state the HUD uses -
+// which samples the scene, as a HUD quad never does.
+//
+// ⚠️ AND IT STILL DOES NOT CATCH THEM ALL. Measured: it excludes 1-2 draws a frame and the world
+// still appears TWICE per eye, so roughly one resampling pass a frame is getting through, plus
+// flashing in the right eye. Most likely it samples the backbuffer - which is never entered in
+// the census, because restoring it comes through SetRenderTarget with a null surface - or binds
+// at a texture stage other than zero.
+//
+// The remaining hole could be plugged. It is deliberately NOT being plugged, because that would
+// be the fifth filter on this path and the pattern is now the finding: each one separated the
+// examples in hand rather than encoding the real distinction, and each was discovered wrong only
+// after it reached a headset. Duplicating the game's own 2D pass is the wrong shape of solution.
+// The right one is to stop sharing a surface with it - give the overlay its own render target and
+// submit it as a second composition layer, which also drops the 2:1 squeeze this approach cannot
+// avoid. That is a rung, not a filter.
+//
+// Left in, defaulted off, because the measurement infrastructure below is worth keeping and
+// NUMPAD0 makes the near-miss inspectable.
+static bool SamplesARenderTarget(IDirect3DDevice9* dev)
+{
+    IDirect3DBaseTexture9* base = nullptr;
+    if (FAILED(dev->GetTexture(0, &base)) || !base) return false;
+
+    bool hit = false;
+    IDirect3DTexture9* tex = nullptr;
+    if (SUCCEEDED(base->QueryInterface(__uuidof(IDirect3DTexture9), (void**)&tex)) && tex) {
+        IDirect3DSurface9* surf = nullptr;
+        if (SUCCEEDED(tex->GetSurfaceLevel(0, &surf)) && surf) {
+            for (int i = 0; i < g_rtSeenCount && !hit; ++i)
+                if (g_rtSeen[i].surf == surf) hit = true;
+            surf->Release();
+        }
+        tex->Release();
+    }
+    base->Release();
+    return hit;
+}
+
+static volatile LONG g_uiSkippedResample = 0;
+
+static bool ShouldDuplicateUI(IDirect3DDevice9* dev)
+{
+    if (!g_dupUI) return false;
+    if (!(g_simulStereo && !g_inDupDraw && g_rtIsScene && g_capW > 0)) return false;
+    // Only once the scene itself is being split this frame. Before that there is one image and
+    // the HUD belongs across all of it.
+    if (InterlockedCompareExchange(&g_dupFrameDraws, 0, 0) <= 0) return false;
+    DWORD cw = 0;
+    if (FAILED(dev->GetRenderState(D3DRS_COLORWRITEENABLE, &cw)) || cw == 0) return false;
+    if (SamplesARenderTarget(dev)) { InterlockedIncrement(&g_uiSkippedResample); return false; }
+    return true;
+}
+
+// Same halving as DuplicateDraw and deliberately NOT the same function: that one uploads an eye
+// matrix to c0 before each issue, which is the one thing this must not do.
+template <typename FN>
+static HRESULT DuplicateViewportOnly(IDirect3DDevice9* dev, FN issue)
+{
+    D3DVIEWPORT9 vpWas{};
+    if (FAILED(dev->GetViewport(&vpWas))) return issue();
+
+    g_inDupDraw = true;
+    HRESULT hr = D3D_OK;
+    for (int eye = 0; eye < 2; ++eye) {
+        D3DVIEWPORT9 vp = vpWas;
+        vp.X     = vpWas.X + ((eye == 0) ? 0 : vpWas.Width / 2);
+        vp.Width = vpWas.Width / 2;
+        dev->SetViewport(&vp);
+        hr = issue();
+    }
+    dev->SetViewport(&vpWas);
+    g_inDupDraw = false;
+    InterlockedIncrement(&g_uiDupDraws);
+    return hr;
+}
+
+static void ReportUpSample()
+{
+    const long tot = g_upSeenColour + g_upSeenNoColour;
+    if (tot > 0) {
+        Log("[up] one sampled frame: %ld draws write colour (%ld prims), %ld write none"
+            " (%ld prims, the occlusion boxes)",
+            g_upSeenColour, g_upPrimColour, g_upSeenNoColour, g_upPrimNoColour);
+        Log("[up]   the colour-writing ones, split - a full-screen blit is 2 prims and is what"
+            " tiles the world when duplicated:");
+        for (int i = 0; i < g_upBCount; ++i)
+            Log("[up]     blend=%lu z=%lu  %u prims  x%ld draws   order %ld..%ld of %ld",
+                g_upB[i].blend, g_upB[i].z, g_upB[i].prims, g_upB[i].count,
+                g_upB[i].firstOrd, g_upB[i].lastOrd, g_upOrdinal);
+    }
+    g_upSeenColour = g_upSeenNoColour = g_upPrimColour = g_upPrimNoColour = 0;
+    g_upBCount = 0; g_upOrdinal = 0;
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type,
+                                                 UINT primCount, const void* data, UINT stride)
+{
+    NoteUpDraw(dev, primCount);
+    if (ShouldDuplicateUI(dev))
+        return DuplicateViewportOnly(dev, [&] {
+            return g_origDrawPrimUP(dev, type, primCount, data, stride);
+        });
+    return g_origDrawPrimUP(dev, type, primCount, data, stride);
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type,
+                                                    UINT minVertex, UINT numVerts, UINT primCount,
+                                                    const void* idx, D3DFORMAT idxFmt,
+                                                    const void* verts, UINT stride)
+{
+    NoteUpDraw(dev, primCount);
+    if (ShouldDuplicateUI(dev))
+        return DuplicateViewportOnly(dev, [&] {
+            return g_origDrawIndexedUP(dev, type, minVertex, numVerts, primCount, idx, idxFmt,
+                                       verts, stride);
+        });
+    return g_origDrawIndexedUP(dev, type, minVertex, numVerts, primCount, idx, idxFmt,
+                               verts, stride);
+}
+
+static void ReportUpDraws()
+{
+    const LONG all   = InterlockedExchange(&g_upDraws, 0);
+    const LONG scene = InterlockedExchange(&g_upOnScene, 0);
+    if (all == 0) {
+        Log("[up] no user-pointer draws at all over 600 frames - the HUD is NOT coming through"
+            " DrawPrimitiveUP, and the hypothesis is wrong");
+        return;
+    }
+    Log("[up] user-pointer draws over 600 frames: %ld total, %ld onto the scene target while"
+        " stereo was live, %ld DUPLICATED into both eyes  (%s)",
+        all, scene, InterlockedExchange(&g_uiDupDraws, 0), g_dupUI ? "NUMPAD0 off" : "OFF");
+    Log("[up]   %ld colour-writing draws were left alone because they SAMPLE a render target"
+        " - composites and post passes, the ones that tiled the world",
+        InterlockedExchange(&g_uiSkippedResample, 0));
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type,
                                                UINT start, UINT count)
 {
@@ -6855,6 +7140,10 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     // sustained pattern anyway. Deliberately NOT inside the g_simulStereo report at 900 - the
     // whole point is to run while duplication is not happening.
     if ((f % 120) == 0) AdoptSceneTarget();
+    // Arm the detailed sample for the NEXT frame, and report it the frame after. One frame of
+    // per-draw state reads, not six hundred.
+    if ((f % 600) == 0) { ReportUpDraws(); g_upSample = true; }
+    else if (g_upSample) { ReportUpSample(); g_upSample = false; }
 
     // ---- the engine's FOV now matters ONLY for CPU culling ----
     //
@@ -7167,6 +7456,10 @@ static void PatchDeviceOnce(IDirect3DDevice9* dev)
     g_origCreateQuery     = (PFN_CreateQuery)     PatchVTable(dev, DEV_CreateQuery, (void*)&Hook_CreateQuery);
     g_origDrawPrim    = (PFN_DrawPrim)    PatchVTable(dev, DEV_DrawPrimitive, (void*)&Hook_DrawPrim);
     g_origDrawIndexed = (PFN_DrawIndexed) PatchVTable(dev, DEV_DrawIndexedPrimitive, (void*)&Hook_DrawIndexed);
+    g_origDrawPrimUP    = (PFN_DrawPrimUP)   PatchVTable(dev, DEV_DrawPrimitiveUP,
+                                                         (void*)&Hook_DrawPrimUP);
+    g_origDrawIndexedUP = (PFN_DrawIndexedUP)PatchVTable(dev, DEV_DrawIndexedPrimitiveUP,
+                                                         (void*)&Hook_DrawIndexedUP);
     // Slot 94, extracted from d3d9.h and cross-checked against the reference's working hooks.
     g_origSetVSConstF = (PFN_SetVSConstF) PatchVTable(dev, DEV_SetVertexShaderConstantF,
                                                       (void*)&Hook_SetVSConstF);
