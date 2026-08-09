@@ -25,6 +25,25 @@
 ; belongs anywhere near it.
 
 
+; ---------------------------------------------------------------- debugging
+
+; On by default. Turn it off for normal play and the mod becomes invisible: no text on the
+; screen, and no hotkey does anything.
+;
+; Three keys stay live, because none of them is a diagnostic and each one leaves you stuck
+; if it is missing:
+;
+;   PAGE UP      recentre the view. A headset put on at an angle needs this, and needs it
+;                more with debugging off, since nothing else can correct the seating.
+;   PAUSE (hold) close the game cleanly, so the engine writes its save.
+;   F6           rescan for the view matrix. Stereo arms itself, but if it gives up it says
+;                "press F6 by hand" - so the key has to still be there to press.
+;
+; Everything else - the overlay, the stereo strength and IPD controls, the animation locks,
+; the frame cap, the capture and occlusion experiments - is off.
+Debug = on
+
+
 ; ---------------------------------------------------------------- frame pacing
 
 ; The engine's MaxSmoothedFrameRate. NUMPAD7 cycles 60 / 72 / 90 / 120 / 144 / 250 / 62.

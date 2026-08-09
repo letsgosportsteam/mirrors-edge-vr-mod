@@ -110,6 +110,22 @@ enum {
 
 static HMODULE          g_real       = nullptr;
 static HMODULE          g_selfModule = nullptr;   // this DLL, for finding mevr.ini beside it
+
+// ---- development affordances, on by default, `Debug=off` in mevr.ini to remove them ----
+//
+// Off means: no on-screen overlay, and no hotkey does anything - EXCEPT the three that are not
+// diagnostics at all and whose absence would leave a player stuck.
+//
+//   PAGE UP    recentre. A headset put on crooked needs this, and needs it MORE with debugging
+//              off, because nothing else can fix the seating.
+//   PAUSE hold close the game cleanly, so the engine writes its save.
+//   F6         rescan for the view matrix. The startup sequence gives up loudly after ten
+//              attempts and tells you to press F6; taking the key away would leave that message
+//              pointing at nothing, and stereo unrecoverable for the run.
+//
+// ⚠️ The scan's own countdown and commit live inside the F6 handler and must keep running
+// whatever this is set to - they are the mechanism, not the key.
+static bool             g_debug      = true;
 static CRITICAL_SECTION g_lock;
 static bool             g_lockReady  = false;
 static wchar_t          g_logPath[MAX_PATH] = L"";
@@ -3234,6 +3250,7 @@ static void ApplySwanNeck()
 // perform without relaunching is worth far more than one that needs two runs to compare.
 static void CheckSwanHotkey()
 {
+    if (!g_debug) return;
     static bool wasDown = false;
     const bool down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
     if (down && !wasDown) {
@@ -3872,8 +3889,15 @@ static void CheckVMHotkey()
     static bool p6 = false;
     const bool d6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
 
+    // F6 survives Debug=off deliberately - see g_debug. It is the only way back if the startup
+    // sequence gives up, and it is what that message tells the player to press.
     if (d6 && !p6) { g_autoDone = true; ArmVMScan(false); }
     p6 = d6;
+
+    // ⚠️ Everything from here to the countdown is diagnostic and gated; the countdown is NOT.
+    // It is the scan's commit step, and returning early past it would arm a scan that never
+    // lands - stereo would simply never come on with debugging off.
+    if (g_debug) {
 
     // F2 cycles the injection. A 300 UU offset is far larger than any per-eye separation will
     // ever be, on purpose: the point of this rung is an unmistakable yes or no, and a subtle
@@ -3899,6 +3923,7 @@ static void CheckVMHotkey()
         }
     }
     p2 = d2;
+    }   // end if (g_debug)
 
     if (g_vmArmCountdown > 0 && --g_vmArmCountdown == 0) {
         InterlockedExchange(&g_vmScanArmed, 0);
@@ -3944,7 +3969,8 @@ static void CheckVMHotkey()
             // A new register has proved nothing yet, whatever the last one managed.
             g_vmProven = false;
             g_vmStrikes = 0;
-            Log("[vm] committed. F2 cycles the injection: off / forward / right / up (300 UU)");
+            Log("[vm] committed.%s", g_debug
+                ? " F2 cycles the injection: off / forward / right / up (300 UU)" : "");
         }
         Log("");
     }
@@ -4011,7 +4037,8 @@ static void AutoArm()
         InterlockedExchange(&g_dupDraws, 0);
         g_autoDone = true;
         Log("*** [auto] ready - stereo ON, simultaneous. No keypresses needed.");
-        Log("[auto] F1 turns stereo off, F10 falls back to alternate-eye, F6 rescans.");
+        Log(g_debug ? "[auto] F1 turns stereo off, F10 falls back to alternate-eye, F6 rescans."
+                    : "[auto] Debug is off: F6 still rescans, PAGE UP recentres, hold PAUSE exits.");
         return;
     }
 
@@ -4107,6 +4134,18 @@ extern float g_halfIpdUU;
 
 static void CheckHeadHotkeys()
 {
+    // ---- always available, debugging or not ----
+    //
+    // Recentring is not a diagnostic. A headset put on at an angle needs it, and a player with
+    // debugging off has nothing else that can fix the seating.
+    {
+        static bool pPgUpAlways = false;
+        const bool dPgUpAlways = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
+        if (dPgUpAlways && !pPgUpAlways) { g_haveCentre = false; Log("*** [6dof] PAGE UP -> recentring"); }
+        pPgUpAlways = dPgUpAlways;
+    }
+    if (!g_debug) return;
+
     static bool p9 = false, p5 = false, p4 = false;
     const bool d9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
     const bool d5 = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
@@ -4360,15 +4399,14 @@ static void CheckHeadHotkeys()
     // PAGE UP recentres 6-DOF, PAGE DOWN toggles it. Recentre matters because the origin is
     // captured wherever the head happened to be at the first valid pose - typically mid-air
     // while the headset is being put on.
-    static bool pPgUp = false, pPgDn = false;
-    const bool dPgUp = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
+    // PAGE UP is handled at the top of this function, outside the debug gate.
+    static bool pPgDn = false;
     const bool dPgDn = (GetAsyncKeyState(VK_NEXT)  & 0x8000) != 0;
-    if (dPgUp && !pPgUp) { g_haveCentre = false; Log("*** [6dof] PAGE UP -> recentring"); }
     if (dPgDn && !pPgDn) {
         g_sixDof = !g_sixDof;
         Log("*** [6dof] PAGE DOWN -> %s", g_sixDof ? "ON" : "OFF (decaying to neutral)");
     }
-    pPgUp = dPgUp; pPgDn = dPgDn;
+    pPgDn = dPgDn;
 
     // F11 adjusts world scale. UE3 units per metre is game-specific and unmeasured here, and
     // it is the one number that decides whether the world feels life-sized.
@@ -6865,7 +6903,7 @@ static bool g_overlay = true;      // F3 toggles
 
 static void DrawOverlay(IDirect3DDevice9* dev)
 {
-    if (!g_overlay || !dev) return;
+    if (!g_debug || !g_overlay || !dev) return;   // Debug=off takes the text off the screen
 
     // Sized with headroom and bounds-checked below. The rows are edited per test by design,
     // and this array had silently grown to nine entries in an eight-row buffer - /analyze
@@ -7906,6 +7944,13 @@ static void LoadSettings()
         } else if (_stricmp(key, "LockAnimRoll") == 0) {
             if (SettingBool(val, &b)) { g_animRollFollow = !b; Log("[cfg]   LockAnimRoll = %s", b?"on":"off"); applied++; }
             else { Log("[cfg]   LockAnimRoll '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "Debug") == 0) {
+            if (SettingBool(val, &b)) {
+                g_debug = b;
+                Log("[cfg]   Debug = %s%s", b ? "on" : "off",
+                    b ? "" : "  (no overlay, no hotkeys except PAGE UP, F6 and hold-PAUSE)");
+                applied++;
+            } else { Log("[cfg]   Debug '%s' is not a boolean - ignored", val); rejected++; }
         } else if (_stricmp(key, "LockAnimYaw") == 0) {
             if (SettingBool(val, &b)) { g_animYawFollow = !b; Log("[cfg]   LockAnimYaw = %s", b?"on":"off"); applied++; }
             else { Log("[cfg]   LockAnimYaw '%s' is not a boolean - ignored", val); rejected++; }
