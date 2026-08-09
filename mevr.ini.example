@@ -15,7 +15,7 @@
 ; Every line is reported in the log at startup - applied, or rejected with the reason. A
 ; misspelt key is never silent:
 ;
-;     [cfg] R:\MirrorsEdge\Binaries\mevr.ini
+;     [cfg] ...the full path of the file it read, so there is never any doubt which one...
 ;     [cfg]   FrameCap = 72
 ;     [cfg]   unknown key 'FrmeCap' - ignored
 ;     [cfg] 1 applied, 1 ignored. Hotkeys still override anything set here.
