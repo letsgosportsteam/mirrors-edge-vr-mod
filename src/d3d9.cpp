@@ -1301,6 +1301,10 @@ static inline UINT SceneX() { return (g_capW > SceneW()) ? (g_capW - SceneW()) /
 static inline UINT SceneY() { return (g_capH > SceneH()) ? (g_capH - SceneH()) / 2 : 0; }
 extern float             g_sceneMat[16];
 extern volatile LONG     g_dupDraws;
+// Duplicated draws in THIS frame, as opposed to g_dupDraws which is a running total for the
+// occlusion override. Reset every frame at the submit, so it answers one question: does the
+// frame about to be presented actually contain two eyes side by side?
+extern volatile LONG     g_dupFrameDraws;
 float                    g_halfIpdUU = 0.0f;     // filled from the located views
 float                    g_gameHalfFovX = 0.0f;  // read out of the view matrix, radians
 float                    g_gameHalfFovY = 0.0f;
@@ -1486,6 +1490,40 @@ static void SubmitTestQuad()
         }
     }
 
+    // ---- ⚠️ A MONO FRAME MUST NOT BE SUBMITTED AS STEREO ----
+    //
+    // Stereo mode being ON says what we INTEND. It does not say the frame in hand actually has
+    // two eyes in it. Duplication is gated per draw - on the scene matrix being live, on the
+    // render target, on the pawn's pose being readable - and every one of those legitimately
+    // goes false: a menu, a cutscene camera, the seconds after a death.
+    //
+    // When it does, the engine renders one ordinary picture and this code cut it down the middle
+    // and gave half to each eye. That is the "it looks wrong once I go back to the menu": not a
+    // stereo image at all, just the left half of the menu in the left eye and the right half in
+    // the right. Before any of this arms, the same menu goes out through the mono quad and looks
+    // like a screen floating in front of you - which is correct, and is what should happen
+    // whenever the frame is mono, not only before the first arm.
+    //
+    // So the frame is asked, not the mode. The layer choice below already falls back to the quad;
+    // it simply never got the chance.
+    //
+    // Held for a few frames rather than switched instantly: duplication can miss a frame at a
+    // transition, and alternating layer types frame to frame would be far worse than either. Going
+    // back to stereo is immediate, because the first duplicated frame is unambiguous.
+    const LONG dupThisFrame = InterlockedExchange(&g_dupFrameDraws, 0);
+    static int monoRun = 0;
+    if (dupThisFrame >= 4) monoRun = 0; else if (monoRun < 1000) ++monoRun;
+    const bool frameIsStereo = (monoRun < 10);
+    {
+        static bool wasStereo = false;
+        if (frameIsStereo != wasStereo) {
+            wasStereo = frameIsStereo;
+            Log("[eye] frame is %s - presenting the %s",
+                frameIsStereo ? "side-by-side" : "MONO (nothing duplicated)",
+                frameIsStereo ? "stereo projection" : "head-locked quad");
+        }
+    }
+
     // ---- stereo: locate the eyes, fill the one this frame rendered, submit a projection ----
     XrCompositionLayerProjection      proj{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
     XrCompositionLayerProjectionView  projViews[2]{};
@@ -1589,7 +1627,18 @@ static void SubmitTestQuad()
                 proj.space     = g_xrSpace;
                 proj.viewCount = 2;
                 proj.views     = projViews;
-                stereoSubmitted = true;
+                // ⚠️ THE ONLY THING THE MONO TEST MAY GATE IS THE LAYER CHOICE.
+                //
+                // It gated the whole block above for one build, and that DEADLOCKED: g_halfIpdUU
+                // is computed in here from the located views, ShouldDuplicate requires it to be
+                // non-zero, so no duplication meant no IPD meant duplication could never start.
+                // Ten frames after launch it latched and the run was mono for good, while every
+                // other signal - the scan, the register, 100% acceptance - looked perfect.
+                //
+                // Locating the views, deriving the IPD and filling the eyes are what ARM stereo.
+                // Whether this frame's picture happens to be side by side decides only which
+                // layer is handed to the compositor, and it must be asked here, at the end.
+                stereoSubmitted = (frameIsStereo || !g_simulStereo);
             }
         }
     }
@@ -5254,6 +5303,7 @@ bool         g_sceneMatValid = false;
 // True while c0 currently holds the scene view matrix rather than a foreign one.
 bool         g_c0IsScene = false;
 volatile LONG g_dupDraws = 0;
+volatile LONG g_dupFrameDraws = 0;
 
 // ---- only duplicate draws aimed at a SCENE-SIZED render target ----
 //
@@ -6227,6 +6277,7 @@ static HRESULT DuplicateDraw(IDirect3DDevice9* dev, FN issue)
     g_origSetVSConstF(dev, (UINT)g_vmReg, g_sceneMat, 4);   // leave c0 as the engine left it
     g_inDupDraw = false;
     InterlockedIncrement(&g_dupDraws);
+    InterlockedIncrement(&g_dupFrameDraws);
     return hr;
 }
 
