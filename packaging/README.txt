@@ -116,6 +116,9 @@ Delete those three files. Nothing else was touched.
    else is letterboxed, and the eye crop then has to assume the black bars are
    centred.
 
+   A RESOLUTION CHANGE ONLY TAKES EFFECT AFTER RESTARTING THE GAME. Set it
+   before you get comfortable, not partway through a session.
+
 2. TURN VERTICAL SYNC OFF.
 
    It paces the game to your flat monitor, which fights the frame cap the mod

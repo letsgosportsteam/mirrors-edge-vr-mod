@@ -65,6 +65,9 @@ resolution from the headset yet — it splits the game's own frame down the midd
 eye, so the game's resolution *is* your per-eye resolution. Keep the aspect at 16:9: anything
 else is letterboxed, and the eye crop then has to assume the black bars are centred.
 
+**A resolution change only takes effect after restarting the game**, so set it before you get
+comfortable rather than partway through a session.
+
 **Turn vertical sync off.** It paces the game to your flat monitor, which fights the frame cap
 the mod uses to pace the headset.
 
