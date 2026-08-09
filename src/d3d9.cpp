@@ -79,6 +79,9 @@
 #include <cmath>
 #include <vector>
 #include <psapi.h>
+// Rung 10. The build script reads this include to decide whether to compile MinHook's sources,
+// so it is the switch as well as the declaration - see the note in build.ps1.
+#include "MinHook.h"
 
 // ---------------------------------------------------------------- vtable slots
 
@@ -112,6 +115,10 @@ static bool  g_devicePatched = false;   // IDirect3DDevice9 vtable patched
 // Declared up here rather than beside the rest of the rung 8a state, because the frame grab -
 // which sits far above that code - has to know which kind of device it is grabbing from.
 static bool  g_devIsEx       = false;   // the device really is D3D9Ex
+// Rung 10, defined below the call sites in the XR setup and the frame loop.
+static void  XrInitActions();
+static void  XrSyncInput();
+static void  InstallXInputHook();
 static long  g_frames        = 0;
 static bool  g_describedBackbuffer = false;
 
@@ -440,9 +447,334 @@ static bool InitXR()
         Log("[xr] VIEW space failed - head tracking unavailable, rendering unaffected");
     }
 
+    XrInitActions();
+
     Log("*** [xr] OpenXR session created. 32-bit OpenXR works in this process.");
     g_xrReady = true;
     return true;
+}
+
+// ================================================================ rung 10: motion controllers
+//
+// As a gamepad, deliberately. The controllers drive the game through the pad interface it
+// already supports, rather than through anything that has to be discovered.
+//
+// ---- why a synthesised XInput pad and not written input properties ----
+//
+// The game's import table names DINPUT8.dll and XINPUT1_3.dll, so a 360 pad is a first-class
+// input path in this engine already. Everything that path reaches - menus, jump, crouch,
+// interact, the run button, movement, look - is bound and tested by the developers.
+//
+// The alternative was writing PlayerInput's axis properties directly, which this project has the
+// object model to do. It would move the player and nothing else: the axes are readable but the
+// BUTTONS are bound to exec functions, and reaching those means driving the script VM. Every
+// button would have been a separate piece of reverse engineering, and menus would still need the
+// keyboard. Synthesising the pad gets the entire surface for one hook.
+//
+// ---- what this deliberately is not ----
+//
+// No hands, no pointing, no positional use of the controllers at all. The sticks are sticks and
+// the buttons are buttons. That keeps the whole rung inside a surface the game already
+// understands, and leaves anything genuinely spatial for later, when it can be judged on its own.
+
+// Declared locally rather than by including <Xinput.h>. The structs are stable across every
+// XInput version and this way the build gains no header search path and no import - the DLL is
+// reached through GetProcAddress, so nothing here makes us depend on it being present.
+struct MEVR_XINPUT_GAMEPAD {
+    WORD  wButtons;
+    BYTE  bLeftTrigger;
+    BYTE  bRightTrigger;
+    SHORT sThumbLX, sThumbLY, sThumbRX, sThumbRY;
+};
+struct MEVR_XINPUT_STATE { DWORD dwPacketNumber; MEVR_XINPUT_GAMEPAD Gamepad; };
+struct MEVR_XINPUT_VIBRATION { WORD wLeftMotorSpeed, wRightMotorSpeed; };
+struct MEVR_XINPUT_CAPABILITIES {
+    BYTE Type, SubType; WORD Flags;
+    MEVR_XINPUT_GAMEPAD Gamepad; MEVR_XINPUT_VIBRATION Vibration;
+};
+
+enum : WORD {
+    MEVR_PAD_DPAD_UP = 0x0001, MEVR_PAD_DPAD_DOWN = 0x0002,
+    MEVR_PAD_DPAD_LEFT = 0x0004, MEVR_PAD_DPAD_RIGHT = 0x0008,
+    MEVR_PAD_START = 0x0010, MEVR_PAD_BACK = 0x0020,
+    MEVR_PAD_LTHUMB = 0x0040, MEVR_PAD_RTHUMB = 0x0080,
+    MEVR_PAD_LSHOULDER = 0x0100, MEVR_PAD_RSHOULDER = 0x0200,
+    MEVR_PAD_A = 0x1000, MEVR_PAD_B = 0x2000, MEVR_PAD_X = 0x4000, MEVR_PAD_Y = 0x8000
+};
+
+static XrActionSet g_actionSet = XR_NULL_HANDLE;
+static XrAction    g_aMove = XR_NULL_HANDLE, g_aLook = XR_NULL_HANDLE;
+static XrAction    g_aA = XR_NULL_HANDLE, g_aB = XR_NULL_HANDLE;
+static XrAction    g_aX = XR_NULL_HANDLE, g_aY = XR_NULL_HANDLE;
+static XrAction    g_aLTrig = XR_NULL_HANDLE, g_aRTrig = XR_NULL_HANDLE;
+static XrAction    g_aLGrip = XR_NULL_HANDLE, g_aRGrip = XR_NULL_HANDLE;
+static XrAction    g_aMenu = XR_NULL_HANDLE;
+static XrAction    g_aLClick = XR_NULL_HANDLE, g_aRClick = XR_NULL_HANDLE;
+static bool        g_actionsReady = false;
+static bool        g_padEnabled = true;            // NUMPAD9 toggles
+static MEVR_XINPUT_STATE g_pad = {};
+static CRITICAL_SECTION  g_padLock;
+static bool        g_padLockReady = false;
+static long        g_padPolls = 0;
+
+static void XrInitActions()
+{
+    if (g_xrInstance == XR_NULL_HANDLE || g_xrSession == XR_NULL_HANDLE) return;
+
+    XrActionSetCreateInfo asci{ XR_TYPE_ACTION_SET_CREATE_INFO };
+    strcpy_s(asci.actionSetName, "gameplay");
+    strcpy_s(asci.localizedActionSetName, "Gameplay");
+    if (XR_FAILED(xrCreateActionSet(g_xrInstance, &asci, &g_actionSet))) {
+        Log("[pad] xrCreateActionSet failed - controllers unavailable");
+        return;
+    }
+
+    auto mk = [&](XrAction* out, const char* name, XrActionType type) {
+        XrActionCreateInfo aci{ XR_TYPE_ACTION_CREATE_INFO };
+        strcpy_s(aci.actionName, name);
+        strcpy_s(aci.localizedActionName, name);
+        aci.actionType = type;
+        if (XR_FAILED(xrCreateAction(g_actionSet, &aci, out))) {
+            Log("[pad] xrCreateAction(%s) failed", name);
+            *out = XR_NULL_HANDLE;
+        }
+    };
+    mk(&g_aMove,   "move",   XR_ACTION_TYPE_VECTOR2F_INPUT);
+    mk(&g_aLook,   "look",   XR_ACTION_TYPE_VECTOR2F_INPUT);
+    mk(&g_aA,      "abtn",   XR_ACTION_TYPE_BOOLEAN_INPUT);
+    mk(&g_aB,      "bbtn",   XR_ACTION_TYPE_BOOLEAN_INPUT);
+    mk(&g_aX,      "xbtn",   XR_ACTION_TYPE_BOOLEAN_INPUT);
+    mk(&g_aY,      "ybtn",   XR_ACTION_TYPE_BOOLEAN_INPUT);
+    mk(&g_aLTrig,  "ltrig",  XR_ACTION_TYPE_FLOAT_INPUT);
+    mk(&g_aRTrig,  "rtrig",  XR_ACTION_TYPE_FLOAT_INPUT);
+    mk(&g_aLGrip,  "lgrip",  XR_ACTION_TYPE_FLOAT_INPUT);
+    mk(&g_aRGrip,  "rgrip",  XR_ACTION_TYPE_FLOAT_INPUT);
+    mk(&g_aMenu,   "menu",   XR_ACTION_TYPE_BOOLEAN_INPUT);
+    mk(&g_aLClick, "lclick", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    mk(&g_aRClick, "rclick", XR_ACTION_TYPE_BOOLEAN_INPUT);
+
+    auto path = [&](const char* s) {
+        XrPath p = XR_NULL_PATH;
+        xrStringToPath(g_xrInstance, s, &p);
+        return p;
+    };
+
+    // Touch, because that is what a Quest reports through Virtual Desktop. The simple controller
+    // profile is suggested as well: it carries only a select and a menu button, which is not
+    // playable, but it means an unrecognised controller still reaches the menus instead of
+    // appearing completely dead.
+    const XrActionSuggestedBinding touch[] = {
+        { g_aMove,   path("/user/hand/left/input/thumbstick") },
+        { g_aLook,   path("/user/hand/right/input/thumbstick") },
+        { g_aA,      path("/user/hand/right/input/a/click") },
+        { g_aB,      path("/user/hand/right/input/b/click") },
+        { g_aX,      path("/user/hand/left/input/x/click") },
+        { g_aY,      path("/user/hand/left/input/y/click") },
+        { g_aLTrig,  path("/user/hand/left/input/trigger/value") },
+        { g_aRTrig,  path("/user/hand/right/input/trigger/value") },
+        { g_aLGrip,  path("/user/hand/left/input/squeeze/value") },
+        { g_aRGrip,  path("/user/hand/right/input/squeeze/value") },
+        { g_aMenu,   path("/user/hand/left/input/menu/click") },
+        { g_aLClick, path("/user/hand/left/input/thumbstick/click") },
+        { g_aRClick, path("/user/hand/right/input/thumbstick/click") },
+    };
+    XrInteractionProfileSuggestedBinding sib{ XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+    sib.interactionProfile = path("/interaction_profiles/oculus/touch_controller");
+    sib.suggestedBindings = touch;
+    sib.countSuggestedBindings = (uint32_t)(sizeof(touch) / sizeof(touch[0]));
+    XrResult sr = xrSuggestInteractionProfileBindings(g_xrInstance, &sib);
+    if (XR_FAILED(sr)) Log("[pad] suggested bindings for oculus/touch rejected -> %d", (int)sr);
+
+    const XrActionSuggestedBinding simple[] = {
+        { g_aA,    path("/user/hand/right/input/select/click") },
+        { g_aMenu, path("/user/hand/left/input/menu/click") },
+    };
+    XrInteractionProfileSuggestedBinding sib2{ XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+    sib2.interactionProfile = path("/interaction_profiles/khr/simple_controller");
+    sib2.suggestedBindings = simple;
+    sib2.countSuggestedBindings = (uint32_t)(sizeof(simple) / sizeof(simple[0]));
+    xrSuggestInteractionProfileBindings(g_xrInstance, &sib2);
+
+    // ⚠️ Permanent. Once action sets are attached to a session no more can be added, so this is
+    // the last chance to have created every action - which is why they are all made above rather
+    // than lazily when first needed.
+    XrSessionActionSetsAttachInfo ai{ XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
+    ai.countActionSets = 1;
+    ai.actionSets = &g_actionSet;
+    if (XR_FAILED(xrAttachSessionActionSets(g_xrSession, &ai))) {
+        Log("[pad] xrAttachSessionActionSets failed - controllers unavailable");
+        return;
+    }
+    if (!g_padLockReady) { InitializeCriticalSection(&g_padLock); g_padLockReady = true; }
+    g_actionsReady = true;
+    Log("*** [pad] controller actions attached - sticks, triggers, grips and face buttons");
+}
+
+// Read the controllers and build a 360 pad out of them. Called once per frame from the XR loop.
+static void XrSyncInput()
+{
+    if (!g_actionsReady || !g_padEnabled) return;
+
+    XrActiveActionSet aas{ g_actionSet, XR_NULL_PATH };
+    XrActionsSyncInfo si{ XR_TYPE_ACTIONS_SYNC_INFO };
+    si.countActiveActionSets = 1;
+    si.activeActionSets = &aas;
+    // Returns SESSION_NOT_FOCUSED whenever the headset menu is up. Not an error, and not worth
+    // logging every frame - the actions simply report inactive and the pad reads as centred.
+    if (XR_FAILED(xrSyncActions(g_xrSession, &si))) return;
+
+    auto vec2 = [&](XrAction a, float* x, float* y) {
+        *x = *y = 0.0f;
+        if (a == XR_NULL_HANDLE) return;
+        XrActionStateGetInfo gi{ XR_TYPE_ACTION_STATE_GET_INFO };
+        gi.action = a;
+        XrActionStateVector2f st{ XR_TYPE_ACTION_STATE_VECTOR2F };
+        if (XR_SUCCEEDED(xrGetActionStateVector2f(g_xrSession, &gi, &st)) && st.isActive) {
+            *x = st.currentState.x; *y = st.currentState.y;
+        }
+    };
+    auto flt = [&](XrAction a) -> float {
+        if (a == XR_NULL_HANDLE) return 0.0f;
+        XrActionStateGetInfo gi{ XR_TYPE_ACTION_STATE_GET_INFO };
+        gi.action = a;
+        XrActionStateFloat st{ XR_TYPE_ACTION_STATE_FLOAT };
+        if (XR_SUCCEEDED(xrGetActionStateFloat(g_xrSession, &gi, &st)) && st.isActive)
+            return st.currentState;
+        return 0.0f;
+    };
+    auto bl = [&](XrAction a) -> bool {
+        if (a == XR_NULL_HANDLE) return false;
+        XrActionStateGetInfo gi{ XR_TYPE_ACTION_STATE_GET_INFO };
+        gi.action = a;
+        XrActionStateBoolean st{ XR_TYPE_ACTION_STATE_BOOLEAN };
+        if (XR_SUCCEEDED(xrGetActionStateBoolean(g_xrSession, &gi, &st)) && st.isActive)
+            return st.currentState == XR_TRUE;
+        return false;
+    };
+
+    float mx, my, lx, ly;
+    vec2(g_aMove, &mx, &my);
+    vec2(g_aLook, &lx, &ly);
+
+    MEVR_XINPUT_STATE s{};
+    auto axis = [](float v) -> SHORT {
+        if (v >  1.0f) v =  1.0f;
+        if (v < -1.0f) v = -1.0f;
+        return (SHORT)(v * 32767.0f);
+    };
+    s.Gamepad.sThumbLX = axis(mx);
+    s.Gamepad.sThumbLY = axis(my);
+    s.Gamepad.sThumbRX = axis(lx);
+    s.Gamepad.sThumbRY = axis(ly);
+    s.Gamepad.bLeftTrigger  = (BYTE)(flt(g_aLTrig) * 255.0f);
+    s.Gamepad.bRightTrigger = (BYTE)(flt(g_aRTrig) * 255.0f);
+
+    WORD b = 0;
+    if (bl(g_aA)) b |= MEVR_PAD_A;
+    if (bl(g_aB)) b |= MEVR_PAD_B;
+    if (bl(g_aX)) b |= MEVR_PAD_X;
+    if (bl(g_aY)) b |= MEVR_PAD_Y;
+    if (bl(g_aMenu))   b |= MEVR_PAD_START;
+    if (bl(g_aLClick)) b |= MEVR_PAD_LTHUMB;
+    if (bl(g_aRClick)) b |= MEVR_PAD_RTHUMB;
+    // Grips are analogue on Touch and shoulder buttons on a pad, so they cross over at a
+    // threshold rather than being dropped. Half pressed is deliberate: a grip is squeezed
+    // decisively or not at all, unlike a trigger.
+    if (flt(g_aLGrip) > 0.5f) b |= MEVR_PAD_LSHOULDER;
+    if (flt(g_aRGrip) > 0.5f) b |= MEVR_PAD_RSHOULDER;
+    s.Gamepad.wButtons = b;
+
+    EnterCriticalSection(&g_padLock);
+    // The packet number must CHANGE when the state does, or a poller that compares packets will
+    // decide nothing happened and skip the read entirely.
+    const bool changed = memcmp(&s.Gamepad, &g_pad.Gamepad, sizeof(s.Gamepad)) != 0;
+    const DWORD pn = g_pad.dwPacketNumber + (changed ? 1 : 0);
+    g_pad = s;
+    g_pad.dwPacketNumber = pn;
+    LeaveCriticalSection(&g_padLock);
+}
+
+// ---- the hook ----
+//
+// XInputGetState is detoured rather than the import patched, so it is caught however the game
+// reaches it. That matters here: the exe names XINPUT1_3.dll in its imports but no XInput
+// function by name, which means the functions are imported BY ORDINAL and there is no import
+// name to patch.
+
+typedef DWORD (WINAPI *PFN_XInputGetState)(DWORD, MEVR_XINPUT_STATE*);
+typedef DWORD (WINAPI *PFN_XInputGetCaps)(DWORD, DWORD, MEVR_XINPUT_CAPABILITIES*);
+static PFN_XInputGetState g_origXiGetState = nullptr;
+static PFN_XInputGetCaps  g_origXiGetCaps  = nullptr;
+static bool g_xiHooked = false;
+
+static DWORD WINAPI Hook_XInputGetState(DWORD idx, MEVR_XINPUT_STATE* out)
+{
+    // Only pad 0. Reporting a controller on every index makes the game think four players are
+    // present, and some engines then poll all of them every frame for nothing.
+    if (g_padEnabled && g_actionsReady && idx == 0 && out) {
+        EnterCriticalSection(&g_padLock);
+        *out = g_pad;
+        LeaveCriticalSection(&g_padLock);
+        if (InterlockedIncrement(&g_padPolls) == 1)
+            Log("*** [pad] the game is polling XInput - the synthesised pad is reaching it");
+        return ERROR_SUCCESS;
+    }
+    if (g_origXiGetState) return g_origXiGetState(idx, out);
+    return ERROR_DEVICE_NOT_CONNECTED;
+}
+
+static DWORD WINAPI Hook_XInputGetCaps(DWORD idx, DWORD flags, MEVR_XINPUT_CAPABILITIES* out)
+{
+    if (g_padEnabled && g_actionsReady && idx == 0 && out) {
+        MEVR_XINPUT_CAPABILITIES c{};
+        c.Type = 1;        // XINPUT_DEVTYPE_GAMEPAD
+        c.SubType = 1;     // XINPUT_DEVSUBTYPE_GAMEPAD
+        // Every field the pad can report, set to its maximum: this describes what the device is
+        // CAPABLE of, not its current state, and a zeroed one reads as a pad with no sticks.
+        c.Gamepad.wButtons = 0xF3FF;
+        c.Gamepad.bLeftTrigger = 0xFF; c.Gamepad.bRightTrigger = 0xFF;
+        c.Gamepad.sThumbLX = c.Gamepad.sThumbLY = (SHORT)0xFFC0;
+        c.Gamepad.sThumbRX = c.Gamepad.sThumbRY = (SHORT)0xFFC0;
+        *out = c;
+        return ERROR_SUCCESS;
+    }
+    if (g_origXiGetCaps) return g_origXiGetCaps(idx, flags, out);
+    return ERROR_DEVICE_NOT_CONNECTED;
+}
+
+// Retried from Present until it takes. The module is imported by the exe so it is loaded before
+// we are, but ordering assumptions about another process's loader are exactly the kind of thing
+// that holds until it does not.
+static void InstallXInputHook()
+{
+    if (g_xiHooked) return;
+    static long tries = 0;
+    if (++tries > 600) return;                    // ten seconds at 60 fps, then stop asking
+
+    HMODULE xi = GetModuleHandleA("xinput1_3.dll");
+    if (!xi) xi = GetModuleHandleA("XINPUT1_3.dll");
+    if (!xi) xi = GetModuleHandleA("xinput9_1_0.dll");
+    if (!xi) xi = GetModuleHandleA("xinput1_4.dll");
+    if (!xi) return;
+
+    void* pState = (void*)GetProcAddress(xi, "XInputGetState");
+    void* pCaps  = (void*)GetProcAddress(xi, "XInputGetCapabilities");
+    if (!pState) { g_xiHooked = true; Log("[pad] XInputGetState not exported - cannot hook"); return; }
+
+    if (MH_Initialize() != MH_OK && MH_Initialize() != MH_ERROR_ALREADY_INITIALIZED) {
+        g_xiHooked = true;
+        Log("[pad] MH_Initialize failed - controllers unavailable");
+        return;
+    }
+    MH_STATUS a = MH_CreateHook(pState, (void*)&Hook_XInputGetState, (void**)&g_origXiGetState);
+    if (a == MH_OK) MH_EnableHook(pState);
+    if (pCaps) {
+        MH_STATUS c = MH_CreateHook(pCaps, (void*)&Hook_XInputGetCaps, (void**)&g_origXiGetCaps);
+        if (c == MH_OK) MH_EnableHook(pCaps);
+    }
+    g_xiHooked = true;
+    Log("*** [pad] XInputGetState hooked in %s (status %d) - motion controllers act as a pad",
+        xi == GetModuleHandleA("xinput1_3.dll") ? "xinput1_3.dll" : "an xinput module", (int)a);
 }
 
 // Actions only deliver data while FOCUSED, and frames may only be submitted while the session
@@ -1248,6 +1580,9 @@ static void SubmitTestQuad()
     // Head tracking uses the SAME predicted display time the frame is submitted for, so the
     // pose the game renders from and the pose the compositor expects agree.
     ApplyHeadTracking(fs.predictedDisplayTime);
+    // Once a frame, beside the head sample. Both read the same runtime and both describe the same
+    // instant, so keeping them together is what stops the sticks from lagging the view.
+    XrSyncInput();
     TickPacing();
     ReportStereoGeometry();
     // ReportPoseHonesty is gone. It compared the CHANGE in head yaw against the change in the
@@ -3547,6 +3882,18 @@ static void CheckHeadHotkeys()
     // NUMPAD8 switches the frame grab between the shared surface and the old CPU round trip.
     // THIS one can be a runtime toggle where the device type could not: the grab is chosen per
     // frame and owns nothing the game can see.
+    // NUMPAD9 drops the synthesised pad. Worth having as a keypress rather than a rebuild: if the
+    // game decides a controller is present it switches its prompts and can stop listening to the
+    // keyboard, and that needs to be reversible from inside the headset.
+    static bool pN9 = false;
+    const bool dN9 = (GetAsyncKeyState(VK_NUMPAD9) & 0x8000) != 0;
+    if (dN9 && !pN9) {
+        g_padEnabled = !g_padEnabled;
+        Log("*** [pad] NUMPAD9 -> motion controllers %s",
+            g_padEnabled ? "ON (acting as a gamepad)" : "OFF (keyboard and mouse only)");
+    }
+    pN9 = dN9;
+
     static bool pN8 = false;
     const bool dN8 = (GetAsyncKeyState(VK_NUMPAD8) & 0x8000) != 0;
     if (dN8 && !pN8) {
@@ -5912,6 +6259,8 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
 
     // Cheap once the object model is up: re-resolves only when the cached pointer stops
     // looking like a TdSwanNeck, which is on level transitions.
+    InstallXInputHook();
+
     // AutoArm last, so a manual keypress on this frame is seen before the sequence acts on it.
     if (g_offName >= 0) {
         CheckSwanHotkey(); ApplySwanNeck(); CheckHeadHotkeys(); CheckVMHotkey(); AutoArm();
