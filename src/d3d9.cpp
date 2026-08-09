@@ -2427,6 +2427,7 @@ extern int g_offDefaultFOV;
 extern int g_offCamLoc;
 extern int g_offCamRot;
 extern int g_offMoveState;
+extern int g_offCtlPawn;        // PlayerController::Pawn - the pawn without a 115k-object walk
 
 static DWORD WINAPI ObjectModelThread(LPVOID)
 {
@@ -2513,6 +2514,14 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                 g_offCamLoc = LookupProp("TdPlayerPawn", "PlayerCameraLocation", true);
                 LookupProp("TdPlayerPawn", "SwanNeck1p", true);
                 g_offMoveState = LookupProp("TdPlayerPawn", "MovementState", true);
+
+                // ---- the lookup that replaces a search with a read ----
+                //
+                // Controller::Pawn is the pawn, directly. FindPlayerPawn answers the same question
+                // by walking every object in the game - measured at 1.2-1.6 s over ~115000 slots,
+                // on the render thread - and then not repeating for 600 frames, which is the
+                // delay after every death.
+                g_offCtlPawn = LookupProp("TdPlayerController", "Pawn", true);
                 DumpClassProperties("TdPlayerController", 60);
                 FindEngineObject();
             }
@@ -4191,27 +4200,115 @@ static void CheckHeadHotkeys()
 
 int g_offCamLoc = -1;
 int g_offCamRot = -1;
+int g_offCtlPawn = -1;
 
 uintptr_t g_playerPawn = 0;
 static long      g_pawnNextTry = 0;
 static bool      g_pawnMissLogged = false;
+// Last pawn accepted and last pawn refused via the controller, so each logs a CHANGE rather
+// than once per frame.
+static uintptr_t g_pawnFromCtl = 0;
+static uintptr_t g_pawnRejectedFromCtl = 0;
 
 // Non-static: declared above, where the rung 5b code drives the pawn search.
+// Is obj an instance of `wantClass` OR of anything derived from it?
+//
+// UE3 chains classes through SuperField at +0x3C - the same field LookupProp walks to find an
+// inherited property, and for the same reason: what you are looking for is usually declared
+// further up than the object's own class.
+static bool IsAOfClass(uintptr_t obj, const char* wantClass)
+{
+    uint32_t cls;
+    if (!SafeU32(obj + 0x34, &cls) || cls < 0x10000) return false;
+    for (int depth = 0; cls && depth < 16; ++depth) {
+        if (ObjNameIs(cls, wantClass)) return true;
+        uint32_t super;
+        if (!SafeU32(cls + 0x3C, &super) || super < 0x10000) break;
+        cls = super;
+    }
+    return false;
+}
+
+// ⚠️ WHAT THE PAWN IS CALLED IS NOT THE TEST. What it IS, is.
+//
+// This asked two questions about names and both were wrong, in the same way, one level apart.
+//
+// It required the object's OWN NAME to be "TdPlayerPawn". UE3 derives a spawned actor's name
+// from its class, so that holds for anything the engine spawns and need not hold for an actor a
+// designer placed in a level.
+//
+// It then required the EXACT class. Measured, and it is why a new game never worked while
+// loading a save always did: the tutorial level's player pawn is a **TdTutorialPawn**, and there
+// is no TdPlayerPawn instance in that level at all. The full walk found one object of the class
+// and it was the class default object:
+//
+//     [vm] no live TdPlayerPawn - 1395.1 ms over 104834 slots, 1 objects of that class
+//                                 named: Default__TdPlayerPawn
+//     [view] ViewTarget -> 4785C800 class "TdTutorialPawn"  |  pawn is 00000000
+//
+// So the chain is walked and the question asked once. The offsets stay valid either way:
+// PlayerCameraLocation and PlayerCameraRotation are declared on TdPlayerPawn, and a subclass
+// inherits them at the same offsets.
+//
+// The one thing that answers yes and should not is the class default object - a structurally
+// perfect instance - which is what the own-name check was really buying, and all it was buying.
 bool LooksLikePlayerPawn(uintptr_t obj)
 {
     if (!obj || g_offName < 0) return false;
     uint32_t vt;
     if (!SafeU32(obj, &vt) || !InModule(vt)) return false;
-    if (!ObjNameIs(obj, "TdPlayerPawn")) return false;
-    uint32_t cls;
-    if (!SafeU32(obj + 0x34, &cls) || cls < 0x10000) return false;
-    return ObjNameIs(cls, "TdPlayerPawn");
+    if (!IsAOfClass(obj, "TdPlayerPawn")) return false;
+    char nm[64];
+    if (!ReadObjName(obj, nm, sizeof(nm))) return false;
+    return strncmp(nm, "Default__", 9) != 0;
 }
 
 uintptr_t FindPlayerPawn()
 {
     if (LooksLikePlayerPawn(g_playerPawn)) return g_playerPawn;
     if (g_playerPawn) { g_playerPawn = 0; g_pawnNextTry = 0; }
+
+    // ---- ⚠️ ASK THE CONTROLLER. The walk is the fallback, not the method. ----
+    //
+    // Controller::Pawn is the answer as one pointer read. The walk below answers the same
+    // question in 1.2-1.6 seconds across ~115000 slots, on the render thread, and then refuses
+    // to repeat for 600 frames - which is not a cache, it is the delay after every death,
+    // measured at 10-14 s of mono while the new pawn sits there unfound.
+    //
+    // The controller SURVIVES the death that destroys the pawn, so this path is live at exactly
+    // the moment the walk is not. Validated through LooksLikePlayerPawn rather than trusted: a
+    // stale or mid-respawn Pawn pointer must fail the same test as anything else.
+    if (g_offCtlPawn >= 0 && g_playerCtl) {
+        uint32_t p = 0;
+        if (SafeU32(g_playerCtl + g_offCtlPawn, &p) && p >= 0x10000) {
+            char cn[64] = "?";
+            uint32_t clsObj = 0;
+            if (SafeU32(p + 0x34, &clsObj) && clsObj >= 0x10000)
+                ReadObjName(clsObj, cn, sizeof(cn));
+
+            if (LooksLikePlayerPawn(p)) {
+                g_playerPawn = p;
+                g_pawnMissLogged = false;
+                if (g_pawnFromCtl != p) {
+                    g_pawnFromCtl = p;
+                    Log("[vm] pawn %p class \"%s\" - from Controller::Pawn, no walk",
+                        (void*)p, cn);
+                }
+                return p;
+            }
+
+            // ⚠️ The controller HAS a pawn and we are refusing it. That is the shape of both
+            // naming failures above - a live pawn on the other side of an assumption - and both
+            // times the log said only "not found". It says what it turned down now.
+            if (g_pawnRejectedFromCtl != p) {
+                g_pawnRejectedFromCtl = p;
+                Log("[vm] ⚠️ Controller::Pawn is %p class \"%s\" and it is being REJECTED -"
+                    " not a TdPlayerPawn by any ancestor. The camera offsets do not apply to it.",
+                    (void*)p, cn);
+            }
+        }
+    }
+
     if (g_frames < g_pawnNextTry) return 0;
     if (!g_gobjAddr || g_offName < 0) { g_pawnNextTry = g_frames + 600; return 0; }
 
@@ -4219,17 +4316,50 @@ uintptr_t FindPlayerPawn()
     if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) {
         g_pawnNextTry = g_frames + 600; return 0;
     }
+    // ---- diag: a miss must say what it SAW, not only that it saw nothing ----
+    //
+    // The old miss line was three words and it cost two runs. "no live TdPlayerPawn yet" cannot
+    // distinguish an unreadable object table from a table with no such class in it from a table
+    // full of them being turned away by the predicate. Naming what it turned down is what
+    // produced "1 objects of that class named: Default__TdPlayerPawn" - which said, in one line,
+    // that the level had no such pawn and the search was looking for the wrong thing entirely.
+    const double t0 = NowMs();
+    int  kinds = 0;
+    char seen[3][64] = {};
+
     for (uint32_t i = 0; i < count; ++i) {
-        uint32_t obj;
+        uint32_t obj, vt;
         if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
-        if (!LooksLikePlayerPawn(obj)) continue;
+        if (!SafeU32(obj, &vt) || !InModule(vt)) continue;
+        if (!IsAOfClass(obj, "TdPlayerPawn")) continue;
+
+        char nm[64] = "";
+        if (!ReadObjName(obj, nm, sizeof(nm))) continue;
+        // Report the CLASS, not the object name: the class is what varies between levels and it
+        // is the thing that was wrong. TdTutorialPawn is invisible in a list of object names.
+        char cn[64] = "?";
+        uint32_t clsObj = 0;
+        if (SafeU32(obj + 0x34, &clsObj) && clsObj >= 0x10000) ReadObjName(clsObj, cn, sizeof(cn));
+        if (kinds < 3) strcpy_s(seen[kinds], cn);
+        kinds++;
+        if (strncmp(nm, "Default__", 9) == 0) continue;   // the CDO is not a live pawn
+
         g_playerPawn = obj;
         g_pawnMissLogged = false;
-        Log("[vm] TdPlayerPawn instance at %p", (void*)obj);
+        Log("[vm] pawn %p class \"%s\" - found by WALK, %.1f ms over %u slots"
+            " (Controller::Pawn should have got here first)",
+            (void*)obj, cn, NowMs() - t0, count);
         return obj;
     }
     g_pawnNextTry = g_frames + 600;   // same backoff discipline as the other searches
-    if (!g_pawnMissLogged) { g_pawnMissLogged = true; Log("[vm] no live TdPlayerPawn yet"); }
+    if (!g_pawnMissLogged) {
+        g_pawnMissLogged = true;
+        Log("[vm] no live pawn of any TdPlayerPawn kind - %.1f ms over %u slots, %d seen%s%s%s%s",
+            NowMs() - t0, count, kinds,
+            kinds > 0 ? ", classes: " : "",
+            kinds > 0 ? seen[0] : "",
+            kinds > 1 ? ", " : "", kinds > 1 ? seen[1] : "");
+    }
     return 0;
 }
 
