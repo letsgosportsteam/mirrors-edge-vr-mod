@@ -1246,6 +1246,45 @@ lines above them are removals of the engine defaults.
 call for a pad and reads oddly on a controller held in the fist, where it lands on the grip. The
 mod maps 1:1 and does not second-guess it.
 
+### âš ï¸ The two controls the table above leaves out, and why they matter
+
+The table lists what is bound to something useful. Reading it as the complete picture is what
+sent one investigation the wrong way, so the remaining two entries are recorded here.
+
+**D-pad â€” bound, but to engine debris. Do not map it.** The game removes the engine defaults
+(`MoveForward` / `MoveBackward` / `TurnLeft` / `TurnRight`, lines 61â€“64) and replaces them under
+a comment reading `; Hard bindings`:
+
+| D-pad | Command |
+|---|---|
+| Up | `SwitchToItemInSlot 1 \| God` |
+| Down | `SwitchToItemInSlot 2 \| Jesus \| TriggerEmoteMessage 1` |
+| Left | `SwitchToItemInSlot 3 \| InvertMouseCheat \| TriggerEmoteMessage 2` |
+| Right | `SwitchToItemInSlot 4 \| DropMe \| TriggerEmoteMessage 0` |
+
+Vestigial UT3 CheatManager exec functions, not Mirror's Edge actions. Whether a shipping build
+instantiates the CheatManager at all is **unverified** â€” but `InvertMouseCheat` or `God` firing
+mid-run is a bad way to find out, and there is no upside to weigh against it.
+
+In menus the d-pad *is* used heavily â€” `NavFocus*`, `MoveSelection*`, `ScrollUp`/`Down`, slider
+increment, `NextPage`/`PreviousPage`. Every one of those aliases lists `Gamepad_LeftStick_*`
+beside it, so the left stick already reaches all of it. Two go further and are stick-only:
+`UIOptionListBase.MoveSelectionLeft/Right` names no d-pad key, and the chapter shelf uses
+shoulders and triggers. **Nothing in the UI needs the d-pad.**
+
+**Left thumbstick click â€” deliberately blanked, and therefore free.** Line 146:
+
+```
+.Bindings=(Name="XboxTypeS_LeftThumbstick",Command="")
+```
+
+An explicit override killing the engine default of `ToggleDebugCamera` (`BaseInput.ini` line
+115). It is dead in menus too â€” every widget alias naming a stick click names the right one.
+
+That made it the place to put **Back / `GBA_InGameMenu`**, which was otherwise unreachable: a
+Touch pair has no spare button, and the right controller's system button belongs to the runtime.
+The mod maps left stick click â†’ `MEVR_PAD_BACK`.
+
 Menus bind **A to `Clicked`** and **B to `Consume`**, so any remap that moves those makes confirm
 a different button in menus than in play.
 

@@ -675,7 +675,21 @@ static void XrSyncInput()
     if (bl(g_aX)) b |= MEVR_PAD_X;
     if (bl(g_aY)) b |= MEVR_PAD_Y;
     if (bl(g_aMenu))   b |= MEVR_PAD_START;
-    if (bl(g_aLClick)) b |= MEVR_PAD_LTHUMB;
+    // ---- left stick click is BACK, not LTHUMB ----
+    //
+    // Back is `GBA_InGameMenu` and was the one live binding no physical control could reach:
+    // every button on a Touch pair is already spoken for, and the right controller's system
+    // button belongs to the runtime. LTHUMB was the one press being spent on nothing.
+    //
+    // "Nothing" is the game's own decision, not an omission. DefaultInput.ini line 146 is
+    // `.Bindings=(Name="XboxTypeS_LeftThumbstick",Command="")` - an explicit blanking, put there
+    // to kill the engine default of ToggleDebugCamera in BaseInput.ini. It is dead in menus too;
+    // every widget alias that names a stick click names the RIGHT one.
+    //
+    // So this costs nothing and buys the in-game menu. The pad is synthesised, so the remap
+    // happens here - hand-editing the ini is not an option, the game hash-checks its config and
+    // refuses to start, already measured at two runs.
+    if (bl(g_aLClick)) b |= MEVR_PAD_BACK;
     if (bl(g_aRClick)) b |= MEVR_PAD_RTHUMB;
     // Grips are analogue on Touch and shoulder buttons on a pad, so they cross over at a
     // threshold rather than being dropped. Half pressed is deliberate: a grip is squeezed
