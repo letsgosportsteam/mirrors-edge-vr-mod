@@ -106,6 +106,17 @@ enum {
     DEV_SetVertexShaderConstantF = 94,
 };
 
+// ---------------------------------------------------------------- version
+//
+// The single source of truth for the build's identity. build.ps1 PARSES THIS LINE to name
+// the release zip, rather than carrying its own copy that could disagree with the DLL's -
+// the same reasoning that makes it read `#include <openxr...>` instead of a flag.
+//
+// It exists for one reason: mevr.log is the whole diagnostic channel, and a pasted log that
+// cannot say which build produced it turns every bug report into a round trip. Logged in the
+// header, above everything, so it survives truncation from either end.
+#define MEVR_VERSION "0.1.0-alpha"
+
 // ---------------------------------------------------------------- state
 
 static HMODULE          g_real       = nullptr;
@@ -7827,13 +7838,15 @@ static void LogHeader()
     char exe[MAX_PATH * 2] = "";
     WideCharToMultiByte(CP_UTF8, 0, exeW, -1, exe, sizeof(exe), nullptr, nullptr);
 
-    Log("=== Mirror's Edge VR rung 1 attached %04u-%02u-%02u %02u:%02u:%02u - run starts here ===",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    Log("=== Mirror's Edge VR %s attached %04u-%02u-%02u %02u:%02u:%02u - run starts here ===",
+        MEVR_VERSION, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
     Log("[host] %s", exe);
     Log("[host] pid %lu, this DLL is %u-bit",
         GetCurrentProcessId(), (unsigned)(sizeof(void*) * 8));
-    Log("[note] Observation only. Nothing is altered; the game must behave exactly as");
-    Log("[note] it does without this file. Any visible difference is itself a finding.");
+    // Built here rather than written as a literal so it cannot drift from the compiler that
+    // actually produced the binary - "which build is this" is the first question a bug report
+    // has to answer, and a hand-maintained string answers it wrongly eventually.
+    Log("[host] built %s %s with MSC %d", __DATE__, __TIME__, (int)_MSC_VER);
 }
 
 // ---------------------------------------------------------------- settings
@@ -7912,9 +7925,19 @@ static void LoadSettings()
     if (!ok) { Log("[cfg] mevr.ini could not be read"); return; }
     buf[got] = 0;
 
+    // Skip a UTF-8 BOM. Notepad and most Windows editors offer "UTF-8 with BOM" and some
+    // default to it, so a user who edits this file can easily add one - and we do not control
+    // their editor. The three bytes are not spaces or tabs, so the trim below leaves them, the
+    // first line then matches neither the comment test nor a key, and the file's own opening
+    // comment is reported as rejected. A file whose FIRST line is a setting would lose it.
+    char* text = buf;
+    if (got >= 3 && (unsigned char)buf[0] == 0xEF
+                 && (unsigned char)buf[1] == 0xBB
+                 && (unsigned char)buf[2] == 0xBF) text += 3;
+
     int applied = 0, rejected = 0;
     char* ctx = nullptr;
-    for (char* line = strtok_s(buf, "\r\n", &ctx); line; line = strtok_s(nullptr, "\r\n", &ctx)) {
+    for (char* line = strtok_s(text, "\r\n", &ctx); line; line = strtok_s(nullptr, "\r\n", &ctx)) {
         while (*line == ' ' || *line == '\t') ++line;
         if (!*line || *line == ';' || *line == '#' || *line == '[') continue;
 

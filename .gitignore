@@ -21,6 +21,12 @@ paths.local.ps1
 # keep the OpenXR loader out - it is vendored at build time from the SDK
 openxr_loader*.dll
 
+# ---- release staging ----
+# `build.ps1 -Package` writes here. Release artefacts belong on a GitHub release, attached
+# to a tag, not in git history - a zip does not delta-compress, so every rebuild committed
+# would add its full size to the clone forever.
+dist/
+
 # ---- run artefacts ----
 last_run.log
 run*.log

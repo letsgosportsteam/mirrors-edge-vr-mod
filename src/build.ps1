@@ -4,7 +4,7 @@
 # Everything machine-specific lives in `paths.local.ps1` (gitignored) or in the
 # MEVR_OPENXR_SDK / MEVR_GAME_BIN environment variables. This script contains no paths.
 
-param([switch]$Install)
+param([switch]$Install, [switch]$Package)
 
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -156,6 +156,114 @@ try {
                 Write-Host "Copied mevr.ini.example. Rename it to mevr.ini there to use it."
             }
         }
+    }
+
+    # ---- -Package: stage the release zip ----
+    #
+    # Everything a user needs and nothing else. The two rules this enforces, because both
+    # failures are silent and both reach the user before anyone notices:
+    #
+    #   1. A zip must correspond to a COMMIT. Otherwise the version in the log names a tree
+    #      nobody can check out, and the first question a bug report has to answer - "which
+    #      build is this" - has no answer.
+    #   2. The shipped mevr.ini must actually say Debug=off. The compiled default is ON, so a
+    #      failed substitution does not produce a broken build; it produces a working build
+    #      with a diagnostic overlay across the player's face.
+    if ($Package) {
+        if (-not $needsOpenXr) { throw "packaging a build with no OpenXR is not a release" }
+
+        # ---- the version, read from the source ----
+        # Same principle as $needsOpenXr above: the DLL logs this string, so parsing it here
+        # means the zip cannot be named after a version the binary does not report.
+        $verLine = Select-String -LiteralPath (Join-Path $here "d3d9.cpp") `
+                                 -Pattern '^\s*#define\s+MEVR_VERSION\s+"([^"]+)"'
+        if (-not $verLine) { throw "no MEVR_VERSION #define found in d3d9.cpp" }
+        $version = $verLine.Matches[0].Groups[1].Value
+
+        # ---- refuse to package a dirty or unknown tree ----
+        $dirty = git -C $root status --porcelain
+        if ($LASTEXITCODE -ne 0) { throw "not a git repository - cannot identify this build" }
+        if ($dirty) {
+            $dirty | ForEach-Object { Write-Host "  $_" }
+            throw "working tree is dirty. Commit or stash before packaging - a release zip " +
+                  "that does not correspond to a commit cannot be reproduced or bisected."
+        }
+        $sha = (git -C $root rev-parse --short HEAD).Trim()
+
+        & (Join-Path $root "tools\check-clean.ps1")
+        if ($LASTEXITCODE -ne 0) { throw "check-clean failed - not packaging" }
+
+        # ---- the DLL must be 32-bit ----
+        # The game is a 32-bit process, so an x64 d3d9.dll is not loaded at all - which looks
+        # exactly like the mod doing nothing. Read the PE machine field rather than trusting
+        # that vcvarsall was invoked with x86 twenty lines up.
+        $dllPath = Join-Path $here "d3d9.dll"
+        $fs = [System.IO.File]::OpenRead($dllPath)
+        try {
+            $br = New-Object System.IO.BinaryReader($fs)
+            $fs.Position = 0x3C
+            $fs.Position = $br.ReadInt32() + 4      # e_lfanew -> COFF header, past "PE\0\0"
+            $machine = $br.ReadUInt16()
+        } finally { $fs.Dispose() }
+        if ($machine -ne 0x014C) {
+            throw ("d3d9.dll is not x86 (PE machine 0x{0:X4}, expected 0x014C)" -f $machine)
+        }
+
+        $dist  = Join-Path $root "dist"
+        $stage = Join-Path $dist "mevr-$version"
+        if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+        New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+        Copy-Item $dllPath $stage
+        Copy-Item (Join-Path $binDir "openxr_loader.dll") $stage
+        Copy-Item (Join-Path $root "LICENSE")                  (Join-Path $stage "LICENSE.txt")
+        Copy-Item (Join-Path $root "THIRD-PARTY-NOTICES.txt")   $stage
+        Copy-Item (Join-Path $root "packaging\README.txt")      $stage
+
+        # ---- mevr.ini, derived from the example rather than kept as a second copy ----
+        #
+        # One source of truth for the settings and their documentation, with exactly two
+        # deliberate release deltas. Each MUST match, or the build stops: a silently skipped
+        # substitution here ships the wrong default, and nothing downstream would catch it.
+        $iniText = Get-Content (Join-Path $root "mevr.ini.example") -Raw
+        $edits = @(
+            @{ What = "the rename instruction";
+               Rx   = '(?m)^; Rename this file to  mevr\.ini  and leave it beside d3d9\.dll.*$';
+               To   = '; This IS mevr.ini. Keep it beside d3d9.dll in the game''s Binaries folder.' }
+            @{ What = "Debug defaulted off for release";
+               Rx   = '(?m)^Debug = on\s*$';
+               To   = 'Debug = off' }
+        )
+        foreach ($e in $edits) {
+            if ($iniText -notmatch $e.Rx) {
+                throw "packaging cannot apply '$($e.What)' - mevr.ini.example no longer matches. " +
+                      "Fix the pattern in build.ps1 rather than shipping the file unedited."
+            }
+            $iniText = [regex]::Replace($iniText, $e.Rx, $e.To)
+        }
+        # NOT Set-Content -Encoding utf8, which on Windows PowerShell 5.1 writes a BOM. The
+        # parser skips spaces and tabs before testing for ';', and a BOM is neither - so the
+        # file's own first comment would be reported as a rejected line in every release, and
+        # a setting on line 1 would be dropped outright. LoadSettings tolerates a BOM now; this
+        # side simply never produces one.
+        [System.IO.File]::WriteAllText((Join-Path $stage "mevr.ini"), $iniText,
+                                       (New-Object System.Text.UTF8Encoding($false)))
+
+        $zip = Join-Path $dist "mevr-$version.zip"
+        if (Test-Path $zip) { Remove-Item $zip -Force }
+        Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip
+
+        # The PDB is a SEPARATE release asset, never inside the zip. It is wanted only to turn
+        # a crash address in somebody's log into a line number, and putting it in the zip
+        # invites users to copy it into Binaries where it does nothing.
+        Copy-Item (Join-Path $here "d3d9.pdb") (Join-Path $dist "d3d9-$version.pdb") -Force
+
+        Write-Host ""
+        Write-Host "Packaged $version ($sha)" -ForegroundColor Green
+        Write-Host "  $zip"
+        Write-Host "  $(Join-Path $dist "d3d9-$version.pdb")  (separate release asset, not in the zip)"
+        Write-Host ""
+        Write-Host "  git tag -a v$version -m ""pre-alpha"" && git push origin v$version"
     }
 } finally {
     Pop-Location

@@ -23,7 +23,11 @@ $patterns = @(
 $allow = @(
     @{ Rx = '(?i)noreply@anthropic\.com';          Why = "commit trailer, not a personal address" }
     @{ Rx = '(?i)users\.noreply\.github\.com';     Why = "GitHub privacy address, deliberate" }
-    @{ Rx = '(?i)github\.com/(EliotVU|yole|softsoundd|TsudaKageyu)'; Why = "third-party project references" }
+    @{ Rx = '(?i)github\.com/(EliotVU|yole|softsoundd|TsudaKageyu|KhronosGroup)'; Why = "third-party project references" }
+    # This repository's own public URL. The pattern exists to catch a link that would
+    # deanonymise the author or point at somewhere private - not to forbid the project
+    # naming itself in its own README, which is where users find the releases and issues.
+    @{ Rx = '(?i)github\.com/letsgosportsteam';    Why = "this project's own public repository" }
     @{ Rx = '(?i)^X:\\path\\';                     Why = "placeholder in paths.local.ps1.example" }
     @{ Rx = '(?i)nvidia\.com';                     Why = "vendor URL in a user-facing message" }
 )

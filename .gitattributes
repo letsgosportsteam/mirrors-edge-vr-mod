@@ -15,3 +15,11 @@
 *.c         text
 *.md        text
 *.def       text
+
+# The files a user actually unzips and opens. These leave the development environment
+# entirely, so they get CRLF explicitly rather than whatever the checkout happened to
+# produce - the release zip copies them straight out of the working tree, and the reader
+# on the other end is on Windows in an unknown editor.
+*.txt          text eol=crlf
+LICENSE        text eol=crlf
+*.ini.example  text eol=crlf

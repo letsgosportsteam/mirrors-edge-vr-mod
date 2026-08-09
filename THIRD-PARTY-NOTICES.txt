@@ -1,0 +1,106 @@
+THIRD-PARTY NOTICES
+Mirror's Edge VR
+
+This file lists software by other authors that is compiled into `d3d9.dll` or
+shipped alongside it. It travels WITH THE BINARY, not only with the source:
+both licences below require their notice to accompany redistributions in binary
+form, and the release zip is a binary redistribution.
+
+The mod's own code is MIT — see LICENSE.
+
+============================================================================
+1. MinHook
+============================================================================
+
+Compiled into d3d9.dll. Source vendored under third_party/minhook/.
+
+    Homepage : https://github.com/TsudaKageyu/minhook
+    Licence  : BSD 2-Clause
+    Full text: third_party/minhook/LICENSE.txt
+
+    MinHook - The Minimalistic API Hooking Library for x64/x86
+    Copyright (C) 2009-2017 Tsuda Kageyu.
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
+
+     1. Redistributions of source code must retain the above copyright
+        notice, this list of conditions and the following disclaimer.
+     2. Redistributions in binary form must reproduce the above copyright
+        notice, this list of conditions and the following disclaimer in the
+        documentation and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+    TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+    PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER
+    OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+    EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+    PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+    PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+    LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+    NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+MinHook includes the Hacker Disassembler Engine 32/64 C, Copyright (c)
+2008-2009 Vyacheslav Patkov, under the same terms. Its notice is reproduced in
+full in third_party/minhook/LICENSE.txt.
+
+============================================================================
+2. OpenXR Loader
+============================================================================
+
+Shipped as `openxr_loader.dll` beside d3d9.dll. NOT vendored in this repo; it
+is taken from the Khronos OpenXR.Loader NuGet package at build time.
+
+    Homepage : https://github.com/KhronosGroup/OpenXR-SDK
+    Package  : OpenXR.Loader 1.1.61 (native/Win32/release)
+    Licence  : Apache-2.0 OR MIT — the package's own SPDX expression
+
+The dual licence lets a redistributor pick either. THIS PROJECT TAKES THE MIT
+BRANCH, because MIT is satisfied by reproducing the notice below, whereas
+Apache-2.0 would additionally require carrying its NOTICE file and marking
+modified files — obligations with no benefit here, since the loader is shipped
+verbatim and unmodified.
+
+    Copyright (c) The Khronos Group Inc.
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+
+============================================================================
+3. Microsoft Visual C++ runtime
+============================================================================
+
+d3d9.dll is built with /MD and therefore imports vcruntime140.dll and
+msvcp140.dll. These are NOT redistributed here — the mod requires the user to
+install Microsoft's own redistributable, so no licence obligation attaches to
+this package. See README.md for the download.
+
+============================================================================
+Not distributed
+============================================================================
+
+reference/singularity_d3d9.cpp is kept for study and is not compiled, not
+linked, and not present in any release artefact.
+
+Mirror's Edge is a trademark of Electronic Arts Inc. This project is not
+affiliated with or endorsed by EA or DICE, contains no game code or assets,
+and is useless without a legally obtained copy of the game.
