@@ -109,6 +109,7 @@ enum {
 // ---------------------------------------------------------------- state
 
 static HMODULE          g_real       = nullptr;
+static HMODULE          g_selfModule = nullptr;   // this DLL, for finding mevr.ini beside it
 static CRITICAL_SECTION g_lock;
 static bool             g_lockReady  = false;
 static wchar_t          g_logPath[MAX_PATH] = L"";
@@ -7797,10 +7798,131 @@ static void LogHeader()
     Log("[note] it does without this file. Any visible difference is itself a finding.");
 }
 
+// ---------------------------------------------------------------- settings
+//
+// mevr.ini, looked for BESIDE THIS DLL first and in the log directory second. Absent from both,
+// everything keeps its compiled default - the file can only ever move a setting the hotkeys
+// could already move, so there is no state here that a run without it cannot reach.
+//
+// Beside the DLL is the primary location because that is what shipping looks like: drop
+// d3d9.dll and mevr.ini into Binaries together and the mod is installed and configured. The log
+// directory is kept as a fallback for anyone who would rather not put files in the game folder,
+// and because the log already lives there.
+//
+// ⚠️ Binaries is NOT the hash-checked directory - that is TdGame\Config, whose files the game
+// verifies and refuses to start without, already measured at two runs. Nothing here goes near
+// it, and nothing in mevr.ini corresponds to anything the game reads.
+//
+// Parsed by hand rather than through GetPrivateProfileString for one reason: that API cannot
+// tell you about a key it was not asked for. A typo would silently do nothing, which in a mod
+// configured while wearing a headset is the worst possible failure. Every line is either applied
+// and logged, or rejected and logged.
+static bool SettingBool(const char* v, bool* out)
+{
+    if (_stricmp(v, "1") == 0 || _stricmp(v, "true") == 0 ||
+        _stricmp(v, "on") == 0 || _stricmp(v, "yes") == 0) { *out = true;  return true; }
+    if (_stricmp(v, "0") == 0 || _stricmp(v, "false") == 0 ||
+        _stricmp(v, "off") == 0 || _stricmp(v, "no") == 0) { *out = false; return true; }
+    return false;
+}
+
+// Replace the filename on a full path. Returns false rather than truncating.
+static bool PathSibling(const wchar_t* full, const wchar_t* leaf, wchar_t* out, size_t cap)
+{
+    if (!full || !full[0]) return false;
+    wcscpy_s(out, cap, full);
+    wchar_t* slash = wcsrchr(out, L'\\');
+    if (!slash) return false;
+    const size_t room = cap - (size_t)(slash + 1 - out);
+    if (wcslen(leaf) + 1 > room) return false;
+    wcscpy_s(slash + 1, room, leaf);
+    return true;
+}
+
+static void LoadSettings()
+{
+    wchar_t beside[MAX_PATH] = L"", fallback[MAX_PATH] = L"";
+    wchar_t self[MAX_PATH] = L"";
+    if (g_selfModule && GetModuleFileNameW(g_selfModule, self, MAX_PATH))
+        PathSibling(self, L"mevr.ini", beside, MAX_PATH);
+    PathSibling(g_logPath, L"mevr.ini", fallback, MAX_PATH);
+
+    const wchar_t* path = nullptr;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    for (const wchar_t* cand : { (const wchar_t*)beside, (const wchar_t*)fallback }) {
+        if (!cand[0]) continue;
+        h = CreateFileW(cand, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) { path = cand; break; }
+    }
+    if (h == INVALID_HANDLE_VALUE) {
+        // Both paths named, because "it is not reading my settings" is otherwise a guessing
+        // game about which directory the file should have been in.
+        Log("[cfg] no mevr.ini - every setting is at its compiled default. Looked beside the DLL");
+        Log("[cfg]   and beside the log; either location works, the DLL's own folder wins.");
+        return;
+    }
+    {
+        char shown[MAX_PATH * 2] = "";
+        WideCharToMultiByte(CP_UTF8, 0, path, -1, shown, sizeof(shown), nullptr, nullptr);
+        Log("[cfg] %s", shown);
+    }
+    char buf[8192];
+    DWORD got = 0;
+    const bool ok = ReadFile(h, buf, sizeof(buf) - 1, &got, nullptr) != 0;
+    CloseHandle(h);
+    if (!ok) { Log("[cfg] mevr.ini could not be read"); return; }
+    buf[got] = 0;
+
+    int applied = 0, rejected = 0;
+    char* ctx = nullptr;
+    for (char* line = strtok_s(buf, "\r\n", &ctx); line; line = strtok_s(nullptr, "\r\n", &ctx)) {
+        while (*line == ' ' || *line == '\t') ++line;
+        if (!*line || *line == ';' || *line == '#' || *line == '[') continue;
+
+        char* eq = strchr(line, '=');
+        if (!eq) { Log("[cfg]   ignored (no '='): %s", line); rejected++; continue; }
+        *eq = 0;
+        char* key = line;
+        char* val = eq + 1;
+        // trim both sides of both halves
+        for (char* e = key + strlen(key); e > key && (e[-1]==' '||e[-1]=='\t'); --e) e[-1] = 0;
+        while (*val == ' ' || *val == '\t') ++val;
+        for (char* e = val + strlen(val); e > val && (e[-1]==' '||e[-1]=='\t'); --e) e[-1] = 0;
+
+        // ---- the table. One row per setting; adding another is one row. ----
+        //
+        // The three animation locks are expressed as LOCKS, matching how they are spoken about,
+        // and inverted into the FOLLOW flags the code carries. Naming them "follow" in the file
+        // would invert the meaning of `0` relative to every conversation about them.
+        bool b = false;
+        if (_stricmp(key, "FrameCap") == 0) {
+            const float f = (float)atof(val);
+            if (f >= 20.0f && f <= 1000.0f) { g_fpsCap = f; Log("[cfg]   FrameCap = %.0f", f); applied++; }
+            else { Log("[cfg]   FrameCap '%s' out of range 20..1000 - ignored", val); rejected++; }
+        } else if (_stricmp(key, "LockAnimPitch") == 0) {
+            if (SettingBool(val, &b)) { g_animFollow = !b; Log("[cfg]   LockAnimPitch = %s", b?"on":"off"); applied++; }
+            else { Log("[cfg]   LockAnimPitch '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "LockAnimRoll") == 0) {
+            if (SettingBool(val, &b)) { g_animRollFollow = !b; Log("[cfg]   LockAnimRoll = %s", b?"on":"off"); applied++; }
+            else { Log("[cfg]   LockAnimRoll '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "LockAnimYaw") == 0) {
+            if (SettingBool(val, &b)) { g_animYawFollow = !b; Log("[cfg]   LockAnimYaw = %s", b?"on":"off"); applied++; }
+            else { Log("[cfg]   LockAnimYaw '%s' is not a boolean - ignored", val); rejected++; }
+        } else {
+            Log("[cfg]   unknown key '%s' - ignored", key);
+            rejected++;
+        }
+    }
+    Log("[cfg] %d applied, %d ignored. Hotkeys still override anything set here.",
+        applied, rejected);
+}
+
 BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(mod);
+        g_selfModule = mod;
         InitializeCriticalSection(&g_lock);
         g_lockReady = true;
         {
@@ -7811,6 +7933,9 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID)
         BuildLogPath();
         ArchivePreviousLog();
         LogHeader();
+        // Straight after the header, so what a run was configured with is the first thing in the
+        // log rather than something to be inferred from behaviour further down.
+        LoadSettings();
     } else if (reason == DLL_PROCESS_DETACH) {
         Log("");
         Log("=== SUMMARY ===");

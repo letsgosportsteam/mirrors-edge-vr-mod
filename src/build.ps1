@@ -1,4 +1,4 @@
-# Builds the VR shim as x86, and optionally installs it beside the game exe.
+﻿# Builds the VR shim as x86, and optionally installs it beside the game exe.
 # Compiles MinHook's C sources alongside the C++ shim (no separate lib step needed).
 #
 # Everything machine-specific lives in `paths.local.ps1` (gitignored) or in the
@@ -140,6 +140,21 @@ try {
             Write-Host "Installed d3d9.dll + openxr_loader.dll to the configured game folder."
         } else {
             Write-Host "Installed d3d9.dll to the configured game folder."
+        }
+
+        # The example goes too, so the dev install matches what a release looks like: the mod
+        # reads mevr.ini from beside the DLL, and that is only testable if this folder is laid
+        # out the way a user's would be.
+        #
+        # The EXAMPLE, never mevr.ini itself - overwriting somebody's edited settings on every
+        # build is exactly the kind of quiet loss this project keeps paying for elsewhere.
+        $iniExample = Join-Path $root "mevr.ini.example"
+        if (Test-Path $iniExample) {
+            Copy-Item $iniExample $GameBin -Force
+            $live = Join-Path $GameBin "mevr.ini"
+            if (-not (Test-Path $live)) {
+                Write-Host "Copied mevr.ini.example. Rename it to mevr.ini there to use it."
+            }
         }
     }
 } finally {

@@ -1,0 +1,56 @@
+; Mirror's Edge VR - optional settings
+;
+; Rename this file to  mevr.ini  and leave it beside d3d9.dll in the game's Binaries folder.
+; That is the whole installation: d3d9.dll and mevr.ini in the same directory.
+;
+; It is also read from %LOCALAPPDATA%\MirrorsEdgeVR\ (beside mevr.log) if you would rather not
+; put files in the game folder. Beside the DLL wins if both exist, and the log names the file
+; it actually read.
+;
+; With no file present every setting keeps its compiled default.
+;
+; This file can only set things the hotkeys could already set, so it cannot reach a state a
+; run without it could not. Hotkeys still work and override anything here.
+;
+; Every line is reported in the log at startup - applied, or rejected with the reason. A
+; misspelt key is never silent:
+;
+;     [cfg] R:\MirrorsEdge\Binaries\mevr.ini
+;     [cfg]   FrameCap = 72
+;     [cfg]   unknown key 'FrmeCap' - ignored
+;     [cfg] 1 applied, 1 ignored. Hotkeys still override anything set here.
+;
+; Binaries is safe. TdGame\Config is NOT - Mirror's Edge hash-checks the files in there and
+; refuses to start when they are edited, which cost two runs to learn. Nothing in this file
+; belongs anywhere near it.
+
+
+; ---------------------------------------------------------------- frame pacing
+
+; The engine's MaxSmoothedFrameRate. NUMPAD7 cycles 60 / 72 / 90 / 120 / 144 / 250 / 62.
+;
+; What matters is not the number but whether it divides the headset's refresh EXACTLY: a
+; frame held for 2 display periods every time is smoother than a faster rate held for 2
+; then 3. At 120 Hz that means 60; at 144 Hz it means 72. Press NUMPAD7 in game and the log
+; reports the ratio for the headset actually attached.
+;
+; 62 is the game's own shipped default, kept for comparison. 250 is effectively uncapped.
+FrameCap = 60
+
+
+; ---------------------------------------------------------------- animation locks
+;
+; Mirror's Edge moves the camera by itself constantly - wall-run roll, landing dips, vaults.
+; These cancel that motion per axis, leaving the view where your head put it.
+;
+; All OFF by default, which means the animation plays as the game shipped it. Turning one ON
+; locks that axis against the animation.
+;
+; Yaw is the one to leave off in most cases: an animation that turns the player is carrying
+; them somewhere, and cancelling it leaves the body facing one way and the view another.
+;
+; Hotkeys: NUMPAD2 pitch, NUMPAD4 roll, NUMPAD5 yaw.
+
+LockAnimPitch = off
+LockAnimRoll  = off
+LockAnimYaw   = off
