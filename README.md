@@ -4,14 +4,41 @@ A VR mod for *Mirror's Edge* (2008, Unreal Engine 3.536). It is a `d3d9.dll` pro
 forwards every Direct3D 9 export to the real system library, and along the way renders the
 game in stereo to an OpenXR headset with 6-DOF head tracking.
 
-No game files are modified. Installing is copying three files into the game's `Binaries`
-folder; uninstalling is deleting them.
-
 > **Pre-alpha.** This is an early build shared to gather reports, not a finished mod. The
 > HUD is broken in VR (see [Known issues](#known-issues)), and it has been tested on very
 > few machines. Expect crashes.
 
 ---
+
+## Install — three files into one folder
+
+**That is the whole installation.** No installer, no patcher, and no game file is modified.
+
+1. **Check [Requirements](#requirements) first** — you need **Virtual Desktop**. SteamVR and
+   Meta Link cannot run this at all. Ten seconds now saves a wasted download.
+2. Download **`mevr-<version>.zip`** from
+   [Releases](https://github.com/letsgosportsteam/mirrors-edge-vr-mod/releases).
+3. Unzip it, and copy these three files into the game's `Binaries` folder, beside
+   `MirrorsEdge.exe`:
+
+   ```
+   d3d9.dll
+   openxr_loader.dll
+   mevr.ini
+   ```
+
+4. Start the Virtual Desktop stream, **then** launch the game normally.
+
+To find `Binaries` on Steam: right-click the game → **Manage** → **Browse local files**, then
+open `Binaries`.
+
+Stereo arms itself a few seconds into the first loaded level — not at the menu. If it gives up,
+it says so in the log and tells you to press **F6**.
+
+**To uninstall:** delete those three files. Nothing else was touched.
+
+> ⚠️ **Do not put anything in `TdGame\Config`.** Mirror's Edge hash-checks the files in that
+> folder and refuses to start when they are edited. Nothing this mod needs goes near it.
 
 ## What works today
 
@@ -109,25 +136,6 @@ Three keyboard keys stay live even though the mod is otherwise invisible:
 
 The in-game menus do not display correctly in the headset yet. Until that is fixed, glance at
 the flat monitor to read them — the game is still rendering there normally.
-
-## Install
-
-1. Download `mevr-<version>.zip` from [Releases](https://github.com/letsgosportsteam/mirrors-edge-vr-mod/releases).
-2. Find the game's `Binaries` folder. In Steam: right-click the game → **Manage** → **Browse
-   local files**, then open `Binaries`. It is the folder containing `MirrorsEdge.exe`.
-3. Copy `d3d9.dll`, `openxr_loader.dll` and `mevr.ini` into it, beside the exe.
-4. **Start the Virtual Desktop stream first**, then launch the game normally.
-
-Stereo arms itself a few seconds into the first loaded level — not at the menu. If it gives
-up, it says so in the log and tells you to press **F6**.
-
-### Uninstall
-
-Delete those three files. Nothing else was touched, and no game file was modified.
-
-> ⚠️ **Do not put anything in `TdGame\Config`.** Mirror's Edge hash-checks the files in that
-> folder and refuses to start when they are edited. Nothing this mod needs goes anywhere
-> near it.
 
 ## Configuration
 
