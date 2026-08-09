@@ -2428,6 +2428,8 @@ extern int g_offCamLoc;
 extern int g_offCamRot;
 extern int g_offMoveState;
 extern int g_offCtlPawn;        // PlayerController::Pawn - the pawn without a 115k-object walk
+extern int g_offCtlCamera;      // PlayerController::PlayerCamera - how ViewTarget is reached
+extern int g_offCamViewTarget;  // Camera::ViewTarget - whose view is actually being rendered
 
 static DWORD WINAPI ObjectModelThread(LPVOID)
 {
@@ -2522,6 +2524,15 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                 // on the render thread - and then not repeating for 600 frames, which is the
                 // delay after every death.
                 g_offCtlPawn = LookupProp("TdPlayerController", "Pawn", true);
+
+                // Camera::ViewTarget is whose view is being RENDERED, which is a different
+                // question from where the pawn is and the one the scene test keeps needing.
+                // TdPlayerCamera.UpdateViewTarget guards its whole style switch on
+                // Pawn(OutVT.Target).CalcCamera(), so Target is the actor the frame belongs to:
+                // when it is not the pawn, the matrices on their way to the GPU are not the
+                // player's view and no amount of rejecting them is a fault.
+                g_offCtlCamera     = LookupProp("TdPlayerController", "PlayerCamera", true);
+                g_offCamViewTarget = LookupProp("TdPlayerCamera", "ViewTarget", true);
                 DumpClassProperties("TdPlayerController", 60);
                 FindEngineObject();
             }
@@ -4201,6 +4212,8 @@ static void CheckHeadHotkeys()
 int g_offCamLoc = -1;
 int g_offCamRot = -1;
 int g_offCtlPawn = -1;
+int g_offCtlCamera = -1;
+int g_offCamViewTarget = -1;
 
 uintptr_t g_playerPawn = 0;
 static long      g_pawnNextTry = 0;
@@ -4361,6 +4374,54 @@ uintptr_t FindPlayerPawn()
             kinds > 1 ? ", " : "", kinds > 1 ? seen[1] : "");
     }
     return 0;
+}
+
+// ---- diag: whose view is the engine actually rendering? ----
+//
+// The question behind three separate faults. The scene test rejects matrices during menus, death
+// cameras and cutscenes, and the log could only ever say that rejection went up, never why. If
+// Target is the pawn the frame is the player's view and rejection is a real fault; if it is
+// anything else, rejection is the correct answer to a frame that was never ours.
+//
+// ✅ The struct layout was a guess when this was written - LookupProp gives the offset of the
+// ViewTarget STRUCT, and that its first member is the Target pointer was UE3 knowledge rather
+// than a measurement here. The first run settled it, reading back "CameraActor" through an intro
+// cutscene and "TdTutorialPawn" in gameplay. Both are real classes in the right places, which a
+// wrong offset does not produce.
+//
+// It earned its keep immediately: TdTutorialPawn is how the new-game failure was found, and no
+// amount of staring at the pawn search would have shown it. Nothing is GATED on this yet - the
+// scene test and the watchdog should use it, and that is a later rung, not this one.
+static void ReportViewTarget()
+{
+    if (g_offCtlCamera < 0 || g_offCamViewTarget < 0 || !g_playerCtl) return;
+
+    uint32_t cam = 0;
+    if (!SafeU32(g_playerCtl + g_offCtlCamera, &cam) || cam < 0x10000) {
+        Log("[view] PlayerCamera unreadable at +0x%04X", g_offCtlCamera);
+        return;
+    }
+    uint32_t target = 0;
+    if (!SafeU32(cam + g_offCamViewTarget, &target) || target < 0x10000) {
+        Log("[view] ViewTarget.Target unreadable at camera %p +0x%04X"
+            " - the struct's first member is not a pointer, so the layout guess is wrong",
+            (void*)cam, g_offCamViewTarget);
+        return;
+    }
+
+    char cls[64] = "?";
+    uint32_t clsObj = 0;
+    if (SafeU32(target + 0x34, &clsObj) && clsObj >= 0x10000) ReadObjName(clsObj, cls, sizeof(cls));
+
+    // Only on a CHANGE. Steady state is one line per transition, which is exactly the signal -
+    // gameplay to cutscene and back - rather than a periodic reminder of what has not changed.
+    static uint32_t lastTarget = 0;
+    if (target == lastTarget) return;
+    lastTarget = target;
+    Log("*** [view] ViewTarget -> %p class \"%s\"  |  pawn is %p  =>  %s",
+        (void*)target, cls, (void*)g_playerPawn,
+        (target == (uint32_t)g_playerPawn) ? "THE PLAYER'S VIEW"
+                                           : "NOT the pawn - cutscene, death cam or scripted camera");
 }
 
 PFN_SetVSConstF g_origSetVSConstF = nullptr;
@@ -6500,6 +6561,11 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     // Sampled every frame - the peaks are what matter and a landing lasts a few frames.
     ProbeCameraAnimation();
     if ((f % 900) == 0) { ReportCameraAnimation(); if (g_simulStereo) ReportRenderTargets(); }
+
+    // Six times a second is fast enough to place a transition against the acceptance windows it
+    // is meant to explain, and it costs three reads on the frames it runs. It logs only when the
+    // target CHANGES, so the rate sets resolution, not volume.
+    if ((f % 10) == 0) ReportViewTarget();
 
     // ---- the engine's FOV now matters ONLY for CPU culling ----
     //
