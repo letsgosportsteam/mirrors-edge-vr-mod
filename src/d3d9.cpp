@@ -3197,6 +3197,12 @@ extern float g_vmBestScore;
 extern volatile LONG g_vmScanArmed;
 extern volatile LONG g_vmWindowsTested;
 extern volatile LONG g_vmPoseFailures;
+// The watchdog's signal, raised by the render thread's constant hook and consumed in Present.
+extern volatile LONG g_vmRescanRequest;
+// Whether the committed register has ever been seen carrying the view, and how many substantial
+// windows it has failed while it has not. Both are cleared by whoever commits a register.
+extern bool          g_vmProven;
+extern int           g_vmStrikes;
 extern bool  g_vmValidate;
 extern int   g_vmReg;
 extern bool  g_vmRow;
@@ -3867,6 +3873,9 @@ static void CheckVMHotkey()
             // register nothing validated.
             g_vmReg = g_vmBestReg;
             g_vmRow = g_vmBestRow;
+            // A new register has proved nothing yet, whatever the last one managed.
+            g_vmProven = false;
+            g_vmStrikes = 0;
             Log("[vm] committed. F2 cycles the injection: off / forward / right / up (300 UU)");
         }
         Log("");
@@ -3887,31 +3896,43 @@ static void CheckVMHotkey()
 //
 // It retries rather than firing once: the pawn appears at level load, and the camera pose can
 // still be junk for a moment after that. Retrying costs a pointer read per attempt.
+//
+// The state lives outside the function so the watchdog can put the sequence back to the start.
+// It was function-local while a run only ever armed once; a rescan is a second arming, and
+// statics that cannot be reset would have made the watchdog fire into a sequence that had
+// already decided it was finished.
+static int  g_autoStage    = 0;     // 0 = waiting for the world, 1 = scan armed
+static int  g_autoWait     = 0;
+static int  g_autoRetries  = 0;
+static int  g_autoAttempts = 0;     // every 20th stage-0 poll reports its reason
+
+static void ResetAutoArm()
+{
+    g_autoStage = 0; g_autoWait = 0; g_autoRetries = 0; g_autoAttempts = 0;
+    g_vmScanRefused = false;
+    g_autoDone = false;
+}
+
 static void AutoArm()
 {
     if (g_autoDone) return;
 
-    static int stage = 0;         // 0 = waiting for the world, 1 = scan armed
-    static int wait = 0;
-    static int retries = 0;
-    static int attempts = 0;      // every 20th stage-0 poll reports its reason
-
     if (!g_xrReady) return;       // no session, nothing to be stereo on
-    if (wait > 0) { --wait; return; }
+    if (g_autoWait > 0) { --g_autoWait; return; }
 
-    if (stage == 0) {
+    if (g_autoStage == 0) {
         g_vmScanRefused = false;
         // ⚠️ Every twentieth attempt is LOUD, and the one-shot announcement it replaces cost a
         // run. The sequence polls every 30 frames and cannot report each one, but a single line
         // at the top of the log left "never armed at all" indistinguishable from "blocked on the
         // pawn" and from "blocked at the origin" - three different faults, one silence.
-        const bool loud = (attempts++ % 20) == 0;
+        const bool loud = (g_autoAttempts++ % 20) == 0;
         if (!ArmVMScan(!loud)) {
-            wait = 30;
+            g_autoWait = 30;
             return;
         }
-        stage = 1;
-        wait = 10;                // the scan itself needs 2 frames; this is slack, not a poll
+        g_autoStage = 1;
+        g_autoWait = 10;          // the scan itself needs 2 frames; this is slack, not a poll
         return;
     }
 
@@ -3932,20 +3953,83 @@ static void AutoArm()
     // load would exhaust ten attempts before the world appeared and then give up on it.
     if (g_vmScanRefused) {
         g_vmScanRefused = false;
-        stage = 0;
-        wait = 120;
+        g_autoStage = 0;
+        g_autoWait = 120;
         return;
     }
 
     // The scan ran and committed nothing. Almost always a camera pose that was not usable yet,
     // which fixes itself a second later - so retry, and give up loudly rather than silently.
-    if (++retries >= 10) {
+    if (++g_autoRetries >= 10) {
         g_autoDone = true;
-        Log("[auto] the scan committed no register after %d attempts - press F6 by hand", retries);
+        Log("[auto] the scan committed no register after %d attempts - press F6 by hand", g_autoRetries);
         return;
     }
-    stage = 0;
-    wait = 120;
+    g_autoStage = 0;
+    g_autoWait = 120;
+}
+
+// ---- the watchdog: a committed register that has never carried the view ----
+//
+// The acceptance counter has printed the rate every 600 frames for a long time, and on the run
+// that went wrong it printed 99.9% rejected eleven times in a row while nothing acted on it.
+// Everything needed to notice was already being measured; noticing was the missing part.
+//
+// ⚠️ THE FIRST VERSION OF THIS FIRED ON A CORRECT REGISTER AND COST A SESSION.
+//
+// It fired whenever a 600-frame window rejected most of its uploads while the camera pose was
+// valid, on the reasoning that a valid pose means we are looking at the player's view. That
+// reasoning is wrong. A valid pose means the PAWN EXISTS - nothing more. The engine spends long
+// stretches with a live pawn while rendering something that is not its camera, and the measured
+// run walks through three of them on one committed-correct register:
+//
+//     33962 accepted,    65 rejected ( 0.2%)   gameplay
+//      3451 accepted, 18308 rejected (84.1%)   dying - the view is not the new pawn's yet
+//     71789 accepted,    67 rejected ( 0.1%)   gameplay again
+//       119 accepted, 19076 rejected (99.4%)   the pause menu  <- fired here, dropped c0
+//
+// A wrong register is indistinguishable from a pause menu BY RATE, so rate cannot be the test
+// and no threshold rescues it. What separates them is history: a correct register works within
+// seconds of gameplay and keeps working, a wrong one has never worked once. The menu commit ran
+// 99.9-100% rejected for ELEVEN consecutive windows and never had a good one.
+//
+// So the register is asked to prove itself, once. After that the watchdog is done with it for
+// good, and menus, deaths and cutscenes cannot touch it however long they last. Before that it
+// gets five substantial windows to manage a single one - which the correct register above did
+// on its very first, and the wrong one never would.
+static const long kVMJudgeSamples = 5000;   // a window smaller than this judges nothing
+static const int  kVMMaxStrikes   = 5;      // ~50 s of never once working
+static const int  kVMMaxRescans   = 5;
+static int        g_vmRescans     = 0;
+
+static void CheckVMWatchdog()
+{
+    // Nothing committed means nothing to be wrong about, and a sequence still working means it
+    // owns the outcome - the watchdog judges commits that have been declared finished.
+    if (g_vmReg < 0 || !g_autoDone) return;
+
+    if (!InterlockedCompareExchange(&g_vmRescanRequest, 0, 0)) return;
+    InterlockedExchange(&g_vmRescanRequest, 0);
+
+    Log("");
+    Log("*** [vm] WATCHDOG FIRED - the committed register has never carried the view");
+
+    // Drop the register FIRST and unconditionally, including on the give-up path. A wrong
+    // register is worse than none: none means the frame is merely flat, wrong means the eye
+    // offsets are rewriting a pass that has nothing to do with the view.
+    Log("[vm] dropping c%d. Nothing is injected until a scan commits again.", g_vmReg);
+    g_vmReg = -1;
+    g_vmProven = false;
+    g_vmStrikes = 0;
+    g_sceneMatValid = false;
+    g_c0IsScene = false;
+
+    if (++g_vmRescans > kVMMaxRescans) {
+        Log("[vm] %d rescans have not held - not trying again. Press F6 by hand.", kVMMaxRescans);
+        return;
+    }
+    Log("[vm] rescan %d of %d - restarting the startup sequence", g_vmRescans, kVMMaxRescans);
+    ResetAutoArm();
 }
 
 extern bool g_overlay;
@@ -4449,6 +4533,9 @@ PFN_SetVSConstF g_origSetVSConstF = nullptr;
 static volatile LONG g_vmScanArmed = 0;
 volatile LONG g_vmWindowsTested = 0;
 volatile LONG g_vmPoseFailures  = 0;
+volatile LONG g_vmRescanRequest = 0;
+bool          g_vmProven  = false;
+int           g_vmStrikes = 0;
 static int  g_vmBestReg = -1;
 static bool g_vmBestRow = false;
 bool  g_vmBestWorld = false;
@@ -4678,7 +4765,13 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
             {
                 static long lastFrame = -1;
                 static long acc = 0, rej = 0;
+                // The watchdog's own pair. Deliberately NOT the same counters: acc/rej answer
+                // "what is happening", including the near-total rejection of a respawn window,
+                // and that reading is worth keeping intact. These answer the narrower question
+                // the watchdog acts on - with a camera pose we trust, is this register the view.
+                static long wacc = 0, wrej = 0;
                 if (isScene) acc++; else rej++;
+                if (g_camCacheValid) { if (isScene) wacc++; else wrej++; }
                 if (lastFrame != g_frames) {
                     lastFrame = g_frames;
                     static long frames = 0;
@@ -4687,7 +4780,35 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                             " camera step %.0f UU/frame, tolerance %.0f",
                             acc, rej, 100.0f * (float)rej / (float)((acc + rej) ? (acc + rej) : 1),
                             g_pivotStep, tol);
+
+                        // ---- has this register EVER been the view? ----
+                        //
+                        // Half is not a judgement about one window, it is the line between "this
+                        // register carries the view and the engine sometimes draws other things"
+                        // and "this register has never carried the view at all". Real ones sit
+                        // at 0.1-24% while playing; the wrong one sat at 99.9% forever.
+                        //
+                        // One window under the line is proof, and proof is permanent. Everything
+                        // that made the first version fire on a working register - the menu, the
+                        // death camera, a cutscene - arrives after that proof and is ignored.
+                        const long tot = wacc + wrej;
+                        if (tot >= kVMJudgeSamples) {
+                            if (wrej * 2 < tot) {
+                                if (!g_vmProven) {
+                                    g_vmProven = true;
+                                    Log("[vm] c%d proved itself - %ld of %ld accepted. The"
+                                        " watchdog is finished with this register.",
+                                        g_vmReg, wacc, tot);
+                                }
+                            } else if (!g_vmProven && ++g_vmStrikes >= kVMMaxStrikes) {
+                                Log("[vm] c%d has failed %d substantial windows without ever"
+                                    " once being the view (last: %ld of %ld rejected)",
+                                    g_vmReg, g_vmStrikes, wrej, tot);
+                                InterlockedExchange(&g_vmRescanRequest, 1);
+                            }
+                        }
                         acc = rej = 0;
+                        wacc = wrej = 0;
                     }
                 }
             }
@@ -6652,7 +6773,8 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
 
     // AutoArm last, so a manual keypress on this frame is seen before the sequence acts on it.
     if (g_offName >= 0) {
-        CheckSwanHotkey(); ApplySwanNeck(); CheckHeadHotkeys(); CheckVMHotkey(); AutoArm();
+        CheckSwanHotkey(); ApplySwanNeck(); CheckHeadHotkeys(); CheckVMHotkey();
+        CheckVMWatchdog(); AutoArm();
     }
 
     // Sampled every frame - the peaks are what matter and a landing lasts a few frames.
