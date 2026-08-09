@@ -1196,3 +1196,78 @@ rather than from measurement, and both eventually fired on the feature instead o
 
 Both now **bail out** rather than clamp. Leaving the engine's own view alone is never
 catastrophic; correcting on a value already judged untrustworthy always can be.
+
+---
+
+## Input: how the game reads a gamepad, and what it binds
+
+### The import table answers the architecture question without a run
+
+`MirrorsEdge.exe` imports, in order:
+
+```
+Direct3DCreate9  d3d9.dll  ...  DirectInput8Create  DINPUT8.dll  XINPUT1_3.dll
+```
+
+So a 360 pad is a first-class input path in this engine. Everything that path reaches â€” menus,
+jump, crouch, interact, run, movement, look â€” is bound and tested by the developers, which makes
+a synthesised XInput pad the cheapest complete controller support available.
+
+âš ï¸ The exe names `XINPUT1_3.dll` but **no XInput function by name**, so the functions are imported
+**by ordinal** and there is no import name to patch. The function body has to be detoured.
+
+The alternative â€” writing `PlayerInput`'s axis properties directly, which the object model makes
+possible â€” moves the player and nothing else. The axes are readable, but the BUTTONS are bound to
+exec functions and reaching those means driving the script VM. Every button would be its own
+reverse-engineering job, and menus would still need the keyboard.
+
+### The active gamepad bindings
+
+From `TdGame/Config/DefaultInput.ini`. The `.Bindings` lines are the live set; the `-Bindings`
+lines above them are removals of the engine defaults.
+
+| Pad control | Command | In game |
+|---|---|---|
+| LeftShoulder | `GBA_Jump` | **jump** |
+| LeftTrigger | `GBA_Crouch` | crouch / slide |
+| RightTrigger | `GBA_Fire` | fire |
+| RightShoulder | `GBA_LookBehind` | look behind |
+| A | `GBA_Use` | use / interact |
+| B | `GBA_LookAt` | look at |
+| X | `GBA_ReactionTime` | reaction time |
+| Y | `GBA_SwitchWeapon` | switch weapon |
+| Start | `GBA_Pause` | pause |
+| Back | `GBA_InGameMenu` | in-game menu |
+| RightThumbstick | `GBA_ZoomWeapon` | zoom |
+| LeftX / LeftY | `GBA_Strafe_Gamepad` / `GBA_Move_Gamepad` | move |
+| RightX / RightY | `GBA_Turn_Gamepad` / `GBA_Look_Gamepad` | look |
+
+**Jump is on a shoulder, deliberately** â€” it keeps both thumbs on the sticks. That is the right
+call for a pad and reads oddly on a controller held in the fist, where it lands on the grip. The
+mod maps 1:1 and does not second-guess it.
+
+Menus bind **A to `Clicked`** and **B to `Consume`**, so any remap that moves those makes confirm
+a different button in menus than in play.
+
+âš ï¸ Hand-editing `DefaultInput.ini` to remap is expected to fail: the game hash-checks its config
+and refuses to start when modified, measured earlier at a cost of two runs. Nothing in the input
+config mentions rebinding, so whether the in-game controls menu exposes gamepad rebinding is
+**unverified**. A remap inside the mod has no such problem â€” the pad is synthesised, so any
+physical control can drive any pad button.
+
+### Notes on synthesising the pad
+
+- Only index 0 answers. Reporting a controller on all four makes the game believe four players
+  are present.
+- The **packet number must change when the state changes**, or a poller comparing packet numbers
+  decides nothing happened and skips the read.
+- `XInputGetCapabilities` needs hooking too, with every field at its maximum. That structure
+  describes what the device is *capable* of, not its current state, and a zeroed one reads as a
+  pad with no sticks.
+- Actions are synced once per frame **beside the head sample**, so the sticks and the view
+  describe the same instant.
+- OpenXR action-set attachment is **permanent**: once attached to a session no further action can
+  be created, so every action must exist before `xrAttachSessionActionSets`.
+- Bindings suggested for `oculus/touch_controller` (what a Quest reports through Virtual Desktop)
+  and `khr/simple_controller` as a fallback. Simple carries only select and menu â€” not playable,
+  but an unrecognised controller reaches the menus instead of appearing dead.
