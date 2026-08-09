@@ -4161,14 +4161,38 @@ static void CheckHeadHotkeys()
     const bool dN7 = (GetAsyncKeyState(VK_NUMPAD7) & 0x8000) != 0;
     if (dN7 && !pN7) {
         // kCaps[0] IS the initial value at the top of the file, so the two cannot disagree and
-        // the first press always moves somewhere.
-        static const float kCaps[] = { 60.0f, 90.0f, 120.0f, 250.0f, 62.0f };
+        // the first press always moves somewhere. 72 and 144 are here because they are headset
+        // rates in their own right: at 144 Hz it is 72 that divides evenly and 60 that does not,
+        // which is the whole point of the annotation below.
+        static const float kCaps[] = { 60.0f, 72.0f, 90.0f, 120.0f, 144.0f, 250.0f, 62.0f };
         static int ci = 0;
         ci = (ci + 1) % (int)(sizeof(kCaps) / sizeof(kCaps[0]));
         g_fpsCap = kCaps[ci];
-        Log("*** [fps] NUMPAD7 -> cap %.0f%s", g_fpsCap,
-            (g_fpsCap == 60.0f) ? "  (divides 120 exactly - even cadence)" :
-            (g_fpsCap == 62.0f) ? "  (the game's own default, for comparison)" : "");
+
+        // ---- whether it divides evenly is a fact about THIS headset, not a constant ----
+        //
+        // "60 divides 120" was written into the log as literal text, which is true only while the
+        // runtime is at 120 Hz. Ask the runtime instead: g_predPeriod is the display period it
+        // reported for the last frame, so the ratio is the real one.
+        const double hz = g_predPeriod ? (1.0e9 / (double)g_predPeriod) : 0.0;
+        const double ratio = (hz > 1.0 && g_fpsCap > 0.0f) ? (hz / (double)g_fpsCap) : 0.0;
+        const bool even = (ratio >= 0.99) &&
+                          (fabs(ratio - floor(ratio + 0.5)) < 0.02);
+        // Three outcomes, not two. A cap ABOVE the headset's rate is not an uneven cadence -
+        // the compositor simply cannot show every frame, so work is thrown away. Calling that
+        // "uneven" would point at the wrong problem, which is the one thing this line exists
+        // to avoid.
+        const char* verdict =
+            (ratio < 0.995) ? "  <- ABOVE the headset's rate; frames are rendered and discarded"
+          : even            ? "  <- EVEN CADENCE"
+                            : "  <- uneven, frames will be held for differing times";
+        if (hz > 1.0)
+            Log("*** [fps] NUMPAD7 -> cap %.0f   headset is %.0f Hz, %.2f display periods per"
+                " frame%s%s", g_fpsCap, hz, ratio, verdict,
+                (g_fpsCap == 62.0f) ? "  (the game's own default, for comparison)" : "");
+        else
+            Log("*** [fps] NUMPAD7 -> cap %.0f  (no display period yet - headset rate unknown)",
+                g_fpsCap);
     }
     pN7 = dN7;
 
