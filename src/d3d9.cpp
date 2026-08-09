@@ -1257,9 +1257,34 @@ extern bool              g_rtIsScene;
 extern int               g_dupOnlyTarget;
 extern bool              g_forceVisible;
 extern int               g_occlusionMode;
-struct RtSeen { IDirect3DSurface9* surf; UINT w, h; D3DFORMAT fmt; long draws; };
+struct RtSeen { IDirect3DSurface9* surf; UINT w, h; D3DFORMAT fmt; long draws; long sceneDraws; };
 extern RtSeen            g_rtSeen[16];
 extern int               g_rtSeenCount;
+
+// ---- where the engine actually renders the scene, which is not always the backbuffer ----
+//
+// 0 means "not learned, use the backbuffer", and that is the state every working run has been
+// in: at 2560x1440 the scene target and the backbuffer are the same size, so the distinction
+// never arose. It arises at 1600x1200 - a 4:3 mode - where the engine renders the scene 16:9
+// into a 1600x900 target and letterboxes it. The backbuffer-sized surface then takes ZERO
+// draws, g_rtIsScene is false for the target that matters, and duplication never runs.
+//
+// The name for this is already in the history: "the backbuffer is not what the engine renders
+// at - rung 9's premise was wrong". Same premise, a different consequence.
+UINT                     g_sceneW = 0, g_sceneH = 0;
+
+// The scene's rectangle within the captured backbuffer. Every one of these collapses to the
+// whole backbuffer while g_sceneW/H are unset or equal to it, so every use below is an identity
+// transform in the configurations that work today - which is the property that makes this safe
+// to thread through the eye path at all.
+//
+// ⚠️ The offset ASSUMES the letterbox is centred. That is what UE3 does and what a 1600x900
+// scene in a 1600x1200 frame looks like, but it is an assumption, not a measurement. If a mode
+// turns up that pillarboxes to one side, this is the line that will be wrong.
+static inline UINT SceneW() { return g_sceneW ? g_sceneW : g_capW; }
+static inline UINT SceneH() { return g_sceneH ? g_sceneH : g_capH; }
+static inline UINT SceneX() { return (g_capW > SceneW()) ? (g_capW - SceneW()) / 2 : 0; }
+static inline UINT SceneY() { return (g_capH > SceneH()) ? (g_capH - SceneH()) / 2 : 0; }
 extern float             g_sceneMat[16];
 extern volatile LONG     g_dupDraws;
 float                    g_halfIpdUU = 0.0f;     // filled from the located views
@@ -1356,11 +1381,13 @@ static bool FillEye(int eye)
     bool ok = false;
     if (XR_SUCCEEDED(xrWaitSwapchainImage(g_eyeSwap[eye], &wi))) {
         if (g_simulStereo) {
-            // Both eyes live in one frame side by side, so each swapchain takes its own half.
+            // Both eyes live in one frame side by side, so each swapchain takes its own half -
+            // of the SCENE rectangle, which is the whole frame unless the engine letterboxed it.
+            // Cutting the full backbuffer instead would hand the compositor the black bars.
             D3D11_BOX box{};
-            box.left  = (UINT)(eye == 0 ? 0 : g_capW / 2);
-            box.right = box.left + g_capW / 2;
-            box.top = 0; box.bottom = g_capH;
+            box.left  = SceneX() + (UINT)(eye == 0 ? 0 : SceneW() / 2);
+            box.right = box.left + SceneW() / 2;
+            box.top = SceneY(); box.bottom = SceneY() + SceneH();
             box.front = 0; box.back = 1;
             g_ctx11->CopySubresourceRegion(g_eyeImages[eye][idx], 0, 0, 0, 0, src, 0, &box);
         } else {
@@ -1482,14 +1509,15 @@ static void SubmitTestQuad()
                 if (-g_views[e].fov.angleDown > dn) dn = -g_views[e].fov.angleDown;
             }
             const float halfY = (up > dn) ? up : dn;
-            if (halfY > 0.1f && g_capH > 0) {
+            if (halfY > 0.1f && SceneH() > 0) {
                 g_targetHalfFovY = halfY;
                 // Square pixels: the horizontal follows from the aspect of what ONE EYE
-                // actually renders into. Under draw duplication that is half the backbuffer,
-                // so the aspect halves - and this single value is used both to force the
-                // matrix and to tell the compositor, which is the only way they can agree.
-                const float aspect = g_simulStereo ? ((float)g_capW * 0.5f / (float)g_capH)
-                                                   : ((float)g_capW / (float)g_capH);
+                // actually renders into. Under draw duplication that is half the SCENE, so the
+                // aspect halves - and this single value is used both to force the matrix and to
+                // tell the compositor, which is the only way they can agree. Taking it from the
+                // backbuffer instead would describe the letterbox rather than the picture.
+                const float aspect = g_simulStereo ? ((float)SceneW() * 0.5f / (float)SceneH())
+                                                   : ((float)SceneW() / (float)SceneH());
                 g_targetHalfFovX = atanf(tanf(halfY) * aspect);
                 if (!g_fovLogged) {
                     g_fovLogged = true;
@@ -1500,8 +1528,9 @@ static void SubmitTestQuad()
             }
         }
 
-        const uint32_t eyeW = g_simulStereo ? (g_capW / 2) : g_capW;
-        if (g_viewsValid && EnsureEyeSwapchains(eyeW, g_capH)) {
+        // Sized to the region FillEye actually copies, or the copy and the swapchain disagree.
+        const uint32_t eyeW = g_simulStereo ? (SceneW() / 2) : SceneW();
+        if (g_viewsValid && EnsureEyeSwapchains(eyeW, SceneH())) {
             // Simultaneous: both halves are from THIS frame, so both eyes fill every frame.
             if (g_simulStereo) { FillEye(0); FillEye(1); }
             else if (g_renderedEye >= 0) FillEye(g_renderedEye);
@@ -5138,7 +5167,12 @@ static HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWO
         if (surf) {
             D3DSURFACE_DESC d{};
             if (SUCCEEDED(surf->GetDesc(&d))) {
-                g_rtIsScene = (d.Width == g_capW && d.Height == g_capH);
+                // Against the SCENE size, which is the backbuffer until something proves it is
+                // not - see AdoptSceneTarget. Identical to the old test in every configuration
+                // where the two agree, which is every one that has ever worked.
+                const UINT sw = g_sceneW ? g_sceneW : g_capW;
+                const UINT sh = g_sceneH ? g_sceneH : g_capH;
+                g_rtIsScene = (d.Width == sw && d.Height == sh);
                 // Census keyed on the SURFACE, not on its descriptor: several distinct targets
                 // can share a size and format, and merging them is what hid the problem in the
                 // reference for eighteen runs.
@@ -5154,15 +5188,75 @@ static HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWO
     return g_origSetRenderTarget(dev, idx, surf);
 }
 
+// ---- ⚠️ A FALLBACK, NOT A REPLACEMENT ----
+//
+// This may only change anything in a configuration that is ALREADY broken, and the rule enforces
+// it: if any backbuffer-sized target is taking scene draws, the existing behaviour is working and
+// nothing here fires. Only when no such target is being drawn to at all - the letterboxed case,
+// where the backbuffer-sized surface sits at zero - does it look for where the scene really went.
+//
+// Written this way round on purpose. "Adopt the target with the most scene draws" is a
+// better-sounding rule that could adopt a full-resolution shadow map and break a configuration
+// that works today - the reference's run 27 records exactly that hazard, UE3 allocating dominant
+// shadow maps at scene resolution.
+//
+// ⚠️ Judged over THIS window only, and the counters are cleared on the way out. Lifetime totals
+// looked simpler and are wrong twice: a backbuffer-sized target that took scene draws once at a
+// menu would veto adoption for the rest of the run, and an adoption made under one resolution
+// could never be undone after a Reset changed the backbuffer under it. Both are the same mistake
+// - deciding a live question from a record that only accumulates - so the decision is made afresh
+// and can go back as easily as forward.
+static void AdoptSceneTarget()
+{
+    if (!g_capW || !g_capH) { return; }
+
+    int  best = -1;
+    long bestScene = 0;
+    bool backbufferIsLive = false;
+    for (int i = 0; i < g_rtSeenCount; ++i) {
+        const long sd = g_rtSeen[i].sceneDraws;
+        if (sd > 0 && g_rtSeen[i].w == g_capW && g_rtSeen[i].h == g_capH) backbufferIsLive = true;
+        else if (sd > bestScene) { bestScene = sd; best = i; }
+    }
+    for (int i = 0; i < g_rtSeenCount; ++i) g_rtSeen[i].sceneDraws = 0;
+
+    // The original premise holds: the scene is going where it always did. Revert if we had
+    // previously followed it elsewhere, so a resolution change cannot strand us on a stale size.
+    if (backbufferIsLive) {
+        if (g_sceneW || g_sceneH) {
+            Log("*** [rt] the scene is back in the backbuffer (%ux%u) - dropping the override",
+                g_capW, g_capH);
+            g_sceneW = g_sceneH = 0;
+        }
+        return;
+    }
+
+    // Enough draws to be a scene pass rather than a stray probe or a two-triangle blit.
+    if (best < 0 || bestScene < 200) return;
+
+    const UINT w = g_rtSeen[best].w, h = g_rtSeen[best].h;
+    if (w == g_sceneW && h == g_sceneH) return;
+    g_sceneW = w; g_sceneH = h;
+    Log("");
+    Log("*** [rt] the scene is not being rendered into the backbuffer. Backbuffer is %ux%u,"
+        " the scene goes to %ux%u (%ld draws with the scene matrix this window).",
+        g_capW, g_capH, w, h, bestScene);
+    Log("[rt] following it there, so stereo works instead of silently falling back to mono.");
+    if (g_capW != w || g_capH != h)
+        Log("[rt] ⚠️ this is a LETTERBOXED mode. The eyes are cut out of the PRESENTED frame, so"
+            " the crop assumes the bars are centred. A 16:9 game resolution avoids the guess.");
+}
+
 static void ReportRenderTargets()
 {
+    const UINT sw = g_sceneW ? g_sceneW : g_capW;
+    const UINT sh = g_sceneH ? g_sceneH : g_capH;
     Log("[rt] distinct render targets seen this window:");
     for (int i = 0; i < g_rtSeenCount; ++i) {
-        Log("[rt]   %p  %4ux%-4u fmt %-3d  %8ld draws  %s",
+        Log("[rt]   %p  %4ux%-4u fmt %-3d  %8ld draws (%ld scene)  %s",
             (void*)g_rtSeen[i].surf, g_rtSeen[i].w, g_rtSeen[i].h, (int)g_rtSeen[i].fmt,
-            g_rtSeen[i].draws,
-            (g_rtSeen[i].w == g_capW && g_rtSeen[i].h == g_capH) ? "<- scene-sized, DUPLICATED"
-                                                                 : "");
+            g_rtSeen[i].draws, g_rtSeen[i].sceneDraws,   // sceneDraws is a live window, not a total
+            (g_rtSeen[i].w == sw && g_rtSeen[i].h == sh) ? "<- scene-sized, DUPLICATED" : "");
         g_rtSeen[i].draws = 0;
     }
 }
@@ -5989,8 +6083,14 @@ static HRESULT DuplicateDraw(IDirect3DDevice9* dev, FN issue)
 
     for (int eye = 0; eye < 2; ++eye) {
         D3DVIEWPORT9 vp = vpWas;
-        vp.X     = (eye == 0) ? 0 : g_capW / 2;
-        vp.Width = g_capW / 2;
+        // ---- split the viewport the engine set, not the backbuffer ----
+        //
+        // The viewport is in the bound render target's own coordinates, so taking its width from
+        // g_capW was only ever correct while the target was backbuffer-sized. Halving what is
+        // already there is right for any target, and produces the identical rectangle in the case
+        // that worked before - vpWas.X = 0 and vpWas.Width = g_capW.
+        vp.X     = vpWas.X + ((eye == 0) ? 0 : vpWas.Width / 2);
+        vp.Width = vpWas.Width / 2;
         dev->SetViewport(&vp);
         BuildEyeMatrix(eyeMat, eye);
         g_origSetVSConstF(dev, (UINT)g_vmReg, eyeMat, 4);
@@ -6015,7 +6115,13 @@ static HRESULT DuplicateDraw(IDirect3DDevice9* dev, FN issue)
 // the scene view, so a draw is only duplicated while it is.
 static bool ShouldDuplicate()
 {
-    if (g_rtCurrent) g_rtCurrent->draws++;
+    if (g_rtCurrent) {
+        g_rtCurrent->draws++;
+        // Counted BEFORE the gate, deliberately: this is what AdoptSceneTarget reads, and if it
+        // only counted draws that were already being duplicated it could never discover a target
+        // that duplication is not reaching - which is the entire situation it exists for.
+        if (g_c0IsScene) g_rtCurrent->sceneDraws++;
+    }
     if (!(g_simulStereo && !g_inDupDraw && g_sceneMatValid && g_c0IsScene && g_rtIsScene &&
           g_vmReg >= 0 && g_halfIpdUU > 0.0f && g_capW > 0)) return false;
 
@@ -6567,6 +6673,11 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     // target CHANGES, so the rate sets resolution, not volume.
     if ((f % 10) == 0) ReportViewTarget();
 
+    // Every 120 frames rather than every frame: it walks the census and can only act on a
+    // sustained pattern anyway. Deliberately NOT inside the g_simulStereo report at 900 - the
+    // whole point is to run while duplication is not happening.
+    if ((f % 120) == 0) AdoptSceneTarget();
+
     // ---- the engine's FOV now matters ONLY for CPU culling ----
     //
     // The projection is forced in the matrix, so what the engine believes its FOV to be no
@@ -6598,10 +6709,11 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     // because 15% of an angle near the asymptote is not 15% of a frustum.
     //
     // Written every frame because the camera update pulls it back toward the default each tick.
-    if (g_fovForce && g_offFOVAngle >= 0 && g_targetHalfFovX > 0.0f && g_capH > 0) {
+    if (g_fovForce && g_offFOVAngle >= 0 && g_targetHalfFovX > 0.0f && SceneH() > 0) {
         const uintptr_t ctl = FindPlayerController();
         if (ctl) {
-            const float aspectFull = (float)g_capW / (float)g_capH;
+            // The engine culls against the frame IT renders, so the aspect has to be the scene's.
+            const float aspectFull = (float)SceneW() / (float)SceneH();
             const float needVert = tanf(g_targetHalfFovY) * aspectFull;  // to cover our vertical
             const float needHorz = tanf(g_targetHalfFovX);               // to cover our horizontal
             const float t = ((needVert > needHorz) ? needVert : needHorz) * 1.15f;
