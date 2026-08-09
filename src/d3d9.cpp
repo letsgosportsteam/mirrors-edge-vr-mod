@@ -3659,6 +3659,50 @@ static void ApplyHeadTracking(XrTime when)
 // for them to drift.
 static int g_vmArmCountdown = 0;
 
+// ---- how much evidence a scan must see before its answer is allowed to stand ----
+//
+// Separators between two MEASURED runs, not guessed thresholds. Two launches four minutes
+// apart, same build, same level:
+//
+//     20:31:02   windows tested 5551, candidates 417  -> c0 ROW WORLD, 0.0-0.9% rejected after
+//     20:29:10   windows tested  304, candidates   6  -> c6 COL,       99.9-100% rejected after
+//
+// The second armed at the MAIN MENU, which uploads almost nothing. It committed a register
+// that was never the view, set g_autoDone, and never looked again - so that whole session ran
+// with no stereo and with eye offsets going into a foreign matrix. Every number is an order of
+// magnitude apart, so anything between them separates the two; these sit in the middle.
+static const LONG  kVMMinWindows    = 1000;
+static const int   kVMMinCandidates = 50;
+
+// ---- and why standing on the world origin disqualifies a scan outright ----
+//
+// TestWindow separates the real matrix from the noise by probing it TWICE: once with the camera
+// position, once with the world origin. A matrix that maps the CAMERA to clip.w ~ 0 is the view;
+// one that maps the ORIGIN there is a translated-world transform. The tolerances differ - 25.0
+// against 1.0 - precisely because the two probes are asking different questions.
+//
+// Put the camera at the origin and they stop being two questions. The menu run logged it:
+//
+//     [vm] c5   COL  w(cam)=    0.010  w(origin)=    0.010  dotFwd=+1.0000
+//     [vm] c6   COL  w(cam)=    1.000  w(origin)=    1.000  dotFwd=+1.0000
+//
+// Identical on every candidate. The test collapses into "does this matrix map the origin to
+// zero", which every UI and 2D transform in the frame passes, and the scan picks one of them.
+//
+// 1000 UU is 10 m at the measured 100 UU/m. Refusing costs nothing: the startup sequence waits
+// and tries again, and a real gameplay camera is thousands of UU out - the good run above read
+// w(origin)=19044 - within seconds of the level starting.
+static const float kVMMinCamDist = 1000.0f;
+
+// Logged once per armed sequence rather than per attempt: the startup sequence retries every
+// 30 frames, and this is the state it sits in for the whole time the menu is up.
+static bool g_vmOriginRefusalLogged = false;
+
+// Set when a scan ran but its answer was thrown away for lack of evidence. The startup sequence
+// reads it to tell "I looked and the world was not there yet" from "I looked at the world and
+// found nothing" - only the second is a real failure, and only it should burn a retry.
+static bool g_vmScanRefused = false;
+
 static bool ArmVMScan(bool quiet)
 {
     if (!g_origSetVSConstF) {
@@ -3669,6 +3713,29 @@ static bool ArmVMScan(bool quiet)
         if (!quiet) Log("[vm] no TdPlayerPawn resolved yet - the scan needs the camera pose");
         return false;
     }
+
+    // A pawn EXISTING was the only prerequisite before, and it is not enough - one exists at the
+    // menu too. What the scan actually needs is a camera somewhere in the world.
+    {
+        float loc[3], fwd[3];
+        if (!GetCameraPose(loc, fwd)) {
+            if (!quiet) Log("[vm] the pawn has no readable camera pose yet - not scanning"
+                            " (camLoc offset %d, camRot offset %d)", g_offCamLoc, g_offCamRot);
+            return false;
+        }
+        const float dist = sqrtf(loc[0] * loc[0] + loc[1] * loc[1] + loc[2] * loc[2]);
+        if (dist < kVMMinCamDist) {
+            if (!g_vmOriginRefusalLogged) {
+                g_vmOriginRefusalLogged = true;
+                Log("[vm] camera is %.0f UU from the world origin, under the %.0f needed to tell"
+                    " the two probes apart - not scanning. This is the menu, or a level that has"
+                    " not placed the player yet; either way it clears as soon as they move.",
+                    dist, kVMMinCamDist);
+            }
+            return false;
+        }
+    }
+
     g_vmCandidates = 0; g_vmBestReg = -1; g_vmBestScore = -1e9f;
     InterlockedExchange(&g_vmWindowsTested, 0);
     InterlockedExchange(&g_vmPoseFailures, 0);
@@ -3688,7 +3755,14 @@ static void CheckVMHotkey()
     static bool p6 = false;
     const bool d6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
 
-    if (d6 && !p6) { g_autoDone = true; ArmVMScan(false); }
+    // The refusal flags are cleared first so a deliberate keypress always gets an answer. They
+    // exist to keep the startup sequence's 30-frame polling out of the log, and a key pressed
+    // by hand that appears to do nothing at all is the opposite of what they are for.
+    if (d6 && !p6) {
+        g_autoDone = true;
+        g_vmOriginRefusalLogged = false;
+        ArmVMScan(false);
+    }
     p6 = d6;
 
     // F2 cycles the injection. A 300 UU offset is far larger than any per-eye separation will
@@ -3734,6 +3808,21 @@ static void CheckVMHotkey()
         else if (g_vmCandidates == 0)
             Log("[vm] windows were tested but none matched - the matrix may not be uploaded as"
                 " vertex shader constants, or the probes/tolerances are wrong");
+        // ⚠️ A BEST is not an ANSWER. Ranking picks the least-bad of whatever it was shown, and
+        // shown six matrices from a menu frame it returns one of the six with score 1.0000 -
+        // the score says "this beat its rivals", never "there were rivals worth beating".
+        //
+        // So the count is the evidence and the score is not. Refusing here leaves g_vmReg at -1,
+        // which is the safe state: no register means nothing is injected, where a WRONG register
+        // means the eye offsets land in some other pass and the frame comes apart.
+        else if (tested < kVMMinWindows || g_vmCandidates < kVMMinCandidates) {
+            g_vmScanRefused = true;
+            Log("*** [vm] REFUSING TO COMMIT - %ld windows and %d candidates is not a frame that"
+                " was rendering the world (need %ld and %d)",
+                tested, g_vmCandidates, kVMMinWindows, kVMMinCandidates);
+            Log("[vm] best on offer was c%d %s, score %.4f - discarded. Will rescan.",
+                g_vmBestReg, g_vmBestRow ? "ROW" : "COL", g_vmBestScore);
+        }
         else {
             Log("*** [vm] BEST: c%d %s in %s space  (score %.4f, %d candidates seen)",
                 g_vmBestReg, g_vmBestRow ? "ROW" : "COL",
@@ -3775,6 +3864,7 @@ static void AutoArm()
     if (wait > 0) { --wait; return; }
 
     if (stage == 0) {
+        g_vmScanRefused = false;
         if (!ArmVMScan(true)) {   // quiet: at the main menu this fails every time by design
             if (!announced) { Log("[auto] waiting for a player pawn before arming the scan"); announced = true; }
             wait = 30;
@@ -3793,6 +3883,17 @@ static void AutoArm()
         g_autoDone = true;
         Log("*** [auto] ready - stereo ON, simultaneous. No keypresses needed.");
         Log("[auto] F1 turns stereo off, F10 falls back to alternate-eye, F6 rescans.");
+        return;
+    }
+
+    // A scan that was thrown away for lack of evidence is not a failure to find the matrix, it
+    // is a frame that was not drawing the world - a loading screen, a fade, a cutscene hand-off.
+    // Waiting is the correct response and it must not consume the retry budget, or a slow level
+    // load would exhaust ten attempts before the world appeared and then give up on it.
+    if (g_vmScanRefused) {
+        g_vmScanRefused = false;
+        stage = 0;
+        wait = 120;
         return;
     }
 
