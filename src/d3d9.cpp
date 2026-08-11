@@ -549,6 +549,19 @@ static CRITICAL_SECTION  g_padLock;
 static bool        g_padLockReady = false;
 static long        g_padPolls = 0;
 
+// ---- what the sticks actually carried, per report window ----
+//
+// Added after a report the log could not answer: jump, crouch, punch and turn all working,
+// forward and back doing nothing. All of those are built in XrSyncInput from the same four
+// fields on the same frame, so nothing that only records THAT the pad was synthesised can tell
+// a dead left stick from a game that received it and refused to move.
+static long  g_padSyncs = 0, g_padMoveLive = 0, g_padLookLive = 0;
+static float g_padLo[4] = { 0, 0, 0, 0 };      // move x, move y, look x, look y
+static float g_padHi[4] = { 0, 0, 0, 0 };
+static WORD  g_padButtonsSeen = 0;
+static BYTE  g_padTrigPeak[2] = { 0, 0 };
+static long  g_padPollsSeen = 0;               // g_padPolls at the last report
+
 static void XrInitActions()
 {
     if (g_xrInstance == XR_NULL_HANDLE || g_xrSession == XR_NULL_HANDLE) return;
@@ -655,15 +668,22 @@ static void XrSyncInput()
     // logging every frame - the actions simply report inactive and the pad reads as centred.
     if (XR_FAILED(xrSyncActions(g_xrSession, &si))) return;
 
-    auto vec2 = [&](XrAction a, float* x, float* y) {
+    // Returns whether the action was ACTIVE, which the caller now records. isActive is the
+    // runtime saying "this action is bound to a control on a controller that is present" - so
+    // a stick that is never active is a stick that was never wired up, and a stick that is
+    // always active but always centred is a player who did not push it. Those are different
+    // bugs and the difference was previously discarded here.
+    auto vec2 = [&](XrAction a, float* x, float* y) -> bool {
         *x = *y = 0.0f;
-        if (a == XR_NULL_HANDLE) return;
+        if (a == XR_NULL_HANDLE) return false;
         XrActionStateGetInfo gi{ XR_TYPE_ACTION_STATE_GET_INFO };
         gi.action = a;
         XrActionStateVector2f st{ XR_TYPE_ACTION_STATE_VECTOR2F };
         if (XR_SUCCEEDED(xrGetActionStateVector2f(g_xrSession, &gi, &st)) && st.isActive) {
             *x = st.currentState.x; *y = st.currentState.y;
+            return true;
         }
+        return false;
     };
     auto flt = [&](XrAction a) -> float {
         if (a == XR_NULL_HANDLE) return 0.0f;
@@ -685,8 +705,8 @@ static void XrSyncInput()
     };
 
     float mx, my, lx, ly;
-    vec2(g_aMove, &mx, &my);
-    vec2(g_aLook, &lx, &ly);
+    const bool moveLive = vec2(g_aMove, &mx, &my);
+    const bool lookLive = vec2(g_aLook, &lx, &ly);
 
     MEVR_XINPUT_STATE s{};
     auto axis = [](float v) -> SHORT {
@@ -730,6 +750,28 @@ static void XrSyncInput()
     if (flt(g_aRGrip) > 0.5f) b |= MEVR_PAD_RSHOULDER;
     s.Gamepad.wButtons = b;
 
+    // ---- record the window, before the lock ----
+    //
+    // These are ours: written only here, read only by ReportPadState, and both run on the thread
+    // that drives Present. Nothing shared with the game's poller, so no lock.
+    //
+    // EXTREMES rather than a sample, for the reason the animation probe keeps peaks: a value
+    // read once every fifteen seconds catches the player mid-nothing and reports a centred stick
+    // whatever is true.
+    {
+        const float v[4] = { mx, my, lx, ly };
+        for (int i = 0; i < 4; ++i) {
+            if (v[i] < g_padLo[i]) g_padLo[i] = v[i];
+            if (v[i] > g_padHi[i]) g_padHi[i] = v[i];
+        }
+        g_padSyncs++;
+        if (moveLive) g_padMoveLive++;
+        if (lookLive) g_padLookLive++;
+        g_padButtonsSeen |= b;
+        if (s.Gamepad.bLeftTrigger  > g_padTrigPeak[0]) g_padTrigPeak[0] = s.Gamepad.bLeftTrigger;
+        if (s.Gamepad.bRightTrigger > g_padTrigPeak[1]) g_padTrigPeak[1] = s.Gamepad.bRightTrigger;
+    }
+
     EnterCriticalSection(&g_padLock);
     // The packet number must CHANGE when the state does, or a poller that compares packets will
     // decide nothing happened and skip the read entirely.
@@ -738,6 +780,60 @@ static void XrSyncInput()
     g_pad = s;
     g_pad.dwPacketNumber = pn;
     LeaveCriticalSection(&g_padLock);
+}
+
+// The pad half of the movement diagnosis. Reported on the same window as the animation probe,
+// so a "cannot move" report arrives with both ends of the chain on adjacent lines: what the
+// runtime handed us, and what the game did with it.
+static void ReportPadState()
+{
+    if (!g_actionsReady || g_padSyncs == 0) return;
+
+    const long polls = g_padPolls;
+    Log("[pad] over %ld syncs: LEFT  x %+.2f..%+.2f  y %+.2f..%+.2f   delivered by the runtime %ld/%ld",
+        g_padSyncs, g_padLo[0], g_padHi[0], g_padLo[1], g_padHi[1], g_padMoveLive, g_padSyncs);
+    Log("[pad]                 RIGHT x %+.2f..%+.2f  y %+.2f..%+.2f   delivered by the runtime %ld/%ld",
+        g_padLo[2], g_padHi[2], g_padLo[3], g_padHi[3], g_padLookLive, g_padSyncs);
+
+    // Named with what the game does with each, because the whole point of a 1:1 map is that the
+    // pad name is not the thing the reporter pressed. LTHUMB is absent deliberately: the left
+    // stick click is synthesised as BACK, so the bit is never set.
+    static const struct { WORD bit; const char* name; } kPadBits[] = {
+        { MEVR_PAD_A,         "A(use)"                 },
+        { MEVR_PAD_B,         "B(lookat)"              },
+        { MEVR_PAD_X,         "X(reaction)"            },
+        { MEVR_PAD_Y,         "Y(weapon)"              },
+        { MEVR_PAD_START,     "START(pause)"           },
+        { MEVR_PAD_BACK,      "BACK(ingame-menu)"      },
+        { MEVR_PAD_RTHUMB,    "RTHUMB(zoom)"           },
+        { MEVR_PAD_LSHOULDER, "LSHOULDER(jump)"        },
+        { MEVR_PAD_RSHOULDER, "RSHOULDER(lookbehind)"  },
+    };
+    char btns[256]; int n = 0;
+    btns[0] = 0;
+    for (int i = 0; i < (int)(sizeof(kPadBits) / sizeof(kPadBits[0])); ++i)
+        if (g_padButtonsSeen & kPadBits[i].bit)
+            n += _snprintf_s(btns + n, sizeof(btns) - n, _TRUNCATE, " %s", kPadBits[i].name);
+    Log("[pad]   buttons this window:%s  |  triggers peak L %u R %u  |  the game read the pad %ld times",
+        btns[0] ? btns : " none", (unsigned)g_padTrigPeak[0], (unsigned)g_padTrigPeak[1],
+        polls - g_padPollsSeen);
+
+    // The two conclusions worth stating outright, because the numbers above are only obvious
+    // once you already know which fault you are looking at.
+    if (g_padMoveLive == 0)
+        Log("[pad] ⚠️ the LEFT stick was never DELIVERED this window - not bound, rather than not"
+            " pushed. Movement cannot reach the game and the fault is on this side.");
+    else if (g_padLo[0] == 0.0f && g_padHi[0] == 0.0f && g_padLo[1] == 0.0f && g_padHi[1] == 0.0f)
+        Log("[pad]   the left stick was live all window and never left centre.");
+    else if ((polls - g_padPollsSeen) == 0)
+        Log("[pad] ⚠️ the left stick moved but the game did not READ the pad this window - the"
+            " XInput hook is installed but nothing is polling it.");
+
+    g_padSyncs = g_padMoveLive = g_padLookLive = 0;
+    for (int i = 0; i < 4; ++i) g_padLo[i] = g_padHi[i] = 0.0f;
+    g_padButtonsSeen = 0;
+    g_padTrigPeak[0] = g_padTrigPeak[1] = 0;
+    g_padPollsSeen = polls;
 }
 
 // ---- the hook ----
@@ -939,15 +1035,22 @@ static bool EnsureSwapchain(uint32_t w, uint32_t h)
 
 // ================================================================ rung 3: the frame grab
 //
+// ⚠️ NO LONGER THE DEFAULT. Superseded by the shared surface at rung 8b, which does the same job
+// on the GPU in 0.4 ms against this path's 3.7-4.6. This is the fallback now: it runs when the
+// device is not Ex, when NUMPAD8 asks for it, and for any single frame the fast path declines.
+//
+// Kept whole rather than deleted. It is the known-good reference the shared surface was measured
+// against, and a fallback that has to be reconstructed to be used is not a fallback.
+//
 // The SLOW path on purpose: backbuffer -> GetRenderTargetData -> SYSTEMMEM -> lock -> D3D11
 // dynamic texture -> CopyResource into the XR swapchain image.
 //
-// It cost the Singularity project roughly 9.8 ms of a 16 ms frame at 4K, and it is still the
+// It cost the Singularity project roughly 9.8 ms of a 16 ms frame at 4K, and it was still the
 // right thing to build first. The fast route needs a D3D9Ex device, and D3D9Ex does not
-// support D3DPOOL_MANAGED at all - so it drags in translating the 11,084 MANAGED allocations
-// rung 1 counted, with a SYSTEMMEM shadow behind each one. That wrapper was a live source of
-// bugs for a hundred runs in the reference. Proving the pipe end to end without it means any
-// problem that shows up later has one plausible cause instead of two.
+// support D3DPOOL_MANAGED at all - so it drags in translating every MANAGED allocation rung 1
+// counted. That wrapper was a live source of bugs for a hundred runs in the reference. Proving
+// the pipe end to end without it meant any problem that showed up later had one plausible cause
+// instead of two - which is exactly how rung 8 was able to be judged when it arrived.
 //
 // Formats line up without conversion, which is why this is a copy and not a shader:
 // D3D9 A8R8G8B8 is BGRA byte order, i.e. exactly DXGI_FORMAT_B8G8R8A8_UNORM.
@@ -1745,9 +1848,13 @@ static void SubmitTestQuad()
 
     if (n == 1)        Log("*** [xr] first XR frame submitted, xrEndFrame -> %d", (int)er);
     else if (n % 600 == 0) {
-        // The capture cost is the number that decides whether the D3D9Ex wrapper is worth
-        // taking on. Reported as a mean over the window, and reset, so it tracks the current
-        // scene rather than being flattened by the menu at startup.
+        // The capture cost. It was the number that decided whether the D3D9Ex work was worth
+        // taking on - it said yes, and rung 8 took it from 3.7-4.6 ms to 0.4. Still reported,
+        // because it is now the fastest way to tell which grab path a run is actually using: a
+        // number near 4 means the fast path declined and the fallback is carrying the frame.
+        //
+        // A mean over the window, and reset, so it tracks the current scene rather than being
+        // flattened by the menu at startup.
         const double mean = g_capSamples ? (g_capMsTotal / g_capSamples) : 0.0;
         // ---- the delivered rate, and what the headset wanted ----
         //
@@ -2543,6 +2650,7 @@ static void ProbeSwanNeck();
 static bool DerivePropertyOffsets();
 static void DumpClassProperties(const char* className, int maxLines);
 static int  LookupProp(const char* className, const char* propName, bool verbose);
+static void ResolveInputGates();
 extern int g_offActorRotation;
 extern int g_offActorLocation;
 extern int g_offFOVAngle;
@@ -2657,6 +2765,11 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                 // player's view and no amount of rejecting them is a fault.
                 g_offCtlCamera     = LookupProp("TdPlayerController", "PlayerCamera", true);
                 g_offCamViewTarget = LookupProp("TdPlayerCamera", "ViewTarget", true);
+
+                // Nothing above this line can tell "the stick never arrived" from "the game
+                // ignored it", and the first public build produced a report that needed exactly
+                // that distinction. See the block above ResolveInputGates.
+                ResolveInputGates();
                 DumpClassProperties("TdPlayerController", 60);
                 FindEngineObject();
             }
@@ -3051,6 +3164,243 @@ static int LookupProp(const char* className, const char* propName, bool verbose)
         Log("[prop] %s::%s NOT FOUND after walking %d fields up the class chain",
             className, propName, walked);
     return -1;
+}
+
+// ================================================================ the input gates
+//
+// ---- why this exists ----
+//
+// The first public build produced a report the log could not answer: jump, crouch, punch and
+// smooth turn all working, forward and back doing nothing. Every one of those controls arrives
+// through the same synthesised pad, in the same four fields, on the same frame - so "the left
+// stick never reached the game" and "the game received it and declined to move" produce BYTE
+// IDENTICAL logs. Two entirely different faults, one indistinguishable symptom, and a round
+// trip to the reporter to learn which.
+//
+// The pad side is answered beside XrSyncInput, where the sticks are built. This is the other
+// half: what the GAME thinks it was given, and whether it was allowed to act on it.
+//
+//   TdPlayerController::InputSize   the analogue magnitude the game computed for itself. Zero
+//                                   while the player pushes forward means the pad never landed,
+//                                   and no amount of looking at our own end would have shown it.
+//   bLeftThumbStickPassedDeadZone   the game's own verdict on that magnitude.
+//   IgnoreMoveInput / bCinematicMode
+//                                   UE3 zeroes aForward and aStrafe when move input is ignored
+//                                   and touches NOTHING ELSE - look, jump, crouch and fire all
+//                                   keep working. That is the reported symptom exactly, and a
+//                                   scripted sequence that never hands control back leaves it
+//                                   set. Worth knowing before anything is built to fix it.
+
+// ---- UBoolProperty::BitMask, derived the way everything else here is derived ----
+//
+// A UE3 bool is one BIT. UProperty::Offset gives only the dword it lives in - which is why the
+// TdPlayerController dump shows twenty different bools all reporting +0x052C - so the offset
+// alone cannot read one. The mask lives in UBoolProperty, past the end of UProperty, and the
+// end of UProperty is precisely the kind of build-specific number this file refuses to assume.
+//
+// It falls out of a constraint no wrong dword satisfies: within one group of bools sharing an
+// Offset, the masks are DISTINCT POWERS OF TWO. ArrayDim is 1 for every property - a power of
+// two, but not distinct, so a group of two kills it. PropertyFlags collide and are rarely a
+// single bit. A pointer is neither. The twenty-strong group on TdPlayerController is what makes
+// this decisive rather than suggestive; a lone bool would pass every candidate and prove
+// nothing, which is why a minimum group size is required as well as a minimum count.
+static int g_offBoolMask = -1;
+
+static bool PropIsBool(uintptr_t prop)
+{
+    uint32_t cls;
+    if (!SafeU32(prop + 0x34, &cls) || cls < 0x10000) return false;   // UObject::Class, +0x34
+    return ObjNameIs(cls, "BoolProperty");
+}
+
+static void DeriveBoolMaskOffset(const char* className)
+{
+    if (g_offChildren < 0 || g_offNext < 0 || g_offPropOff < 0) return;
+    const uintptr_t cls0 = FindClassByName(className);
+    if (!cls0) { Log("[prop] %s not found - bool flags cannot be read", className); return; }
+
+    int passed[8] = {}, npassed = 0, bestBools = 0, bestGroup = 0;
+    for (int bo = 4; bo <= 0xC0; bo += 4) {
+        if (bo == g_offPropOff) continue;
+
+        uint32_t goff[96] = {}, gbits[96] = {};    // an offset, and the bits already claimed there
+        int gsize[96] = {};
+        int groups = 0, bools = 0, biggest = 0;
+        bool ok = true;
+
+        for (uintptr_t cls = cls0; cls && ok; ) {
+            uint32_t head = 0;
+            if (SafeU32(cls + g_offChildren, &head) && head >= 0x10000) {
+                uintptr_t seen[512]; int nseen = 0;
+                for (uintptr_t p = head; p && nseen < 512 && ok; ) {
+                    uint32_t off = 0, m = 0;
+                    if (PropIsBool(p) && SafeU32(p + g_offPropOff, &off) && SafeU32(p + bo, &m)) {
+                        if (m == 0 || (m & (m - 1)) != 0) {
+                            ok = false;                      // not a single bit - wrong dword
+                        } else {
+                            int g = -1;
+                            for (int k = 0; k < groups; ++k) if (goff[k] == off) { g = k; break; }
+                            if (g < 0 && groups < 96) { g = groups++; goff[g] = off; }
+                            if (g >= 0) {
+                                if (gbits[g] & m) ok = false;   // two bools sharing one bit
+                                else {
+                                    gbits[g] |= m;
+                                    if (++gsize[g] > biggest) biggest = gsize[g];
+                                }
+                            }
+                            bools++;
+                        }
+                    }
+                    bool cycle = false;
+                    for (int k = 0; k < nseen; ++k) if (seen[k] == p) { cycle = true; break; }
+                    if (cycle) break;
+                    seen[nseen++] = p;
+                    uint32_t nxt;
+                    if (!SafeU32(p + g_offNext, &nxt) || nxt < 0x10000) break;
+                    p = nxt;
+                }
+            }
+            uint32_t super;
+            if (!SafeU32(cls + 0x3C, &super) || super < 0x10000) break;   // SuperField
+            cls = super;
+        }
+
+        if (ok && bools >= 8 && biggest >= 4) {
+            if (npassed < 8) passed[npassed++] = bo;
+            if (bools > bestBools) { bestBools = bools; bestGroup = biggest; }
+        }
+    }
+
+    if (npassed == 0) {
+        Log("[prop] UBoolProperty::BitMask NOT FOUND - bool flags will be skipped");
+        return;
+    }
+    // BitMask is the first member PAST UProperty, so among the survivors the lowest offset above
+    // Offset is the one. More than one survivor is reported rather than hidden: it means the
+    // constraint was not as tight as it looks on this build, and a wrong pick would otherwise
+    // show up much later as a flag that is always zero.
+    g_offBoolMask = -1;
+    for (int i = 0; i < npassed; ++i)
+        if (passed[i] > g_offPropOff && (g_offBoolMask < 0 || passed[i] < g_offBoolMask))
+            g_offBoolMask = passed[i];
+    if (g_offBoolMask < 0) g_offBoolMask = passed[0];
+
+    Log("*** [prop] UBoolProperty::BitMask at +0x%02X   (%d bools, largest group %d, every mask a"
+        " distinct single bit)", g_offBoolMask, bestBools, bestGroup);
+    if (npassed > 1)
+        Log("[prop]   ⚠️ %d dwords satisfied the test; took the lowest above Offset. A flag that"
+            " reads as always-zero means this picked wrong.", npassed);
+}
+
+// ---- one property, and HOW to read it ----
+//
+// Same walk as LookupProp, but it also answers what kind of field arrived. That matters here
+// and nowhere else so far: UE3 changed the ignore-input flags from bools into byte COUNTERS
+// partway through its life, and Mirror's Edge sits close enough to the changeover that which
+// one this build carries is not knowable from the name. A mask of zero means "read the byte".
+struct FlagRef { int off; uint32_t mask; };
+
+static bool LookupFlag(const char* className, const char* propName, FlagRef* out)
+{
+    out->off = -1; out->mask = 0;
+    if (g_offChildren < 0 || g_offNext < 0 || g_offPropOff < 0) return false;
+    uintptr_t cls = FindClassByName(className);
+    if (!cls) return false;
+
+    for (int depth = 0; cls && depth < 16; ++depth) {
+        char cn[96] = "?";
+        ReadObjName(cls, cn, sizeof(cn));
+        uint32_t head = 0;
+        if (SafeU32(cls + g_offChildren, &head) && head >= 0x10000) {
+            uintptr_t seen[512]; int nseen = 0;
+            for (uintptr_t p = head; p && nseen < 512; ) {
+                char nm[96];
+                if (!ReadObjName(p, nm, sizeof(nm))) break;
+                if (strcmp(nm, propName) == 0) {
+                    uint32_t off;
+                    if (SafeU32(p + g_offPropOff, &off) && off < 0x8000) {
+                        const bool isBool = PropIsBool(p);
+                        uint32_t m = 0;
+                        if (isBool) {
+                            // A bool we cannot mask is worse than no bool at all - the whole
+                            // dword reads as "set" whenever ANY of its twenty flags is.
+                            if (g_offBoolMask < 0 || !SafeU32(p + g_offBoolMask, &m) || m == 0) {
+                                Log("[input] %s::%s is a bool but its mask is unknown - skipped",
+                                    className, propName);
+                                return false;
+                            }
+                        }
+                        out->off = (int)off; out->mask = m;
+                        Log("*** [input] %s::%s at +0x%04X  (%s, declared on %s)",
+                            className, propName, off,
+                            isBool ? "bit" : "byte", cn);
+                        return true;
+                    }
+                }
+                bool cycle = false;
+                for (int k = 0; k < nseen; ++k) if (seen[k] == p) { cycle = true; break; }
+                if (cycle) break;
+                seen[nseen++] = p;
+                uint32_t nxt;
+                if (!SafeU32(p + g_offNext, &nxt) || nxt < 0x10000) break;
+                p = nxt;
+            }
+        }
+        uint32_t super;
+        if (!SafeU32(cls + 0x3C, &super) || super < 0x10000) break;
+        cls = super;
+    }
+    return false;
+}
+
+// ---- the names are CANDIDATES, not a schema ----
+//
+// Every one of these is a guess at what this revision of UE3 calls the thing, and half of them
+// are expected to be absent. Absence is reported once, in one line, because "this build has no
+// bCinematicMode" is itself an answer worth having in a bug report - and because a silent miss
+// here would look exactly like a flag that is always zero.
+static const char* const kGateNames[] = {
+    "IgnoreMoveInput", "bIgnoreMoveInput",
+    "IgnoreLookInput", "bIgnoreLookInput",
+    "bCinematicMode", "bCinemaDisableInputMove", "bCinemaDisableInputLook",
+    "bIgnoreButtonInput",
+    "bLeftThumbStickPassedDeadZone", "bRightThumbStickPassedDeadZone",
+    "bIsWalking", "bIsStopping",
+};
+static const int kGateMax = (int)(sizeof(kGateNames) / sizeof(kGateNames[0]));
+
+struct Gate { const char* name; FlagRef ref; };
+static Gate g_gates[kGateMax];
+static int  g_gateCount = 0;
+static int  g_offInputSize = -1;
+
+static void ResolveInputGates()
+{
+    DeriveBoolMaskOffset("TdPlayerController");
+
+    char missing[512]; int mn = 0; int nmissing = 0;
+    missing[0] = 0;
+    for (int i = 0; i < kGateMax; ++i) {
+        FlagRef r;
+        if (LookupFlag("TdPlayerController", kGateNames[i], &r)) {
+            g_gates[g_gateCount].name = kGateNames[i];
+            g_gates[g_gateCount].ref  = r;
+            g_gateCount++;
+        } else {
+            nmissing++;
+            mn += _snprintf_s(missing + mn, sizeof(missing) - mn, _TRUNCATE, " %s", kGateNames[i]);
+        }
+    }
+
+    // The stick magnitude the game computed for itself. The single most useful number here:
+    // it sits on the game's side of the pad and answers the "did it arrive" half outright.
+    g_offInputSize = LookupProp("TdPlayerController", "InputSize", true);
+
+    Log("[input] %d of %d gates resolved; InputSize %s", g_gateCount, kGateMax,
+        g_offInputSize >= 0 ? "found" : "NOT FOUND");
+    if (nmissing)
+        Log("[input]   absent on this build (expected - the names differ by UE3 revision):%s",
+            missing);
 }
 
 // Walk a class and its superclasses, logging every property with its offset.
@@ -5372,10 +5722,18 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
 //
 // ---- side-by-side inside the existing backbuffer, not a wider one ----
 //
-// Each eye gets half the width: 1280x1440. That costs horizontal resolution and keeps the
-// frame grab at 3.7 MP / ~4.4 ms, so the D3D9Ex wrapper stays deferred. Widening the
-// backbuffer to restore per-eye resolution doubles the pixels grabbed and is what finally
-// forces that work - a separate decision, made when the geometry is known to be right.
+// Each eye gets half the width: 1280x1440. That cost horizontal resolution and kept the frame
+// grab at 3.7 MP, which was the reason the D3D9Ex work stayed deferred until rung 8.
+//
+// ⚠️ That reason is gone and the resolution is still halved. Rung 8 took the grab to 0.4 ms and
+// it no longer scales with anything the CPU touches, so the constraint this sizing served has
+// been removed - but rung 9 tried to widen the buffer and MEASURED why that does not work: the
+// engine sizes its scene targets from its OWN configured resolution and upscales to whatever
+// backbuffer it is handed, so a wider backbuffer enlarges an upscale and nothing else.
+//
+// Worse, it breaks the split. ShouldDuplicate identifies the scene by matching the BACKBUFFER's
+// dimensions, which was a coincidence that held for nine rungs rather than a property. Any
+// future attempt at per-eye resolution has to fix that identity test FIRST, and separately.
 //
 // It also improves the aspect: 1280x1440 is 0.89 against the headset's 0.93, where the full
 // 16:9 frame was 1.78 and needed most of its horizontal field thrown away.
@@ -6795,6 +7153,84 @@ static void ReportCameraAnimation()
     g_animSamples = 0;
 }
 
+// ================================================================ the game's side of the pad
+//
+// The counterpart to ReportPadState. That one says what the runtime handed us; this says what
+// the game made of it, and whether it was allowed to act on it. See the block above
+// DeriveBoolMaskOffset for why the pair exists.
+
+static long  g_gateSamples = 0;
+static long  g_gateReads[kGateMax] = {};
+static long  g_gateSet[kGateMax]   = {};       // samples in which the flag read non-zero
+static uint32_t g_gateLast[kGateMax] = {};
+static float g_inputSizePeak = 0.0f;
+
+static bool ReadFlag(uintptr_t obj, const FlagRef& f, uint32_t* out)
+{
+    if (f.off < 0) return false;
+    if (f.mask) {
+        uint32_t dw;
+        if (!SafeRead(obj + f.off, &dw, 4)) return false;
+        *out = (dw & f.mask) ? 1u : 0u;
+        return true;
+    }
+    uint8_t b;
+    if (!SafeRead(obj + f.off, &b, 1)) return false;
+    *out = b;                                   // a byte counter, so the COUNT is the value
+    return true;
+}
+
+static void ProbeInputGates()
+{
+    if (g_gateCount == 0 && g_offInputSize < 0) return;
+    // Validated rather than merely non-null, for the reason recorded at the vertex-constant
+    // hook: between a controller being destroyed and Present noticing, this reads a freed
+    // object - and a freed dword masked to one bit still reads as a perfectly plausible flag.
+    const uintptr_t ctl = g_playerCtl;
+    if (!LooksLikePlayerController(ctl)) return;
+
+    g_gateSamples++;
+    for (int i = 0; i < g_gateCount; ++i) {
+        uint32_t v = 0;
+        if (!ReadFlag(ctl, g_gates[i].ref, &v)) continue;
+        g_gateReads[i]++;
+        g_gateLast[i] = v;
+        if (v) g_gateSet[i]++;
+    }
+    if (g_offInputSize >= 0) {
+        float sz = 0.0f;
+        // Bounded, not merely read. A stick magnitude is 0..1 and anything far outside that is
+        // a wrong offset or a dead object, which should not be reported as a peak.
+        if (SafeRead(ctl + g_offInputSize, &sz, 4) && sz > g_inputSizePeak && sz < 100.0f)
+            g_inputSizePeak = sz;
+    }
+}
+
+static void ReportInputGates()
+{
+    if (g_gateSamples == 0) return;
+
+    char line[768]; int n = 0;
+    n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE,
+                     "[input] over %ld samples:", g_gateSamples);
+    for (int i = 0; i < g_gateCount; ++i) {
+        if (g_gateReads[i] == 0) continue;
+        // Last value AND how often it was set: a gate that is set for every sample and one that
+        // flickered once are the same number at the instant this line is written.
+        n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE, "  %s=%u(set %ld/%ld)",
+                         g_gates[i].name, g_gateLast[i], g_gateSet[i], g_gateReads[i]);
+    }
+    Log("%s", line);
+
+    if (g_offInputSize >= 0)
+        Log("[input]   InputSize peaked %.2f this window  <- the stick magnitude the GAME computed."
+            " Zero while the player is pushing means the pad never reached it.", g_inputSizePeak);
+
+    g_gateSamples = 0;
+    g_inputSizePeak = 0.0f;
+    for (int i = 0; i < kGateMax; ++i) { g_gateReads[i] = 0; g_gateSet[i] = 0; }
+}
+
 // ================================================================ the on-screen readout
 //
 // Ported from the Singularity mod, where it was added at run 127 for a reason this project has
@@ -7203,7 +7639,17 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
 
     // Sampled every frame - the peaks are what matter and a landing lasts a few frames.
     ProbeCameraAnimation();
-    if ((f % 900) == 0) { ReportCameraAnimation(); if (g_simulStereo) ReportRenderTargets(); }
+    // Same window, and deliberately adjacent in the log: [pad] is what the runtime delivered,
+    // [input] is what the game made of it. A "cannot move" report is answered by reading the
+    // two together, and splitting them across different windows would mean pairing them by
+    // frame number in a text editor.
+    ProbeInputGates();
+    if ((f % 900) == 0) {
+        ReportCameraAnimation();
+        ReportPadState();
+        ReportInputGates();
+        if (g_simulStereo) ReportRenderTargets();
+    }
 
     // Six times a second is fast enough to place a transition against the acceptance windows it
     // is meant to explain, and it costs three reads on the frames it runs. It logs only when the
