@@ -9,8 +9,11 @@
 ;
 ; With no file present every setting keeps its compiled default.
 ;
-; This file can only set things the hotkeys could already set, so it cannot reach a state a
-; run without it could not. Hotkeys still work and override anything here.
+; Almost everything here can also be set by a hotkey in game, and the hotkey wins - so a run
+; without this file can reach the same states.
+;
+; D3D9Ex is the exception, and cannot be otherwise: a graphics device's type is fixed when it
+; is created, so there is no moment later at which a key could change it.
 ;
 ; Every line is reported in the log at startup - applied, or rejected with the reason. A
 ; misspelt key is never silent:
@@ -73,3 +76,32 @@ FrameCap = 60
 LockAnimPitch = off
 LockAnimRoll  = off
 LockAnimYaw   = off
+
+
+; ---------------------------------------------------------------- graphics path
+
+; How the frame reaches the headset. Both of these exist for one reason: if the fast path
+; misbehaves on your machine, you need a way back that does not require a different build.
+;
+; On by default, and worth leaving on - together they are what took the frame grab from about
+; 4 ms to 0.4 and the frame rate from 75-80 to over 100.
+
+; Ask Windows for a D3D9Ex device instead of the plain one the game requests. Everything below
+; depends on it: a shared surface is an Ex feature, so D3D9Ex = off also forces FastCapture off.
+;
+; No hotkey, and there cannot be one - see the note at the top. If the game will not start or
+; renders nothing at all, this is the first thing to turn off.
+;
+; An empty file named  mevr_noex.txt  beside d3d9.dll does the same thing and beats this
+; setting. It exists for the case where the game fails before it gets far enough to be worth
+; editing anything, and because an empty file can be created from a file manager without
+; opening a text editor.
+D3D9Ex = on
+
+; Copy the frame on the GPU rather than dragging it through system memory. About ten times
+; faster, and the only thing that could go wrong with it is tearing - two devices share one
+; surface, and if the ordering between them ever fails you would see a torn strip rather than
+; a wrong image.
+;
+; Hotkey: NUMPAD8, so you can compare both in one session.
+FastCapture = on

@@ -8158,9 +8158,18 @@ static void CheckExOptOut()
     if (!slash) return;
     _snwprintf_s(slash + 1, MAX_PATH - (slash + 1 - path), _TRUNCATE, L"mevr_noex.txt");
 
+    // ⚠️ This file predates mevr.ini and is now the SECOND way to say the same thing. Kept, and
+    // kept as the one that WINS, because the two are not equivalent in the case that matters: if
+    // the Ex device is what stops the game reaching a state where anything can be read or edited,
+    // the escape has to work without the ini being parsed at all. An empty file is also something
+    // that can be created blind, from a file manager, by someone who has never opened the ini.
+    //
+    // D3D9Ex=off in mevr.ini is the normal way. This is the one that still works when the normal
+    // way cannot be reached.
     if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
         g_wantEx = false;
-        Log("[ex] mevr_noex.txt found - staying on the plain D3D9 device");
+        Log("[ex] mevr_noex.txt found - staying on the plain D3D9 device"
+            " (overrides D3D9Ex in mevr.ini)");
     }
 }
 
@@ -8420,6 +8429,29 @@ static void LoadSettings()
                     b ? "" : "  (no overlay, no hotkeys except PAGE UP, F6 and hold-PAUSE)");
                 applied++;
             } else { Log("[cfg]   Debug '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "D3D9Ex") == 0) {
+            // ⚠️ Not a hotkey, and cannot be. A device's TYPE is fixed when it is created, so
+            // switching it later would mean destroying every resource in the game. This is the
+            // only place the choice can be made, which is exactly why it belongs in the file
+            // rather than behind Debug: a machine where the Ex device misbehaves needs the way
+            // out to be reachable by someone who is playing, not developing.
+            if (SettingBool(val, &b)) {
+                g_wantEx = b;
+                Log("[cfg]   D3D9Ex = %s%s", b ? "on" : "off",
+                    b ? "" : "  (plain D3D9 - also forces the slow frame grab, which needs Ex)");
+                applied++;
+            } else { Log("[cfg]   D3D9Ex '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "FastCapture") == 0) {
+            // The grab path CAN change at runtime - it is chosen per frame and owns nothing the
+            // game can see - so NUMPAD8 toggles it too. The file exists because the hotkey is
+            // behind Debug, and "this machine tears with the shared surface" is a setting a
+            // player needs, not a development affordance.
+            if (SettingBool(val, &b)) {
+                g_fastCapture = b;
+                Log("[cfg]   FastCapture = %s%s", b ? "on" : "off",
+                    b ? "  (shared surface, stays on the GPU)" : "  (CPU round trip, ~4 ms/frame)");
+                applied++;
+            } else { Log("[cfg]   FastCapture '%s' is not a boolean - ignored", val); rejected++; }
         } else if (_stricmp(key, "LockAnimYaw") == 0) {
             if (SettingBool(val, &b)) { g_animYawFollow = !b; Log("[cfg]   LockAnimYaw = %s", b?"on":"off"); applied++; }
             else { Log("[cfg]   LockAnimYaw '%s' is not a boolean - ignored", val); rejected++; }
