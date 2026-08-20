@@ -149,7 +149,7 @@ static bool  g_devicePatched = false;   // IDirect3DDevice9 vtable patched
 static bool  g_devIsEx       = false;   // the device really is D3D9Ex
 // Rung 10, defined below the call sites in the XR setup and the frame loop.
 static void  XrInitActions();
-static void  XrSyncInput();
+static bool  XrSyncInput();
 static void  InstallXInputHook();
 static long  g_frames        = 0;
 static bool  g_describedBackbuffer = false;
@@ -542,8 +542,16 @@ static XrAction    g_aLTrig = XR_NULL_HANDLE, g_aRTrig = XR_NULL_HANDLE;
 static XrAction    g_aLGrip = XR_NULL_HANDLE, g_aRGrip = XR_NULL_HANDLE;
 static XrAction    g_aMenu = XR_NULL_HANDLE;
 static XrAction    g_aLClick = XR_NULL_HANDLE, g_aRClick = XR_NULL_HANDLE;
+// Phase 1 motion hands. These actions must exist before the action set is attached even while
+// the feature is disabled: OpenXR does not permit extending an attached action set later.
+static XrAction    g_aLGripPose = XR_NULL_HANDLE, g_aRGripPose = XR_NULL_HANDLE;
+static XrAction    g_aLAimPose  = XR_NULL_HANDLE, g_aRAimPose  = XR_NULL_HANDLE;
+static XrSpace     g_sLGripPose = XR_NULL_HANDLE, g_sRGripPose = XR_NULL_HANDLE;
+static XrSpace     g_sLAimPose  = XR_NULL_HANDLE, g_sRAimPose  = XR_NULL_HANDLE;
 static bool        g_actionsReady = false;
 static bool        g_padEnabled = true;            // NUMPAD9 toggles
+static bool        g_motionHands = false;           // incomplete Phase 1 path, opt-in only
+static bool        g_motionHandsDebug = false;      // bounded pose-state and position reports
 static MEVR_XINPUT_STATE g_pad = {};
 static CRITICAL_SECTION  g_padLock;
 static bool        g_padLockReady = false;
@@ -561,6 +569,25 @@ static float g_padHi[4] = { 0, 0, 0, 0 };
 static WORD  g_padButtonsSeen = 0;
 static BYTE  g_padTrigPeak[2] = { 0, 0 };
 static long  g_padPollsSeen = 0;               // g_padPolls at the last report
+
+struct MotionPoseSample {
+    bool active = false;
+    XrSpaceLocationFlags flags = 0;
+    XrPosef pose{};                             // relative to VIEW (the tracked head)
+    int reportedStatus = -1;
+};
+static MotionPoseSample g_poseLGrip, g_poseRGrip, g_poseLAim, g_poseRAim;
+
+static void XrDestroyMotionPoseSpaces()
+{
+    XrSpace* spaces[] = { &g_sLGripPose, &g_sRGripPose, &g_sLAimPose, &g_sRAimPose };
+    for (XrSpace* space : spaces) {
+        if (*space != XR_NULL_HANDLE) {
+            xrDestroySpace(*space);
+            *space = XR_NULL_HANDLE;
+        }
+    }
+}
 
 static void XrInitActions()
 {
@@ -597,6 +624,26 @@ static void XrInitActions()
     mk(&g_aMenu,   "menu",   XR_ACTION_TYPE_BOOLEAN_INPUT);
     mk(&g_aLClick, "lclick", XR_ACTION_TYPE_BOOLEAN_INPUT);
     mk(&g_aRClick, "rclick", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    mk(&g_aLGripPose, "left_grip_pose",  XR_ACTION_TYPE_POSE_INPUT);
+    mk(&g_aRGripPose, "right_grip_pose", XR_ACTION_TYPE_POSE_INPUT);
+    mk(&g_aLAimPose,  "left_aim_pose",   XR_ACTION_TYPE_POSE_INPUT);
+    mk(&g_aRAimPose,  "right_aim_pose",  XR_ACTION_TYPE_POSE_INPUT);
+
+    auto mkSpace = [&](XrAction action, XrSpace* out, const char* name) {
+        if (action == XR_NULL_HANDLE) return;
+        XrActionSpaceCreateInfo ci{ XR_TYPE_ACTION_SPACE_CREATE_INFO };
+        ci.action = action;
+        ci.poseInActionSpace.orientation.w = 1.0f;
+        const XrResult result = xrCreateActionSpace(g_xrSession, &ci, out);
+        if (XR_FAILED(result)) {
+            *out = XR_NULL_HANDLE;
+            Log("[hands] xrCreateActionSpace(%s) failed -> %d", name, (int)result);
+        }
+    };
+    mkSpace(g_aLGripPose, &g_sLGripPose, "left grip");
+    mkSpace(g_aRGripPose, &g_sRGripPose, "right grip");
+    mkSpace(g_aLAimPose,  &g_sLAimPose,  "left aim");
+    mkSpace(g_aRAimPose,  &g_sRAimPose,  "right aim");
 
     auto path = [&](const char* s) {
         XrPath p = XR_NULL_PATH;
@@ -608,37 +655,48 @@ static void XrInitActions()
     // profile is suggested as well: it carries only a select and a menu button, which is not
     // playable, but it means an unrecognised controller still reaches the menus instead of
     // appearing completely dead.
-    const XrActionSuggestedBinding touch[] = {
-        { g_aMove,   path("/user/hand/left/input/thumbstick") },
-        { g_aLook,   path("/user/hand/right/input/thumbstick") },
-        { g_aA,      path("/user/hand/right/input/a/click") },
-        { g_aB,      path("/user/hand/right/input/b/click") },
-        { g_aX,      path("/user/hand/left/input/x/click") },
-        { g_aY,      path("/user/hand/left/input/y/click") },
-        { g_aLTrig,  path("/user/hand/left/input/trigger/value") },
-        { g_aRTrig,  path("/user/hand/right/input/trigger/value") },
-        { g_aLGrip,  path("/user/hand/left/input/squeeze/value") },
-        { g_aRGrip,  path("/user/hand/right/input/squeeze/value") },
-        { g_aMenu,   path("/user/hand/left/input/menu/click") },
-        { g_aLClick, path("/user/hand/left/input/thumbstick/click") },
-        { g_aRClick, path("/user/hand/right/input/thumbstick/click") },
+    std::vector<XrActionSuggestedBinding> touch;
+    auto bind = [&](std::vector<XrActionSuggestedBinding>& bindings,
+                    XrAction action, const char* source) {
+        if (action != XR_NULL_HANDLE) bindings.push_back({ action, path(source) });
     };
+    bind(touch, g_aMove,      "/user/hand/left/input/thumbstick");
+    bind(touch, g_aLook,      "/user/hand/right/input/thumbstick");
+    bind(touch, g_aA,         "/user/hand/right/input/a/click");
+    bind(touch, g_aB,         "/user/hand/right/input/b/click");
+    bind(touch, g_aX,         "/user/hand/left/input/x/click");
+    bind(touch, g_aY,         "/user/hand/left/input/y/click");
+    bind(touch, g_aLTrig,     "/user/hand/left/input/trigger/value");
+    bind(touch, g_aRTrig,     "/user/hand/right/input/trigger/value");
+    bind(touch, g_aLGrip,     "/user/hand/left/input/squeeze/value");
+    bind(touch, g_aRGrip,     "/user/hand/right/input/squeeze/value");
+    bind(touch, g_aMenu,      "/user/hand/left/input/menu/click");
+    bind(touch, g_aLClick,    "/user/hand/left/input/thumbstick/click");
+    bind(touch, g_aRClick,    "/user/hand/right/input/thumbstick/click");
+    bind(touch, g_aLGripPose, "/user/hand/left/input/grip/pose");
+    bind(touch, g_aRGripPose, "/user/hand/right/input/grip/pose");
+    bind(touch, g_aLAimPose,  "/user/hand/left/input/aim/pose");
+    bind(touch, g_aRAimPose,  "/user/hand/right/input/aim/pose");
     XrInteractionProfileSuggestedBinding sib{ XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
     sib.interactionProfile = path("/interaction_profiles/oculus/touch_controller");
-    sib.suggestedBindings = touch;
-    sib.countSuggestedBindings = (uint32_t)(sizeof(touch) / sizeof(touch[0]));
+    sib.suggestedBindings = touch.data();
+    sib.countSuggestedBindings = (uint32_t)touch.size();
     XrResult sr = xrSuggestInteractionProfileBindings(g_xrInstance, &sib);
     if (XR_FAILED(sr)) Log("[pad] suggested bindings for oculus/touch rejected -> %d", (int)sr);
 
-    const XrActionSuggestedBinding simple[] = {
-        { g_aA,    path("/user/hand/right/input/select/click") },
-        { g_aMenu, path("/user/hand/left/input/menu/click") },
-    };
+    std::vector<XrActionSuggestedBinding> simple;
+    bind(simple, g_aA,         "/user/hand/right/input/select/click");
+    bind(simple, g_aMenu,      "/user/hand/left/input/menu/click");
+    bind(simple, g_aLGripPose, "/user/hand/left/input/grip/pose");
+    bind(simple, g_aRGripPose, "/user/hand/right/input/grip/pose");
+    bind(simple, g_aLAimPose,  "/user/hand/left/input/aim/pose");
+    bind(simple, g_aRAimPose,  "/user/hand/right/input/aim/pose");
     XrInteractionProfileSuggestedBinding sib2{ XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
     sib2.interactionProfile = path("/interaction_profiles/khr/simple_controller");
-    sib2.suggestedBindings = simple;
-    sib2.countSuggestedBindings = (uint32_t)(sizeof(simple) / sizeof(simple[0]));
-    xrSuggestInteractionProfileBindings(g_xrInstance, &sib2);
+    sib2.suggestedBindings = simple.data();
+    sib2.countSuggestedBindings = (uint32_t)simple.size();
+    const XrResult sr2 = xrSuggestInteractionProfileBindings(g_xrInstance, &sib2);
+    if (XR_FAILED(sr2)) Log("[hands] suggested bindings for simple controller rejected -> %d", (int)sr2);
 
     // ⚠️ Permanent. Once action sets are attached to a session no more can be added, so this is
     // the last chance to have created every action - which is why they are all made above rather
@@ -648,17 +706,23 @@ static void XrInitActions()
     ai.actionSets = &g_actionSet;
     if (XR_FAILED(xrAttachSessionActionSets(g_xrSession, &ai))) {
         Log("[pad] xrAttachSessionActionSets failed - controllers unavailable");
+        XrDestroyMotionPoseSpaces();
         return;
     }
     if (!g_padLockReady) { InitializeCriticalSection(&g_padLock); g_padLockReady = true; }
     g_actionsReady = true;
     Log("*** [pad] controller actions attached - sticks, triggers, grips and face buttons");
+    Log("*** [hands] grip/aim pose actions attached; spaces Lg=%s Rg=%s La=%s Ra=%s",
+        g_sLGripPose != XR_NULL_HANDLE ? "yes" : "NO",
+        g_sRGripPose != XR_NULL_HANDLE ? "yes" : "NO",
+        g_sLAimPose  != XR_NULL_HANDLE ? "yes" : "NO",
+        g_sRAimPose  != XR_NULL_HANDLE ? "yes" : "NO");
 }
 
 // Read the controllers and build a 360 pad out of them. Called once per frame from the XR loop.
-static void XrSyncInput()
+static bool XrSyncInput()
 {
-    if (!g_actionsReady || !g_padEnabled) return;
+    if (!g_actionsReady) return false;
 
     XrActiveActionSet aas{ g_actionSet, XR_NULL_PATH };
     XrActionsSyncInfo si{ XR_TYPE_ACTIONS_SYNC_INFO };
@@ -666,7 +730,9 @@ static void XrSyncInput()
     si.activeActionSets = &aas;
     // Returns SESSION_NOT_FOCUSED whenever the headset menu is up. Not an error, and not worth
     // logging every frame - the actions simply report inactive and the pad reads as centred.
-    if (XR_FAILED(xrSyncActions(g_xrSession, &si))) return;
+    if (XR_FAILED(xrSyncActions(g_xrSession, &si))) return false;
+    // Pose actions share this action set. They remain live when NUMPAD9 disables pad synthesis.
+    if (!g_padEnabled) return true;
 
     // Returns whether the action was ACTIVE, which the caller now records. isActive is the
     // runtime saying "this action is bound to a control on a controller that is present" - so
@@ -780,6 +846,81 @@ static void XrSyncInput()
     g_pad = s;
     g_pad.dwPacketNumber = pn;
     LeaveCriticalSection(&g_padLock);
+    return true;
+}
+
+static int MotionPoseStatus(const MotionPoseSample& sample)
+{
+    int status = sample.active ? 1 : 0;
+    if (sample.flags & XR_SPACE_LOCATION_POSITION_VALID_BIT)       status |= 2;
+    if (sample.flags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)    status |= 4;
+    if (sample.flags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT)     status |= 8;
+    if (sample.flags & XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT)  status |= 16;
+    return status;
+}
+
+static void XrSampleMotionPose(const char* name, XrAction action, XrSpace space,
+                               XrTime when, bool actionsSynced, MotionPoseSample* sample)
+{
+    sample->active = false;
+    sample->flags = 0;
+    sample->pose = {};
+
+    if (actionsSynced && action != XR_NULL_HANDLE && space != XR_NULL_HANDLE &&
+        g_viewSpace != XR_NULL_HANDLE) {
+        XrActionStateGetInfo gi{ XR_TYPE_ACTION_STATE_GET_INFO };
+        gi.action = action;
+        XrActionStatePose state{ XR_TYPE_ACTION_STATE_POSE };
+        if (XR_SUCCEEDED(xrGetActionStatePose(g_xrSession, &gi, &state)) && state.isActive) {
+            sample->active = true;
+            XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
+            if (XR_SUCCEEDED(xrLocateSpace(space, g_viewSpace, when, &loc))) {
+                sample->flags = loc.locationFlags;
+                sample->pose = loc.pose;
+            }
+        }
+    }
+
+    const int status = MotionPoseStatus(*sample);
+    if (g_motionHandsDebug && status != sample->reportedStatus) {
+        // Do not emit four unhelpful "inactive" lines on the first frame. Once a pose has been
+        // seen, every loss and recovery is logged exactly once at the transition.
+        if (sample->reportedStatus >= 0 || status != 0) {
+            Log("[hands] %s pose -> active=%d position=%s/%s orientation=%s/%s",
+                name, sample->active ? 1 : 0,
+                (sample->flags & XR_SPACE_LOCATION_POSITION_VALID_BIT) ? "valid" : "invalid",
+                (sample->flags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT) ? "tracked" : "untracked",
+                (sample->flags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) ? "valid" : "invalid",
+                (sample->flags & XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT) ? "tracked" : "untracked");
+        }
+        sample->reportedStatus = status;
+    }
+}
+
+static void XrSampleMotionPoses(XrTime when, bool actionsSynced)
+{
+    if (!g_motionHands && !g_motionHandsDebug) return;
+
+    XrSampleMotionPose("left grip",  g_aLGripPose, g_sLGripPose, when, actionsSynced, &g_poseLGrip);
+    XrSampleMotionPose("right grip", g_aRGripPose, g_sRGripPose, when, actionsSynced, &g_poseRGrip);
+
+    // Aim poses are created for Phase 2 but sampled only for diagnostics in Phase 1.
+    if (g_motionHandsDebug) {
+        XrSampleMotionPose("left aim",  g_aLAimPose, g_sLAimPose, when, actionsSynced, &g_poseLAim);
+        XrSampleMotionPose("right aim", g_aRAimPose, g_sRAimPose, when, actionsSynced, &g_poseRAim);
+
+        static double lastReportMs = 0.0;
+        const double now = NowMs();
+        if (now - lastReportMs >= 5000.0) {
+            lastReportMs = now;
+            Log("[hands] head-relative metres: grip L(%+.3f,%+.3f,%+.3f) R(%+.3f,%+.3f,%+.3f)"
+                "  aim L(%+.3f,%+.3f,%+.3f) R(%+.3f,%+.3f,%+.3f)",
+                g_poseLGrip.pose.position.x, g_poseLGrip.pose.position.y, g_poseLGrip.pose.position.z,
+                g_poseRGrip.pose.position.x, g_poseRGrip.pose.position.y, g_poseRGrip.pose.position.z,
+                g_poseLAim.pose.position.x,  g_poseLAim.pose.position.y,  g_poseLAim.pose.position.z,
+                g_poseRAim.pose.position.x,  g_poseRAim.pose.position.y,  g_poseRAim.pose.position.z);
+        }
+    }
 }
 
 // The pad half of the movement diagnosis. Reported on the same window as the animation probe,
@@ -952,6 +1093,10 @@ static void PumpXREvents()
                 xrEndSession(g_xrSession);
                 g_xrRunning = false;
                 Log("[xr] session stopped");
+            } else if (s->state == XR_SESSION_STATE_LOSS_PENDING ||
+                       s->state == XR_SESSION_STATE_EXITING) {
+                XrDestroyMotionPoseSpaces();
+                Log("[hands] pose spaces destroyed with the terminating XR session");
             }
         }
         ev = { XR_TYPE_EVENT_DATA_BUFFER };
@@ -1809,7 +1954,8 @@ static void SubmitTestQuad()
     ApplyHeadTracking(fs.predictedDisplayTime);
     // Once a frame, beside the head sample. Both read the same runtime and both describe the same
     // instant, so keeping them together is what stops the sticks from lagging the view.
-    XrSyncInput();
+    const bool actionsSynced = XrSyncInput();
+    XrSampleMotionPoses(fs.predictedDisplayTime, actionsSynced);
     TickPacing();
     ReportStereoGeometry();
     // ReportPoseHonesty is gone. It compared the CHANGE in head yaw against the change in the
@@ -8429,6 +8575,19 @@ static void LoadSettings()
                     b ? "" : "  (no overlay, no hotkeys except PAGE UP, F6 and hold-PAUSE)");
                 applied++;
             } else { Log("[cfg]   Debug '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "MotionHands") == 0) {
+            if (SettingBool(val, &b)) {
+                g_motionHands = b;
+                Log("[cfg]   MotionHands = %s%s", b ? "on" : "off",
+                    b ? "  (Phase 1 pose sampling enabled; arm control is not landed yet)" : "");
+                applied++;
+            } else { Log("[cfg]   MotionHands '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "MotionHandsDebug") == 0) {
+            if (SettingBool(val, &b)) {
+                g_motionHandsDebug = b;
+                Log("[cfg]   MotionHandsDebug = %s", b ? "on" : "off");
+                applied++;
+            } else { Log("[cfg]   MotionHandsDebug '%s' is not a boolean - ignored", val); rejected++; }
         } else if (_stricmp(key, "D3D9Ex") == 0) {
             // ⚠️ Not a hotkey, and cannot be. A device's TYPE is fixed when it is created, so
             // switching it later would mean destroying every resource in the game. This is the

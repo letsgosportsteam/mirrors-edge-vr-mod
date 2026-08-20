@@ -47,6 +47,17 @@
 Debug = on
 
 
+; ---------------------------------------------------------------- Phase 1 motion hands (experimental)
+;
+; The pose-input foundation is under active development. MotionHands currently samples the
+; controller grip poses but does not move Faith's arms yet. Leave it OFF for ordinary play.
+; MotionHandsDebug adds bounded pose validity/tracking transitions and a five-second report of
+; grip/aim positions relative to the headset to mevr.log.
+
+MotionHands = off
+MotionHandsDebug = off
+
+
 ; ---------------------------------------------------------------- frame pacing
 
 ; The engine's MaxSmoothedFrameRate. NUMPAD7 cycles 60 / 72 / 90 / 120 / 144 / 250 / 62.
