@@ -196,6 +196,9 @@ Roughly in the order they matter. Nothing here is a promise of a date.
 | **Guns** | Basic, plus hand tracking for weapons |
 | **Advanced** | Parkour mechanics actually performed with the hands |
 
+The implementation plan for the first stage is in
+[`PHASE1_MOTION_CONTROLS.md`](PHASE1_MOTION_CONTROLS.md).
+
 ## Reporting a bug
 
 Open an [issue](https://github.com/letsgosportsteam/mirrors-edge-vr-mod/issues) and attach
