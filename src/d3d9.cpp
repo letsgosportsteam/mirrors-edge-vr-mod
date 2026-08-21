@@ -3593,18 +3593,26 @@ static void ResolveMotionRigOffsets()
     g_offSingleBoneRotationSpace =
         LookupProp("SkelControlSingleBone", "BoneRotationSpace", true);
 
-    const bool ready =
-        g_offMesh1p >= 0 &&
+    const bool reflectedPointers =
         g_offLeftHandWorldIK >= 0 && g_offRightHandWorldIK >= 0 &&
         g_offLeftHandRotation >= 0 && g_offRightHandRotation >= 0 &&
-        g_offLeftForeArmRoll >= 0 && g_offRightForeArmRoll >= 0 &&
+        g_offLeftForeArmRoll >= 0 && g_offRightForeArmRoll >= 0;
+    const bool reflectedControllerFields =
         g_offLimbEffector >= 0 && g_offLimbEffectorSpace >= 0 &&
         g_offSkelControlStrength >= 0 &&
         g_offSingleBoneRotation >= 0 && g_offSingleBoneRotationSpace >= 0;
 
-    InterlockedExchange(&g_motionRigOffsetsReady, ready ? 1 : -1);
-    Log("[hands-rig] reflected layout %s; optional joint target %s",
-        ready ? "READY" : "INCOMPLETE - discovery disabled",
+    // The retail cook keeps Mesh1p reflected but strips the editinline IK pointer properties
+    // and the native Engine controller fields from Children. That is not permission to guess
+    // offsets. Runtime discovery can still proceed from Mesh1p's proven boundary and derive the
+    // pawn pointers from the complete class pattern; later writes remain disabled until their
+    // own layout is independently derived.
+    InterlockedExchange(&g_motionRigOffsetsReady, g_offMesh1p >= 0 ? 1 : -1);
+    Log("[hands-rig] reflected discovery base %s; pawn pointers %s; controller fields %s;"
+        " optional joint target %s",
+        g_offMesh1p >= 0 ? "READY" : "INCOMPLETE - discovery disabled",
+        reflectedPointers ? "available" : "stripped - require structural derivation",
+        reflectedControllerFields ? "available" : "stripped - writes remain disabled",
         (g_offLimbJointTarget >= 0 && g_offLimbJointTargetSpace >= 0)
             ? "available" : "unavailable");
 }
@@ -5473,6 +5481,74 @@ static bool LooksLikeRigObject(uintptr_t obj, const char* expectedClass)
     return strncmp(name, "Default__", 9) != 0;
 }
 
+static bool MotionRigPointerOffsetsKnown()
+{
+    return g_offLeftHandWorldIK >= 0 && g_offRightHandWorldIK >= 0 &&
+           g_offLeftHandRotation >= 0 && g_offRightHandRotation >= 0 &&
+           g_offLeftForeArmRoll >= 0 && g_offRightForeArmRoll >= 0;
+}
+
+// The retail cook removes six editinline properties from UClass::Children even though their
+// storage and gameplay use remain. Derive that storage from the authored declaration itself:
+//
+//   world limb L/R, local limb L/R, wrist rotation R/L,
+//   heavy-weapon spring, forearm rotation R/L
+//
+// Nine consecutive, live, class-validated UObjects are a fingerprint rather than a guessed
+// address. The scan is bounded to the pawn's own fields before the reflected Mesh1p pointer,
+// runs only until it succeeds, and requires every object plus distinct left/right instances.
+static bool DeriveMotionRigPointerOffsets(uintptr_t pawn)
+{
+    if (MotionRigPointerOffsetsKnown()) return true;
+    if (!pawn || g_offMesh1p <= 0x40) return false;
+
+    const char* expected[] = {
+        "TdSkelControlLimb", "TdSkelControlLimb",
+        "SkelControlLimb", "SkelControlLimb",
+        "SkelControlSingleBone", "SkelControlSingleBone",
+        "TdSkelControlSpring",
+        "SkelControlSingleBone", "SkelControlSingleBone",
+    };
+    const int count = (int)(sizeof(expected) / sizeof(expected[0]));
+
+    for (int off = 0x40; off + count * 4 <= g_offMesh1p; off += 4) {
+        uintptr_t objects[count] = {};
+        bool match = true;
+        for (int i = 0; i < count; ++i) {
+            uint32_t value = 0;
+            if (!SafeU32(pawn + off + i * 4, &value) ||
+                !LooksLikeRigObject(value, expected[i])) {
+                match = false;
+                break;
+            }
+            objects[i] = value;
+        }
+        if (!match) continue;
+        if (objects[0] == objects[1] || objects[2] == objects[3] ||
+            objects[4] == objects[5] || objects[7] == objects[8]) continue;
+
+        g_offLeftHandWorldIK  = off;
+        g_offRightHandWorldIK = off + 4;
+        g_offRightHandRotation = off + 16;
+        g_offLeftHandRotation  = off + 20;
+        g_offRightForeArmRoll = off + 28;
+        g_offLeftForeArmRoll  = off + 32;
+
+        Log("*** [hands-rig] derived stripped TdPawn controller block at +0x%04X"
+            " from complete 9-object class pattern", off);
+        for (int i = 0; i < count; ++i) {
+            char objectName[64] = "?", className[64] = "?";
+            ReadObjName(objects[i], objectName, sizeof(objectName));
+            ReadClassName(objects[i], className, sizeof(className));
+            Log("[hands-rig]   +0x%04X -> %p name \"%s\" class \"%s\"",
+                off + i * 4, (void*)objects[i], objectName, className);
+        }
+        return true;
+    }
+
+    return false;
+}
+
 static void ClearMotionRig(const char* reason)
 {
     if (g_motionRig.valid) {
@@ -5517,6 +5593,13 @@ static void UpdateMotionRigDiscovery()
     if (!pawn) {
         ClearMotionRig("no live player pawn");
         ReportRigRejection(0, -1, "pawn", 0, "TdPlayerPawn", "is unavailable");
+        return;
+    }
+
+    if (!DeriveMotionRigPointerOffsets(pawn)) {
+        ClearMotionRig("stripped controller block has not been derived");
+        ReportRigRejection(pawn, -2, "controller block", 0,
+                           "complete 9-object class pattern", "was not found");
         return;
     }
 
