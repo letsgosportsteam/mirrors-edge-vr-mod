@@ -151,6 +151,7 @@ static bool  g_devIsEx       = false;   // the device really is D3D9Ex
 static void  XrInitActions();
 static bool  XrSyncInput();
 static void  InstallXInputHook();
+void         RecenterSixDof();
 static long  g_frames        = 0;
 static bool  g_describedBackbuffer = false;
 
@@ -570,13 +571,168 @@ static WORD  g_padButtonsSeen = 0;
 static BYTE  g_padTrigPeak[2] = { 0, 0 };
 static long  g_padPollsSeen = 0;               // g_padPolls at the last report
 
+struct MEVR_Vec3 { float x = 0.0f, y = 0.0f, z = 0.0f; };
+struct RenderedHeadFrame {
+    MEVR_Vec3 position;
+    MEVR_Vec3 forward;
+    MEVR_Vec3 right;
+    MEVR_Vec3 up;
+};
+static bool GetRenderedHeadFrame(RenderedHeadFrame* out);
+extern float g_worldScale;
+static volatile LONG g_motionRecenterSerial = 0;
+
 struct MotionPoseSample {
     bool active = false;
     XrSpaceLocationFlags flags = 0;
     XrPosef pose{};                             // relative to VIEW (the tracked head)
+    MEVR_Vec3 cameraLocal;                      // UE3 F/R/U, in Unreal units
+    MEVR_Vec3 worldPosition;                    // exact space expected by world-space limb IK
+    XrQuaternionf worldOrientation{};           // UE3 X-forward, Y-right, Z-up basis
+    float sourceQuatNorm = 0.0f;
+    float worldQuatNorm = 0.0f;
+    bool worldValid = false;
+    long rejectedConversions = 0;
     int reportedStatus = -1;
 };
 static MotionPoseSample g_poseLGrip, g_poseRGrip, g_poseLAim, g_poseRAim;
+
+static bool FiniteVec(const MEVR_Vec3& v)
+{
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+}
+
+static float VecLength(const MEVR_Vec3& v)
+{
+    return sqrtf(v.x*v.x + v.y*v.y + v.z*v.z);
+}
+
+static MEVR_Vec3 RotateByQuaternion(const XrQuaternionf& q, const MEVR_Vec3& v)
+{
+    // q * v * conjugate(q), expanded. q is normalised by the caller.
+    const MEVR_Vec3 t{ 2.0f * (q.y*v.z - q.z*v.y),
+                       2.0f * (q.z*v.x - q.x*v.z),
+                       2.0f * (q.x*v.y - q.y*v.x) };
+    return { v.x + q.w*t.x + (q.y*t.z - q.z*t.y),
+             v.y + q.w*t.y + (q.z*t.x - q.x*t.z),
+             v.z + q.w*t.z + (q.x*t.y - q.y*t.x) };
+}
+
+// OpenXR VIEW: +X right, +Y up, -Z forward. UE3 camera-local: +X forward, +Y right, +Z up.
+static MEVR_Vec3 XrViewToUECamera(const MEVR_Vec3& v)
+{
+    return { -v.z, v.x, v.y };
+}
+
+static MEVR_Vec3 CameraVectorToWorld(const RenderedHeadFrame& head, const MEVR_Vec3& v)
+{
+    return { head.forward.x*v.x + head.right.x*v.y + head.up.x*v.z,
+             head.forward.y*v.x + head.right.y*v.y + head.up.y*v.z,
+             head.forward.z*v.x + head.right.z*v.y + head.up.z*v.z };
+}
+
+static XrQuaternionf QuaternionFromUEBasis(const MEVR_Vec3& forward,
+                                           const MEVR_Vec3& right,
+                                           const MEVR_Vec3& up)
+{
+    // Rotation matrix columns are the UE3 hand's +X/+Y/+Z axes in world space.
+    const float m00 = forward.x, m01 = right.x, m02 = up.x;
+    const float m10 = forward.y, m11 = right.y, m12 = up.y;
+    const float m20 = forward.z, m21 = right.z, m22 = up.z;
+    XrQuaternionf q{};
+    const float trace = m00 + m11 + m22;
+    if (trace > 0.0f) {
+        const float s = sqrtf(trace + 1.0f) * 2.0f;
+        q.w = 0.25f * s;
+        q.x = (m21 - m12) / s;
+        q.y = (m02 - m20) / s;
+        q.z = (m10 - m01) / s;
+    } else if (m00 > m11 && m00 > m22) {
+        const float s = sqrtf(1.0f + m00 - m11 - m22) * 2.0f;
+        q.w = (m21 - m12) / s;
+        q.x = 0.25f * s;
+        q.y = (m01 + m10) / s;
+        q.z = (m02 + m20) / s;
+    } else if (m11 > m22) {
+        const float s = sqrtf(1.0f + m11 - m00 - m22) * 2.0f;
+        q.w = (m02 - m20) / s;
+        q.x = (m01 + m10) / s;
+        q.y = 0.25f * s;
+        q.z = (m12 + m21) / s;
+    } else {
+        const float s = sqrtf(1.0f + m22 - m00 - m11) * 2.0f;
+        q.w = (m10 - m01) / s;
+        q.x = (m02 + m20) / s;
+        q.y = (m12 + m21) / s;
+        q.z = 0.25f * s;
+    }
+    return q;
+}
+
+static bool ConvertMotionPoseToUEWorld(const char* name, const RenderedHeadFrame& head,
+                                       MotionPoseSample* sample)
+{
+    sample->worldValid = false;
+    sample->cameraLocal = {};
+    sample->worldPosition = {};
+    sample->worldOrientation = {};
+    sample->sourceQuatNorm = 0.0f;
+    sample->worldQuatNorm = 0.0f;
+
+    const XrSpaceLocationFlags need = XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                                      XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    if (!sample->active || (sample->flags & need) != need) return false;
+
+    const XrVector3f p = sample->pose.position;
+    const XrQuaternionf raw = sample->pose.orientation;
+    const float qn2 = raw.x*raw.x + raw.y*raw.y + raw.z*raw.z + raw.w*raw.w;
+    const float metres = sqrtf(p.x*p.x + p.y*p.y + p.z*p.z);
+    const bool honest = std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
+                        std::isfinite(qn2) && qn2 > 0.81f && qn2 < 1.21f &&
+                        metres >= 0.01f && metres <= 3.0f;
+    if (!honest) {
+        const long rejected = ++sample->rejectedConversions;
+        if (g_motionHandsDebug && (rejected == 1 || rejected % 600 == 0))
+            Log("[hands] rejected %s conversion #%ld: distance=%.3f m quaternion norm^2=%.4f",
+                name, rejected, metres, qn2);
+        return false;
+    }
+
+    sample->sourceQuatNorm = sqrtf(qn2);
+    const float qi = 1.0f / sample->sourceQuatNorm;
+    const XrQuaternionf q{ raw.x*qi, raw.y*qi, raw.z*qi, raw.w*qi };
+
+    sample->cameraLocal = XrViewToUECamera({ p.x*g_worldScale,
+                                             p.y*g_worldScale,
+                                             p.z*g_worldScale });
+    const MEVR_Vec3 worldOffset = CameraVectorToWorld(head, sample->cameraLocal);
+    sample->worldPosition = { head.position.x + worldOffset.x,
+                              head.position.y + worldOffset.y,
+                              head.position.z + worldOffset.z };
+
+    // Convert the controller's own OpenXR forward/right/up axes through the same two bases as
+    // position. Keeping position and orientation on one mapping prevents a correct palm attached
+    // to a mirrored arm when P1.4 starts consuming this quaternion.
+    const MEVR_Vec3 handForwardView = RotateByQuaternion(q, { 0.0f, 0.0f, -1.0f });
+    const MEVR_Vec3 handRightView   = RotateByQuaternion(q, { 1.0f, 0.0f,  0.0f });
+    const MEVR_Vec3 handUpView      = RotateByQuaternion(q, { 0.0f, 1.0f,  0.0f });
+    const MEVR_Vec3 handForwardWorld = CameraVectorToWorld(head, XrViewToUECamera(handForwardView));
+    const MEVR_Vec3 handRightWorld   = CameraVectorToWorld(head, XrViewToUECamera(handRightView));
+    const MEVR_Vec3 handUpWorld      = CameraVectorToWorld(head, XrViewToUECamera(handUpView));
+    sample->worldOrientation = QuaternionFromUEBasis(handForwardWorld, handRightWorld, handUpWorld);
+    const XrQuaternionf& wq = sample->worldOrientation;
+    sample->worldQuatNorm = sqrtf(wq.x*wq.x + wq.y*wq.y + wq.z*wq.z + wq.w*wq.w);
+    sample->worldValid = FiniteVec(sample->cameraLocal) && FiniteVec(sample->worldPosition) &&
+                         std::isfinite(sample->worldQuatNorm) &&
+                         sample->worldQuatNorm > 0.99f && sample->worldQuatNorm < 1.01f;
+    if (!sample->worldValid) {
+        const long rejected = ++sample->rejectedConversions;
+        if (g_motionHandsDebug && (rejected == 1 || rejected % 600 == 0))
+            Log("[hands] rejected %s UE transform #%ld: output quaternion norm=%.4f",
+                name, rejected, sample->worldQuatNorm);
+    }
+    return sample->worldValid;
+}
 
 static void XrDestroyMotionPoseSpaces()
 {
@@ -865,6 +1021,12 @@ static void XrSampleMotionPose(const char* name, XrAction action, XrSpace space,
     sample->active = false;
     sample->flags = 0;
     sample->pose = {};
+    sample->cameraLocal = {};
+    sample->worldPosition = {};
+    sample->worldOrientation = {};
+    sample->sourceQuatNorm = 0.0f;
+    sample->worldQuatNorm = 0.0f;
+    sample->worldValid = false;
 
     if (actionsSynced && action != XR_NULL_HANDLE && space != XR_NULL_HANDLE &&
         g_viewSpace != XR_NULL_HANDLE) {
@@ -908,7 +1070,63 @@ static void XrSampleMotionPoses(XrTime when, bool actionsSynced)
     if (g_motionHandsDebug) {
         XrSampleMotionPose("left aim",  g_aLAimPose, g_sLAimPose, when, actionsSynced, &g_poseLAim);
         XrSampleMotionPose("right aim", g_aRAimPose, g_sRAimPose, when, actionsSynced, &g_poseRAim);
+    }
 
+    RenderedHeadFrame head{};
+    const bool haveHead = GetRenderedHeadFrame(&head);
+    {
+        static bool reported = false, previous = false;
+        if (g_motionHandsDebug && (!reported || haveHead != previous)) {
+            // The initial menu-side miss is expected, but naming it makes a run that never finds
+            // the pawn distinguishable from a pose conversion that silently did nothing.
+            Log("[hands] rendered UE3 head frame -> %s",
+                haveHead ? "available (camera anchor + 6-DOF)" : "unavailable (no live player camera)");
+            reported = true;
+            previous = haveHead;
+        }
+    }
+
+    if (haveHead) {
+        ConvertMotionPoseToUEWorld("left grip",  head, &g_poseLGrip);
+        ConvertMotionPoseToUEWorld("right grip", head, &g_poseRGrip);
+        if (g_motionHandsDebug) {
+            ConvertMotionPoseToUEWorld("left aim",  head, &g_poseLAim);
+            ConvertMotionPoseToUEWorld("right aim", head, &g_poseRAim);
+        }
+    }
+
+    // PAGE UP clears the camera's positional offset and the hand world anchor together. The
+    // invariant is the controller relative to the rendered head, so measure that directly over
+    // the recenter frame rather than expecting absolute world coordinates to stay fixed.
+    {
+        static LONG seenSerial = 0;
+        static bool havePrevious = false;
+        static MEVR_Vec3 previousLeft{}, previousRight{};
+        const LONG serial = g_motionRecenterSerial;
+        if (g_motionHandsDebug && serial != seenSerial) {
+            if (havePrevious && g_poseLGrip.worldValid && g_poseRGrip.worldValid) {
+                const MEVR_Vec3 dl{ g_poseLGrip.cameraLocal.x - previousLeft.x,
+                                    g_poseLGrip.cameraLocal.y - previousLeft.y,
+                                    g_poseLGrip.cameraLocal.z - previousLeft.z };
+                const MEVR_Vec3 dr{ g_poseRGrip.cameraLocal.x - previousRight.x,
+                                    g_poseRGrip.cameraLocal.y - previousRight.y,
+                                    g_poseRGrip.cameraLocal.z - previousRight.z };
+                Log("[hands] recenter #%ld: head-relative grip jump L %.2f UU R %.2f UU"
+                    " (physical motion plus one frame; no recenter offset is applied to hands)",
+                    serial, VecLength(dl), VecLength(dr));
+            } else {
+                Log("[hands] recenter #%ld: no pair of valid grip poses available for jump check", serial);
+            }
+            seenSerial = serial;
+        }
+        if (g_poseLGrip.worldValid && g_poseRGrip.worldValid) {
+            previousLeft = g_poseLGrip.cameraLocal;
+            previousRight = g_poseRGrip.cameraLocal;
+            havePrevious = true;
+        }
+    }
+
+    if (g_motionHandsDebug) {
         static double lastReportMs = 0.0;
         const double now = NowMs();
         if (now - lastReportMs >= 5000.0) {
@@ -919,6 +1137,27 @@ static void XrSampleMotionPoses(XrTime when, bool actionsSynced)
                 g_poseRGrip.pose.position.x, g_poseRGrip.pose.position.y, g_poseRGrip.pose.position.z,
                 g_poseLAim.pose.position.x,  g_poseLAim.pose.position.y,  g_poseLAim.pose.position.z,
                 g_poseRAim.pose.position.x,  g_poseRAim.pose.position.y,  g_poseRAim.pose.position.z);
+            if (g_poseLGrip.worldValid && g_poseRGrip.worldValid) {
+                const MEVR_Vec3 separation{ g_poseRGrip.worldPosition.x - g_poseLGrip.worldPosition.x,
+                                            g_poseRGrip.worldPosition.y - g_poseLGrip.worldPosition.y,
+                                            g_poseRGrip.worldPosition.z - g_poseLGrip.worldPosition.z };
+                Log("[hands] camera-local UU (F,R,U): grip L(%+.1f,%+.1f,%+.1f)"
+                    " R(%+.1f,%+.1f,%+.1f)  distance L %.1f R %.1f",
+                    g_poseLGrip.cameraLocal.x, g_poseLGrip.cameraLocal.y, g_poseLGrip.cameraLocal.z,
+                    g_poseRGrip.cameraLocal.x, g_poseRGrip.cameraLocal.y, g_poseRGrip.cameraLocal.z,
+                    VecLength(g_poseLGrip.cameraLocal), VecLength(g_poseRGrip.cameraLocal));
+                Log("[hands] UE3 world UU: head(%+.1f,%+.1f,%+.1f) L(%+.1f,%+.1f,%+.1f)"
+                    " R(%+.1f,%+.1f,%+.1f) separation %.1f | quat norms L %.4f->%.4f R %.4f->%.4f",
+                    head.position.x, head.position.y, head.position.z,
+                    g_poseLGrip.worldPosition.x, g_poseLGrip.worldPosition.y, g_poseLGrip.worldPosition.z,
+                    g_poseRGrip.worldPosition.x, g_poseRGrip.worldPosition.y, g_poseRGrip.worldPosition.z,
+                    VecLength(separation),
+                    g_poseLGrip.sourceQuatNorm, g_poseLGrip.worldQuatNorm,
+                    g_poseRGrip.sourceQuatNorm, g_poseRGrip.worldQuatNorm);
+            } else {
+                Log("[hands] UE3 conversion unavailable this report: head=%d left=%d right=%d",
+                    haveHead ? 1 : 0, g_poseLGrip.worldValid ? 1 : 0, g_poseRGrip.worldValid ? 1 : 0);
+            }
         }
     }
 }
@@ -4648,7 +4887,10 @@ static void CheckHeadHotkeys()
     {
         static bool pPgUpAlways = false;
         const bool dPgUpAlways = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
-        if (dPgUpAlways && !pPgUpAlways) { g_haveCentre = false; Log("*** [6dof] PAGE UP -> recentring"); }
+        if (dPgUpAlways && !pPgUpAlways) {
+            RecenterSixDof();
+            Log("*** [6dof] PAGE UP -> recentring head and motion hands together");
+        }
         pPgUpAlways = dPgUpAlways;
     }
     if (!g_debug) return;
@@ -5191,14 +5433,19 @@ bool  g_vmBestWorld = false;
 float g_vmBestScore = -1e9f;
 static int  g_vmCandidates = 0;
 
-// Camera pose straight from the pawn's cached values - the same numbers CalcCamera produced.
-static bool GetCameraPose(float* loc, float* fwd)
+static bool ReadCameraAnchor(float* loc, int32_t* rot)
 {
     if (g_offCamLoc < 0 || g_offCamRot < 0) return false;
     if (!LooksLikePlayerPawn(g_playerPawn)) return false;
-    if (!SafeRead(g_playerPawn + g_offCamLoc, loc, 12)) return false;
+    return SafeRead(g_playerPawn + g_offCamLoc, loc, 12) &&
+           SafeRead(g_playerPawn + g_offCamRot, rot, 12);
+}
+
+// Camera pose straight from the pawn's cached values - the same numbers CalcCamera produced.
+static bool GetCameraPose(float* loc, float* fwd)
+{
     int32_t rot[3];
-    if (!SafeRead(g_playerPawn + g_offCamRot, rot, 12)) return false;
+    if (!ReadCameraAnchor(loc, rot)) return false;
 
     const float kToRad = 3.14159265f / 32768.0f;
     const float pitch = rot[0] * kToRad, yaw = rot[1] * kToRad;
@@ -5206,6 +5453,65 @@ static bool GetCameraPose(float* loc, float* fwd)
     fwd[1] = cosf(pitch) * sinf(yaw);
     fwd[2] = sinf(pitch);
     return true;
+}
+
+// The world transform of the rendered head anchor. Position starts at the exact camera location
+// CalcCamera cached on the pawn, then receives the same current 6-DOF offset as the view matrix.
+// Orientation uses the cached camera animation/rotation, which is the frame Mesh1p must inhabit.
+static bool GetRenderedHeadFrame(RenderedHeadFrame* out)
+{
+    if (!out) return false;
+    float loc[3];
+    int32_t rot[3];
+    if (!ReadCameraAnchor(loc, rot)) return false;
+
+    const float kToRad = 3.14159265f / 32768.0f;
+    const float pitch = (float)rot[0] * kToRad;
+    const float yaw   = (float)rot[1] * kToRad;
+    const float roll  = (float)rot[2] * kToRad;
+    const float sp = sinf(pitch), cp = cosf(pitch);
+    const float sy = sinf(yaw),   cy = cosf(yaw);
+    const float sr = sinf(roll),  cr = cosf(roll);
+
+    // UE3 FRotationMatrix axes: X forward, Y right, Z up.
+    out->forward = { cp*cy, cp*sy, sp };
+    out->right = { sr*sp*cy - cr*sy,
+                   sr*sp*sy + cr*cy,
+                  -sr*cp };
+    out->up = { -(cr*sp*cy + sr*sy),
+                  cy*sr - cr*sp*sy,
+                  cr*cp };
+    const MEVR_Vec3 sixDofRight = out->right;  // ApplySixDof runs before the head-roll injection
+
+    // Head roll never reaches PlayerCameraRotation: UE3 zeros controller roll and the mod adds
+    // it in the projection path. Put the same roll into the logical head frame used by hands,
+    // otherwise a stationary controller would orbit when the player tilted their head.
+    if (g_rollEnabled && fabsf(g_headRoll) > 1e-5f) {
+        const float th = g_headRoll * (float)g_rollSign;
+        const float ch = cosf(th), sh = sinf(th);
+        const MEVR_Vec3 oldRight = out->right;
+        const MEVR_Vec3 oldUp = out->up;
+        out->right = { oldRight.x*ch + oldUp.x*sh,
+                       oldRight.y*ch + oldUp.y*sh,
+                       oldRight.z*ch + oldUp.z*sh };
+        out->up = { oldUp.x*ch - oldRight.x*sh,
+                    oldUp.y*ch - oldRight.y*sh,
+                    oldUp.z*ch - oldRight.z*sh };
+    }
+
+    // ApplySixDof uses the levelled camera-right axis, world up, and their derived forward.
+    // Repeat that composition here so the rendered head and hand targets share one anchor.
+    float rx = sixDofRight.x, ry = sixDofRight.y;
+    const float rl = sqrtf(rx*rx + ry*ry);
+    if (rl < 1e-6f) return false;
+    rx /= rl; ry /= rl;
+    const float ox = rx*g_dofOffset[0] + ry*g_dofOffset[2];
+    const float oy = ry*g_dofOffset[0] - rx*g_dofOffset[2];
+    const float oz =                          g_dofOffset[1];
+    out->position = { loc[0] + ox, loc[1] + oy, loc[2] + oz };
+
+    return FiniteVec(out->position) && FiniteVec(out->forward) &&
+           FiniteVec(out->right) && FiniteVec(out->up);
 }
 
 // Evaluate one 4-register window under one storage convention.
@@ -6185,6 +6491,15 @@ bool         g_sixDof = true;
 bool         g_haveCentre = false;
 static float g_centre[3] = { 0, 0, 0 };
 float        g_dofOffset[3] = { 0, 0, 0 };   // head-local, UE3 units
+
+void RecenterSixDof()
+{
+    g_haveCentre = false;
+    // The old offset must not survive the frame in which PAGE UP is pressed. The next valid head
+    // pose becomes the new centre; until then both the camera and hands use the neutral anchor.
+    g_dofOffset[0] = g_dofOffset[1] = g_dofOffset[2] = 0.0f;
+    InterlockedIncrement(&g_motionRecenterSerial);
+}
 
 void UpdateSixDof(XrTime when)
 {
