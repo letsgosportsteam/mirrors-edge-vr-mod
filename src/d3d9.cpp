@@ -3035,6 +3035,7 @@ static void ProbeSwanNeck();
 static bool DerivePropertyOffsets();
 static void DumpClassProperties(const char* className, int maxLines);
 static int  LookupProp(const char* className, const char* propName, bool verbose);
+static void ResolveMotionRigOffsets();
 static void ResolveInputGates();
 extern int g_offActorRotation;
 extern int g_offActorLocation;
@@ -3150,6 +3151,11 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                 // player's view and no amount of rejecting them is a fault.
                 g_offCtlCamera     = LookupProp("TdPlayerController", "PlayerCamera", true);
                 g_offCamViewTarget = LookupProp("TdPlayerCamera", "ViewTarget", true);
+
+                // Phase 1.2 is read-only: resolve the whole first-person arm rig now, on this
+                // background thread, so runtime discovery is only a handful of validated pointer
+                // reads. No GObjects census belongs in a per-frame hand path.
+                ResolveMotionRigOffsets();
 
                 // Nothing above this line can tell "the stick never arrived" from "the game
                 // ignored it", and the first public build produced a report that needed exactly
@@ -3341,6 +3347,18 @@ int g_offDefaultFOV    = -1;
 static int g_offChildren = -1;
 static int g_offNext     = -1;
 static int g_offPropOff  = -1;
+
+// Phase 1.2 reflected rig layout. Pawn fields point at live objects; controller fields are the
+// data P1.3/P1.4 will eventually write after this rung proves the object lifecycle is safe.
+static int g_offMesh1p = -1;
+static int g_offLeftHandWorldIK = -1, g_offRightHandWorldIK = -1;
+static int g_offLeftHandRotation = -1, g_offRightHandRotation = -1;
+static int g_offLeftForeArmRoll = -1, g_offRightForeArmRoll = -1;
+static int g_offLimbEffector = -1, g_offLimbEffectorSpace = -1;
+static int g_offLimbJointTarget = -1, g_offLimbJointTargetSpace = -1;
+static int g_offSkelControlStrength = -1;
+static int g_offSingleBoneRotation = -1, g_offSingleBoneRotationSpace = -1;
+static volatile LONG g_motionRigOffsetsReady = 0;
 
 static bool ObjNameIs(uintptr_t obj, const char* want);   // defined with the swan-neck code
 
@@ -3549,6 +3567,46 @@ static int LookupProp(const char* className, const char* propName, bool verbose)
         Log("[prop] %s::%s NOT FOUND after walking %d fields up the class chain",
             className, propName, walked);
     return -1;
+}
+
+// Resolve every field needed to identify the first-person arm rig, plus the controller data
+// later phases will manipulate.  P1.2 only reads these fields; resolving the future write
+// targets now proves they exist on this exact game build before any motion override is added.
+static void ResolveMotionRigOffsets()
+{
+    g_offMesh1p              = LookupProp("TdPawn", "Mesh1p", true);
+    g_offLeftHandWorldIK     = LookupProp("TdPawn", "LeftHandWorldIKController", true);
+    g_offRightHandWorldIK    = LookupProp("TdPawn", "RightHandWorldIKController", true);
+    g_offLeftHandRotation    = LookupProp("TdPawn", "LeftHandRotationController", true);
+    g_offRightHandRotation   = LookupProp("TdPawn", "RightHandRotationController", true);
+    g_offLeftForeArmRoll     = LookupProp("TdPawn", "LeftForeArmRollRotationController", true);
+    g_offRightForeArmRoll    = LookupProp("TdPawn", "RightForeArmRollRotationController", true);
+
+    g_offLimbEffector        = LookupProp("SkelControlLimb", "EffectorLocation", true);
+    g_offLimbEffectorSpace   = LookupProp("SkelControlLimb", "EffectorLocationSpace", true);
+    // Joint targeting is useful for a later elbow-pole refinement, but is not required for the
+    // first controller-driven wrist target. Record it without making this rung depend on it.
+    g_offLimbJointTarget      = LookupProp("SkelControlLimb", "JointTargetLocation", true);
+    g_offLimbJointTargetSpace = LookupProp("SkelControlLimb", "JointTargetLocationSpace", true);
+    g_offSkelControlStrength  = LookupProp("SkelControlBase", "ControlStrength", true);
+    g_offSingleBoneRotation   = LookupProp("SkelControlSingleBone", "BoneRotation", true);
+    g_offSingleBoneRotationSpace =
+        LookupProp("SkelControlSingleBone", "BoneRotationSpace", true);
+
+    const bool ready =
+        g_offMesh1p >= 0 &&
+        g_offLeftHandWorldIK >= 0 && g_offRightHandWorldIK >= 0 &&
+        g_offLeftHandRotation >= 0 && g_offRightHandRotation >= 0 &&
+        g_offLeftForeArmRoll >= 0 && g_offRightForeArmRoll >= 0 &&
+        g_offLimbEffector >= 0 && g_offLimbEffectorSpace >= 0 &&
+        g_offSkelControlStrength >= 0 &&
+        g_offSingleBoneRotation >= 0 && g_offSingleBoneRotationSpace >= 0;
+
+    InterlockedExchange(&g_motionRigOffsetsReady, ready ? 1 : -1);
+    Log("[hands-rig] reflected layout %s; optional joint target %s",
+        ready ? "READY" : "INCOMPLETE - discovery disabled",
+        (g_offLimbJointTarget >= 0 && g_offLimbJointTargetSpace >= 0)
+            ? "available" : "unavailable");
 }
 
 // ================================================================ the input gates
@@ -5369,6 +5427,176 @@ uintptr_t FindPlayerPawn()
             kinds > 1 ? ", " : "", kinds > 1 ? seen[1] : "");
     }
     return 0;
+}
+
+// ================================================================ Phase 1.2: live arm-rig discovery
+//
+// This cache is deliberately rebuilt from the pawn's reflected editinline properties rather
+// than found through GObjects. A death or level load can destroy the pawn and every controller
+// beneath it; the surviving PlayerController gives FindPlayerPawn the replacement in one read.
+// Every sampled pass rereads and revalidates the nested pointers, so the cache never grants a
+// future write path permission to use stale controller objects.
+struct MotionRigCache {
+    uintptr_t pawn;
+    uintptr_t mesh;
+    uintptr_t leftWorld;
+    uintptr_t rightWorld;
+    uintptr_t leftRotation;
+    uintptr_t rightRotation;
+    uintptr_t leftForearm;
+    uintptr_t rightForearm;
+    bool valid;
+};
+
+static MotionRigCache g_motionRig = {};
+static unsigned long g_motionRigGeneration = 0;
+static uintptr_t g_lastRigRejectedPawn = 0;
+static uintptr_t g_lastRigRejectedObject = 0;
+static int g_lastRigRejectedField = -2;
+
+static bool ReadClassName(uintptr_t obj, char* out, size_t cap)
+{
+    if (!out || !cap) return false;
+    strcpy_s(out, cap, "?");
+    uint32_t cls = 0;
+    return obj >= 0x10000 && SafeU32(obj + 0x34, &cls) && cls >= 0x10000 &&
+           ReadObjName(cls, out, cap);
+}
+
+static bool LooksLikeRigObject(uintptr_t obj, const char* expectedClass)
+{
+    if (obj < 0x10000) return false;
+    uint32_t vt = 0;
+    if (!SafeU32(obj, &vt) || !InModule(vt) || !IsAOfClass(obj, expectedClass)) return false;
+    char name[64];
+    if (!ReadObjName(obj, name, sizeof(name))) return false;
+    return strncmp(name, "Default__", 9) != 0;
+}
+
+static void ClearMotionRig(const char* reason)
+{
+    if (g_motionRig.valid) {
+        Log("[hands-rig] invalidated generation %lu: %s (pawn %p, mesh %p)",
+            g_motionRigGeneration, reason, (void*)g_motionRig.pawn, (void*)g_motionRig.mesh);
+    }
+    ZeroMemory(&g_motionRig, sizeof(g_motionRig));
+}
+
+static void ReportRigRejection(uintptr_t pawn, int field, const char* fieldName,
+                               uintptr_t object, const char* expectedClass,
+                               const char* reason)
+{
+    // An absent pawn or one bad editinline pointer can persist for hundreds of frames while UE3
+    // respawns. Log each distinct rejection, not every ten-frame sample of the same state.
+    if (g_lastRigRejectedPawn == pawn && g_lastRigRejectedField == field &&
+        g_lastRigRejectedObject == object) return;
+    g_lastRigRejectedPawn = pawn;
+    g_lastRigRejectedField = field;
+    g_lastRigRejectedObject = object;
+
+    char actual[64] = "?";
+    if (object) ReadClassName(object, actual, sizeof(actual));
+    Log("[hands-rig] waiting: pawn %p %s %s at %p (class \"%s\", expected %s)",
+        (void*)pawn, fieldName, reason, (void*)object, actual, expectedClass);
+}
+
+static bool SameMotionRig(const MotionRigCache& a, const MotionRigCache& b)
+{
+    return a.pawn == b.pawn && a.mesh == b.mesh &&
+           a.leftWorld == b.leftWorld && a.rightWorld == b.rightWorld &&
+           a.leftRotation == b.leftRotation && a.rightRotation == b.rightRotation &&
+           a.leftForearm == b.leftForearm && a.rightForearm == b.rightForearm;
+}
+
+static void UpdateMotionRigDiscovery()
+{
+    if ((!g_motionHands && !g_motionHandsDebug) ||
+        InterlockedCompareExchange(&g_motionRigOffsetsReady, 0, 0) != 1) return;
+
+    const uintptr_t pawn = FindPlayerPawn();
+    if (!pawn) {
+        ClearMotionRig("no live player pawn");
+        ReportRigRejection(0, -1, "pawn", 0, "TdPlayerPawn", "is unavailable");
+        return;
+    }
+
+    struct RigField {
+        const char* name;
+        const char* expectedClass;
+        int offset;
+        uintptr_t* destination;
+    };
+
+    MotionRigCache candidate = {};
+    candidate.pawn = pawn;
+    RigField fields[] = {
+        { "Mesh1p", "TdSkeletalMeshComponent", g_offMesh1p, &candidate.mesh },
+        { "LeftHandWorldIKController", "TdSkelControlLimb", g_offLeftHandWorldIK,
+          &candidate.leftWorld },
+        { "RightHandWorldIKController", "TdSkelControlLimb", g_offRightHandWorldIK,
+          &candidate.rightWorld },
+        { "LeftHandRotationController", "SkelControlSingleBone", g_offLeftHandRotation,
+          &candidate.leftRotation },
+        { "RightHandRotationController", "SkelControlSingleBone", g_offRightHandRotation,
+          &candidate.rightRotation },
+        { "LeftForeArmRollRotationController", "SkelControlSingleBone", g_offLeftForeArmRoll,
+          &candidate.leftForearm },
+        { "RightForeArmRollRotationController", "SkelControlSingleBone", g_offRightForeArmRoll,
+          &candidate.rightForearm },
+    };
+
+    for (int i = 0; i < (int)(sizeof(fields) / sizeof(fields[0])); ++i) {
+        uint32_t value = 0;
+        if (!SafeU32(pawn + fields[i].offset, &value)) {
+            ClearMotionRig("a reflected rig pointer became unreadable");
+            ReportRigRejection(pawn, i, fields[i].name, 0, fields[i].expectedClass,
+                               "is unreadable");
+            return;
+        }
+        *fields[i].destination = value;
+        if (!LooksLikeRigObject(value, fields[i].expectedClass)) {
+            ClearMotionRig("a reflected rig pointer failed validation");
+            ReportRigRejection(pawn, i, fields[i].name, value, fields[i].expectedClass,
+                               "failed validation");
+            return;
+        }
+    }
+
+    // Left and right resolving to the same controller is a readable, correctly typed result but
+    // still cannot be a safe two-hand rig. Treat it as an incomplete construction state.
+    if (candidate.leftWorld == candidate.rightWorld ||
+        candidate.leftRotation == candidate.rightRotation ||
+        candidate.leftForearm == candidate.rightForearm) {
+        ClearMotionRig("left/right rig controllers alias each other");
+        ReportRigRejection(pawn, 7, "left/right controllers", candidate.leftWorld,
+                           "distinct objects", "are aliased");
+        return;
+    }
+
+    candidate.valid = true;
+    if (g_motionRig.valid && SameMotionRig(g_motionRig, candidate)) return;
+    if (g_motionRig.valid) ClearMotionRig("pawn or nested rig object was replaced");
+
+    g_motionRig = candidate;
+    ++g_motionRigGeneration;
+    g_lastRigRejectedPawn = 0;
+    g_lastRigRejectedObject = 0;
+    g_lastRigRejectedField = -2;
+
+    char pawnClass[64], meshClass[64], leftWorldClass[64], rightWorldClass[64];
+    ReadClassName(candidate.pawn, pawnClass, sizeof(pawnClass));
+    ReadClassName(candidate.mesh, meshClass, sizeof(meshClass));
+    ReadClassName(candidate.leftWorld, leftWorldClass, sizeof(leftWorldClass));
+    ReadClassName(candidate.rightWorld, rightWorldClass, sizeof(rightWorldClass));
+    Log("*** [hands-rig] acquired generation %lu: pawn %p \"%s\", Mesh1p %p \"%s\"",
+        g_motionRigGeneration, (void*)candidate.pawn, pawnClass,
+        (void*)candidate.mesh, meshClass);
+    Log("[hands-rig] world IK: L %p \"%s\", R %p \"%s\"",
+        (void*)candidate.leftWorld, leftWorldClass,
+        (void*)candidate.rightWorld, rightWorldClass);
+    Log("[hands-rig] wrist rotation: L %p, R %p; forearm roll: L %p, R %p (read-only)",
+        (void*)candidate.leftRotation, (void*)candidate.rightRotation,
+        (void*)candidate.leftForearm, (void*)candidate.rightForearm);
 }
 
 // ---- diag: whose view is the engine actually rendering? ----
@@ -8115,7 +8343,10 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     // Six times a second is fast enough to place a transition against the acceptance windows it
     // is meant to explain, and it costs three reads on the frames it runs. It logs only when the
     // target CHANGES, so the rate sets resolution, not volume.
-    if ((f % 10) == 0) ReportViewTarget();
+    if ((f % 10) == 0) {
+        ReportViewTarget();
+        UpdateMotionRigDiscovery();
+    }
 
     // Every 120 frames rather than every frame: it walks the census and can only act on a
     // sustained pattern anyway. Deliberately NOT inside the g_simulStereo report at 900 - the
