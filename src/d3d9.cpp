@@ -3347,6 +3347,7 @@ int g_offDefaultFOV    = -1;
 static int g_offChildren = -1;
 static int g_offNext     = -1;
 static int g_offPropOff  = -1;
+static int g_offOuter    = -1;   // UObject::Outer, derived from a known property -> owner link
 
 // Phase 1.2 reflected rig layout. Pawn fields point at live objects; controller fields are the
 // data P1.3/P1.4 will eventually write after this rung proves the object lifecycle is safe.
@@ -3433,6 +3434,29 @@ static bool DerivePropertyOffsets()
 
     uint32_t head = 0;
     SafeU32(cls + g_offChildren, &head);
+
+    // ---- Outer: a known UProperty must point back to its declaring UClass ----
+    //
+    // Retail cooking can remove a property from UStruct::Children without removing the
+    // UProperty object that script bytecode references. Recovering those detached properties
+    // requires identifying their owner, not trusting a globally duplicated field name. The
+    // first TdSwanNeck field and its already-proven class give an exact pointer equality test.
+    int outerMatches = 0;
+    for (int off = 4; off <= 0x60; off += 4) {
+        uint32_t value = 0;
+        if (SafeU32(head + off, &value) && value == cls) {
+            g_offOuter = off;
+            outerMatches++;
+        }
+    }
+    if (outerMatches == 1) {
+        Log("*** [prop] UObject::Outer at +0x%02X (known TdSwanNeck property -> owner UClass)",
+            g_offOuter);
+    } else {
+        Log("[prop] UObject::Outer NOT DERIVED - known property had %d pointers to its owner",
+            outerMatches);
+        g_offOuter = -1;
+    }
 
     // ---- Next: found STRUCTURALLY, by which offset yields a long chain ----
     //
@@ -3569,6 +3593,54 @@ static int LookupProp(const char* className, const char* propName, bool verbose)
     return -1;
 }
 
+// Find a cooked property object that still exists for script bytecode but is detached from its
+// owner's Children chain. Name alone is not enough: common Engine fields repeat everywhere.
+// Require the exact UProperty subclass and an Outer UClass with the requested name, then accept
+// only a single offset (multiple matching objects may exist when imports are duplicated, but
+// they must all agree). This remains UE3-derived data, not a hard-coded game layout.
+static int LookupDetachedProp(const char* className, const char* propName,
+                              const char* propertyClass, bool verbose)
+{
+    if (!g_gobjAddr || g_offName < 0 || g_offOuter < 0 || g_offPropOff < 0) return -1;
+    uint32_t data = 0, count = 0;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return -1;
+
+    int foundOffset = -1;
+    int matches = 0;
+    bool disagreement = false;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t obj = 0, vt = 0, propCls = 0, outer = 0, off = 0;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+        if (!SafeU32(obj, &vt) || !InModule(vt) || !ObjNameIs(obj, propName)) continue;
+        if (!SafeU32(obj + 0x34, &propCls) || propCls < 0x10000 ||
+            !ObjNameIs(propCls, propertyClass)) continue;
+        if (!SafeU32(obj + g_offOuter, &outer) || outer < 0x10000 ||
+            !ObjNameIs(outer, className)) continue;
+        // Its owner must itself be a UClass, not an unrelated object with the same name.
+        uint32_t ownerClass = 0;
+        if (!SafeU32(outer + 0x34, &ownerClass) || ownerClass < 0x10000 ||
+            !ObjNameIs(ownerClass, "Class")) continue;
+        if (!SafeU32(obj + g_offPropOff, &off) || off >= 0x8000) continue;
+
+        if (foundOffset < 0) foundOffset = (int)off;
+        else if (foundOffset != (int)off) disagreement = true;
+        matches++;
+    }
+
+    if (matches > 0 && !disagreement) {
+        Log("*** [prop] %s::%s at +0x%04X from %d detached %s object%s"
+            " (Outer validated)", className, propName, foundOffset, matches, propertyClass,
+            matches == 1 ? "" : "s");
+        return foundOffset;
+    }
+    if (verbose) {
+        Log("[prop] detached %s::%s %s (%d owner-validated %s object%s)",
+            className, propName, disagreement ? "DISAGREED ON OFFSET" : "NOT FOUND",
+            matches, propertyClass, matches == 1 ? "" : "s");
+    }
+    return -1;
+}
+
 // Resolve every field needed to identify the first-person arm rig, plus the controller data
 // later phases will manipulate.  P1.2 only reads these fields; resolving the future write
 // targets now proves they exist on this exact game build before any motion override is added.
@@ -3592,6 +3664,50 @@ static void ResolveMotionRigOffsets()
     g_offSingleBoneRotation   = LookupProp("SkelControlSingleBone", "BoneRotation", true);
     g_offSingleBoneRotationSpace =
         LookupProp("SkelControlSingleBone", "BoneRotationSpace", true);
+
+    // Mirror's Edge's retail cook detaches editinline and native controller properties from
+    // Children. They remain real UProperty objects because the shipped bytecode uses them.
+    // Recover only objects whose property type and owning UClass both match exactly.
+    if (g_offLeftHandWorldIK < 0)
+        g_offLeftHandWorldIK = LookupDetachedProp(
+            "TdPawn", "LeftHandWorldIKController", "ObjectProperty", true);
+    if (g_offRightHandWorldIK < 0)
+        g_offRightHandWorldIK = LookupDetachedProp(
+            "TdPawn", "RightHandWorldIKController", "ObjectProperty", true);
+    if (g_offLeftHandRotation < 0)
+        g_offLeftHandRotation = LookupDetachedProp(
+            "TdPawn", "LeftHandRotationController", "ObjectProperty", true);
+    if (g_offRightHandRotation < 0)
+        g_offRightHandRotation = LookupDetachedProp(
+            "TdPawn", "RightHandRotationController", "ObjectProperty", true);
+    if (g_offLeftForeArmRoll < 0)
+        g_offLeftForeArmRoll = LookupDetachedProp(
+            "TdPawn", "LeftForeArmRollRotationController", "ObjectProperty", true);
+    if (g_offRightForeArmRoll < 0)
+        g_offRightForeArmRoll = LookupDetachedProp(
+            "TdPawn", "RightForeArmRollRotationController", "ObjectProperty", true);
+
+    if (g_offLimbEffector < 0)
+        g_offLimbEffector = LookupDetachedProp(
+            "SkelControlLimb", "EffectorLocation", "StructProperty", true);
+    if (g_offLimbEffectorSpace < 0)
+        g_offLimbEffectorSpace = LookupDetachedProp(
+            "SkelControlLimb", "EffectorLocationSpace", "ByteProperty", true);
+    if (g_offLimbJointTarget < 0)
+        g_offLimbJointTarget = LookupDetachedProp(
+            "SkelControlLimb", "JointTargetLocation", "StructProperty", true);
+    if (g_offLimbJointTargetSpace < 0)
+        g_offLimbJointTargetSpace = LookupDetachedProp(
+            "SkelControlLimb", "JointTargetLocationSpace", "ByteProperty", true);
+    if (g_offSkelControlStrength < 0)
+        g_offSkelControlStrength = LookupDetachedProp(
+            "SkelControlBase", "ControlStrength", "FloatProperty", true);
+    if (g_offSingleBoneRotation < 0)
+        g_offSingleBoneRotation = LookupDetachedProp(
+            "SkelControlSingleBone", "BoneRotation", "StructProperty", true);
+    if (g_offSingleBoneRotationSpace < 0)
+        g_offSingleBoneRotationSpace = LookupDetachedProp(
+            "SkelControlSingleBone", "BoneRotationSpace", "ByteProperty", true);
 
     const bool reflectedPointers =
         g_offLeftHandWorldIK >= 0 && g_offRightHandWorldIK >= 0 &&
