@@ -3687,6 +3687,17 @@ static void ResolveMotionRigOffsets()
         g_offRightForeArmRoll = LookupDetachedProp(
             "TdPawn", "RightForeArmRollRotationController", "ObjectProperty", true);
 
+    // This one property object is absent from the retail live object table, while its right
+    // neighbor survives at +0x0414. The cooked TdPawn declaration places the two object pointers
+    // consecutively, Right then Left. Derive only that adjacent slot; UpdateMotionRigDiscovery
+    // still reads it and requires a live SkelControlSingleBone before the rig can be accepted.
+    if (g_offLeftForeArmRoll < 0 && g_offRightForeArmRoll >= 0) {
+        g_offLeftForeArmRoll = g_offRightForeArmRoll + 4;
+        Log("*** [prop] TdPawn::LeftForeArmRollRotationController provisionally at +0x%04X"
+            " (adjacent after owner-validated Right; live class validation required)",
+            g_offLeftForeArmRoll);
+    }
+
     if (g_offLimbEffector < 0)
         g_offLimbEffector = LookupDetachedProp(
             "SkelControlLimb", "EffectorLocation", "StructProperty", true);
@@ -3709,7 +3720,7 @@ static void ResolveMotionRigOffsets()
         g_offSingleBoneRotationSpace = LookupDetachedProp(
             "SkelControlSingleBone", "BoneRotationSpace", "ByteProperty", true);
 
-    const bool reflectedPointers =
+    const bool resolvedPointers =
         g_offLeftHandWorldIK >= 0 && g_offRightHandWorldIK >= 0 &&
         g_offLeftHandRotation >= 0 && g_offRightHandRotation >= 0 &&
         g_offLeftForeArmRoll >= 0 && g_offRightForeArmRoll >= 0;
@@ -3727,7 +3738,7 @@ static void ResolveMotionRigOffsets()
     Log("[hands-rig] reflected discovery base %s; pawn pointers %s; controller fields %s;"
         " optional joint target %s",
         g_offMesh1p >= 0 ? "READY" : "INCOMPLETE - discovery disabled",
-        reflectedPointers ? "available" : "stripped - require structural derivation",
+        resolvedPointers ? "available" : "stripped - require structural derivation",
         reflectedControllerFields ? "available" : "stripped - writes remain disabled",
         (g_offLimbJointTarget >= 0 && g_offLimbJointTargetSpace >= 0)
             ? "available" : "unavailable");
