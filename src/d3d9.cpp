@@ -3941,6 +3941,24 @@ static void ResolveMotionRigOffsets()
         g_offSingleBoneRotationSpace = LookupDetachedProp(
             "SkelControlSingleBone", "BoneRotationSpace", "ByteProperty", true);
 
+    // A cooked import can disappear from the live object table even while adjacent native fields
+    // remain. EffectorLocationSpace did so in the first post-Update1pArms test, after resolving
+    // independently at +0xA0 in each of the three preceding launches. Derive that one missing byte
+    // only when the two surviving, owner-validated fields prove the authored native layout:
+    //
+    //   EffectorLocation Vector (+12 bytes), EffectorLocationSpace byte,
+    //   JointTargetLocationSpace byte
+    //
+    // P1.3 additionally reads this candidate from both live limb controllers and requires a valid
+    // EBoneControlSpace value before writing, so this relationship alone never grants write access.
+    if (g_offLimbEffectorSpace < 0 && g_offLimbEffector >= 0 &&
+        g_offLimbJointTargetSpace == g_offLimbEffector + (int)sizeof(MEVR_Vec3) + 1) {
+        g_offLimbEffectorSpace = g_offLimbEffector + (int)sizeof(MEVR_Vec3);
+        Log("*** [prop] SkelControlLimb::EffectorLocationSpace provisionally at +0x%04X"
+            " (between owner-validated EffectorLocation and JointTargetLocationSpace;"
+            " both live limbs must validate)", g_offLimbEffectorSpace);
+    }
+
     const bool resolvedPointers =
         g_offLeftHandWorldIK >= 0 && g_offRightHandWorldIK >= 0 &&
         g_offLeftHandRotation >= 0 && g_offRightHandRotation >= 0 &&
@@ -6119,11 +6137,22 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13PoseSnapshot& pose
         g_offSkelControlStrength < 0) return P13_LAYOUT;
     if (!LooksLikePlayerPawn(pawn)) return P13_RIG;
 
-    uint32_t mesh = 0, controller = 0;
+    uint32_t mesh = 0, controller = 0, rightController = 0;
     if (!SafeU32(pawn + g_offMesh1p, &mesh) ||
         !LooksLikeRigObject(mesh, "TdSkeletalMeshComponent") ||
         !SafeU32(pawn + g_offLeftHandWorldIK, &controller) ||
-        !LooksLikeRigObject(controller, "TdSkelControlLimb")) return P13_RIG;
+        !LooksLikeRigObject(controller, "TdSkelControlLimb") ||
+        g_offRightHandWorldIK < 0 ||
+        !SafeU32(pawn + g_offRightHandWorldIK, &rightController) ||
+        !LooksLikeRigObject(rightController, "TdSkelControlLimb") ||
+        rightController == controller) return P13_RIG;
+
+    // EBoneControlSpace is a five-value enum (World, Actor, Component, ParentBone, Bone). Check
+    // both independently validated limb instances before trusting a structurally recovered byte.
+    uint8_t leftSpace = 0xFF, rightSpace = 0xFF;
+    if (!SafeRead(controller + g_offLimbEffectorSpace, &leftSpace, 1) || leftSpace > 4 ||
+        !SafeRead(rightController + g_offLimbEffectorSpace, &rightSpace, 1) || rightSpace > 4)
+        return P13_LAYOUT;
     if (outController) *outController = controller;
 
     if (!CurrentViewTargetIsPawn(pawn)) return P13_VIEW;
