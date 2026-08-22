@@ -597,6 +597,52 @@ struct MotionPoseSample {
 };
 static MotionPoseSample g_poseLGrip, g_poseRGrip, g_poseLAim, g_poseRAim;
 
+// Present owns OpenXR and publishes one immutable position sample for the next game tick.
+// Update1pArms can run on the game thread, so a sequence lock prevents it from observing a
+// half-written 64-bit flags field or a target assembled from two different XR frames.
+struct P13PoseSnapshot {
+    bool active = false;
+    XrSpaceLocationFlags flags = 0;
+    MEVR_Vec3 cameraLocal;
+    MEVR_Vec3 worldPosition;
+    bool worldValid = false;
+    long presentFrame = 0;
+};
+static P13PoseSnapshot g_p13PublishedPose{};
+static volatile LONG g_p13PoseSequence = 0;
+
+static void PublishP13PoseSnapshot()
+{
+    InterlockedIncrement(&g_p13PoseSequence);      // odd: writer owns the snapshot
+    MemoryBarrier();
+    g_p13PublishedPose.active = g_poseLGrip.active;
+    g_p13PublishedPose.flags = g_poseLGrip.flags;
+    g_p13PublishedPose.cameraLocal = g_poseLGrip.cameraLocal;
+    g_p13PublishedPose.worldPosition = g_poseLGrip.worldPosition;
+    g_p13PublishedPose.worldValid = g_poseLGrip.worldValid;
+    g_p13PublishedPose.presentFrame = g_frames;
+    MemoryBarrier();
+    InterlockedIncrement(&g_p13PoseSequence);      // even: readers may consume it
+}
+
+static bool ReadP13PoseSnapshot(P13PoseSnapshot* out)
+{
+    if (!out) return false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const LONG before = InterlockedCompareExchange(&g_p13PoseSequence, 0, 0);
+        if (before == 0 || (before & 1)) continue;
+        MemoryBarrier();
+        const P13PoseSnapshot candidate = g_p13PublishedPose;
+        MemoryBarrier();
+        const LONG after = InterlockedCompareExchange(&g_p13PoseSequence, 0, 0);
+        if (before == after && !(after & 1)) {
+            *out = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool FiniteVec(const MEVR_Vec3& v)
 {
     return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
@@ -1689,7 +1735,8 @@ static bool CaptureFrame(IDirect3DDevice9* dev)
 }
 
 static void ApplyHeadTracking(XrTime when);   // defined with the rung 5b code
-static void ApplyMotionHandPosition();        // P1.3, defined with the validated rig cache
+static void ApplyMotionHandPosition(uintptr_t pawn, const P13PoseSnapshot& pose);
+static void UpdateMotionRigDiscovery();       // P1.2 cache, refreshed outside the game hook
 
 // ---- two measurements aimed at what is left of the judder ----
 //
@@ -2196,10 +2243,11 @@ static void SubmitTestQuad()
     // instant, so keeping them together is what stops the sticks from lagging the view.
     const bool actionsSynced = XrSyncInput();
     XrSampleMotionPoses(fs.predictedDisplayTime, actionsSynced);
-    // Prototype timing: Present is after this frame's skeletal evaluation, so this target is
-    // consumed by the next game tick. P1.6 moves the same guarded writer to Update1pArms once
-    // position, reach, and ownership have been proven in-headset.
-    ApplyMotionHandPosition();
+    // The first position test proved that a write made here is reset by Update1pArms before the
+    // skeleton evaluates. Publish instead; the native arm hook consumes this exact sample after
+    // the game's own arm update on the next tick.
+    PublishP13PoseSnapshot();
+    UpdateMotionRigDiscovery();
     TickPacing();
     ReportStereoGeometry();
     // ReportPoseHonesty is gone. It compared the CHANGE in head yaw against the change in the
@@ -3042,6 +3090,7 @@ static void DumpClassProperties(const char* className, int maxLines);
 static int  LookupProp(const char* className, const char* propName, bool verbose);
 static void ResolveMotionRigOffsets();
 static void ResolveInputGates();
+static void InstallUpdate1pArmsHook();
 extern int g_offActorRotation;
 extern int g_offActorLocation;
 extern int g_offFOVAngle;
@@ -3167,6 +3216,11 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                 // background thread, so runtime discovery is only a handful of validated pointer
                 // reads. No GObjects census belongs in a per-frame hand path.
                 ResolveMotionRigOffsets();
+
+                // P1.3 must run after the native has finished configuring the first-person arm
+                // controllers. Its UFunction stores the native address, derived below from the
+                // live object model rather than hard-coded for one executable layout.
+                InstallUpdate1pArmsHook();
 
                 // Nothing above this line can tell "the stick never arrived" from "the game
                 // ignored it", and the first public build produced a report that needed exactly
@@ -3650,6 +3704,162 @@ static int LookupDetachedProp(const char* className, const char* propName,
             matches, propertyClass, matches == 1 ? "" : "s");
     }
     return -1;
+}
+
+// ================================================================ P1.3 update timing hook
+//
+// Update1pArms is declared `native final` by the shipped TdPlayerPawn package. UE3 stores the
+// executable for every UFunction in UFunction::Func, but that member's offset is build-specific.
+// Derive it by the strong mode formed by thousands of non-native UFunctions: all of those point
+// at the same ProcessInternal implementation, while native functions point at their own execs.
+// Only executable-section pointers participate, which excludes the shared UFunction vtable that
+// otherwise wins this census from .rdata.
+typedef void (__fastcall *PFN_Update1pArms)(void* self, void* edx, void* stack, void* result);
+static PFN_Update1pArms g_origUpdate1pArms = nullptr;
+static uintptr_t g_update1pArmsTarget = 0;
+
+static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, void* result)
+{
+    if (!g_origUpdate1pArms) return;
+    g_origUpdate1pArms(self, edx, stack, result);
+
+    static volatile LONG calls = 0;
+    const LONG call = InterlockedIncrement(&calls);
+    if (call == 1)
+        Log("*** [hands-p1.3] Update1pArms hook executed; VR IK now runs after the game arm update");
+
+    if (!g_motionHands) return;
+    P13PoseSnapshot pose{};
+    ReadP13PoseSnapshot(&pose);   // an unreadable snapshot remains invalid and releases ownership
+    ApplyMotionHandPosition(reinterpret_cast<uintptr_t>(self), pose);
+}
+
+static int DeriveUFunctionFuncOffset(uintptr_t* sharedScriptTarget)
+{
+    if (sharedScriptTarget) *sharedScriptTarget = 0;
+    if (!g_gobjAddr || g_offName < 0 || !g_textLo || g_textHi <= g_textLo) return -1;
+
+    uint32_t data = 0, count = 0;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return -1;
+
+    const int kFirst = 0x40, kLast = 0x100, kStep = 4;
+    const int kOffsets = (kLast - kFirst) / kStep;
+    const int kBuckets = 8;
+    struct Tally { uintptr_t value[kBuckets]; int hits[kBuckets]; };
+    Tally tally[kOffsets]{};
+    uint32_t functionClass = 0;
+    int sampled = 0;
+
+    for (uint32_t i = 0; i < count && sampled < 3000; ++i) {
+        uint32_t obj = 0, cls = 0;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000 ||
+            !SafeU32(obj + 0x34, &cls) || cls < 0x10000) continue;
+        if (!functionClass) {
+            if (!ObjNameIs(cls, "Function")) continue;
+            functionClass = cls;
+        } else if (cls != functionClass) continue;
+
+        ++sampled;
+        for (int k = 0; k < kOffsets; ++k) {
+            uint32_t value = 0;
+            if (!SafeU32(obj + kFirst + k * kStep, &value) ||
+                value < g_textLo || value >= g_textHi) continue;
+            Tally& t = tally[k];
+            int freeSlot = -1, slot = -1;
+            for (int b = 0; b < kBuckets; ++b) {
+                if (t.hits[b] && t.value[b] == value) { slot = b; break; }
+                if (!t.hits[b] && freeSlot < 0) freeSlot = b;
+            }
+            if (slot < 0) slot = freeSlot;
+            if (slot >= 0) { t.value[slot] = value; ++t.hits[slot]; }
+        }
+    }
+
+    int bestOffset = -1, bestHits = 0;
+    uintptr_t bestTarget = 0;
+    for (int k = 0; k < kOffsets; ++k) {
+        for (int b = 0; b < kBuckets; ++b) {
+            if (tally[k].hits[b] > bestHits) {
+                bestHits = tally[k].hits[b];
+                bestTarget = tally[k].value[b];
+                bestOffset = kFirst + k * kStep;
+            }
+        }
+    }
+
+    Log("[hands-p1.3] UFunction::Func probe sampled %d function objects; best +0x%02X"
+        " -> %p shared by %d (%.1f%%)", sampled, bestOffset, (void*)bestTarget, bestHits,
+        sampled ? 100.0 * bestHits / sampled : 0.0);
+    if (sampled < 50 || bestOffset < 0 || bestHits * 2 < sampled) {
+        Log("[hands-p1.3] Update1pArms hook refused: no majority executable Func field");
+        return -1;
+    }
+    if (sharedScriptTarget) *sharedScriptTarget = bestTarget;
+    return bestOffset;
+}
+
+static void InstallUpdate1pArmsHook()
+{
+    if (!g_motionHands || g_origUpdate1pArms || g_update1pArmsTarget) return;
+
+    uintptr_t scriptTarget = 0;
+    const int funcOffset = DeriveUFunctionFuncOffset(&scriptTarget);
+    if (funcOffset < 0) return;
+
+    uint32_t data = 0, count = 0;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return;
+
+    uintptr_t target = 0;
+    int matches = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t obj = 0, cls = 0, outer = 0, fn = 0, ownerClass = 0;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000 ||
+            !ObjNameIs(obj, "Update1pArms") ||
+            !SafeU32(obj + 0x34, &cls) || !ObjNameIs(cls, "Function") ||
+            !SafeU32(obj + g_offOuter, &outer) || outer < 0x10000 ||
+            !ObjNameIs(outer, "TdPlayerPawn") ||
+            !SafeU32(outer + 0x34, &ownerClass) || !ObjNameIs(ownerClass, "Class") ||
+            !SafeU32(obj + funcOffset, &fn) || fn < g_textLo || fn >= g_textHi) continue;
+        if (!target) target = fn;
+        else if (target != fn) {
+            Log("[hands-p1.3] Update1pArms hook refused: owner-validated functions disagree"
+                " (%p vs %p)", (void*)target, (void*)fn);
+            return;
+        }
+        ++matches;
+    }
+
+    if (!target || matches == 0 || target == scriptTarget) {
+        Log("[hands-p1.3] Update1pArms hook refused: native target was %p, matches=%d,"
+            " shared script target=%p", (void*)target, matches, (void*)scriptTarget);
+        return;
+    }
+
+    const MH_STATUS init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
+        Log("[hands-p1.3] Update1pArms hook refused: MH_Initialize status %d", (int)init);
+        return;
+    }
+    const MH_STATUS create = MH_CreateHook(reinterpret_cast<void*>(target),
+        reinterpret_cast<void*>(&Hook_Update1pArms),
+        reinterpret_cast<void**>(&g_origUpdate1pArms));
+    if (create != MH_OK) {
+        g_origUpdate1pArms = nullptr;
+        Log("[hands-p1.3] Update1pArms MH_CreateHook failed, status %d", (int)create);
+        return;
+    }
+    const MH_STATUS enable = MH_EnableHook(reinterpret_cast<void*>(target));
+    if (enable != MH_OK) {
+        MH_RemoveHook(reinterpret_cast<void*>(target));
+        g_origUpdate1pArms = nullptr;
+        Log("[hands-p1.3] Update1pArms MH_EnableHook failed, status %d", (int)enable);
+        return;
+    }
+
+    g_update1pArmsTarget = target;
+    Log("*** [hands-p1.3] hooked native TdPlayerPawn.Update1pArms at %p"
+        " (UFunction::Func +0x%02X, %d owner-validated object%s)",
+        (void*)target, funcOffset, matches, matches == 1 ? "" : "s");
 }
 
 // Resolve every field needed to identify the first-person arm rig, plus the controller data
@@ -5898,26 +6108,37 @@ static bool SetP13LeftStrength(uintptr_t controller, float strength)
     return WriteRigBytes(controller + g_offSkelControlStrength, &strength, sizeof(strength));
 }
 
-static P13BlockReason P13Eligibility(uint8_t* outMovement, float* outReach)
+static P13BlockReason P13Eligibility(uintptr_t pawn, const P13PoseSnapshot& pose,
+                                     uintptr_t* outController,
+                                     uint8_t* outMovement, float* outReach)
 {
+    if (outController) *outController = 0;
     if (InterlockedCompareExchange(&g_motionRigOffsetsReady, 0, 0) != 1 ||
+        g_offMesh1p < 0 || g_offLeftHandWorldIK < 0 ||
         g_offLimbEffector < 0 || g_offLimbEffectorSpace < 0 ||
         g_offSkelControlStrength < 0) return P13_LAYOUT;
-    if (!g_motionRig.valid || !g_motionRig.pawn || !g_motionRig.leftWorld)
-        return P13_RIG;
-    if (!CurrentViewTargetIsPawn(g_motionRig.pawn)) return P13_VIEW;
+    if (!LooksLikePlayerPawn(pawn)) return P13_RIG;
+
+    uint32_t mesh = 0, controller = 0;
+    if (!SafeU32(pawn + g_offMesh1p, &mesh) ||
+        !LooksLikeRigObject(mesh, "TdSkeletalMeshComponent") ||
+        !SafeU32(pawn + g_offLeftHandWorldIK, &controller) ||
+        !LooksLikeRigObject(controller, "TdSkelControlLimb")) return P13_RIG;
+    if (outController) *outController = controller;
+
+    if (!CurrentViewTargetIsPawn(pawn)) return P13_VIEW;
     if (g_offWeapon < 0 || g_offWeaponAnimState < 0) return P13_WEAPON_LAYOUT;
 
     uint32_t weapon = 0;
     uint8_t weaponAnim = 0;
-    if (!SafeU32(g_motionRig.pawn + g_offWeapon, &weapon) ||
-        !SafeRead(g_motionRig.pawn + g_offWeaponAnimState, &weaponAnim, 1))
+    if (!SafeU32(pawn + g_offWeapon, &weapon) ||
+        !SafeRead(pawn + g_offWeaponAnimState, &weaponAnim, 1))
         return P13_WEAPON_LAYOUT;
     if (weapon != 0 || weaponAnim != 0) return P13_ARMED;
 
     uint8_t movement = 0xFF;
-    if (g_offMoveState < 0 ||
-        !SafeRead(g_motionRig.pawn + g_offMoveState, &movement, 1) || movement != 1) {
+    if (g_offMoveState < 0 || !SafeRead(pawn + g_offMoveState, &movement, 1) ||
+        movement != 1) {
         if (outMovement) *outMovement = movement;
         return P13_MOVEMENT;
     }
@@ -5925,46 +6146,49 @@ static P13BlockReason P13Eligibility(uint8_t* outMovement, float* outReach)
 
     const XrSpaceLocationFlags need = XR_SPACE_LOCATION_POSITION_VALID_BIT |
                                       XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
-    if (!g_poseLGrip.active || !g_poseLGrip.worldValid ||
-        (g_poseLGrip.flags & need) != need) return P13_TRACKING;
+    const long poseAge = g_frames - pose.presentFrame;
+    // If XR submission stops while the game continues ticking, the last valid controller pose
+    // must not pin the arm in space indefinitely. One frame is normal for this producer/consumer
+    // ordering; three allows brief render/game-thread skew without accepting a stale hand.
+    if (pose.presentFrame <= 0 || poseAge < 0 || poseAge > 3) return P13_TRACKING;
+    if (!pose.active || !pose.worldValid || (pose.flags & need) != need)
+        return P13_TRACKING;
 
-    const float reach = VecLength(g_poseLGrip.cameraLocal);
+    const float reach = VecLength(pose.cameraLocal);
     if (outReach) *outReach = reach;
-    if (!FiniteVec(g_poseLGrip.worldPosition) || !std::isfinite(reach) ||
+    if (!FiniteVec(pose.worldPosition) || !std::isfinite(reach) ||
         reach < 10.0f || reach > 150.0f) return P13_REACH;
     return P13_READY;
 }
 
-static void ApplyMotionHandPosition()
+static void ApplyMotionHandPosition(uintptr_t pawn, const P13PoseSnapshot& pose)
 {
     if (!g_motionHands) return;
 
-    // Unlike the ten-frame P1.2 reporter, a writer revalidates every nested object immediately
-    // before use. This is still bounded pointer work; FindPlayerPawn normally reads Controller::Pawn.
-    UpdateMotionRigDiscovery();
-
     static bool owned = false;
+    static uintptr_t ownedPawn = 0;
     static uintptr_t ownedController = 0;
-    static unsigned long ownedGeneration = 0;
     static P13BlockReason reportedReason = (P13BlockReason)-1;
     static long writes = 0;
     static bool writeFaultLatched = false;
 
-    // A replacement rig cannot be released through its predecessor: the old pointer is exactly
-    // what P1.2 invalidated. Drop bookkeeping without touching either object, then consider the
-    // newly validated rig normally below.
-    if (owned && (ownedGeneration != g_motionRigGeneration ||
-                  ownedController != g_motionRig.leftWorld)) {
-        Log("[hands-p1.3] LEFT ownership discarded without a write: rig generation %lu -> %lu",
-            ownedGeneration, g_motionRigGeneration);
+    uintptr_t controller = 0;
+    uint8_t movement = 0xFF;
+    float reach = 0.0f;
+    P13BlockReason reason = writeFaultLatched ? P13_WRITE_FAILED :
+        P13Eligibility(pawn, pose, &controller, &movement, &reach);
+
+    // A replacement pawn/controller cannot be released through its predecessor: the old pointer
+    // is precisely the object that may already have been destroyed. Drop bookkeeping first.
+    if (owned && (ownedPawn != pawn || (controller && ownedController != controller))) {
+        Log("[hands-p1.3] LEFT ownership discarded without a write: pawn/controller replaced"
+            " (%p/%p -> %p/%p)", (void*)ownedPawn, (void*)ownedController,
+            (void*)pawn, (void*)controller);
         owned = false;
+        ownedPawn = 0;
         ownedController = 0;
     }
 
-    uint8_t movement = 0xFF;
-    float reach = 0.0f;
-    P13BlockReason reason = writeFaultLatched
-        ? P13_WRITE_FAILED : P13Eligibility(&movement, &reach);
     if (reason != reportedReason) {
         if (reason == P13_MOVEMENT)
             Log("[hands-p1.3] state -> BLOCKED: %s (state %u)",
@@ -5983,17 +6207,18 @@ static void ApplyMotionHandPosition()
             // have configured this controller earlier in the same game tick.
             const bool neutralise = reason == P13_TRACKING || reason == P13_REACH ||
                                     reason == P13_WRITE_FAILED;
-            const bool lowered = neutralise && ownedController == g_motionRig.leftWorld &&
+            const bool lowered = neutralise && ownedPawn == pawn &&
+                                 ownedController == controller &&
                                  SetP13LeftStrength(ownedController, 0.0f);
             Log("[hands-p1.3] LEFT release: %s; strength zeroed=%d",
                 P13ReasonName(reason), lowered ? 1 : 0);
             owned = false;
+            ownedPawn = 0;
             ownedController = 0;
         }
         return;
     }
 
-    const uintptr_t controller = g_motionRig.leftWorld;
     if (!owned) {
         MEVR_Vec3 beforeTarget{};
         float beforeStrength = 0.0f;
@@ -6001,20 +6226,20 @@ static void ApplyMotionHandPosition()
         SafeRead(controller + g_offLimbEffector, &beforeTarget, sizeof(beforeTarget));
         SafeRead(controller + g_offLimbEffectorSpace, &beforeSpace, 1);
         SafeRead(controller + g_offSkelControlStrength, &beforeStrength, sizeof(beforeStrength));
-        Log("*** [hands-p1.3] LEFT acquire generation %lu controller %p:"
+        Log("*** [hands-p1.3] LEFT acquire pawn %p controller %p:"
             " prior strength %.3f space %u target(%+.1f,%+.1f,%+.1f), reach %.1f UU",
-            g_motionRigGeneration, (void*)controller, beforeStrength, beforeSpace,
+            (void*)pawn, (void*)controller, beforeStrength, beforeSpace,
             beforeTarget.x, beforeTarget.y, beforeTarget.z, reach);
         owned = true;
+        ownedPawn = pawn;
         ownedController = controller;
-        ownedGeneration = g_motionRigGeneration;
     }
 
     const uint8_t worldSpace = 0;  // SetLeftHandWorldIKLocation uses BCS_WorldSpace == 0
     const float strength = 1.0f;
     const bool wrote =
         WriteRigBytes(controller + g_offLimbEffector,
-                      &g_poseLGrip.worldPosition, sizeof(g_poseLGrip.worldPosition)) &&
+                      &pose.worldPosition, sizeof(pose.worldPosition)) &&
         WriteRigBytes(controller + g_offLimbEffectorSpace, &worldSpace, sizeof(worldSpace)) &&
         WriteRigBytes(controller + g_offSkelControlStrength, &strength, sizeof(strength));
 
@@ -6025,9 +6250,9 @@ static void ApplyMotionHandPosition()
         SafeRead(controller + g_offLimbEffector, &readTarget, sizeof(readTarget)) &&
         SafeRead(controller + g_offLimbEffectorSpace, &readSpace, 1) &&
         SafeRead(controller + g_offSkelControlStrength, &readStrength, sizeof(readStrength));
-    const MEVR_Vec3 error{ readTarget.x - g_poseLGrip.worldPosition.x,
-                           readTarget.y - g_poseLGrip.worldPosition.y,
-                           readTarget.z - g_poseLGrip.worldPosition.z };
+    const MEVR_Vec3 error{ readTarget.x - pose.worldPosition.x,
+                           readTarget.y - pose.worldPosition.y,
+                           readTarget.z - pose.worldPosition.z };
     const bool honest = readBack && readSpace == 0 && fabsf(readStrength - 1.0f) < 0.001f &&
                         VecLength(error) < 0.01f;
     if (!honest) {
@@ -6036,6 +6261,7 @@ static void ApplyMotionHandPosition()
             wrote ? 1 : 0, readBack ? 1 : 0, readSpace, readStrength, VecLength(error));
         SetP13LeftStrength(controller, 0.0f);
         owned = false;
+        ownedPawn = 0;
         ownedController = 0;
         writeFaultLatched = true;  // fail closed for the rest of this process
         reportedReason = P13_WRITE_FAILED;
