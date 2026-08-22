@@ -3434,6 +3434,13 @@ static int g_offLimbJointTarget = -1, g_offLimbJointTargetSpace = -1;
 static int g_offSkelControlStrength = -1;
 static int g_offSkelStrengthTarget = -1, g_offSkelBlendTimeToGo = -1;
 static int g_offSingleBoneRotation = -1, g_offSingleBoneRotationSpace = -1;
+// P1.3 detached-arm experiment. These stay optional so failure to expose the deeper skeletal
+// layout cannot take the already-proven wrist-position rung down with it.
+static int g_offMeshAnimations = -1, g_offMeshSkelControlIndex = -1;
+static int g_offMeshSpaceBases = -1, g_offPrimitiveLocalToWorld = -1;
+static int g_offAnimTreeSkelControlLists = -1, g_offSkelNextControl = -1;
+static int g_offSingleBoneTranslation = -1, g_offSingleBoneTranslationSpace = -1;
+static volatile LONG g_detachedArmOffsetsReady = 0;
 static volatile LONG g_motionRigOffsetsReady = 0;
 
 static bool ObjNameIs(uintptr_t obj, const char* want);   // defined with the swan-neck code
@@ -3727,10 +3734,16 @@ static int LookupDetachedProp(const char* className, const char* propName,
 typedef void (__fastcall *PFN_Update1pArms)(void* self, void* edx, void* stack, void* result);
 static PFN_Update1pArms g_origUpdate1pArms = nullptr;
 static uintptr_t g_update1pArmsTarget = 0;
+static void RestoreDetachedArmOverridesBeforeGame(uintptr_t pawn);
+static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose);
 
 static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, void* result)
 {
     if (!g_origUpdate1pArms) return;
+    // The preceding frame may have borrowed a dormant controller for the left shoulder. Always
+    // put the authored tree and controller bytes back before Mirror's Edge updates parkour,
+    // weapon, or root-offset ownership for this tick.
+    RestoreDetachedArmOverridesBeforeGame(reinterpret_cast<uintptr_t>(self));
     g_origUpdate1pArms(self, edx, stack, result);
 
     static volatile LONG calls = 0;
@@ -3742,6 +3755,7 @@ static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, voi
     P13PoseSnapshot pose{};
     ReadP13PoseSnapshot(&pose);   // an unreadable snapshot remains invalid and releases ownership
     ApplyMotionHandPosition(reinterpret_cast<uintptr_t>(self), pose);
+    ApplyDetachedShoulders(reinterpret_cast<uintptr_t>(self), pose);
 }
 
 static int DeriveUFunctionFuncOffset(uintptr_t* sharedScriptTarget)
@@ -3898,6 +3912,18 @@ static void ResolveMotionRigOffsets()
     g_offSingleBoneRotationSpace =
         LookupProp("SkelControlSingleBone", "BoneRotationSpace", true);
 
+    g_offMeshAnimations = LookupProp("SkeletalMeshComponent", "Animations", true);
+    g_offMeshSkelControlIndex =
+        LookupProp("SkeletalMeshComponent", "SkelControlIndex", true);
+    g_offMeshSpaceBases = LookupProp("SkeletalMeshComponent", "SpaceBases", true);
+    g_offPrimitiveLocalToWorld = LookupProp("PrimitiveComponent", "LocalToWorld", true);
+    g_offAnimTreeSkelControlLists = LookupProp("AnimTree", "SkelControlLists", true);
+    g_offSkelNextControl = LookupProp("SkelControlBase", "NextControl", true);
+    g_offSingleBoneTranslation =
+        LookupProp("SkelControlSingleBone", "BoneTranslation", true);
+    g_offSingleBoneTranslationSpace =
+        LookupProp("SkelControlSingleBone", "BoneTranslationSpace", true);
+
     // Mirror's Edge's retail cook detaches editinline and native controller properties from
     // Children. They remain real UProperty objects because the shipped bytecode uses them.
     // Recover only objects whose property type and owning UClass both match exactly.
@@ -3958,6 +3984,30 @@ static void ResolveMotionRigOffsets()
     if (g_offSingleBoneRotationSpace < 0)
         g_offSingleBoneRotationSpace = LookupDetachedProp(
             "SkelControlSingleBone", "BoneRotationSpace", "ByteProperty", true);
+    if (g_offMeshAnimations < 0)
+        g_offMeshAnimations = LookupDetachedProp(
+            "SkeletalMeshComponent", "Animations", "ObjectProperty", true);
+    if (g_offMeshSkelControlIndex < 0)
+        g_offMeshSkelControlIndex = LookupDetachedProp(
+            "SkeletalMeshComponent", "SkelControlIndex", "ArrayProperty", true);
+    if (g_offMeshSpaceBases < 0)
+        g_offMeshSpaceBases = LookupDetachedProp(
+            "SkeletalMeshComponent", "SpaceBases", "ArrayProperty", true);
+    if (g_offPrimitiveLocalToWorld < 0)
+        g_offPrimitiveLocalToWorld = LookupDetachedProp(
+            "PrimitiveComponent", "LocalToWorld", "StructProperty", true);
+    if (g_offAnimTreeSkelControlLists < 0)
+        g_offAnimTreeSkelControlLists = LookupDetachedProp(
+            "AnimTree", "SkelControlLists", "ArrayProperty", true);
+    if (g_offSkelNextControl < 0)
+        g_offSkelNextControl = LookupDetachedProp(
+            "SkelControlBase", "NextControl", "ObjectProperty", true);
+    if (g_offSingleBoneTranslation < 0)
+        g_offSingleBoneTranslation = LookupDetachedProp(
+            "SkelControlSingleBone", "BoneTranslation", "StructProperty", true);
+    if (g_offSingleBoneTranslationSpace < 0)
+        g_offSingleBoneTranslationSpace = LookupDetachedProp(
+            "SkelControlSingleBone", "BoneTranslationSpace", "ByteProperty", true);
 
     // A cooked import can disappear from the live object table even while adjacent native fields
     // remain. EffectorLocationSpace did so in the first post-Update1pArms test, after resolving
@@ -4013,6 +4063,14 @@ static void ResolveMotionRigOffsets()
     // pawn pointers from the complete class pattern; later writes remain disabled until their
     // own layout is independently derived.
     InterlockedExchange(&g_motionRigOffsetsReady, g_offMesh1p >= 0 ? 1 : -1);
+    const bool detachedArmLayout =
+        g_offMeshAnimations >= 0 && g_offMeshSkelControlIndex >= 0 &&
+        g_offMeshSpaceBases >= 0 && g_offPrimitiveLocalToWorld >= 0 &&
+        g_offAnimTreeSkelControlLists >= 0 && g_offSkelNextControl >= 0 &&
+        g_offSingleBoneTranslation >= 0 && g_offSingleBoneTranslationSpace >= 0 &&
+        g_offSingleBoneRotation >= 0 && g_offSkelControlStrength >= 0 &&
+        g_offSkelStrengthTarget >= 0 && g_offSkelBlendTimeToGo >= 0;
+    InterlockedExchange(&g_detachedArmOffsetsReady, detachedArmLayout ? 1 : -1);
     Log("[hands-rig] reflected discovery base %s; pawn pointers %s; controller fields %s;"
         " optional joint target %s",
         g_offMesh1p >= 0 ? "READY" : "INCOMPLETE - discovery disabled",
@@ -4020,6 +4078,9 @@ static void ResolveMotionRigOffsets()
         reflectedControllerFields ? "available" : "stripped - writes remain disabled",
         (g_offLimbJointTarget >= 0 && g_offLimbJointTargetSpace >= 0)
             ? "available" : "unavailable");
+    Log("[hands-detach] bilateral shoulder layout %s (Animations, control lists/index,"
+        " SpaceBases, LocalToWorld, single-bone translation)",
+        detachedArmLayout ? "READY" : "INCOMPLETE - wrist IK remains available");
 }
 
 // ================================================================ the input gates
@@ -6391,6 +6452,533 @@ static void ApplyMotionHandPosition(uintptr_t pawn, const P13PoseSnapshot& pose)
     static P13HandState leftState, rightState;
     ApplyOneMotionHandPosition(pawn, pose.left, pose.presentFrame, true, leftState);
     ApplyOneMotionHandPosition(pawn, pose.right, pose.presentFrame, false, rightState);
+}
+
+// ================================================================ P1.3 detached-shoulder proof
+//
+// The authored AT_C1P tree has a real RightShoulder translation control but no left-hand twin.
+// It does, however, have one empty CameraJoint control-list slot, while the root list contains a
+// dormant additive single-bone RootControl behind SwingControl. During an eligible ordinary
+// walking frame we borrow that dormant controller and map the empty slot to LeftShoulder. At the
+// start of the next Update1pArms call every byte and link is restored BEFORE the game runs. The
+// game therefore always sees its authored tree when it takes ownership for a move or weapon.
+//
+// SK_UpperBody's shipped reference skeleton was measured rather than guessed:
+//   LeftShoulder index 16, RightShoulder 45; shoulder-to-hand chain 63.8 UU on both sides.
+// Runtime SkelControlIndex entries for root, both hands and RightShoulder must all corroborate
+// those indices before the left entry is touched.
+struct UE3Array32 {
+    uint32_t data;
+    int32_t count;
+    int32_t capacity;
+};
+struct UE3ControlListHead {
+    uint32_t boneName;
+    uint32_t boneNameNumber;
+    uint32_t controlHead;
+    int32_t drawY;
+};
+struct UE3Matrix44 { float m[4][4]; };
+
+struct DetachedControlSave {
+    MEVR_Vec3 translation{};
+    uint8_t translationSpace = 0;
+    int32_t rotation[3]{};
+    float strength = 0.0f;
+    float strengthTarget = 0.0f;
+    float blendTimeToGo = 0.0f;
+};
+
+struct DetachedRigFrame {
+    uintptr_t pawn = 0, mesh = 0, tree = 0;
+    uintptr_t swingControl = 0, leftControl = 0, rightControl = 0;
+    uint32_t listData = 0, indexData = 0, spaceBaseData = 0;
+    int listCount = 0, indexCount = 0, spaceBaseCount = 0;
+    int rootSlot = -1, leftHandSlot = -1, rightHandSlot = -1;
+    int rightShoulderSlot = -1, spareSlot = -1, mapBias = 0;
+    uint8_t originalLeftMap = 0xFF;
+    uint32_t originalSwingNext = 0, originalSpareHead = 0;
+    UE3Matrix44 localToWorld{};
+};
+
+struct DetachedOverrideState {
+    bool active = false;
+    bool leftTopology = false;
+    bool leftControl = false;
+    bool rightControl = false;
+    uintptr_t pawn = 0, swing = 0, left = 0, right = 0;
+    uint32_t spareHeadAddress = 0, leftMapAddress = 0;
+    uint32_t originalSwingNext = 0, originalSpareHead = 0;
+    uint8_t originalLeftMap = 0xFF;
+    DetachedControlSave leftSaved{}, rightSaved{};
+};
+
+struct DetachedHandSolver {
+    MEVR_Vec3 filtered{};
+    MEVR_Vec3 lastApplied{};
+    double lastMs = 0.0;
+    bool reportedDetached = false;
+    long writes = 0;
+};
+
+static DetachedOverrideState g_detachedOverride{};
+static DetachedHandSolver g_leftDetach{}, g_rightDetach{};
+static bool g_detachedWriteFault = false;
+static const char* g_detachedDiscoveryFailure = nullptr;
+static uintptr_t g_detachedReportedMesh = 0;
+
+static void ReportDetachedDiscoveryFailure(const char* reason)
+{
+    if (reason == g_detachedDiscoveryFailure) return;
+    g_detachedDiscoveryFailure = reason;
+    Log("[hands-detach] waiting: %s", reason);
+}
+
+static bool ReadUE3Array(uintptr_t object, int offset, int maxCount, UE3Array32* out)
+{
+    UE3Array32 value{};
+    if (!out || offset < 0 || !SafeRead(object + offset, &value, sizeof(value)) ||
+        value.data < 0x10000 || value.count <= 0 || value.count > maxCount ||
+        value.capacity < value.count || value.capacity > maxCount * 4) return false;
+    *out = value;
+    return true;
+}
+
+static int FindControlListSlot(const UE3Array32& lists, const char* bone,
+                               UE3ControlListHead* found)
+{
+    for (int i = 0; i < lists.count; ++i) {
+        UE3ControlListHead entry{};
+        if (!SafeRead(lists.data + i * sizeof(entry), &entry, sizeof(entry))) return -1;
+        char name[64] = "?";
+        if (!NameOf(entry.boneName, name, sizeof(name))) return -1;
+        if (!strcmp(name, bone)) {
+            if (found) *found = entry;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool ReadMappedControl(const UE3Array32& indices, int boneIndex, uint8_t* value)
+{
+    return value && boneIndex >= 0 && boneIndex < indices.count &&
+           SafeRead(indices.data + boneIndex, value, 1);
+}
+
+static bool CaptureDetachedControl(uintptr_t control, DetachedControlSave* save)
+{
+    if (!save || !LooksLikeRigObject(control, "SkelControlSingleBone")) return false;
+    DetachedControlSave s{};
+    if (!SafeRead(control + g_offSingleBoneTranslation, &s.translation,
+                  sizeof(s.translation)) ||
+        !SafeRead(control + g_offSingleBoneTranslationSpace, &s.translationSpace, 1) ||
+        !SafeRead(control + g_offSingleBoneRotation, s.rotation, sizeof(s.rotation)) ||
+        !SafeRead(control + g_offSkelControlStrength, &s.strength, sizeof(float)) ||
+        !SafeRead(control + g_offSkelStrengthTarget, &s.strengthTarget, sizeof(float)) ||
+        !SafeRead(control + g_offSkelBlendTimeToGo, &s.blendTimeToGo, sizeof(float)) ||
+        !FiniteVec(s.translation) || s.translationSpace > 5 ||
+        !std::isfinite(s.strength) || s.strength < 0.0f || s.strength > 1.0f ||
+        !std::isfinite(s.strengthTarget) || s.strengthTarget < 0.0f ||
+        s.strengthTarget > 1.0f || !std::isfinite(s.blendTimeToGo) ||
+        s.blendTimeToGo < 0.0f || s.blendTimeToGo > 60.0f) return false;
+    *save = s;
+    return true;
+}
+
+static bool RestoreDetachedControl(uintptr_t control, const DetachedControlSave& save)
+{
+    return LooksLikeRigObject(control, "SkelControlSingleBone") &&
+        WriteRigBytes(control + g_offSingleBoneTranslation,
+                      &save.translation, sizeof(save.translation)) &&
+        WriteRigBytes(control + g_offSingleBoneTranslationSpace,
+                      &save.translationSpace, 1) &&
+        WriteRigBytes(control + g_offSingleBoneRotation, save.rotation,
+                      sizeof(save.rotation)) &&
+        WriteRigBytes(control + g_offSkelControlStrength,
+                      &save.strength, sizeof(float)) &&
+        WriteRigBytes(control + g_offSkelStrengthTarget,
+                      &save.strengthTarget, sizeof(float)) &&
+        WriteRigBytes(control + g_offSkelBlendTimeToGo,
+                      &save.blendTimeToGo, sizeof(float));
+}
+
+static void RestoreDetachedArmOverridesBeforeGame(uintptr_t pawn)
+{
+    if (!g_detachedOverride.active) return;
+    DetachedOverrideState saved = g_detachedOverride;
+    g_detachedOverride = {};
+
+    // A destroyed/replaced pawn makes every nested pointer suspect. Discard bookkeeping without
+    // touching it; a live matching pawn must pass the exact controller-class checks below.
+    if (saved.pawn != pawn || !LooksLikePlayerPawn(pawn)) {
+        Log("[hands-detach] prior override discarded without writes: pawn replaced");
+        g_leftDetach = {};
+        g_rightDetach = {};
+        return;
+    }
+
+    bool restored = true;
+    if (saved.leftControl)
+        restored = RestoreDetachedControl(saved.left, saved.leftSaved) && restored;
+    if (saved.rightControl)
+        restored = RestoreDetachedControl(saved.right, saved.rightSaved) && restored;
+    if (saved.leftTopology) {
+        restored = WriteRigBytes(saved.leftMapAddress, &saved.originalLeftMap, 1) && restored;
+        restored = WriteRigBytes(saved.spareHeadAddress, &saved.originalSpareHead,
+                                 sizeof(uint32_t)) && restored;
+        restored = WriteRigBytes(saved.swing + g_offSkelNextControl,
+                                 &saved.originalSwingNext, sizeof(uint32_t)) && restored;
+    }
+    if (!restored) {
+        g_detachedWriteFault = true;
+        Log("[hands-detach] RESTORE FAILED - shoulder detachment disabled for this process");
+    }
+}
+
+static bool DiscoverDetachedRig(uintptr_t pawn, DetachedRigFrame* out)
+{
+    if (!out || g_detachedWriteFault ||
+        InterlockedCompareExchange(&g_detachedArmOffsetsReady, 0, 0) != 1 ||
+        !LooksLikePlayerPawn(pawn)) {
+        ReportDetachedDiscoveryFailure("deep reflected layout or live pawn is unavailable");
+        return false;
+    }
+
+    uint32_t mesh = 0, tree = 0;
+    if (!SafeU32(pawn + g_offMesh1p, &mesh) ||
+        !LooksLikeRigObject(mesh, "TdSkeletalMeshComponent") ||
+        !SafeU32(mesh + g_offMeshAnimations, &tree) ||
+        !LooksLikeRigObject(tree, "AnimTree")) {
+        ReportDetachedDiscoveryFailure("Mesh1p does not expose a validated live AnimTree");
+        return false;
+    }
+
+    UE3Array32 lists{}, indices{}, bases{};
+    if (!ReadUE3Array(tree, g_offAnimTreeSkelControlLists, 128, &lists) ||
+        !ReadUE3Array(mesh, g_offMeshSkelControlIndex, 512, &indices) ||
+        !ReadUE3Array(mesh, g_offMeshSpaceBases, 512, &bases) ||
+        indices.count <= 48 || bases.count <= 48) {
+        ReportDetachedDiscoveryFailure("control lists/index or SpaceBases array is invalid");
+        return false;
+    }
+
+    UE3ControlListHead root{}, leftHand{}, rightHand{}, rightShoulder{}, spare{};
+    const int rootSlot = FindControlListSlot(lists, "root", &root);
+    const int leftHandSlot = FindControlListSlot(lists, "LeftHand", &leftHand);
+    const int rightHandSlot = FindControlListSlot(lists, "RightHand", &rightHand);
+    const int rightShoulderSlot =
+        FindControlListSlot(lists, "RightShoulder", &rightShoulder);
+    const int spareSlot = FindControlListSlot(lists, "CameraJoint", &spare);
+    if (rootSlot < 0 || leftHandSlot < 0 || rightHandSlot < 0 ||
+        rightShoulderSlot < 0 || spareSlot < 0 || spare.controlHead != 0 ||
+        !LooksLikeRigObject(root.controlHead, "SkelControlSingleBone") ||
+        !LooksLikeRigObject(rightShoulder.controlHead, "SkelControlSingleBone")) {
+        ReportDetachedDiscoveryFailure("authored root/hand/shoulder/CameraJoint lists disagree");
+        return false;
+    }
+
+    uint32_t leftControl = 0, leftTail = 0;
+    if (!SafeU32(root.controlHead + g_offSkelNextControl, &leftControl) ||
+        !LooksLikeRigObject(leftControl, "SkelControlSingleBone") ||
+        !SafeU32(leftControl + g_offSkelNextControl, &leftTail) || leftTail != 0 ||
+        leftControl == rightShoulder.controlHead) {
+        ReportDetachedDiscoveryFailure("dormant RootControl chain is not the measured two-node chain");
+        return false;
+    }
+
+    uint8_t rootMap = 0, leftHandMap = 0, rightHandMap = 0, rightShoulderMap = 0;
+    uint8_t originalLeftMap = 0;
+    if (!ReadMappedControl(indices, 0, &rootMap) ||
+        !ReadMappedControl(indices, 16, &originalLeftMap) ||
+        !ReadMappedControl(indices, 19, &leftHandMap) ||
+        !ReadMappedControl(indices, 45, &rightShoulderMap) ||
+        !ReadMappedControl(indices, 48, &rightHandMap)) {
+        ReportDetachedDiscoveryFailure("measured root/shoulder/hand bone indices are unreadable");
+        return false;
+    }
+
+    int bias = -1;
+    for (int candidate = 0; candidate <= 1; ++candidate) {
+        if (rootMap == rootSlot + candidate &&
+            leftHandMap == leftHandSlot + candidate &&
+            rightHandMap == rightHandSlot + candidate &&
+            rightShoulderMap == rightShoulderSlot + candidate) {
+            bias = candidate;
+            break;
+        }
+    }
+    const bool leftUnmapped = originalLeftMap == 0xFF || (bias == 1 && originalLeftMap == 0);
+    if (bias < 0 || !leftUnmapped) {
+        ReportDetachedDiscoveryFailure("runtime bone-to-control map does not corroborate the asset");
+        return false;
+    }
+
+    UE3Matrix44 localToWorld{};
+    if (!SafeRead(mesh + g_offPrimitiveLocalToWorld, &localToWorld,
+                  sizeof(localToWorld))) {
+        ReportDetachedDiscoveryFailure("Mesh1p LocalToWorld is unreadable");
+        return false;
+    }
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            if (!std::isfinite(localToWorld.m[r][c])) {
+                ReportDetachedDiscoveryFailure("Mesh1p LocalToWorld contains non-finite data");
+                return false;
+            }
+
+    DetachedRigFrame rig{};
+    rig.pawn = pawn; rig.mesh = mesh; rig.tree = tree;
+    rig.swingControl = root.controlHead;
+    rig.leftControl = leftControl;
+    rig.rightControl = rightShoulder.controlHead;
+    rig.listData = lists.data; rig.indexData = indices.data; rig.spaceBaseData = bases.data;
+    rig.listCount = lists.count; rig.indexCount = indices.count; rig.spaceBaseCount = bases.count;
+    rig.rootSlot = rootSlot; rig.leftHandSlot = leftHandSlot;
+    rig.rightHandSlot = rightHandSlot; rig.rightShoulderSlot = rightShoulderSlot;
+    rig.spareSlot = spareSlot; rig.mapBias = bias;
+    rig.originalLeftMap = originalLeftMap;
+    rig.originalSwingNext = leftControl;
+    rig.originalSpareHead = spare.controlHead;
+    rig.localToWorld = localToWorld;
+    *out = rig;
+    if (g_detachedDiscoveryFailure || g_detachedReportedMesh != mesh) {
+        Log("*** [hands-detach] bilateral rig validated: %d bones, %d control lists;"
+            " L shoulder 16 -> spare slot %d, R shoulder 45 -> slot %d (map bias %d)",
+            indices.count, lists.count, spareSlot, rightShoulderSlot, bias);
+        g_detachedDiscoveryFailure = nullptr;
+        g_detachedReportedMesh = mesh;
+    }
+    return true;
+}
+
+static bool ShoulderWorldPosition(const DetachedRigFrame& rig, int boneIndex,
+                                  const MEVR_Vec3& previousOffset, MEVR_Vec3* out)
+{
+    if (!out || boneIndex < 0 || boneIndex >= rig.spaceBaseCount) return false;
+    UE3Matrix44 bone{};
+    if (!SafeRead(rig.spaceBaseData + boneIndex * sizeof(bone), &bone, sizeof(bone)))
+        return false;
+    const float x = bone.m[3][0], y = bone.m[3][1], z = bone.m[3][2];
+    MEVR_Vec3 world{
+        x*rig.localToWorld.m[0][0] + y*rig.localToWorld.m[1][0] +
+            z*rig.localToWorld.m[2][0] + rig.localToWorld.m[3][0],
+        x*rig.localToWorld.m[0][1] + y*rig.localToWorld.m[1][1] +
+            z*rig.localToWorld.m[2][1] + rig.localToWorld.m[3][1],
+        x*rig.localToWorld.m[0][2] + y*rig.localToWorld.m[1][2] +
+            z*rig.localToWorld.m[2][2] + rig.localToWorld.m[3][2]
+    };
+    // SpaceBases still describes the preceding evaluated frame. Remove the translation we
+    // supplied for that frame to recover the authored shoulder socket before solving again.
+    world.x -= previousOffset.x;
+    world.y -= previousOffset.y;
+    world.z -= previousOffset.z;
+    if (!FiniteVec(world)) return false;
+    *out = world;
+    return true;
+}
+
+static MEVR_Vec3 SolveDetachedOffset(DetachedHandSolver& solver,
+                                    const MEVR_Vec3& socket,
+                                    const MEVR_Vec3& target, bool eligible)
+{
+    if (!eligible) {
+        solver.filtered = {};
+        solver.lastApplied = {};
+        solver.lastMs = 0.0;
+        return {};
+    }
+
+    const MEVR_Vec3 delta{ target.x - socket.x, target.y - socket.y, target.z - socket.z };
+    const float distance = VecLength(delta);
+    // Reference-pose chain is 63.8 UU. Keeping 2 UU in reserve prevents the limb solver from
+    // living exactly at its numerical singularity when the arm is visually straight.
+    const float usableReach = 61.8f;
+    float excess = std::isfinite(distance) ? distance - usableReach : 0.0f;
+    if (excess < 0.0f) excess = 0.0f;
+    if (excess > 60.0f) excess = 60.0f;
+    MEVR_Vec3 desired{};
+    if (distance > 0.01f && excess > 0.0f) {
+        const float scale = excess / distance;
+        desired = { delta.x*scale, delta.y*scale, delta.z*scale };
+    }
+
+    const double now = NowMs();
+    float dt = solver.lastMs > 0.0 ? (float)((now - solver.lastMs) * 0.001) : (1.0f/60.0f);
+    solver.lastMs = now;
+    if (!std::isfinite(dt) || dt < 0.0f) dt = 0.0f;
+    if (dt > 0.05f) dt = 0.05f;
+    const float alpha = 1.0f - expf(-14.0f * dt);
+    solver.filtered.x += (desired.x - solver.filtered.x) * alpha;
+    solver.filtered.y += (desired.y - solver.filtered.y) * alpha;
+    solver.filtered.z += (desired.z - solver.filtered.z) * alpha;
+    if (VecLength(solver.filtered) < 0.05f) solver.filtered = {};
+    return solver.filtered;
+}
+
+static bool WriteDetachedControl(uintptr_t control, const MEVR_Vec3& worldOffset)
+{
+    const uint8_t worldSpace = 0;
+    const int32_t zeroRotation[3] = { 0, 0, 0 };
+    const float one = 1.0f, zero = 0.0f;
+    return WriteRigBytes(control + g_offSingleBoneTranslation,
+                         &worldOffset, sizeof(worldOffset)) &&
+           WriteRigBytes(control + g_offSingleBoneTranslationSpace, &worldSpace, 1) &&
+           WriteRigBytes(control + g_offSingleBoneRotation,
+                         zeroRotation, sizeof(zeroRotation)) &&
+           WriteRigBytes(control + g_offSkelStrengthTarget, &one, sizeof(one)) &&
+           WriteRigBytes(control + g_offSkelBlendTimeToGo, &zero, sizeof(zero)) &&
+           WriteRigBytes(control + g_offSkelControlStrength, &one, sizeof(one));
+}
+
+static bool DetachedControlReadbackIsExact(uintptr_t control,
+                                           const MEVR_Vec3& expectedOffset)
+{
+    MEVR_Vec3 translation{};
+    uint8_t space = 0xFF;
+    int32_t rotation[3] = { 1, 1, 1 };
+    float strength = -1.0f, target = -1.0f, blend = -1.0f;
+    if (!SafeRead(control + g_offSingleBoneTranslation,
+                  &translation, sizeof(translation)) ||
+        !SafeRead(control + g_offSingleBoneTranslationSpace, &space, 1) ||
+        !SafeRead(control + g_offSingleBoneRotation, rotation, sizeof(rotation)) ||
+        !SafeRead(control + g_offSkelControlStrength, &strength, sizeof(strength)) ||
+        !SafeRead(control + g_offSkelStrengthTarget, &target, sizeof(target)) ||
+        !SafeRead(control + g_offSkelBlendTimeToGo, &blend, sizeof(blend))) return false;
+    const MEVR_Vec3 error{ translation.x - expectedOffset.x,
+                           translation.y - expectedOffset.y,
+                           translation.z - expectedOffset.z };
+    return space == 0 && rotation[0] == 0 && rotation[1] == 0 && rotation[2] == 0 &&
+           fabsf(strength - 1.0f) < 0.001f && fabsf(target - 1.0f) < 0.001f &&
+           fabsf(blend) < 0.001f && VecLength(error) < 0.01f;
+}
+
+static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
+{
+    if (!g_motionHands || g_detachedWriteFault) return;
+    DetachedRigFrame rig{};
+    if (!DiscoverDetachedRig(pawn, &rig)) {
+        g_leftDetach.filtered = {}; g_leftDetach.lastApplied = {};
+        g_rightDetach.filtered = {}; g_rightDetach.lastApplied = {};
+        return;
+    }
+
+    uintptr_t ignored = 0;
+    const bool leftEligible =
+        P13Eligibility(pawn, pose.left, pose.presentFrame, true,
+                       &ignored, nullptr, nullptr) == P13_READY;
+    const bool rightEligible =
+        P13Eligibility(pawn, pose.right, pose.presentFrame, false,
+                       &ignored, nullptr, nullptr) == P13_READY;
+
+    MEVR_Vec3 leftSocket{}, rightSocket{};
+    const bool haveLeftSocket = ShoulderWorldPosition(
+        rig, 16, g_leftDetach.lastApplied, &leftSocket);
+    const bool haveRightSocket = ShoulderWorldPosition(
+        rig, 45, g_rightDetach.lastApplied, &rightSocket);
+    const MEVR_Vec3 leftOffset = SolveDetachedOffset(
+        g_leftDetach, leftSocket, pose.left.worldPosition,
+        leftEligible && haveLeftSocket);
+    const MEVR_Vec3 rightOffset = SolveDetachedOffset(
+        g_rightDetach, rightSocket, pose.right.worldPosition,
+        rightEligible && haveRightSocket);
+    const bool useLeft = VecLength(leftOffset) >= 0.05f;
+    const bool useRight = VecLength(rightOffset) >= 0.05f;
+
+    if (!useLeft && g_leftDetach.reportedDetached) {
+        Log("*** [hands-detach] LEFT reattached at authored shoulder socket");
+        g_leftDetach.reportedDetached = false;
+    }
+    if (!useRight && g_rightDetach.reportedDetached) {
+        Log("*** [hands-detach] RIGHT reattached at authored shoulder socket");
+        g_rightDetach.reportedDetached = false;
+    }
+    if (!useLeft && !useRight) return;
+
+    DetachedOverrideState frame{};
+    frame.active = true;
+    frame.pawn = pawn;
+    frame.swing = rig.swingControl;
+    frame.left = rig.leftControl;
+    frame.right = rig.rightControl;
+    frame.originalSwingNext = rig.originalSwingNext;
+    frame.originalSpareHead = rig.originalSpareHead;
+    frame.originalLeftMap = rig.originalLeftMap;
+    frame.spareHeadAddress = rig.listData + rig.spareSlot * sizeof(UE3ControlListHead) + 8;
+    frame.leftMapAddress = rig.indexData + 16;
+
+    bool wrote = true;
+    if (useLeft) {
+        frame.leftControl = CaptureDetachedControl(rig.leftControl, &frame.leftSaved);
+        if (!frame.leftControl) wrote = false;
+        const uint32_t noNext = 0;
+        const uint32_t leftHead = (uint32_t)rig.leftControl;
+        const uint8_t leftMap = (uint8_t)(rig.spareSlot + rig.mapBias);
+        if (wrote) {
+            frame.leftTopology = true;
+            wrote = WriteRigBytes(rig.swingControl + g_offSkelNextControl,
+                                  &noNext, sizeof(noNext)) &&
+                    WriteRigBytes(frame.spareHeadAddress,
+                                  &leftHead, sizeof(leftHead)) &&
+                    WriteRigBytes(frame.leftMapAddress, &leftMap, 1) &&
+                    WriteDetachedControl(rig.leftControl, leftOffset);
+            uint32_t readNext = ~0u, readHead = 0;
+            uint8_t readMap = 0xFF;
+            wrote = wrote &&
+                    SafeU32(rig.swingControl + g_offSkelNextControl, &readNext) &&
+                    SafeU32(frame.spareHeadAddress, &readHead) &&
+                    SafeRead(frame.leftMapAddress, &readMap, 1) &&
+                    readNext == 0 && readHead == leftHead && readMap == leftMap &&
+                    DetachedControlReadbackIsExact(rig.leftControl, leftOffset);
+        }
+    }
+    if (useRight && wrote) {
+        frame.rightControl = CaptureDetachedControl(rig.rightControl, &frame.rightSaved);
+        wrote = frame.rightControl && WriteDetachedControl(rig.rightControl, rightOffset) &&
+                DetachedControlReadbackIsExact(rig.rightControl, rightOffset);
+    }
+
+    g_detachedOverride = frame;
+    if (!wrote) {
+        RestoreDetachedArmOverridesBeforeGame(pawn);
+        g_detachedWriteFault = true;
+        g_leftDetach.lastApplied = {};
+        g_rightDetach.lastApplied = {};
+        Log("[hands-detach] WRITE/READ LAYOUT FAILED - shoulder detachment disabled;");
+        Log("[hands-detach] wrist position IK remains active and unchanged");
+        return;
+    }
+
+    if (useLeft) {
+        g_leftDetach.lastApplied = leftOffset;
+        ++g_leftDetach.writes;
+        if (!g_leftDetach.reportedDetached) {
+            Log("*** [hands-detach] LEFT detached via borrowed RootControl;"
+                " offset %.1f UU toward controller", VecLength(leftOffset));
+            g_leftDetach.reportedDetached = true;
+        }
+    } else {
+        g_leftDetach.lastApplied = {};
+    }
+    if (useRight) {
+        g_rightDetach.lastApplied = rightOffset;
+        ++g_rightDetach.writes;
+        if (!g_rightDetach.reportedDetached) {
+            Log("*** [hands-detach] RIGHT detached via authored shoulder control;"
+                " offset %.1f UU toward controller", VecLength(rightOffset));
+            g_rightDetach.reportedDetached = true;
+        }
+    } else {
+        g_rightDetach.lastApplied = {};
+    }
+    if (g_motionHandsDebug && ((useLeft && g_leftDetach.writes % 600 == 0) ||
+                               (useRight && g_rightDetach.writes % 600 == 0))) {
+        Log("[hands-detach] offsets L %.1f R %.1f UU; shoulder maps L %d R %d;"
+            " list slots spare %d/right %d",
+            VecLength(leftOffset), VecLength(rightOffset),
+            rig.spareSlot + rig.mapBias, rig.rightShoulderSlot + rig.mapBias,
+            rig.spareSlot, rig.rightShoulderSlot);
+    }
 }
 
 // ---- diag: whose view is the engine actually rendering? ----
