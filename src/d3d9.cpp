@@ -3423,6 +3423,7 @@ static int g_offLeftForeArmRoll = -1, g_offRightForeArmRoll = -1;
 static int g_offLimbEffector = -1, g_offLimbEffectorSpace = -1;
 static int g_offLimbJointTarget = -1, g_offLimbJointTargetSpace = -1;
 static int g_offSkelControlStrength = -1;
+static int g_offSkelStrengthTarget = -1, g_offSkelBlendTimeToGo = -1;
 static int g_offSingleBoneRotation = -1, g_offSingleBoneRotationSpace = -1;
 static volatile LONG g_motionRigOffsetsReady = 0;
 
@@ -3882,6 +3883,8 @@ static void ResolveMotionRigOffsets()
     g_offLimbJointTarget      = LookupProp("SkelControlLimb", "JointTargetLocation", true);
     g_offLimbJointTargetSpace = LookupProp("SkelControlLimb", "JointTargetLocationSpace", true);
     g_offSkelControlStrength  = LookupProp("SkelControlBase", "ControlStrength", true);
+    g_offSkelStrengthTarget   = LookupProp("SkelControlBase", "StrengthTarget", true);
+    g_offSkelBlendTimeToGo    = LookupProp("SkelControlBase", "BlendTimeToGo", true);
     g_offSingleBoneRotation   = LookupProp("SkelControlSingleBone", "BoneRotation", true);
     g_offSingleBoneRotationSpace =
         LookupProp("SkelControlSingleBone", "BoneRotationSpace", true);
@@ -3934,6 +3937,12 @@ static void ResolveMotionRigOffsets()
     if (g_offSkelControlStrength < 0)
         g_offSkelControlStrength = LookupDetachedProp(
             "SkelControlBase", "ControlStrength", "FloatProperty", true);
+    if (g_offSkelStrengthTarget < 0)
+        g_offSkelStrengthTarget = LookupDetachedProp(
+            "SkelControlBase", "StrengthTarget", "FloatProperty", true);
+    if (g_offSkelBlendTimeToGo < 0)
+        g_offSkelBlendTimeToGo = LookupDetachedProp(
+            "SkelControlBase", "BlendTimeToGo", "FloatProperty", true);
     if (g_offSingleBoneRotation < 0)
         g_offSingleBoneRotation = LookupDetachedProp(
             "SkelControlSingleBone", "BoneRotation", "StructProperty", true);
@@ -3959,13 +3968,34 @@ static void ResolveMotionRigOffsets()
             " both live limbs must validate)", g_offLimbEffectorSpace);
     }
 
+    // Engine.u declares these consecutively as ControlStrength, BlendInTime, BlendOutTime,
+    // StrengthTarget, BlendTimeToGo. SetSkelControlStrength owns the first, fourth, and fifth.
+    // Retail cooking can omit any individual metadata object, so recover a missing tail only from
+    // the independently owner-validated ControlStrength offset. P1.3 validates all three floats on
+    // both live controllers before this structural fallback can grant write access.
+    if (g_offSkelControlStrength >= 0) {
+        if (g_offSkelStrengthTarget < 0) {
+            g_offSkelStrengthTarget = g_offSkelControlStrength + 3 * (int)sizeof(float);
+            Log("*** [prop] SkelControlBase::StrengthTarget provisionally at +0x%04X"
+                " (shipped Engine.u field sequence; both live limbs must validate)",
+                g_offSkelStrengthTarget);
+        }
+        if (g_offSkelBlendTimeToGo < 0) {
+            g_offSkelBlendTimeToGo = g_offSkelControlStrength + 4 * (int)sizeof(float);
+            Log("*** [prop] SkelControlBase::BlendTimeToGo provisionally at +0x%04X"
+                " (shipped Engine.u field sequence; both live limbs must validate)",
+                g_offSkelBlendTimeToGo);
+        }
+    }
+
     const bool resolvedPointers =
         g_offLeftHandWorldIK >= 0 && g_offRightHandWorldIK >= 0 &&
         g_offLeftHandRotation >= 0 && g_offRightHandRotation >= 0 &&
         g_offLeftForeArmRoll >= 0 && g_offRightForeArmRoll >= 0;
     const bool reflectedControllerFields =
         g_offLimbEffector >= 0 && g_offLimbEffectorSpace >= 0 &&
-        g_offSkelControlStrength >= 0 &&
+        g_offSkelControlStrength >= 0 && g_offSkelStrengthTarget >= 0 &&
+        g_offSkelBlendTimeToGo >= 0 &&
         g_offSingleBoneRotation >= 0 && g_offSingleBoneRotationSpace >= 0;
 
     // The retail cook keeps Mesh1p reflected but strips the editinline IK pointer properties
@@ -6122,8 +6152,15 @@ static bool CurrentViewTargetIsPawn(uintptr_t pawn)
 static bool SetP13LeftStrength(uintptr_t controller, float strength)
 {
     if (!LooksLikeRigObject(controller, "TdSkelControlLimb") ||
-        g_offSkelControlStrength < 0) return false;
-    return WriteRigBytes(controller + g_offSkelControlStrength, &strength, sizeof(strength));
+        g_offSkelControlStrength < 0 || g_offSkelStrengthTarget < 0 ||
+        g_offSkelBlendTimeToGo < 0) return false;
+
+    // Equivalent to SetSkelControlStrength(strength, 0): without StrengthTarget and
+    // BlendTimeToGo, the controller update restores the old target before skeletal evaluation.
+    const float noBlend = 0.0f;
+    return WriteRigBytes(controller + g_offSkelStrengthTarget, &strength, sizeof(strength)) &&
+           WriteRigBytes(controller + g_offSkelBlendTimeToGo, &noBlend, sizeof(noBlend)) &&
+           WriteRigBytes(controller + g_offSkelControlStrength, &strength, sizeof(strength));
 }
 
 static P13BlockReason P13Eligibility(uintptr_t pawn, const P13PoseSnapshot& pose,
@@ -6134,7 +6171,8 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13PoseSnapshot& pose
     if (InterlockedCompareExchange(&g_motionRigOffsetsReady, 0, 0) != 1 ||
         g_offMesh1p < 0 || g_offLeftHandWorldIK < 0 ||
         g_offLimbEffector < 0 || g_offLimbEffectorSpace < 0 ||
-        g_offSkelControlStrength < 0) return P13_LAYOUT;
+        g_offSkelControlStrength < 0 || g_offSkelStrengthTarget < 0 ||
+        g_offSkelBlendTimeToGo < 0) return P13_LAYOUT;
     if (!LooksLikePlayerPawn(pawn)) return P13_RIG;
 
     uint32_t mesh = 0, controller = 0, rightController = 0;
@@ -6147,12 +6185,29 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13PoseSnapshot& pose
         !LooksLikeRigObject(rightController, "TdSkelControlLimb") ||
         rightController == controller) return P13_RIG;
 
-    // EBoneControlSpace is a five-value enum (World, Actor, Component, ParentBone, Bone). Check
-    // both independently validated limb instances before trusting a structurally recovered byte.
+    // EBoneControlSpace has six usable values (World through OtherBone). Check both independently
+    // validated limb instances before trusting a structurally recovered byte.
     uint8_t leftSpace = 0xFF, rightSpace = 0xFF;
-    if (!SafeRead(controller + g_offLimbEffectorSpace, &leftSpace, 1) || leftSpace > 4 ||
-        !SafeRead(rightController + g_offLimbEffectorSpace, &rightSpace, 1) || rightSpace > 4)
+    if (!SafeRead(controller + g_offLimbEffectorSpace, &leftSpace, 1) || leftSpace > 5 ||
+        !SafeRead(rightController + g_offLimbEffectorSpace, &rightSpace, 1) || rightSpace > 5)
         return P13_LAYOUT;
+
+    float leftStrength = 0.0f, leftTarget = 0.0f, leftBlend = 0.0f;
+    float rightStrength = 0.0f, rightTarget = 0.0f, rightBlend = 0.0f;
+    const bool strengthLayoutHonest =
+        SafeRead(controller + g_offSkelControlStrength, &leftStrength, sizeof(float)) &&
+        SafeRead(controller + g_offSkelStrengthTarget, &leftTarget, sizeof(float)) &&
+        SafeRead(controller + g_offSkelBlendTimeToGo, &leftBlend, sizeof(float)) &&
+        SafeRead(rightController + g_offSkelControlStrength, &rightStrength, sizeof(float)) &&
+        SafeRead(rightController + g_offSkelStrengthTarget, &rightTarget, sizeof(float)) &&
+        SafeRead(rightController + g_offSkelBlendTimeToGo, &rightBlend, sizeof(float)) &&
+        std::isfinite(leftStrength) && leftStrength >= 0.0f && leftStrength <= 1.0f &&
+        std::isfinite(leftTarget) && leftTarget >= 0.0f && leftTarget <= 1.0f &&
+        std::isfinite(leftBlend) && leftBlend >= 0.0f && leftBlend <= 60.0f &&
+        std::isfinite(rightStrength) && rightStrength >= 0.0f && rightStrength <= 1.0f &&
+        std::isfinite(rightTarget) && rightTarget >= 0.0f && rightTarget <= 1.0f &&
+        std::isfinite(rightBlend) && rightBlend >= 0.0f && rightBlend <= 60.0f;
+    if (!strengthLayoutHonest) return P13_LAYOUT;
     if (outController) *outController = controller;
 
     if (!CurrentViewTargetIsPawn(pawn)) return P13_VIEW;
@@ -6250,14 +6305,19 @@ static void ApplyMotionHandPosition(uintptr_t pawn, const P13PoseSnapshot& pose)
 
     if (!owned) {
         MEVR_Vec3 beforeTarget{};
-        float beforeStrength = 0.0f;
+        float beforeStrength = 0.0f, beforeStrengthTarget = 0.0f, beforeBlend = 0.0f;
         uint8_t beforeSpace = 0xFF;
         SafeRead(controller + g_offLimbEffector, &beforeTarget, sizeof(beforeTarget));
         SafeRead(controller + g_offLimbEffectorSpace, &beforeSpace, 1);
         SafeRead(controller + g_offSkelControlStrength, &beforeStrength, sizeof(beforeStrength));
+        SafeRead(controller + g_offSkelStrengthTarget,
+                 &beforeStrengthTarget, sizeof(beforeStrengthTarget));
+        SafeRead(controller + g_offSkelBlendTimeToGo, &beforeBlend, sizeof(beforeBlend));
         Log("*** [hands-p1.3] LEFT acquire pawn %p controller %p:"
-            " prior strength %.3f space %u target(%+.1f,%+.1f,%+.1f), reach %.1f UU",
-            (void*)pawn, (void*)controller, beforeStrength, beforeSpace,
+            " prior strength %.3f -> %.3f blend %.3f space %u"
+            " target(%+.1f,%+.1f,%+.1f), reach %.1f UU",
+            (void*)pawn, (void*)controller, beforeStrength, beforeStrengthTarget, beforeBlend,
+            beforeSpace,
             beforeTarget.x, beforeTarget.y, beforeTarget.z, reach);
         owned = true;
         ownedPawn = pawn;
@@ -6270,24 +6330,30 @@ static void ApplyMotionHandPosition(uintptr_t pawn, const P13PoseSnapshot& pose)
         WriteRigBytes(controller + g_offLimbEffector,
                       &pose.worldPosition, sizeof(pose.worldPosition)) &&
         WriteRigBytes(controller + g_offLimbEffectorSpace, &worldSpace, sizeof(worldSpace)) &&
-        WriteRigBytes(controller + g_offSkelControlStrength, &strength, sizeof(strength));
+        SetP13LeftStrength(controller, strength);
 
     MEVR_Vec3 readTarget{};
-    float readStrength = 0.0f;
+    float readStrength = 0.0f, readStrengthTarget = 0.0f, readBlend = -1.0f;
     uint8_t readSpace = 0xFF;
     const bool readBack = wrote &&
         SafeRead(controller + g_offLimbEffector, &readTarget, sizeof(readTarget)) &&
         SafeRead(controller + g_offLimbEffectorSpace, &readSpace, 1) &&
-        SafeRead(controller + g_offSkelControlStrength, &readStrength, sizeof(readStrength));
+        SafeRead(controller + g_offSkelControlStrength, &readStrength, sizeof(readStrength)) &&
+        SafeRead(controller + g_offSkelStrengthTarget,
+                 &readStrengthTarget, sizeof(readStrengthTarget)) &&
+        SafeRead(controller + g_offSkelBlendTimeToGo, &readBlend, sizeof(readBlend));
     const MEVR_Vec3 error{ readTarget.x - pose.worldPosition.x,
                            readTarget.y - pose.worldPosition.y,
                            readTarget.z - pose.worldPosition.z };
-    const bool honest = readBack && readSpace == 0 && fabsf(readStrength - 1.0f) < 0.001f &&
-                        VecLength(error) < 0.01f;
+    const bool honest = readBack && readSpace == 0 &&
+                        fabsf(readStrength - 1.0f) < 0.001f &&
+                        fabsf(readStrengthTarget - 1.0f) < 0.001f &&
+                        fabsf(readBlend) < 0.001f && VecLength(error) < 0.01f;
     if (!honest) {
         Log("[hands-p1.3] LEFT WRITE/READ-BACK FAILED: wrote=%d read=%d space=%u"
-            " strength=%.3f error=%.3f UU - disabling ownership",
-            wrote ? 1 : 0, readBack ? 1 : 0, readSpace, readStrength, VecLength(error));
+            " strength=%.3f target=%.3f blend=%.3f error=%.3f UU - disabling ownership",
+            wrote ? 1 : 0, readBack ? 1 : 0, readSpace, readStrength,
+            readStrengthTarget, readBlend, VecLength(error));
         SetP13LeftStrength(controller, 0.0f);
         owned = false;
         ownedPawn = 0;
@@ -6300,9 +6366,9 @@ static void ApplyMotionHandPosition(uintptr_t pawn, const P13PoseSnapshot& pose)
     ++writes;
     if (writes == 1 || (g_motionHandsDebug && writes % 600 == 0)) {
         Log("[hands-p1.3] LEFT write #%ld target(%+.1f,%+.1f,%+.1f)"
-            " reach %.1f UU strength %.1f space %u read-back exact",
+            " reach %.1f UU strength %.1f -> %.1f blend %.1f space %u read-back exact",
             writes, readTarget.x, readTarget.y, readTarget.z,
-            reach, readStrength, readSpace);
+            reach, readStrength, readStrengthTarget, readBlend, readSpace);
     }
 }
 
