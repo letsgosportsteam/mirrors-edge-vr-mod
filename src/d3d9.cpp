@@ -5735,24 +5735,28 @@ static void UpdateMotionRigDiscovery()
         const char* expectedClass;
         int offset;
         uintptr_t* destination;
+        bool required;
     };
 
     MotionRigCache candidate = {};
     candidate.pawn = pawn;
     RigField fields[] = {
-        { "Mesh1p", "TdSkeletalMeshComponent", g_offMesh1p, &candidate.mesh },
+        { "Mesh1p", "TdSkeletalMeshComponent", g_offMesh1p, &candidate.mesh, true },
         { "LeftHandWorldIKController", "TdSkelControlLimb", g_offLeftHandWorldIK,
-          &candidate.leftWorld },
+          &candidate.leftWorld, true },
         { "RightHandWorldIKController", "TdSkelControlLimb", g_offRightHandWorldIK,
-          &candidate.rightWorld },
+          &candidate.rightWorld, true },
+        // These helpers are declared on TdPawn but are legitimately null in the shipped
+        // first-person setup we measured. Position-only P1.3 needs the world limbs, not these.
+        // A non-null helper is still required to validate as the exact controller family.
         { "LeftHandRotationController", "SkelControlSingleBone", g_offLeftHandRotation,
-          &candidate.leftRotation },
+          &candidate.leftRotation, false },
         { "RightHandRotationController", "SkelControlSingleBone", g_offRightHandRotation,
-          &candidate.rightRotation },
+          &candidate.rightRotation, false },
         { "LeftForeArmRollRotationController", "SkelControlSingleBone", g_offLeftForeArmRoll,
-          &candidate.leftForearm },
+          &candidate.leftForearm, false },
         { "RightForeArmRollRotationController", "SkelControlSingleBone", g_offRightForeArmRoll,
-          &candidate.rightForearm },
+          &candidate.rightForearm, false },
     };
 
     for (int i = 0; i < (int)(sizeof(fields) / sizeof(fields[0])); ++i) {
@@ -5764,6 +5768,7 @@ static void UpdateMotionRigDiscovery()
             return;
         }
         *fields[i].destination = value;
+        if (!value && !fields[i].required) continue;
         if (!LooksLikeRigObject(value, fields[i].expectedClass)) {
             ClearMotionRig("a reflected rig pointer failed validation");
             ReportRigRejection(pawn, i, fields[i].name, value, fields[i].expectedClass,
@@ -5775,8 +5780,10 @@ static void UpdateMotionRigDiscovery()
     // Left and right resolving to the same controller is a readable, correctly typed result but
     // still cannot be a safe two-hand rig. Treat it as an incomplete construction state.
     if (candidate.leftWorld == candidate.rightWorld ||
-        candidate.leftRotation == candidate.rightRotation ||
-        candidate.leftForearm == candidate.rightForearm) {
+        (candidate.leftRotation && candidate.rightRotation &&
+         candidate.leftRotation == candidate.rightRotation) ||
+        (candidate.leftForearm && candidate.rightForearm &&
+         candidate.leftForearm == candidate.rightForearm)) {
         ClearMotionRig("left/right rig controllers alias each other");
         ReportRigRejection(pawn, 7, "left/right controllers", candidate.leftWorld,
                            "distinct objects", "are aliased");
@@ -5794,19 +5801,32 @@ static void UpdateMotionRigDiscovery()
     g_lastRigRejectedField = -2;
 
     char pawnClass[64], meshClass[64], leftWorldClass[64], rightWorldClass[64];
+    char leftRotationClass[64] = "(none)", rightRotationClass[64] = "(none)";
+    char leftForearmClass[64] = "(none)", rightForearmClass[64] = "(none)";
     ReadClassName(candidate.pawn, pawnClass, sizeof(pawnClass));
     ReadClassName(candidate.mesh, meshClass, sizeof(meshClass));
     ReadClassName(candidate.leftWorld, leftWorldClass, sizeof(leftWorldClass));
     ReadClassName(candidate.rightWorld, rightWorldClass, sizeof(rightWorldClass));
+    if (candidate.leftRotation)
+        ReadClassName(candidate.leftRotation, leftRotationClass, sizeof(leftRotationClass));
+    if (candidate.rightRotation)
+        ReadClassName(candidate.rightRotation, rightRotationClass, sizeof(rightRotationClass));
+    if (candidate.leftForearm)
+        ReadClassName(candidate.leftForearm, leftForearmClass, sizeof(leftForearmClass));
+    if (candidate.rightForearm)
+        ReadClassName(candidate.rightForearm, rightForearmClass, sizeof(rightForearmClass));
     Log("*** [hands-rig] acquired generation %lu: pawn %p \"%s\", Mesh1p %p \"%s\"",
         g_motionRigGeneration, (void*)candidate.pawn, pawnClass,
         (void*)candidate.mesh, meshClass);
     Log("[hands-rig] world IK: L %p \"%s\", R %p \"%s\"",
         (void*)candidate.leftWorld, leftWorldClass,
         (void*)candidate.rightWorld, rightWorldClass);
-    Log("[hands-rig] wrist rotation: L %p, R %p; forearm roll: L %p, R %p (read-only)",
-        (void*)candidate.leftRotation, (void*)candidate.rightRotation,
-        (void*)candidate.leftForearm, (void*)candidate.rightForearm);
+    Log("[hands-rig] optional wrist rotation: L %p \"%s\", R %p \"%s\"",
+        (void*)candidate.leftRotation, leftRotationClass,
+        (void*)candidate.rightRotation, rightRotationClass);
+    Log("[hands-rig] optional forearm roll: L %p \"%s\", R %p \"%s\" (read-only)",
+        (void*)candidate.leftForearm, leftForearmClass,
+        (void*)candidate.rightForearm, rightForearmClass);
 }
 
 // ---- diag: whose view is the engine actually rendering? ----
