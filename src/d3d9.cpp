@@ -6463,8 +6463,10 @@ static void ApplyMotionHandPosition(uintptr_t pawn, const P13PoseSnapshot& pose)
 // start of the next Update1pArms call every byte and link is restored BEFORE the game runs. The
 // game therefore always sees its authored tree when it takes ownership for a move or weapon.
 //
-// SK_UpperBody's shipped reference skeleton was measured rather than guessed:
-//   LeftShoulder index 16, RightShoulder 45; shoulder-to-hand chain 63.8 UU on both sides.
+// SK_UpperBody's shipped reference skeleton was measured rather than guessed. The translation
+// controls live on LeftShoulder 16 / RightShoulder 45, but SkelControlLimb's two-bone solve is
+// rooted one child lower at LeftArm 17 / RightArm 46. ForeArm-to-Hand reach is 50.38 UU; the
+// 13.43-UU Shoulder-to-Arm offset is not part of the limb solver and must not delay detachment.
 // Runtime SkelControlIndex entries for root, both hands and RightShoulder must all corroborate
 // those indices before the left entry is touched.
 struct UE3Array32 {
@@ -6517,6 +6519,7 @@ struct DetachedHandSolver {
     MEVR_Vec3 filtered{};
     MEVR_Vec3 lastApplied{};
     double lastMs = 0.0;
+    bool reachEngaged = false;
     bool reportedDetached = false;
     long writes = 0;
 };
@@ -6786,15 +6789,21 @@ static MEVR_Vec3 SolveDetachedOffset(DetachedHandSolver& solver,
         solver.filtered = {};
         solver.lastApplied = {};
         solver.lastMs = 0.0;
+        solver.reachEngaged = false;
         return {};
     }
 
     const MEVR_Vec3 delta{ target.x - socket.x, target.y - socket.y, target.z - socket.z };
     const float distance = VecLength(delta);
-    // Reference-pose chain is 63.8 UU. Keeping 2 UU in reserve prevents the limb solver from
-    // living exactly at its numerical singularity when the arm is visually straight.
-    const float usableReach = 61.8f;
-    float excess = std::isfinite(distance) ? distance - usableReach : 0.0f;
+    // SkelControlLimb rotates Hand + ForeArm around Arm: 25.81 + 24.57 = 50.38 UU. The old
+    // shoulder-to-hand value incorrectly included the 13.43-UU Shoulder->Arm link, producing the
+    // exact dead zone reported in headset testing. Keep 1.58 UU in reserve so shoulder motion
+    // begins just before the two-bone solver locks perfectly straight.
+    const float usableReach = 48.8f;
+    if (!solver.reachEngaged && std::isfinite(distance) && distance > usableReach)
+        solver.reachEngaged = true;
+    float excess = solver.reachEngaged && std::isfinite(distance)
+        ? distance - usableReach : 0.0f;
     if (excess < 0.0f) excess = 0.0f;
     if (excess > 60.0f) excess = 60.0f;
     MEVR_Vec3 desired{};
@@ -6813,6 +6822,11 @@ static MEVR_Vec3 SolveDetachedOffset(DetachedHandSolver& solver,
     solver.filtered.y += (desired.y - solver.filtered.y) * alpha;
     solver.filtered.z += (desired.z - solver.filtered.z) * alpha;
     if (VecLength(solver.filtered) < 0.05f) solver.filtered = {};
+    // Do not chatter between two skeletal topologies at full extension. Once engaged, require the
+    // controller to come a real 2 UU back inside the boundary before arming a future detach.
+    if (solver.reachEngaged && distance < usableReach - 2.0f &&
+        VecLength(solver.filtered) < 0.05f)
+        solver.reachEngaged = false;
     return solver.filtered;
 }
 
@@ -6873,9 +6887,9 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
 
     MEVR_Vec3 leftSocket{}, rightSocket{};
     const bool haveLeftSocket = ShoulderWorldPosition(
-        rig, 16, g_leftDetach.lastApplied, &leftSocket);
+        rig, 17, g_leftDetach.lastApplied, &leftSocket);
     const bool haveRightSocket = ShoulderWorldPosition(
-        rig, 45, g_rightDetach.lastApplied, &rightSocket);
+        rig, 46, g_rightDetach.lastApplied, &rightSocket);
     const MEVR_Vec3 leftOffset = SolveDetachedOffset(
         g_leftDetach, leftSocket, pose.left.worldPosition,
         leftEligible && haveLeftSocket);
