@@ -7096,10 +7096,37 @@ static bool DiscoverWristSide(const DetachedRigFrame& rig, bool left,
     return true;
 }
 
-static bool GripQuaternionToUERotator(const XrQuaternionf& q, int32_t out[3])
+static XrQuaternionf MultiplyQuaternion(const XrQuaternionf& a, const XrQuaternionf& b)
 {
-    if (!out || !std::isfinite(q.x) || !std::isfinite(q.y) ||
-        !std::isfinite(q.z) || !std::isfinite(q.w)) return false;
+    return {
+        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
+    };
+}
+
+static bool GripQuaternionToUERotator(const XrQuaternionf& raw, bool leftHand,
+                                     int32_t out[3])
+{
+    if (!out || !std::isfinite(raw.x) || !std::isfinite(raw.y) ||
+        !std::isfinite(raw.z) || !std::isfinite(raw.w)) return false;
+    const float rawNorm2 = raw.x*raw.x + raw.y*raw.y + raw.z*raw.z + raw.w*raw.w;
+    if (!std::isfinite(rawNorm2) || rawNorm2 < 0.98f || rawNorm2 > 1.02f) return false;
+    const float rawInv = 1.0f / sqrtf(rawNorm2);
+    const XrQuaternionf tracked{
+        raw.x*rawInv, raw.y*rawInv, raw.z*rawInv, raw.w*rawInv
+    };
+
+    // The controller's grip frame tracks correctly, but Faith's mirrored hand meshes have
+    // opposite palm-up axes. Headset photos measured a fixed 90-degree error: left was 90 down,
+    // right 90 up. Post-multiply a LOCAL forward-axis calibration so all later controller motion
+    // remains unchanged while the authored palms begin at the correct orientation.
+    const float halfSqrt = 0.7071067811865475f;
+    const XrQuaternionf gripToHand = leftHand
+        ? XrQuaternionf{ +halfSqrt, 0.0f, 0.0f, halfSqrt }
+        : XrQuaternionf{ -halfSqrt, 0.0f, 0.0f, halfSqrt };
+    const XrQuaternionf q = MultiplyQuaternion(tracked, gripToHand);
     const float norm2 = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
     if (!std::isfinite(norm2) || norm2 < 0.98f || norm2 > 1.02f) return false;
     const float inv = 1.0f / sqrtf(norm2);
@@ -7147,11 +7174,12 @@ static bool WriteWristControl(uintptr_t control, const int32_t rotation[3])
 
 static bool ApplyOneWristSide(const WristRuntimeSide& runtime,
                               const P13HandPoseSnapshot& pose,
+                              bool leftHand,
                               WristSideFrame* frame)
 {
     if (!frame) return false;
     int32_t rotation[3]{};
-    if (!GripQuaternionToUERotator(pose.worldOrientation, rotation)) return false;
+    if (!GripQuaternionToUERotator(pose.worldOrientation, leftHand, rotation)) return false;
     WristSideFrame saved{};
     saved.active = CaptureDetachedControl(runtime.control, &saved.saved);
     saved.control = runtime.control;
@@ -7247,9 +7275,10 @@ static void ApplyWristRotations(uintptr_t pawn, const P13PoseSnapshot& pose)
     frame.active = true;
     frame.pawn = pawn;
     bool wrote = true;
-    if (leftEligible) wrote = ApplyOneWristSide(leftRuntime, pose.left, &frame.left);
+    if (leftEligible)
+        wrote = ApplyOneWristSide(leftRuntime, pose.left, true, &frame.left);
     if (rightEligible && wrote)
-        wrote = ApplyOneWristSide(rightRuntime, pose.right, &frame.right);
+        wrote = ApplyOneWristSide(rightRuntime, pose.right, false, &frame.right);
     g_wristOverride = frame;
     if (!wrote) {
         RestoreWristRotationOverridesBeforeGame(pawn);
@@ -7270,8 +7299,8 @@ static void ApplyWristRotations(uintptr_t pawn, const P13PoseSnapshot& pose)
         ((leftEligible && g_wristLeftWrites % 600 == 0) ||
          (rightEligible && g_wristRightWrites % 600 == 0))) {
         int32_t l[3]{}, r[3]{};
-        GripQuaternionToUERotator(pose.left.worldOrientation, l);
-        GripQuaternionToUERotator(pose.right.worldOrientation, r);
+        GripQuaternionToUERotator(pose.left.worldOrientation, true, l);
+        GripQuaternionToUERotator(pose.right.worldOrientation, false, r);
         Log("[hands-wrist] UE rotator P/Y/R: L(%d,%d,%d) R(%d,%d,%d);"
             " writes L %ld R %ld", l[0], l[1], l[2], r[0], r[1], r[2],
             g_wristLeftWrites, g_wristRightWrites);
