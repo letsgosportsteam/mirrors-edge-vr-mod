@@ -600,12 +600,16 @@ static MotionPoseSample g_poseLGrip, g_poseRGrip, g_poseLAim, g_poseRAim;
 // Present owns OpenXR and publishes one immutable position sample for the next game tick.
 // Update1pArms can run on the game thread, so a sequence lock prevents it from observing a
 // half-written 64-bit flags field or a target assembled from two different XR frames.
-struct P13PoseSnapshot {
+struct P13HandPoseSnapshot {
     bool active = false;
     XrSpaceLocationFlags flags = 0;
     MEVR_Vec3 cameraLocal;
     MEVR_Vec3 worldPosition;
     bool worldValid = false;
+};
+struct P13PoseSnapshot {
+    P13HandPoseSnapshot left;
+    P13HandPoseSnapshot right;
     long presentFrame = 0;
 };
 static P13PoseSnapshot g_p13PublishedPose{};
@@ -615,11 +619,16 @@ static void PublishP13PoseSnapshot()
 {
     InterlockedIncrement(&g_p13PoseSequence);      // odd: writer owns the snapshot
     MemoryBarrier();
-    g_p13PublishedPose.active = g_poseLGrip.active;
-    g_p13PublishedPose.flags = g_poseLGrip.flags;
-    g_p13PublishedPose.cameraLocal = g_poseLGrip.cameraLocal;
-    g_p13PublishedPose.worldPosition = g_poseLGrip.worldPosition;
-    g_p13PublishedPose.worldValid = g_poseLGrip.worldValid;
+    g_p13PublishedPose.left.active = g_poseLGrip.active;
+    g_p13PublishedPose.left.flags = g_poseLGrip.flags;
+    g_p13PublishedPose.left.cameraLocal = g_poseLGrip.cameraLocal;
+    g_p13PublishedPose.left.worldPosition = g_poseLGrip.worldPosition;
+    g_p13PublishedPose.left.worldValid = g_poseLGrip.worldValid;
+    g_p13PublishedPose.right.active = g_poseRGrip.active;
+    g_p13PublishedPose.right.flags = g_poseRGrip.flags;
+    g_p13PublishedPose.right.cameraLocal = g_poseRGrip.cameraLocal;
+    g_p13PublishedPose.right.worldPosition = g_poseRGrip.worldPosition;
+    g_p13PublishedPose.right.worldValid = g_poseRGrip.worldValid;
     g_p13PublishedPose.presentFrame = g_frames;
     MemoryBarrier();
     InterlockedIncrement(&g_p13PoseSequence);      // even: readers may consume it
@@ -6098,11 +6107,11 @@ static void UpdateMotionRigDiscovery()
         (void*)candidate.rightForearm, rightForearmClass);
 }
 
-// ================================================================ Phase 1.3: left position proof
+// ================================================================ Phase 1.3: two-hand position proof
 //
-// One hand, one writable vector, one strength. This deliberately does not rotate the wrist,
-// pose fingers, or write the right hand. Every write is preceded in the same frame by the full
-// P1.2 pawn/mesh/controller revalidation above.
+// One writable vector and one strength state per hand. This deliberately does not rotate either
+// wrist or pose fingers. Every write revalidates the pawn, mesh, and both limb controllers after
+// the game's own Update1pArms has returned.
 enum P13BlockReason {
     P13_READY = 0,
     P13_LAYOUT,
@@ -6119,15 +6128,15 @@ enum P13BlockReason {
 static const char* P13ReasonName(P13BlockReason reason)
 {
     switch (reason) {
-        case P13_READY:         return "eligible: unarmed Walking + tracked left grip";
+        case P13_READY:         return "eligible: unarmed Walking + tracked grip";
         case P13_LAYOUT:        return "rig/controller layout is not ready";
         case P13_RIG:           return "no validated live position rig";
         case P13_VIEW:          return "ViewTarget is not the player pawn";
         case P13_WEAPON_LAYOUT: return "weapon ownership fields are unavailable";
         case P13_ARMED:         return "weapon equipped or weapon animation is not Unarmed";
         case P13_MOVEMENT:      return "movement is not Walking";
-        case P13_TRACKING:      return "left grip position is not active, valid, and tracked";
-        case P13_REACH:         return "left grip target is outside the 10..150 UU proof volume";
+        case P13_TRACKING:      return "grip position is not active, valid, and tracked";
+        case P13_REACH:         return "grip target is outside the 10..150 UU proof volume";
         case P13_WRITE_FAILED:  return "a guarded IK write or read-back failed";
         default:                return "unknown";
     }
@@ -6149,7 +6158,7 @@ static bool CurrentViewTargetIsPawn(uintptr_t pawn)
            SafeU32(camera + g_offCamViewTarget, &target) && target == (uint32_t)pawn;
 }
 
-static bool SetP13LeftStrength(uintptr_t controller, float strength)
+static bool SetP13Strength(uintptr_t controller, float strength)
 {
     if (!LooksLikeRigObject(controller, "TdSkelControlLimb") ||
         g_offSkelControlStrength < 0 || g_offSkelStrengthTarget < 0 ||
@@ -6163,7 +6172,8 @@ static bool SetP13LeftStrength(uintptr_t controller, float strength)
            WriteRigBytes(controller + g_offSkelControlStrength, &strength, sizeof(strength));
 }
 
-static P13BlockReason P13Eligibility(uintptr_t pawn, const P13PoseSnapshot& pose,
+static P13BlockReason P13Eligibility(uintptr_t pawn, const P13HandPoseSnapshot& pose,
+                                     long presentFrame, bool leftHand,
                                      uintptr_t* outController,
                                      uint8_t* outMovement, float* outReach)
 {
@@ -6175,29 +6185,29 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13PoseSnapshot& pose
         g_offSkelBlendTimeToGo < 0) return P13_LAYOUT;
     if (!LooksLikePlayerPawn(pawn)) return P13_RIG;
 
-    uint32_t mesh = 0, controller = 0, rightController = 0;
+    uint32_t mesh = 0, leftController = 0, rightController = 0;
     if (!SafeU32(pawn + g_offMesh1p, &mesh) ||
         !LooksLikeRigObject(mesh, "TdSkeletalMeshComponent") ||
-        !SafeU32(pawn + g_offLeftHandWorldIK, &controller) ||
-        !LooksLikeRigObject(controller, "TdSkelControlLimb") ||
+        !SafeU32(pawn + g_offLeftHandWorldIK, &leftController) ||
+        !LooksLikeRigObject(leftController, "TdSkelControlLimb") ||
         g_offRightHandWorldIK < 0 ||
         !SafeU32(pawn + g_offRightHandWorldIK, &rightController) ||
         !LooksLikeRigObject(rightController, "TdSkelControlLimb") ||
-        rightController == controller) return P13_RIG;
+        rightController == leftController) return P13_RIG;
 
     // EBoneControlSpace has six usable values (World through OtherBone). Check both independently
     // validated limb instances before trusting a structurally recovered byte.
     uint8_t leftSpace = 0xFF, rightSpace = 0xFF;
-    if (!SafeRead(controller + g_offLimbEffectorSpace, &leftSpace, 1) || leftSpace > 5 ||
+    if (!SafeRead(leftController + g_offLimbEffectorSpace, &leftSpace, 1) || leftSpace > 5 ||
         !SafeRead(rightController + g_offLimbEffectorSpace, &rightSpace, 1) || rightSpace > 5)
         return P13_LAYOUT;
 
     float leftStrength = 0.0f, leftTarget = 0.0f, leftBlend = 0.0f;
     float rightStrength = 0.0f, rightTarget = 0.0f, rightBlend = 0.0f;
     const bool strengthLayoutHonest =
-        SafeRead(controller + g_offSkelControlStrength, &leftStrength, sizeof(float)) &&
-        SafeRead(controller + g_offSkelStrengthTarget, &leftTarget, sizeof(float)) &&
-        SafeRead(controller + g_offSkelBlendTimeToGo, &leftBlend, sizeof(float)) &&
+        SafeRead(leftController + g_offSkelControlStrength, &leftStrength, sizeof(float)) &&
+        SafeRead(leftController + g_offSkelStrengthTarget, &leftTarget, sizeof(float)) &&
+        SafeRead(leftController + g_offSkelBlendTimeToGo, &leftBlend, sizeof(float)) &&
         SafeRead(rightController + g_offSkelControlStrength, &rightStrength, sizeof(float)) &&
         SafeRead(rightController + g_offSkelStrengthTarget, &rightTarget, sizeof(float)) &&
         SafeRead(rightController + g_offSkelBlendTimeToGo, &rightBlend, sizeof(float)) &&
@@ -6208,7 +6218,7 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13PoseSnapshot& pose
         std::isfinite(rightTarget) && rightTarget >= 0.0f && rightTarget <= 1.0f &&
         std::isfinite(rightBlend) && rightBlend >= 0.0f && rightBlend <= 60.0f;
     if (!strengthLayoutHonest) return P13_LAYOUT;
-    if (outController) *outController = controller;
+    if (outController) *outController = leftHand ? leftController : rightController;
 
     if (!CurrentViewTargetIsPawn(pawn)) return P13_VIEW;
     if (g_offWeapon < 0 || g_offWeaponAnimState < 0) return P13_WEAPON_LAYOUT;
@@ -6230,11 +6240,11 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13PoseSnapshot& pose
 
     const XrSpaceLocationFlags need = XR_SPACE_LOCATION_POSITION_VALID_BIT |
                                       XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
-    const long poseAge = g_frames - pose.presentFrame;
+    const long poseAge = g_frames - presentFrame;
     // If XR submission stops while the game continues ticking, the last valid controller pose
     // must not pin the arm in space indefinitely. One frame is normal for this producer/consumer
     // ordering; three allows brief render/game-thread skew without accepting a stale hand.
-    if (pose.presentFrame <= 0 || poseAge < 0 || poseAge > 3) return P13_TRACKING;
+    if (presentFrame <= 0 || poseAge < 0 || poseAge > 3) return P13_TRACKING;
     if (!pose.active || !pose.worldValid || (pose.flags & need) != need)
         return P13_TRACKING;
 
@@ -6245,65 +6255,69 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13PoseSnapshot& pose
     return P13_READY;
 }
 
-static void ApplyMotionHandPosition(uintptr_t pawn, const P13PoseSnapshot& pose)
+struct P13HandState {
+    bool owned = false;
+    uintptr_t ownedPawn = 0;
+    uintptr_t ownedController = 0;
+    P13BlockReason reportedReason = (P13BlockReason)-1;
+    long writes = 0;
+    bool writeFaultLatched = false;
+};
+
+static void ApplyOneMotionHandPosition(uintptr_t pawn, const P13HandPoseSnapshot& pose,
+                                       long presentFrame, bool leftHand, P13HandState& state)
 {
-    if (!g_motionHands) return;
-
-    static bool owned = false;
-    static uintptr_t ownedPawn = 0;
-    static uintptr_t ownedController = 0;
-    static P13BlockReason reportedReason = (P13BlockReason)-1;
-    static long writes = 0;
-    static bool writeFaultLatched = false;
-
+    const char* hand = leftHand ? "LEFT" : "RIGHT";
     uintptr_t controller = 0;
     uint8_t movement = 0xFF;
     float reach = 0.0f;
-    P13BlockReason reason = writeFaultLatched ? P13_WRITE_FAILED :
-        P13Eligibility(pawn, pose, &controller, &movement, &reach);
+    P13BlockReason reason = state.writeFaultLatched ? P13_WRITE_FAILED :
+        P13Eligibility(pawn, pose, presentFrame, leftHand,
+                       &controller, &movement, &reach);
 
     // A replacement pawn/controller cannot be released through its predecessor: the old pointer
     // is precisely the object that may already have been destroyed. Drop bookkeeping first.
-    if (owned && (ownedPawn != pawn || (controller && ownedController != controller))) {
-        Log("[hands-p1.3] LEFT ownership discarded without a write: pawn/controller replaced"
-            " (%p/%p -> %p/%p)", (void*)ownedPawn, (void*)ownedController,
-            (void*)pawn, (void*)controller);
-        owned = false;
-        ownedPawn = 0;
-        ownedController = 0;
+    if (state.owned && (state.ownedPawn != pawn ||
+                        (controller && state.ownedController != controller))) {
+        Log("[hands-p1.3] %s ownership discarded without a write: pawn/controller replaced"
+            " (%p/%p -> %p/%p)", hand, (void*)state.ownedPawn,
+            (void*)state.ownedController, (void*)pawn, (void*)controller);
+        state.owned = false;
+        state.ownedPawn = 0;
+        state.ownedController = 0;
     }
 
-    if (reason != reportedReason) {
+    if (reason != state.reportedReason) {
         if (reason == P13_MOVEMENT)
-            Log("[hands-p1.3] state -> BLOCKED: %s (state %u)",
-                P13ReasonName(reason), movement);
+            Log("[hands-p1.3] %s state -> BLOCKED: %s (state %u)",
+                hand, P13ReasonName(reason), movement);
         else
-            Log("[hands-p1.3] state -> %s: %s",
+            Log("[hands-p1.3] %s state -> %s: %s", hand,
                 reason == P13_READY ? "READY" : "BLOCKED", P13ReasonName(reason));
-        reportedReason = reason;
+        state.reportedReason = reason;
     }
 
     if (reason != P13_READY) {
-        if (owned) {
+        if (state.owned) {
             // Tracking/reach loss occurs while the game is otherwise still in ordinary walking,
             // so the game has no move transition that would lower this controller. Neutralise it.
             // For a move, weapon, view, or pawn transition, write NOTHING: that owner may already
             // have configured this controller earlier in the same game tick.
             const bool neutralise = reason == P13_TRACKING || reason == P13_REACH ||
                                     reason == P13_WRITE_FAILED;
-            const bool lowered = neutralise && ownedPawn == pawn &&
-                                 ownedController == controller &&
-                                 SetP13LeftStrength(ownedController, 0.0f);
-            Log("[hands-p1.3] LEFT release: %s; strength zeroed=%d",
-                P13ReasonName(reason), lowered ? 1 : 0);
-            owned = false;
-            ownedPawn = 0;
-            ownedController = 0;
+            const bool lowered = neutralise && state.ownedPawn == pawn &&
+                                 state.ownedController == controller &&
+                                 SetP13Strength(state.ownedController, 0.0f);
+            Log("[hands-p1.3] %s release: %s; strength zeroed=%d",
+                hand, P13ReasonName(reason), lowered ? 1 : 0);
+            state.owned = false;
+            state.ownedPawn = 0;
+            state.ownedController = 0;
         }
         return;
     }
 
-    if (!owned) {
+    if (!state.owned) {
         MEVR_Vec3 beforeTarget{};
         float beforeStrength = 0.0f, beforeStrengthTarget = 0.0f, beforeBlend = 0.0f;
         uint8_t beforeSpace = 0xFF;
@@ -6313,24 +6327,23 @@ static void ApplyMotionHandPosition(uintptr_t pawn, const P13PoseSnapshot& pose)
         SafeRead(controller + g_offSkelStrengthTarget,
                  &beforeStrengthTarget, sizeof(beforeStrengthTarget));
         SafeRead(controller + g_offSkelBlendTimeToGo, &beforeBlend, sizeof(beforeBlend));
-        Log("*** [hands-p1.3] LEFT acquire pawn %p controller %p:"
+        Log("*** [hands-p1.3] %s acquire pawn %p controller %p:"
             " prior strength %.3f -> %.3f blend %.3f space %u"
             " target(%+.1f,%+.1f,%+.1f), reach %.1f UU",
-            (void*)pawn, (void*)controller, beforeStrength, beforeStrengthTarget, beforeBlend,
-            beforeSpace,
-            beforeTarget.x, beforeTarget.y, beforeTarget.z, reach);
-        owned = true;
-        ownedPawn = pawn;
-        ownedController = controller;
+            hand, (void*)pawn, (void*)controller, beforeStrength, beforeStrengthTarget,
+            beforeBlend, beforeSpace, beforeTarget.x, beforeTarget.y, beforeTarget.z, reach);
+        state.owned = true;
+        state.ownedPawn = pawn;
+        state.ownedController = controller;
     }
 
-    const uint8_t worldSpace = 0;  // SetLeftHandWorldIKLocation uses BCS_WorldSpace == 0
+    const uint8_t worldSpace = 0;
     const float strength = 1.0f;
     const bool wrote =
         WriteRigBytes(controller + g_offLimbEffector,
                       &pose.worldPosition, sizeof(pose.worldPosition)) &&
         WriteRigBytes(controller + g_offLimbEffectorSpace, &worldSpace, sizeof(worldSpace)) &&
-        SetP13LeftStrength(controller, strength);
+        SetP13Strength(controller, strength);
 
     MEVR_Vec3 readTarget{};
     float readStrength = 0.0f, readStrengthTarget = 0.0f, readBlend = -1.0f;
@@ -6350,26 +6363,34 @@ static void ApplyMotionHandPosition(uintptr_t pawn, const P13PoseSnapshot& pose)
                         fabsf(readStrengthTarget - 1.0f) < 0.001f &&
                         fabsf(readBlend) < 0.001f && VecLength(error) < 0.01f;
     if (!honest) {
-        Log("[hands-p1.3] LEFT WRITE/READ-BACK FAILED: wrote=%d read=%d space=%u"
+        Log("[hands-p1.3] %s WRITE/READ-BACK FAILED: wrote=%d read=%d space=%u"
             " strength=%.3f target=%.3f blend=%.3f error=%.3f UU - disabling ownership",
-            wrote ? 1 : 0, readBack ? 1 : 0, readSpace, readStrength,
+            hand, wrote ? 1 : 0, readBack ? 1 : 0, readSpace, readStrength,
             readStrengthTarget, readBlend, VecLength(error));
-        SetP13LeftStrength(controller, 0.0f);
-        owned = false;
-        ownedPawn = 0;
-        ownedController = 0;
-        writeFaultLatched = true;  // fail closed for the rest of this process
-        reportedReason = P13_WRITE_FAILED;
+        SetP13Strength(controller, 0.0f);
+        state.owned = false;
+        state.ownedPawn = 0;
+        state.ownedController = 0;
+        state.writeFaultLatched = true;  // fail closed for this hand for the rest of the process
+        state.reportedReason = P13_WRITE_FAILED;
         return;
     }
 
-    ++writes;
-    if (writes == 1 || (g_motionHandsDebug && writes % 600 == 0)) {
-        Log("[hands-p1.3] LEFT write #%ld target(%+.1f,%+.1f,%+.1f)"
+    ++state.writes;
+    if (state.writes == 1 || (g_motionHandsDebug && state.writes % 600 == 0)) {
+        Log("[hands-p1.3] %s write #%ld target(%+.1f,%+.1f,%+.1f)"
             " reach %.1f UU strength %.1f -> %.1f blend %.1f space %u read-back exact",
-            writes, readTarget.x, readTarget.y, readTarget.z,
+            hand, state.writes, readTarget.x, readTarget.y, readTarget.z,
             reach, readStrength, readStrengthTarget, readBlend, readSpace);
     }
+}
+
+static void ApplyMotionHandPosition(uintptr_t pawn, const P13PoseSnapshot& pose)
+{
+    if (!g_motionHands) return;
+    static P13HandState leftState, rightState;
+    ApplyOneMotionHandPosition(pawn, pose.left, pose.presentFrame, true, leftState);
+    ApplyOneMotionHandPosition(pawn, pose.right, pose.presentFrame, false, rightState);
 }
 
 // ---- diag: whose view is the engine actually rendering? ----
@@ -9900,7 +9921,7 @@ static void LoadSettings()
             if (SettingBool(val, &b)) {
                 g_motionHands = b;
                 Log("[cfg]   MotionHands = %s%s", b ? "on" : "off",
-                    b ? "  (Phase 1 pose sampling enabled; arm control is not landed yet)" : "");
+                    b ? "  (Phase 1.3 two-hand position control enabled)" : "");
                 applied++;
             } else { Log("[cfg]   MotionHands '%s' is not a boolean - ignored", val); rejected++; }
         } else if (_stricmp(key, "MotionHandsDebug") == 0) {

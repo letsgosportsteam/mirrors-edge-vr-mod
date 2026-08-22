@@ -297,6 +297,13 @@ Pass:
 behavior in the normal reach volume, evaluate a hybrid/custom-hand representation before adding
 rotation or ownership logic.
 
+Test result (2026-08-21): the left shipped limb follows the tracked controller reliably once the
+post-`Update1pArms` writer updates `ControlStrength`, `StrengthTarget`, and `BlendTimeToGo`
+together. Wrist orientation remains game-controlled, as intended for this rung. At full physical
+extension the rendered hand saturates at the skeletal arm's maximum reach and falls short of the
+controller. Gate A therefore remains open pending the two-hand test; do not proceed automatically
+to shipped-rig wrist orientation without choosing how to handle this positional mismatch.
+
 ### P1.4 — hand orientation
 
 **Question:** Can the shipped rotation controls match controller orientation without wrist flips?
@@ -462,4 +469,3 @@ Phase 1 is complete when an unarmed player can see both existing hands follow th
 ordinary locomotion, all tested parkour/weapon/cinematic states regain their original hand behavior,
 tracking resumes cleanly afterward, and the feature survives normal lifecycle transitions without
 affecting head tracking, stereo, or gamepad synthesis.
-
