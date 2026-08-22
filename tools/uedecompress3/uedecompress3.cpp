@@ -265,10 +265,20 @@ int main(int argc, char** argv)
         }
         printf("  parsed %d well-formed of %d (%d rejected)\n", good, nameCount, bad);
 
-        const char* expect[] = { "Class", "Function", "TdPlayerCamera", "TdPlayerController",
-                                 "TdPlayerPawn", "Rotation", "Location" };
+        const size_t inLen = strlen(inPath);
+        const bool enginePackage = inLen >= 8 &&
+            _stricmp(inPath + inLen - 8, "Engine.u") == 0;
+        const char* expectTdGame[] = { "Class", "Function", "TdPlayerCamera",
+            "TdPlayerController", "TdPlayerPawn", "Rotation", "Location" };
+        const char* expectEngine[] = { "Class", "Function", "SkelControlBase",
+            "SkelControlLimb", "ControlStrength", "StrengthTarget", "BlendTimeToGo" };
+        const char** expect = enginePackage ? expectEngine : expectTdGame;
+        const int expectCount = enginePackage
+            ? (int)(sizeof(expectEngine) / sizeof(*expectEngine))
+            : (int)(sizeof(expectTdGame) / sizeof(*expectTdGame));
         int found = 0;
-        for (const char* e : expect) {
+        for (int i = 0; i < expectCount; ++i) {
+            const char* e = expect[i];
             bool hit = false;
             for (const std::string& s : names) if (s == e) { hit = true; break; }
             printf("  expected name %-22s %s\n", e, hit ? "FOUND" : "missing");
@@ -278,7 +288,7 @@ int main(int argc, char** argv)
         const bool ok = (good >= (int)(nameCount * 0.99)) && (found >= 5);
         if (!ok) {
             printf("*** VERIFICATION FAILED - %d/%d names well-formed, %d/%d expected names "
-                   "found. Output is NOT trustworthy.\n", good, nameCount, found, (int)(sizeof(expect)/sizeof(*expect)));
+                   "found. Output is NOT trustworthy.\n", good, nameCount, found, expectCount);
             return 1;
         }
         printf("*** VERIFIED: %d names parsed, %d expected names present.\n", good, found);
