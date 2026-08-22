@@ -605,6 +605,7 @@ struct P13HandPoseSnapshot {
     XrSpaceLocationFlags flags = 0;
     MEVR_Vec3 cameraLocal;
     MEVR_Vec3 worldPosition;
+    XrQuaternionf worldOrientation{};
     bool worldValid = false;
 };
 struct P13PoseSnapshot {
@@ -623,11 +624,13 @@ static void PublishP13PoseSnapshot()
     g_p13PublishedPose.left.flags = g_poseLGrip.flags;
     g_p13PublishedPose.left.cameraLocal = g_poseLGrip.cameraLocal;
     g_p13PublishedPose.left.worldPosition = g_poseLGrip.worldPosition;
+    g_p13PublishedPose.left.worldOrientation = g_poseLGrip.worldOrientation;
     g_p13PublishedPose.left.worldValid = g_poseLGrip.worldValid;
     g_p13PublishedPose.right.active = g_poseRGrip.active;
     g_p13PublishedPose.right.flags = g_poseRGrip.flags;
     g_p13PublishedPose.right.cameraLocal = g_poseRGrip.cameraLocal;
     g_p13PublishedPose.right.worldPosition = g_poseRGrip.worldPosition;
+    g_p13PublishedPose.right.worldOrientation = g_poseRGrip.worldOrientation;
     g_p13PublishedPose.right.worldValid = g_poseRGrip.worldValid;
     g_p13PublishedPose.presentFrame = g_frames;
     MemoryBarrier();
@@ -3734,8 +3737,10 @@ static int LookupDetachedProp(const char* className, const char* propName,
 typedef void (__fastcall *PFN_Update1pArms)(void* self, void* edx, void* stack, void* result);
 static PFN_Update1pArms g_origUpdate1pArms = nullptr;
 static uintptr_t g_update1pArmsTarget = 0;
+static void RestoreWristRotationOverridesBeforeGame(uintptr_t pawn);
 static void RestoreDetachedArmOverridesBeforeGame(uintptr_t pawn);
 static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose);
+static void ApplyWristRotations(uintptr_t pawn, const P13PoseSnapshot& pose);
 
 static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, void* result)
 {
@@ -3743,6 +3748,7 @@ static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, voi
     // The preceding frame may have borrowed a dormant controller for the left shoulder. Always
     // put the authored tree and controller bytes back before Mirror's Edge updates parkour,
     // weapon, or root-offset ownership for this tick.
+    RestoreWristRotationOverridesBeforeGame(reinterpret_cast<uintptr_t>(self));
     RestoreDetachedArmOverridesBeforeGame(reinterpret_cast<uintptr_t>(self));
     g_origUpdate1pArms(self, edx, stack, result);
 
@@ -3755,6 +3761,7 @@ static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, voi
     P13PoseSnapshot pose{};
     ReadP13PoseSnapshot(&pose);   // an unreadable snapshot remains invalid and releases ownership
     ApplyMotionHandPosition(reinterpret_cast<uintptr_t>(self), pose);
+    ApplyWristRotations(reinterpret_cast<uintptr_t>(self), pose);
     ApplyDetachedShoulders(reinterpret_cast<uintptr_t>(self), pose);
 }
 
@@ -6992,6 +6999,282 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
             VecLength(leftOffset), VecLength(rightOffset),
             rig.spareSlot + rig.mapBias, rig.rightShoulderSlot + rig.mapBias,
             rig.spareSlot, rig.rightShoulderSlot);
+    }
+}
+
+// ================================================================ P1.4 bilateral wrist rotation
+//
+// AT_C1P does not instantiate the TdPawn Left/RightHandRotationController properties; the live
+// pointers are correctly null. It does have one SkelControlSingleBone on each ForeArmRoll list.
+// While ordinary unarmed walking owns a tracked grip pose, temporarily remove those two controls
+// from their roll-bone map and append them to the END of the corresponding Hand control chain.
+// Running after world-position limb IK makes the absolute world rotation the final hand result.
+// As with shoulder detachment, the complete authored topology and controller bytes are restored
+// before the next Update1pArms call, so parkour and weapons never inherit the borrowed controls.
+struct WristSideFrame {
+    bool active = false;
+    uintptr_t control = 0, handTail = 0;
+    uint32_t rollMapAddress = 0;
+    uint8_t originalRollMap = 0xFF;
+    DetachedControlSave saved{};
+};
+struct WristOverrideState {
+    bool active = false;
+    uintptr_t pawn = 0;
+    WristSideFrame left{}, right{};
+};
+struct WristRuntimeSide {
+    uintptr_t control = 0, handTail = 0;
+    uint32_t rollMapAddress = 0;
+    uint8_t originalRollMap = 0xFF, unmappedValue = 0xFF;
+};
+
+static WristOverrideState g_wristOverride{};
+static bool g_wristWriteFault = false;
+static uintptr_t g_wristReportedMesh = 0;
+static long g_wristLeftWrites = 0, g_wristRightWrites = 0;
+
+static bool LooksLikeLiveUObject(uintptr_t object)
+{
+    uint32_t vt = 0, cls = 0;
+    return object >= 0x10000 && SafeU32(object, &vt) && InModule(vt) &&
+           SafeU32(object + 0x34, &cls) && cls >= 0x10000;
+}
+
+static bool FindHandControlTail(uintptr_t head, uintptr_t borrowed, uintptr_t* outTail)
+{
+    if (!outTail || !LooksLikeLiveUObject(head)) return false;
+    uintptr_t seen[32]{};
+    int count = 0;
+    uintptr_t current = head;
+    while (count < 32) {
+        if (!LooksLikeLiveUObject(current) || current == borrowed) return false;
+        for (int i = 0; i < count; ++i) if (seen[i] == current) return false;
+        seen[count++] = current;
+        uint32_t next = 0;
+        if (!SafeU32(current + g_offSkelNextControl, &next)) return false;
+        if (!next) {
+            *outTail = current;
+            return true;
+        }
+        current = next;
+    }
+    return false;
+}
+
+static bool DiscoverWristSide(const DetachedRigFrame& rig, bool left,
+                              WristRuntimeSide* out)
+{
+    if (!out) return false;
+    const UE3Array32 lists{ rig.listData, rig.listCount, rig.listCount };
+    const char* rollBone = left ? "LeftForeArmRoll" : "RightForeArmRoll";
+    const char* handBone = left ? "LeftHand" : "RightHand";
+    const int rollBoneIndex = left ? 41 : 71;
+    UE3ControlListHead roll{}, hand{};
+    const int rollSlot = FindControlListSlot(lists, rollBone, &roll);
+    const int handSlot = FindControlListSlot(lists, handBone, &hand);
+    if (rollSlot < 0 || handSlot < 0 ||
+        !LooksLikeRigObject(roll.controlHead, "SkelControlSingleBone") ||
+        !LooksLikeLiveUObject(hand.controlHead) || roll.controlHead == hand.controlHead)
+        return false;
+
+    uint32_t rollNext = ~0u;
+    uint8_t rollMap = 0xFF;
+    uintptr_t tail = 0;
+    if (!SafeU32(roll.controlHead + g_offSkelNextControl, &rollNext) || rollNext != 0 ||
+        !SafeRead(rig.indexData + rollBoneIndex, &rollMap, 1) ||
+        rollMap != (uint8_t)(rollSlot + rig.mapBias) ||
+        !FindHandControlTail(hand.controlHead, roll.controlHead, &tail)) return false;
+
+    WristRuntimeSide side{};
+    side.control = roll.controlHead;
+    side.handTail = tail;
+    side.rollMapAddress = rig.indexData + rollBoneIndex;
+    side.originalRollMap = rollMap;
+    side.unmappedValue = rig.mapBias == 1 ? 0 : 0xFF;
+    *out = side;
+    return true;
+}
+
+static bool GripQuaternionToUERotator(const XrQuaternionf& q, int32_t out[3])
+{
+    if (!out || !std::isfinite(q.x) || !std::isfinite(q.y) ||
+        !std::isfinite(q.z) || !std::isfinite(q.w)) return false;
+    const float norm2 = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
+    if (!std::isfinite(norm2) || norm2 < 0.98f || norm2 > 1.02f) return false;
+    const float inv = 1.0f / sqrtf(norm2);
+    const XrQuaternionf n{ q.x*inv, q.y*inv, q.z*inv, q.w*inv };
+    const MEVR_Vec3 forward = RotateByQuaternion(n, { 1.0f, 0.0f, 0.0f });
+    const MEVR_Vec3 right   = RotateByQuaternion(n, { 0.0f, 1.0f, 0.0f });
+    const MEVR_Vec3 up      = RotateByQuaternion(n, { 0.0f, 0.0f, 1.0f });
+    const float horizontal = sqrtf(forward.x*forward.x + forward.y*forward.y);
+    const float pitch = atan2f(forward.z, horizontal);
+    const float yaw = atan2f(forward.y, forward.x);
+    // UE3's positive roll rotates its +Y/right axis toward -Z, the opposite sign of the
+    // conventional right-handed +X quaternion rotation used to construct the basis.
+    const float roll = atan2f(-right.z, up.z);
+    const float unrealUnits = 32768.0f / 3.14159265358979323846f;
+    out[0] = (int32_t)lroundf(pitch * unrealUnits);
+    out[1] = (int32_t)lroundf(yaw * unrealUnits);
+    out[2] = (int32_t)lroundf(roll * unrealUnits);
+    return true;
+}
+
+static bool WriteWristControl(uintptr_t control, const int32_t rotation[3])
+{
+    const uint8_t worldSpace = 0;
+    const float one = 1.0f, zero = 0.0f;
+    if (!WriteRigBytes(control + g_offSingleBoneRotation,
+                       rotation, sizeof(int32_t) * 3) ||
+        !WriteRigBytes(control + g_offSingleBoneRotationSpace, &worldSpace, 1) ||
+        !WriteRigBytes(control + g_offSkelStrengthTarget, &one, sizeof(one)) ||
+        !WriteRigBytes(control + g_offSkelBlendTimeToGo, &zero, sizeof(zero)) ||
+        !WriteRigBytes(control + g_offSkelControlStrength, &one, sizeof(one))) return false;
+    int32_t readRotation[3]{};
+    uint8_t readSpace = 0xFF;
+    float strength = -1.0f, target = -1.0f, blend = -1.0f;
+    return SafeRead(control + g_offSingleBoneRotation,
+                    readRotation, sizeof(readRotation)) &&
+           SafeRead(control + g_offSingleBoneRotationSpace, &readSpace, 1) &&
+           SafeRead(control + g_offSkelControlStrength, &strength, sizeof(strength)) &&
+           SafeRead(control + g_offSkelStrengthTarget, &target, sizeof(target)) &&
+           SafeRead(control + g_offSkelBlendTimeToGo, &blend, sizeof(blend)) &&
+           readRotation[0] == rotation[0] && readRotation[1] == rotation[1] &&
+           readRotation[2] == rotation[2] && readSpace == 0 &&
+           fabsf(strength - 1.0f) < 0.001f && fabsf(target - 1.0f) < 0.001f &&
+           fabsf(blend) < 0.001f;
+}
+
+static bool ApplyOneWristSide(const WristRuntimeSide& runtime,
+                              const P13HandPoseSnapshot& pose,
+                              WristSideFrame* frame)
+{
+    if (!frame) return false;
+    int32_t rotation[3]{};
+    if (!GripQuaternionToUERotator(pose.worldOrientation, rotation)) return false;
+    WristSideFrame saved{};
+    saved.active = CaptureDetachedControl(runtime.control, &saved.saved);
+    saved.control = runtime.control;
+    saved.handTail = runtime.handTail;
+    saved.rollMapAddress = runtime.rollMapAddress;
+    saved.originalRollMap = runtime.originalRollMap;
+    if (!saved.active) return false;
+
+    const uint32_t appended = (uint32_t)runtime.control;
+    const bool wrote =
+        WriteRigBytes(runtime.rollMapAddress, &runtime.unmappedValue, 1) &&
+        WriteRigBytes(runtime.handTail + g_offSkelNextControl,
+                      &appended, sizeof(appended)) &&
+        WriteWristControl(runtime.control, rotation);
+    uint8_t readMap = 0xFF;
+    uint32_t readNext = 0;
+    if (!wrote || !SafeRead(runtime.rollMapAddress, &readMap, 1) ||
+        !SafeU32(runtime.handTail + g_offSkelNextControl, &readNext) ||
+        readMap != runtime.unmappedValue || readNext != appended) {
+        *frame = saved;
+        return false;
+    }
+    *frame = saved;
+    return true;
+}
+
+static void RestoreOneWristSide(const WristSideFrame& side, bool* restored)
+{
+    if (!side.active || !restored) return;
+    const uint32_t noNext = 0;
+    *restored = RestoreDetachedControl(side.control, side.saved) && *restored;
+    *restored = WriteRigBytes(side.handTail + g_offSkelNextControl,
+                              &noNext, sizeof(noNext)) && *restored;
+    *restored = WriteRigBytes(side.rollMapAddress,
+                              &side.originalRollMap, 1) && *restored;
+}
+
+static void RestoreWristRotationOverridesBeforeGame(uintptr_t pawn)
+{
+    if (!g_wristOverride.active) return;
+    const WristOverrideState saved = g_wristOverride;
+    g_wristOverride = {};
+    if (saved.pawn != pawn || !LooksLikePlayerPawn(pawn)) {
+        Log("[hands-wrist] prior override discarded without writes: pawn replaced");
+        return;
+    }
+    bool restored = true;
+    RestoreOneWristSide(saved.left, &restored);
+    RestoreOneWristSide(saved.right, &restored);
+    if (!restored) {
+        g_wristWriteFault = true;
+        Log("[hands-wrist] RESTORE FAILED - wrist rotation disabled for this process");
+    }
+}
+
+static void ApplyWristRotations(uintptr_t pawn, const P13PoseSnapshot& pose)
+{
+    if (!g_motionHands || g_wristWriteFault) return;
+    DetachedRigFrame rig{};
+    WristRuntimeSide leftRuntime{}, rightRuntime{};
+    if (!DiscoverDetachedRig(pawn, &rig) ||
+        !DiscoverWristSide(rig, true, &leftRuntime) ||
+        !DiscoverWristSide(rig, false, &rightRuntime)) {
+        static bool reported = false;
+        if (!reported) {
+            Log("[hands-wrist] waiting: bilateral ForeArmRoll controls or Hand chain tails"
+                " did not validate");
+            reported = true;
+        }
+        return;
+    }
+    if (g_wristReportedMesh != rig.mesh) {
+        Log("*** [hands-wrist] bilateral rotation rig validated: borrowed roll controls"
+            " append after both authored Hand chains; roll bones 41/71 disabled only while owned");
+        g_wristReportedMesh = rig.mesh;
+    }
+
+    const XrSpaceLocationFlags orientationNeed =
+        XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+        XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+    uintptr_t ignored = 0;
+    const bool leftEligible =
+        P13Eligibility(pawn, pose.left, pose.presentFrame, true,
+                       &ignored, nullptr, nullptr) == P13_READY &&
+        (pose.left.flags & orientationNeed) == orientationNeed;
+    const bool rightEligible =
+        P13Eligibility(pawn, pose.right, pose.presentFrame, false,
+                       &ignored, nullptr, nullptr) == P13_READY &&
+        (pose.right.flags & orientationNeed) == orientationNeed;
+    if (!leftEligible && !rightEligible) return;
+
+    WristOverrideState frame{};
+    frame.active = true;
+    frame.pawn = pawn;
+    bool wrote = true;
+    if (leftEligible) wrote = ApplyOneWristSide(leftRuntime, pose.left, &frame.left);
+    if (rightEligible && wrote)
+        wrote = ApplyOneWristSide(rightRuntime, pose.right, &frame.right);
+    g_wristOverride = frame;
+    if (!wrote) {
+        RestoreWristRotationOverridesBeforeGame(pawn);
+        g_wristWriteFault = true;
+        Log("[hands-wrist] WRITE/READ-BACK FAILED - wrist rotation disabled;");
+        Log("[hands-wrist] position IK and shoulder detachment remain active");
+        return;
+    }
+
+    if (leftEligible) ++g_wristLeftWrites;
+    if (rightEligible) ++g_wristRightWrites;
+    if ((leftEligible && g_wristLeftWrites == 1) ||
+        (rightEligible && g_wristRightWrites == 1)) {
+        Log("*** [hands-wrist] controller-driven world rotation acquired: L=%d R=%d;"
+            " exact read-back passed", leftEligible ? 1 : 0, rightEligible ? 1 : 0);
+    }
+    if (g_motionHandsDebug &&
+        ((leftEligible && g_wristLeftWrites % 600 == 0) ||
+         (rightEligible && g_wristRightWrites % 600 == 0))) {
+        int32_t l[3]{}, r[3]{};
+        GripQuaternionToUERotator(pose.left.worldOrientation, l);
+        GripQuaternionToUERotator(pose.right.worldOrientation, r);
+        Log("[hands-wrist] UE rotator P/Y/R: L(%d,%d,%d) R(%d,%d,%d);"
+            " writes L %ld R %ld", l[0], l[1], l[2], r[0], r[1], r[2],
+            g_wristLeftWrites, g_wristRightWrites);
     }
 }
 
