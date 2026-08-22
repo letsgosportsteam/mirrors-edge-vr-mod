@@ -1689,6 +1689,7 @@ static bool CaptureFrame(IDirect3DDevice9* dev)
 }
 
 static void ApplyHeadTracking(XrTime when);   // defined with the rung 5b code
+static void ApplyMotionHandPosition();        // P1.3, defined with the validated rig cache
 
 // ---- two measurements aimed at what is left of the judder ----
 //
@@ -2195,6 +2196,10 @@ static void SubmitTestQuad()
     // instant, so keeping them together is what stops the sticks from lagging the view.
     const bool actionsSynced = XrSyncInput();
     XrSampleMotionPoses(fs.predictedDisplayTime, actionsSynced);
+    // Prototype timing: Present is after this frame's skeletal evaluation, so this target is
+    // consumed by the next game tick. P1.6 moves the same guarded writer to Update1pArms once
+    // position, reach, and ownership have been proven in-headset.
+    ApplyMotionHandPosition();
     TickPacing();
     ReportStereoGeometry();
     // ReportPoseHonesty is gone. It compared the CHANGE in head yaw against the change in the
@@ -3045,6 +3050,8 @@ extern int g_offDefaultFOV;
 extern int g_offCamLoc;
 extern int g_offCamRot;
 extern int g_offMoveState;
+extern int g_offWeapon;
+extern int g_offWeaponAnimState;
 extern int g_offCtlPawn;        // PlayerController::Pawn - the pawn without a 115k-object walk
 extern int g_offCtlCamera;      // PlayerController::PlayerCamera - how ViewTarget is reached
 extern int g_offCamViewTarget;  // Camera::ViewTarget - whose view is actually being rendered
@@ -3134,6 +3141,10 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                 g_offCamLoc = LookupProp("TdPlayerPawn", "PlayerCameraLocation", true);
                 LookupProp("TdPlayerPawn", "SwanNeck1p", true);
                 g_offMoveState = LookupProp("TdPlayerPawn", "MovementState", true);
+                // A position proof must still fail closed when the player is armed. Both are
+                // ordinary byte/pointer fields; P1.3 only admits Weapon=None and Unarmed(0).
+                g_offWeapon = LookupProp("TdPawn", "Weapon", true);
+                g_offWeaponAnimState = LookupProp("TdPawn", "WeaponAnimState", true);
 
                 // ---- the lookup that replaces a search with a read ----
                 //
@@ -5829,6 +5840,217 @@ static void UpdateMotionRigDiscovery()
         (void*)candidate.rightForearm, rightForearmClass);
 }
 
+// ================================================================ Phase 1.3: left position proof
+//
+// One hand, one writable vector, one strength. This deliberately does not rotate the wrist,
+// pose fingers, or write the right hand. Every write is preceded in the same frame by the full
+// P1.2 pawn/mesh/controller revalidation above.
+enum P13BlockReason {
+    P13_READY = 0,
+    P13_LAYOUT,
+    P13_RIG,
+    P13_VIEW,
+    P13_WEAPON_LAYOUT,
+    P13_ARMED,
+    P13_MOVEMENT,
+    P13_TRACKING,
+    P13_REACH,
+    P13_WRITE_FAILED,
+};
+
+static const char* P13ReasonName(P13BlockReason reason)
+{
+    switch (reason) {
+        case P13_READY:         return "eligible: unarmed Walking + tracked left grip";
+        case P13_LAYOUT:        return "rig/controller layout is not ready";
+        case P13_RIG:           return "no validated live position rig";
+        case P13_VIEW:          return "ViewTarget is not the player pawn";
+        case P13_WEAPON_LAYOUT: return "weapon ownership fields are unavailable";
+        case P13_ARMED:         return "weapon equipped or weapon animation is not Unarmed";
+        case P13_MOVEMENT:      return "movement is not Walking";
+        case P13_TRACKING:      return "left grip position is not active, valid, and tracked";
+        case P13_REACH:         return "left grip target is outside the 10..150 UU proof volume";
+        case P13_WRITE_FAILED:  return "a guarded IK write or read-back failed";
+        default:                return "unknown";
+    }
+}
+
+static bool WriteRigBytes(uintptr_t address, const void* data, size_t size)
+{
+    if (!address || !data || !size) return false;
+    SIZE_T wrote = 0;
+    return WriteProcessMemory(GetCurrentProcess(), (LPVOID)address, data, size, &wrote) &&
+           wrote == size;
+}
+
+static bool CurrentViewTargetIsPawn(uintptr_t pawn)
+{
+    if (!pawn || !g_playerCtl || g_offCtlCamera < 0 || g_offCamViewTarget < 0) return false;
+    uint32_t camera = 0, target = 0;
+    return SafeU32(g_playerCtl + g_offCtlCamera, &camera) && camera >= 0x10000 &&
+           SafeU32(camera + g_offCamViewTarget, &target) && target == (uint32_t)pawn;
+}
+
+static bool SetP13LeftStrength(uintptr_t controller, float strength)
+{
+    if (!LooksLikeRigObject(controller, "TdSkelControlLimb") ||
+        g_offSkelControlStrength < 0) return false;
+    return WriteRigBytes(controller + g_offSkelControlStrength, &strength, sizeof(strength));
+}
+
+static P13BlockReason P13Eligibility(uint8_t* outMovement, float* outReach)
+{
+    if (InterlockedCompareExchange(&g_motionRigOffsetsReady, 0, 0) != 1 ||
+        g_offLimbEffector < 0 || g_offLimbEffectorSpace < 0 ||
+        g_offSkelControlStrength < 0) return P13_LAYOUT;
+    if (!g_motionRig.valid || !g_motionRig.pawn || !g_motionRig.leftWorld)
+        return P13_RIG;
+    if (!CurrentViewTargetIsPawn(g_motionRig.pawn)) return P13_VIEW;
+    if (g_offWeapon < 0 || g_offWeaponAnimState < 0) return P13_WEAPON_LAYOUT;
+
+    uint32_t weapon = 0;
+    uint8_t weaponAnim = 0;
+    if (!SafeU32(g_motionRig.pawn + g_offWeapon, &weapon) ||
+        !SafeRead(g_motionRig.pawn + g_offWeaponAnimState, &weaponAnim, 1))
+        return P13_WEAPON_LAYOUT;
+    if (weapon != 0 || weaponAnim != 0) return P13_ARMED;
+
+    uint8_t movement = 0xFF;
+    if (g_offMoveState < 0 ||
+        !SafeRead(g_motionRig.pawn + g_offMoveState, &movement, 1) || movement != 1) {
+        if (outMovement) *outMovement = movement;
+        return P13_MOVEMENT;
+    }
+    if (outMovement) *outMovement = movement;
+
+    const XrSpaceLocationFlags need = XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                                      XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+    if (!g_poseLGrip.active || !g_poseLGrip.worldValid ||
+        (g_poseLGrip.flags & need) != need) return P13_TRACKING;
+
+    const float reach = VecLength(g_poseLGrip.cameraLocal);
+    if (outReach) *outReach = reach;
+    if (!FiniteVec(g_poseLGrip.worldPosition) || !std::isfinite(reach) ||
+        reach < 10.0f || reach > 150.0f) return P13_REACH;
+    return P13_READY;
+}
+
+static void ApplyMotionHandPosition()
+{
+    if (!g_motionHands) return;
+
+    // Unlike the ten-frame P1.2 reporter, a writer revalidates every nested object immediately
+    // before use. This is still bounded pointer work; FindPlayerPawn normally reads Controller::Pawn.
+    UpdateMotionRigDiscovery();
+
+    static bool owned = false;
+    static uintptr_t ownedController = 0;
+    static unsigned long ownedGeneration = 0;
+    static P13BlockReason reportedReason = (P13BlockReason)-1;
+    static long writes = 0;
+    static bool writeFaultLatched = false;
+
+    // A replacement rig cannot be released through its predecessor: the old pointer is exactly
+    // what P1.2 invalidated. Drop bookkeeping without touching either object, then consider the
+    // newly validated rig normally below.
+    if (owned && (ownedGeneration != g_motionRigGeneration ||
+                  ownedController != g_motionRig.leftWorld)) {
+        Log("[hands-p1.3] LEFT ownership discarded without a write: rig generation %lu -> %lu",
+            ownedGeneration, g_motionRigGeneration);
+        owned = false;
+        ownedController = 0;
+    }
+
+    uint8_t movement = 0xFF;
+    float reach = 0.0f;
+    P13BlockReason reason = writeFaultLatched
+        ? P13_WRITE_FAILED : P13Eligibility(&movement, &reach);
+    if (reason != reportedReason) {
+        if (reason == P13_MOVEMENT)
+            Log("[hands-p1.3] state -> BLOCKED: %s (state %u)",
+                P13ReasonName(reason), movement);
+        else
+            Log("[hands-p1.3] state -> %s: %s",
+                reason == P13_READY ? "READY" : "BLOCKED", P13ReasonName(reason));
+        reportedReason = reason;
+    }
+
+    if (reason != P13_READY) {
+        if (owned) {
+            // Tracking/reach loss occurs while the game is otherwise still in ordinary walking,
+            // so the game has no move transition that would lower this controller. Neutralise it.
+            // For a move, weapon, view, or pawn transition, write NOTHING: that owner may already
+            // have configured this controller earlier in the same game tick.
+            const bool neutralise = reason == P13_TRACKING || reason == P13_REACH ||
+                                    reason == P13_WRITE_FAILED;
+            const bool lowered = neutralise && ownedController == g_motionRig.leftWorld &&
+                                 SetP13LeftStrength(ownedController, 0.0f);
+            Log("[hands-p1.3] LEFT release: %s; strength zeroed=%d",
+                P13ReasonName(reason), lowered ? 1 : 0);
+            owned = false;
+            ownedController = 0;
+        }
+        return;
+    }
+
+    const uintptr_t controller = g_motionRig.leftWorld;
+    if (!owned) {
+        MEVR_Vec3 beforeTarget{};
+        float beforeStrength = 0.0f;
+        uint8_t beforeSpace = 0xFF;
+        SafeRead(controller + g_offLimbEffector, &beforeTarget, sizeof(beforeTarget));
+        SafeRead(controller + g_offLimbEffectorSpace, &beforeSpace, 1);
+        SafeRead(controller + g_offSkelControlStrength, &beforeStrength, sizeof(beforeStrength));
+        Log("*** [hands-p1.3] LEFT acquire generation %lu controller %p:"
+            " prior strength %.3f space %u target(%+.1f,%+.1f,%+.1f), reach %.1f UU",
+            g_motionRigGeneration, (void*)controller, beforeStrength, beforeSpace,
+            beforeTarget.x, beforeTarget.y, beforeTarget.z, reach);
+        owned = true;
+        ownedController = controller;
+        ownedGeneration = g_motionRigGeneration;
+    }
+
+    const uint8_t worldSpace = 0;  // SetLeftHandWorldIKLocation uses BCS_WorldSpace == 0
+    const float strength = 1.0f;
+    const bool wrote =
+        WriteRigBytes(controller + g_offLimbEffector,
+                      &g_poseLGrip.worldPosition, sizeof(g_poseLGrip.worldPosition)) &&
+        WriteRigBytes(controller + g_offLimbEffectorSpace, &worldSpace, sizeof(worldSpace)) &&
+        WriteRigBytes(controller + g_offSkelControlStrength, &strength, sizeof(strength));
+
+    MEVR_Vec3 readTarget{};
+    float readStrength = 0.0f;
+    uint8_t readSpace = 0xFF;
+    const bool readBack = wrote &&
+        SafeRead(controller + g_offLimbEffector, &readTarget, sizeof(readTarget)) &&
+        SafeRead(controller + g_offLimbEffectorSpace, &readSpace, 1) &&
+        SafeRead(controller + g_offSkelControlStrength, &readStrength, sizeof(readStrength));
+    const MEVR_Vec3 error{ readTarget.x - g_poseLGrip.worldPosition.x,
+                           readTarget.y - g_poseLGrip.worldPosition.y,
+                           readTarget.z - g_poseLGrip.worldPosition.z };
+    const bool honest = readBack && readSpace == 0 && fabsf(readStrength - 1.0f) < 0.001f &&
+                        VecLength(error) < 0.01f;
+    if (!honest) {
+        Log("[hands-p1.3] LEFT WRITE/READ-BACK FAILED: wrote=%d read=%d space=%u"
+            " strength=%.3f error=%.3f UU - disabling ownership",
+            wrote ? 1 : 0, readBack ? 1 : 0, readSpace, readStrength, VecLength(error));
+        SetP13LeftStrength(controller, 0.0f);
+        owned = false;
+        ownedController = 0;
+        writeFaultLatched = true;  // fail closed for the rest of this process
+        reportedReason = P13_WRITE_FAILED;
+        return;
+    }
+
+    ++writes;
+    if (writes == 1 || (g_motionHandsDebug && writes % 600 == 0)) {
+        Log("[hands-p1.3] LEFT write #%ld target(%+.1f,%+.1f,%+.1f)"
+            " reach %.1f UU strength %.1f space %u read-back exact",
+            writes, readTarget.x, readTarget.y, readTarget.z,
+            reach, readStrength, readSpace);
+    }
+}
+
 // ---- diag: whose view is the engine actually rendering? ----
 //
 // The question behind three separate faults. The scene test rejects matrices during menus, death
@@ -7999,6 +8221,8 @@ static HRESULT STDMETHODCALLTYPE Hook_DrawIndexed(IDirect3DDevice9* dev, D3DPRIM
 // project months.
 
 int  g_offMoveState = -1;
+int  g_offWeapon = -1;
+int  g_offWeaponAnimState = -1;
 static float g_animPeak[3] = { 0, 0, 0 };       // degrees, |pitch| |yaw| |roll| since last report
 float        g_animNow[3]  = { 0, 0, 0 };       // live, for the overlay and the pitch anchor
 static int   g_animState   = -1;
