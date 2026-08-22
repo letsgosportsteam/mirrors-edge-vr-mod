@@ -7124,8 +7124,8 @@ static bool GripQuaternionToUERotator(const XrQuaternionf& raw, bool leftHand,
     // remains unchanged while the authored palms begin at the correct orientation.
     const float halfSqrt = 0.7071067811865475f;
     const XrQuaternionf gripToHand = leftHand
-        ? XrQuaternionf{ +halfSqrt, 0.0f, 0.0f, halfSqrt }
-        : XrQuaternionf{ -halfSqrt, 0.0f, 0.0f, halfSqrt };
+        ? XrQuaternionf{ -halfSqrt, 0.0f, 0.0f, halfSqrt }
+        : XrQuaternionf{ +halfSqrt, 0.0f, 0.0f, halfSqrt };
     const XrQuaternionf q = MultiplyQuaternion(tracked, gripToHand);
     const float norm2 = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
     if (!std::isfinite(norm2) || norm2 < 0.98f || norm2 > 1.02f) return false;
