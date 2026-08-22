@@ -616,6 +616,12 @@ struct P13PoseSnapshot {
 static P13PoseSnapshot g_p13PublishedPose{};
 static volatile LONG g_p13PoseSequence = 0;
 
+// Live debug calibration in degrees, [left/right][pitch/yaw/roll]. The measured starting point
+// is mirrored roll: left -90, right +90. The overlay hotkeys can tune all six without a rebuild.
+static int g_wristCalibrationDeg[2][3] = { { 0, 0, -90 }, { 0, 0, 90 } };
+// Selection order follows the requested overlay: Right P/Y/R, then Left P/Y/R.
+static int g_wristTuneSelected = 0;
+
 static void PublishP13PoseSnapshot()
 {
     InterlockedIncrement(&g_p13PoseSequence);      // odd: writer owns the snapshot
@@ -5582,6 +5588,49 @@ static void CheckHeadHotkeys()
     static bool p3 = false;
     const bool d3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
     if (d3 && !p3) { g_overlay = !g_overlay; Log("[hud] F3 -> overlay %s", g_overlay ? "ON" : "OFF"); }
+
+    // Live wrist calibration. The arrows are unassigned by this mod and are active only while
+    // the debug overlay is visible, which prevents an ordinary gameplay keypress from silently
+    // changing a persistent-looking hand offset. Left/Right walks R P/Y/R then L P/Y/R;
+    // Up/Down changes the selected local grip offset by five degrees.
+    static bool pLeft = false, pRight = false, pUp = false, pDown = false;
+    const bool dLeft  = (GetAsyncKeyState(VK_LEFT)  & 0x8000) != 0;
+    const bool dRight = (GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0;
+    const bool dUp    = (GetAsyncKeyState(VK_UP)    & 0x8000) != 0;
+    const bool dDown  = (GetAsyncKeyState(VK_DOWN)  & 0x8000) != 0;
+    if (g_overlay && g_motionHands) {
+        if (dLeft && !pLeft) {
+            g_wristTuneSelected = (g_wristTuneSelected + 5) % 6;
+            Log("[hands-tune] selected %s %s", g_wristTuneSelected < 3 ? "RIGHT" : "LEFT",
+                (g_wristTuneSelected % 3) == 0 ? "PITCH" :
+                ((g_wristTuneSelected % 3) == 1 ? "YAW" : "ROLL"));
+        }
+        if (dRight && !pRight) {
+            g_wristTuneSelected = (g_wristTuneSelected + 1) % 6;
+            Log("[hands-tune] selected %s %s", g_wristTuneSelected < 3 ? "RIGHT" : "LEFT",
+                (g_wristTuneSelected % 3) == 0 ? "PITCH" :
+                ((g_wristTuneSelected % 3) == 1 ? "YAW" : "ROLL"));
+        }
+        int delta = 0;
+        if (dUp && !pUp) delta += 5;
+        if (dDown && !pDown) delta -= 5;
+        if (delta) {
+            const int hand = g_wristTuneSelected < 3 ? 1 : 0; // array is L/R; UI is R then L
+            const int axis = g_wristTuneSelected % 3;
+            int& value = g_wristCalibrationDeg[hand][axis];
+            value += delta;
+            if (value > 180) value -= 360;
+            if (value < -180) value += 360;
+            Log("*** [hands-tune] R P/Y/R %+d %+d %+d | L P/Y/R %+d %+d %+d"
+                " (selected %s %s, %+d deg)",
+                g_wristCalibrationDeg[1][0], g_wristCalibrationDeg[1][1],
+                g_wristCalibrationDeg[1][2], g_wristCalibrationDeg[0][0],
+                g_wristCalibrationDeg[0][1], g_wristCalibrationDeg[0][2],
+                hand ? "RIGHT" : "LEFT",
+                axis == 0 ? "PITCH" : (axis == 1 ? "YAW" : "ROLL"), delta);
+        }
+    }
+    pLeft = dLeft; pRight = dRight; pUp = dUp; pDown = dDown;
     static bool p8 = false;
     const bool d8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (d8 && !p8) {
@@ -7118,14 +7167,20 @@ static bool GripQuaternionToUERotator(const XrQuaternionf& raw, bool leftHand,
         raw.x*rawInv, raw.y*rawInv, raw.z*rawInv, raw.w*rawInv
     };
 
-    // The controller's grip frame tracks correctly, but Faith's mirrored hand meshes have
-    // opposite palm-up axes. Headset photos measured a fixed 90-degree error: left was 90 down,
-    // right 90 up. Post-multiply a LOCAL forward-axis calibration so all later controller motion
-    // remains unchanged while the authored palms begin at the correct orientation.
-    const float halfSqrt = 0.7071067811865475f;
-    const XrQuaternionf gripToHand = leftHand
-        ? XrQuaternionf{ -halfSqrt, 0.0f, 0.0f, halfSqrt }
-        : XrQuaternionf{ +halfSqrt, 0.0f, 0.0f, halfSqrt };
+    // The controller's grip frame tracks correctly; only the grip-to-mirrored-hand rest frame
+    // needs calibration. These six values are changed live by the overlay. Build a LOCAL UE-like
+    // yaw/pitch/roll offset, then post-multiply it so every subsequent tracked motion remains
+    // intact. UE positive pitch is the negative conventional +Y quaternion rotation.
+    const int hand = leftHand ? 0 : 1;
+    const float halfToRad = 3.14159265358979323846f / 360.0f;
+    const float hp = g_wristCalibrationDeg[hand][0] * halfToRad;
+    const float hy = g_wristCalibrationDeg[hand][1] * halfToRad;
+    const float hr = g_wristCalibrationDeg[hand][2] * halfToRad;
+    const XrQuaternionf pitchOffset{ 0.0f, -sinf(hp), 0.0f, cosf(hp) };
+    const XrQuaternionf yawOffset{ 0.0f, 0.0f, sinf(hy), cosf(hy) };
+    const XrQuaternionf rollOffset{ sinf(hr), 0.0f, 0.0f, cosf(hr) };
+    const XrQuaternionf gripToHand =
+        MultiplyQuaternion(MultiplyQuaternion(yawOffset, pitchOffset), rollOffset);
     const XrQuaternionf q = MultiplyQuaternion(tracked, gripToHand);
     const float norm2 = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
     if (!std::isfinite(norm2) || norm2 < 0.98f || norm2 > 1.02f) return false;
@@ -9747,6 +9802,13 @@ static int TextRects(D3DRECT* r, int n, int cap, int x0, int y0, int px, const c
 
 static bool g_overlay = true;      // F3 toggles
 
+static void FormatWristTuneValue(char* out, size_t cap, int value, bool selected)
+{
+    if (!out || cap == 0) return;
+    if (selected) _snprintf_s(out, cap, _TRUNCATE, "(%+d)", value);
+    else          _snprintf_s(out, cap, _TRUNCATE, "%+d", value);
+}
+
 static void DrawOverlay(IDirect3DDevice9* dev)
 {
     if (!g_debug || !g_overlay || !dev) return;   // Debug=off takes the text off the screen
@@ -9761,6 +9823,24 @@ static void DrawOverlay(IDirect3DDevice9* dev)
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "MEVR FPS %d GRAB %d MS",
                 (int)(g_capSamples ? (1000.0 / (g_capMsTotal / g_capSamples + 0.001)) : 0),
                 (int)(g_capSamples ? (g_capMsTotal / g_capSamples) : 0.0));
+    // Put the active test at the top. TextRects intentionally caps work; late diagnostic rows
+    // may truncate on a dense frame, but the controls the player is actively using must not.
+    char rp[12], ry[12], rr[12], lp[12], ly[12], lr[12];
+    FormatWristTuneValue(rp, sizeof(rp), g_wristCalibrationDeg[1][0],
+                         g_wristTuneSelected == 0);
+    FormatWristTuneValue(ry, sizeof(ry), g_wristCalibrationDeg[1][1],
+                         g_wristTuneSelected == 1);
+    FormatWristTuneValue(rr, sizeof(rr), g_wristCalibrationDeg[1][2],
+                         g_wristTuneSelected == 2);
+    FormatWristTuneValue(lp, sizeof(lp), g_wristCalibrationDeg[0][0],
+                         g_wristTuneSelected == 3);
+    FormatWristTuneValue(ly, sizeof(ly), g_wristCalibrationDeg[0][1],
+                         g_wristTuneSelected == 4);
+    FormatWristTuneValue(lr, sizeof(lr), g_wristCalibrationDeg[0][2],
+                         g_wristTuneSelected == 5);
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "WRIST R P%s Y%s R%s", rp, ry, rr);
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "WRIST L P%s Y%s R%s", lp, ly, lr);
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "ARROWS L/R SELECT  U/D CHANGE 5 DEG");
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "OBJ %s  PROP %s",
                 g_offName >= 0 ? "OK" : "NO", g_offPropOff >= 0 ? "OK" : "NO");
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "HEAD %s Y%+d P%+d  ROLL %s %+d DEG",
