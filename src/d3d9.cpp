@@ -1948,6 +1948,9 @@ bool                     g_sceneSplitMono = false;
 // Per-frame scene-draw tallies for the split-flip detector, reset every Present.
 long                     g_frameSceneOnBackbuffer = 0;
 long                     g_frameSceneOffscreen = 0;
+// Set by the HOME-key user marker; while positive, the arm-continuity watchdog logs every
+// update unconditionally and decrements it. Render thread sets, game thread consumes.
+volatile LONG            g_markerBurst = 0;
 
 // The scene's rectangle within the captured backbuffer. Every one of these collapses to the
 // whole backbuffer while g_sceneW/H are unset or equal to it, so every use below is an identity
@@ -3939,79 +3942,21 @@ static void LateReanchorP13Pose(uintptr_t pawn, P13PoseSnapshot* pose)
         SafeRead(pawn + g_offActorLocation, &pawnLocation, sizeof(pawnLocation)) &&
         FiniteVec(pawnLocation);
 
-    // Crouch entry/exit moves the pawn ORIGIN about 29 UU in a single game tick while the
-    // camera keeps its own smoothed height - run 9 measured Walking<->Crouch flapping with
-    // exactly that signature, and the locomotion correction below faithfully injected every
-    // snap into both hand targets: the reported "whole arm snapping up and down". Velocity is
-    // continuous under genuine locomotion (sprint, falling), so a JERK above threshold marks
-    // an origin discontinuity; the correction pauses for the few updates whose snapshot can
-    // straddle the snap, and the smooth camera anchor carries the hands across it.
-    static bool havePreviousPawn = false;
-    static MEVR_Vec3 previousPawn{}, previousStep{};
-    static int suppressCorrections = 0;
-    if (havePawn) {
-        if (havePreviousPawn) {
-            const MEVR_Vec3 step{ pawnLocation.x - previousPawn.x,
-                                  pawnLocation.y - previousPawn.y,
-                                  pawnLocation.z - previousPawn.z };
-            const float jerk = VecLength({ step.x - previousStep.x,
-                                           step.y - previousStep.y,
-                                           step.z - previousStep.z });
-            if (std::isfinite(jerk) && jerk > 15.0f) {
-                suppressCorrections = 4;
-                static long lastJerkReport = -1000;
-                if (g_frames - lastJerkReport >= 90) {
-                    lastJerkReport = g_frames;
-                    Log("*** [hands-late] pawn origin discontinuity (jerk %.1f UU/update);"
-                        " locomotion correction paused over the snap", jerk);
-                }
-            }
-            previousStep = step;
-        }
-        previousPawn = pawnLocation;
-        havePreviousPawn = true;
-    } else {
-        havePreviousPawn = false;
-    }
-
+    // ONE coherent camera read per arm update, position and axes together, taken on the game
+    // thread after the game's own update. The previous design anchored position to the
+    // Present-time snapshot and bridged locomotion with a pawn-delta correction - and the
+    // marked run-22 captures measured the result: consecutive arm updates saw the anchor
+    // alternate between two temporal states, so ALL camera translation reached the hands as
+    // half-rate double-lumps (0 then 2x per update: +/-1-3 UU trembling at rest, 15-20 UU
+    // lumps while walking) while the rendered world moved smoothly. Reading the anchor at
+    // consume time makes target latency CONSTANT, which is what smooth means; the correction
+    // and its crouch-jerk gate protected a mechanism that no longer exists. The Present
+    // snapshot remains the fallback for frames where the live camera is unreadable.
     RenderedHeadFrame lateHead{};
-    bool haveLateHead = false;
-    float correction = 0.0f;
-
-    if (pose->sampledHeadValid) {
+    bool haveLateHead = GetRenderedHeadFrame(&lateHead);
+    if (!haveLateHead && pose->sampledHeadValid) {
         lateHead = pose->sampledHead;
         haveLateHead = true;
-        if (pose->sampledPawnValid && havePawn && suppressCorrections == 0) {
-            const MEVR_Vec3 delta{ pawnLocation.x - pose->sampledPawnLocation.x,
-                                   pawnLocation.y - pose->sampledPawnLocation.y,
-                                   pawnLocation.z - pose->sampledPawnLocation.z };
-            correction = VecLength(delta);
-            // A normal one-to-three-frame locomotion delta is small. A level teleport is not a
-            // pose to extrapolate across; eligibility will shortly hand ownership back anyway.
-            if (std::isfinite(correction) && correction <= 300.0f) {
-                lateHead.position.x += delta.x;
-                lateHead.position.y += delta.y;
-                lateHead.position.z += delta.z;
-            } else {
-                correction = 0.0f;
-            }
-        }
-    }
-    if (suppressCorrections > 0) --suppressCorrections;
-
-    // Camera rotation can also advance between Present and the arm update. Its position may
-    // still describe the preceding rendered frame, so only take the fresher axes when a sampled
-    // anchor already supplies the locomotion-corrected position.
-    RenderedHeadFrame currentHead{};
-    if (GetRenderedHeadFrame(&currentHead)) {
-        if (!haveLateHead) {
-            lateHead = currentHead;
-            haveLateHead = true;
-        } else {
-            lateHead.forward = currentHead.forward;
-            lateHead.right = currentHead.right;
-            lateHead.up = currentHead.up;
-        }
     }
     if (!haveLateHead) return;
 
@@ -4045,16 +3990,13 @@ static void LateReanchorP13Pose(uintptr_t pawn, P13PoseSnapshot* pose)
 
     if (g_motionHandsDebug && (left || right)) {
         static long samples = 0;
-        static float worstCorrection = 0.0f;
         static long oldestPose = 0;
-        if (correction > worstCorrection) worstCorrection = correction;
         const long age = g_frames - pose->presentFrame;
         if (age > oldestPose) oldestPose = age;
         if (++samples >= 600) {
-            Log("[hands-late] re-anchored 600 arm updates: pawn correction %.1f UU worst,"
-                " pose age %ld frames worst", worstCorrection, oldestPose);
+            Log("[hands-late] re-anchored 600 arm updates from the live camera;"
+                " controller pose age %ld frames worst", oldestPose);
             samples = 0;
-            worstCorrection = 0.0f;
             oldestPose = 0;
         }
     }
@@ -4693,7 +4635,12 @@ static const uint32_t SWAN_QuadFwd     = 0x68;
 static const uint32_t SWAN_QuadDown    = 0x6C;
 
 static uintptr_t g_swanNeck = 0;
-static int  g_swanMode = 0;          // 0 = original, 1 = zeroed, 2 = exaggerated 8x
+// 0 = original, 1 = zeroed, 2 = exaggerated 8x. ZEROED is the VR default as of run 24: the
+// player's F7 dose-response test convicted the swan lag spring as the standing-judder
+// oscillator (zeroed stops it, original judders at ~1 UU/frame on 585/600 frames, 8x is much
+// worse), and a lag spring under the camera is a flatscreen comfort feature that a headset
+// actively does not want. F7 still cycles for A/B.
+static int  g_swanMode = 1;
 static int  g_swanAppliedMode = -1;  // -1 = nothing written yet
 static float g_swanSaved[4] = { 0, 0, 0, 0 };
 static bool  g_swanSavedOk = false;
@@ -4764,7 +4711,11 @@ static uintptr_t FindSwanNeck()
     }
 
     const double t0 = NowMs();
-    const double kBudgetMs = 3.0;
+    // While a non-original spring mode is waiting to be re-applied to a replacement instance
+    // (level streaming churns it), every frame of walk time is a frame of the lag-spring judder
+    // being back - run 24 measured it returning mid-zeroed for exactly the resolve gap. Spend
+    // more per frame then; 6 ms still fits the 13.9 ms frame with the game's own work.
+    const double kBudgetMs = (g_swanMode != 0) ? 6.0 : 3.0;
     if (g_swanCursor >= count) g_swanCursor = 0;
     uint32_t i = g_swanCursor;
     for (; i < count; ++i) {
@@ -4825,7 +4776,64 @@ static void ApplySwanNeck()
         }
     }
 
-    if (g_swanMode == g_swanAppliedMode) return;
+    if (g_swanMode == g_swanAppliedMode) {
+        // Applied is not the same as STILL applied. Run 25 measured the judder returning while
+        // nominally zeroed, fixed by any re-application: the game swaps camera parameter
+        // profiles on its own schedule and rewrites the spring on the same instance, which the
+        // mode check alone never notices. Verify the live values EVERY FRAME and re-assert.
+        //
+        // But NOT while airborne or landing. The every-frame war taught run 26 an expensive
+        // lesson: the fall/landing flow both writes and reads these fields as part of executing
+        // itself, and same-frame reverts stalled it - long falls stuck, a death-fall frozen in
+        // place, a hard freeze on touchdown, the landing roll never firing. Mid-air the lag
+        // spring cannot judder-loop anyway, so the override stands down for the whole fall
+        // family (originals restored, the game owns its spring) and re-asserts on the first
+        // grounded frame.
+        if (g_swanMode == 0 || !g_swanSavedOk) return;
+        // WHITELIST, not blacklist. Run 27 proved the polarity matters: covered landing states
+        // (Landing/RumpSlide) worked while the uncovered impact family (Stumble, death falls,
+        // pawn churn) still stalled - and an unreadable movement state defaulted to ASSERTING,
+        // the worst possible default mid-death. The judder this override exists for lives only
+        // in sustained grounded play, so assert exactly there - Walking, Crouch, Balance,
+        // LedgeWalk, with a readable state - and let the game own its spring in every other
+        // state, known or unknown.
+        // Stand-down means STOP WRITING - nothing else. The first version restored the
+        // original values on the calm->move transition frame, which is exactly when the move
+        // logic stages its own camera state, and run 29's marked captures showed the cost:
+        // character stuck for one to two seconds at landings and grabs (pawn flat, everything
+        // else running) until the game's logic timed out. The game rewrites this spring
+        // whenever it wants one - 37 measured reassertions in a single run - so outside the
+        // calm states the mod now touches nothing at all, and the calm-frame verify loop
+        // re-zeroes on return.
+        uint8_t move = 0xFF;
+        const bool calm = g_playerPawn && g_offMoveState >= 0 &&
+            SafeRead(g_playerPawn + g_offMoveState, &move, 1) &&
+            (move == 1 || move == 15 || move == 29 || move == 30);
+        if (!calm) return;
+        const float mul = (g_swanMode == 1) ? 0.0f : 8.0f;
+        const uint32_t offs[4] = { SWAN_LinearFwd, SWAN_LinearDown, SWAN_QuadFwd, SWAN_QuadDown };
+        bool drifted = false;
+        for (int i = 0; i < 4; ++i) {
+            float now = 0.0f;
+            if (!SafeRead(obj + offs[i], &now, sizeof(now))) return;   // instance validator's job
+            if (fabsf(now - g_swanSaved[i] * mul) > 0.01f) { drifted = true; break; }
+        }
+        if (!drifted) return;
+        const bool ok = WriteF32(obj + SWAN_LinearFwd,  g_swanSaved[0] * mul) &&
+                        WriteF32(obj + SWAN_LinearDown, g_swanSaved[1] * mul) &&
+                        WriteF32(obj + SWAN_QuadFwd,    g_swanSaved[2] * mul) &&
+                        WriteF32(obj + SWAN_QuadDown,   g_swanSaved[3] * mul);
+        static long reasserted = 0;
+        ++reasserted;
+        static long lastReport = -1000000;
+        if (g_frames - lastReport >= 900) {
+            lastReport = g_frames;
+            Log("*** [swan] game rewrote the spring; re-asserted mode %d"
+                " (%ld reassertions so far)%s", g_swanMode, reasserted,
+                ok ? "" : "  <- A WRITE FAILED");
+        }
+        return;
+    }
     if (!g_swanSavedOk) return;
 
     // ---- three states, not two, and the third is the one that proves anything ----
@@ -5005,19 +5013,37 @@ static uintptr_t FindPlayerController()
     if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) {
         g_ctlNextTry = g_frames + 600; return 0;
     }
-    for (uint32_t i = 0; i < count; ++i) {
+    // Time-sliced like the swan and pawn walks - this was the last full walk left on the
+    // render thread, and it fires on exactly the churny moments (transitions, possession
+    // changes) where a multi-second freeze hurts most.
+    static uint32_t walkCursor = 0;
+    static double walkMs = 0.0;
+    const double t0 = NowMs();
+    const double kBudgetMs = 3.0;
+    if (walkCursor >= count) walkCursor = 0;
+    uint32_t i = walkCursor;
+    for (; i < count; ++i) {
+        if ((i & 0x3F) == 0 && NowMs() - t0 > kBudgetMs) break;
         uint32_t obj;
         if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
         if (!LooksLikePlayerController(obj)) continue;
         g_playerCtl = obj;
         g_ctlMissLogged = false;
-        Log("[head] TdPlayerController instance at %p", (void*)obj);
+        Log("[head] TdPlayerController instance at %p (amortized walk, %.1f ms total)",
+            (void*)obj, walkMs + NowMs() - t0);
+        walkCursor = 0; walkMs = 0.0;
         return obj;
     }
+    walkMs += NowMs() - t0;
+    walkCursor = i;
+    if (i < count) return 0;               // pass continues next call at the cursor
+
+    walkCursor = 0;
     // Backoff, for the reason recorded at FindSwanNeck: an uncached full walk on the render
     // thread costs hundreds of thousands of syscalls a frame.
     g_ctlNextTry = g_frames + 600;
     if (!g_ctlMissLogged) { g_ctlMissLogged = true; Log("[head] no live TdPlayerController yet"); }
+    walkMs = 0.0;
     return 0;
 }
 
@@ -5907,6 +5933,22 @@ static void CheckHeadHotkeys()
     const bool d3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
     if (d3 && !p3) { g_overlay = !g_overlay; Log("[hud] F3 -> overlay %s", g_overlay ? "ON" : "OFF"); }
 
+    // BACKSPACE drops a numbered marker into the log at the player's say-so - "the judder is
+    // happening NOW" - and opens a dense window: the arm-continuity watchdog logs every update
+    // unconditionally for the next ~40, so the marked moment carries per-update data instead
+    // of rate-limited samples. Ends the ambiguity of matching a report to a window after the
+    // fact.
+    static bool pMark = false;
+    const bool dMark = (GetAsyncKeyState(VK_BACK) & 0x8000) != 0;
+    if (dMark && !pMark) {
+        static long markerCount = 0;
+        ++markerCount;
+        Log("*** [mark] ======== USER MARKER #%ld at frame %ld ========"
+            " (next ~40 arm updates logged densely)", markerCount, g_frames);
+        InterlockedExchange(&g_markerBurst, 40);
+    }
+    pMark = dMark;
+
     // Live calibration. Left/Right walks wrist R/L P/Y/R, then forearm R/L roll offset.
     static bool pLeft = false, pRight = false, pUp = false, pDown = false;
     const bool dLeft  = (GetAsyncKeyState(VK_LEFT)  & 0x8000) != 0;
@@ -6246,11 +6288,22 @@ uintptr_t FindPlayerPawn()
     // full of them being turned away by the predicate. Naming what it turned down is what
     // produced "1 objects of that class named: Default__TdPlayerPawn" - which said, in one line,
     // that the level had no such pawn and the search was looking for the wrong thing entirely.
+    //
+    // Time-sliced like the swan walk, and for a measured reason: run 28's death froze the game
+    // for 4294 ms while this walk scanned 116k slots on the render thread hunting a pawn that
+    // was legitimately destroyed. The pass now resumes at a cursor under a per-call budget;
+    // the controller path above still answers instantly the moment the respawned pawn exists.
+    static uint32_t walkCursor = 0;
+    static double walkMs = 0.0;
+    static int  walkKinds = 0;
+    static char walkSeen[3][64] = {};
     const double t0 = NowMs();
-    int  kinds = 0;
-    char seen[3][64] = {};
+    const double kBudgetMs = 3.0;
+    if (walkCursor >= count) walkCursor = 0;
+    uint32_t i = walkCursor;
 
-    for (uint32_t i = 0; i < count; ++i) {
+    for (; i < count; ++i) {
+        if ((i & 0x3F) == 0 && NowMs() - t0 > kBudgetMs) break;
         uint32_t obj, vt;
         if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
         if (!SafeU32(obj, &vt) || !InModule(vt)) continue;
@@ -6263,26 +6316,34 @@ uintptr_t FindPlayerPawn()
         char cn[64] = "?";
         uint32_t clsObj = 0;
         if (SafeU32(obj + 0x34, &clsObj) && clsObj >= 0x10000) ReadObjName(clsObj, cn, sizeof(cn));
-        if (kinds < 3) strcpy_s(seen[kinds], cn);
-        kinds++;
+        if (walkKinds < 3) strcpy_s(walkSeen[walkKinds], cn);
+        walkKinds++;
         if (strncmp(nm, "Default__", 9) == 0) continue;   // the CDO is not a live pawn
 
         g_playerPawn = obj;
         g_pawnMissLogged = false;
-        Log("[vm] pawn %p class \"%s\" - found by WALK, %.1f ms over %u slots"
-            " (Controller::Pawn should have got here first)",
-            (void*)obj, cn, NowMs() - t0, count);
+        Log("[vm] pawn %p class \"%s\" - found by amortized WALK, %.1f ms total at slot %u"
+            " of %u (Controller::Pawn should have got here first)",
+            (void*)obj, cn, walkMs + NowMs() - t0, i, count);
+        walkCursor = 0; walkMs = 0.0; walkKinds = 0;
         return obj;
     }
+    walkMs += NowMs() - t0;
+    walkCursor = i;
+    if (i < count) return 0;               // pass continues next call at the cursor
+
+    walkCursor = 0;
     g_pawnNextTry = g_frames + 600;   // same backoff discipline as the other searches
     if (!g_pawnMissLogged) {
         g_pawnMissLogged = true;
-        Log("[vm] no live pawn of any TdPlayerPawn kind - %.1f ms over %u slots, %d seen%s%s%s%s",
-            NowMs() - t0, count, kinds,
-            kinds > 0 ? ", classes: " : "",
-            kinds > 0 ? seen[0] : "",
-            kinds > 1 ? ", " : "", kinds > 1 ? seen[1] : "");
+        Log("[vm] no live pawn of any TdPlayerPawn kind - %.1f ms spread over a %u-slot pass,"
+            " %d seen%s%s%s%s",
+            walkMs, count, walkKinds,
+            walkKinds > 0 ? ", classes: " : "",
+            walkKinds > 0 ? walkSeen[0] : "",
+            walkKinds > 1 ? ", " : "", walkKinds > 1 ? walkSeen[1] : "");
     }
+    walkMs = 0.0; walkKinds = 0;
     return 0;
 }
 
@@ -8394,14 +8455,25 @@ static bool ApplyOneDedicatedRotationSide(const DedicatedRotationRig& rig,
         float twist = RelativeTwistAboutXRad(forearmQ, handOrientation) +
                       g_forearmRollCalibrationDeg[hand] *
                           (3.14159265358979323846f / 180.0f);
-        // Take the branch nearest the previous update's twist (see g_forearmTwistUnwrap).
+        // Take the branch nearest the previous update's twist, slew-limited and bounded.
+        // Run 23 measured the naked unwrap drifting a full turn: singular-zone forearm-bone
+        // flips feed +/-170-degree APPARENT twist steps, and nearest-branch continuity happily
+        // accumulated them until the right helper sat pinned at the +95 cap while the wrist
+        // read -50. The slew cap (25 deg/update is triple any deliberate wring) turns those
+        // spikes into negligible nudges that cancel, and the fold keeps the reference inside
+        // +/-180 so drift is structurally impossible rather than merely unlikely.
         if (g_forearmTwistUnwrapValid[hand]) {
             float unwrapDelta = twist - g_forearmTwistUnwrap[hand];
             while (unwrapDelta > 3.14159265358979323846f)
                 unwrapDelta -= 6.28318530717958647692f;
             while (unwrapDelta < -3.14159265358979323846f)
                 unwrapDelta += 6.28318530717958647692f;
+            const float maxTwistStep = 25.0f * (3.14159265358979323846f / 180.0f);
+            if (unwrapDelta > maxTwistStep) unwrapDelta = maxTwistStep;
+            else if (unwrapDelta < -maxTwistStep) unwrapDelta = -maxTwistStep;
             twist = g_forearmTwistUnwrap[hand] + unwrapDelta;
+            if (twist > 3.14159265358979323846f) twist -= 6.28318530717958647692f;
+            else if (twist < -3.14159265358979323846f) twist += 6.28318530717958647692f;
         }
         g_forearmTwistUnwrap[hand] = twist;
         g_forearmTwistUnwrapValid[hand] = true;
@@ -8776,6 +8848,8 @@ static void MonitorArmContinuity(uintptr_t pawn, const P13PoseSnapshot& pose)
     struct HandContinuity {
         bool haveTarget = false;
         MEVR_Vec3 targetFromPawn{};
+        bool haveWorldTarget = false;
+        MEVR_Vec3 worldTarget{};
         bool owned = false;
         bool rotationActive = false;
         bool haveHand = false;
@@ -8838,6 +8912,24 @@ static void MonitorArmContinuity(uintptr_t pawn, const P13PoseSnapshot& pose)
         SafeRead(pawn + g_offActorLocation, &pawnLocation, sizeof(pawnLocation)) &&
         FiniteVec(pawnLocation);
 
+    // The tgt column is pawn-relative and therefore ambiguous: it trips when the pawn moves
+    // (ordinary locomotion) exactly as it does when the world target jumps. These two columns
+    // split it - the pawn's own step and each hand's WORLD-target step - so a judder window
+    // names who moved without interpretation.
+    static bool havePreviousPawnStep = false;
+    static MEVR_Vec3 previousPawnLocation{};
+    float pawnStep = -1.0f;
+    if (havePawn) {
+        if (havePreviousPawnStep)
+            pawnStep = VecLength({ pawnLocation.x - previousPawnLocation.x,
+                                   pawnLocation.y - previousPawnLocation.y,
+                                   pawnLocation.z - previousPawnLocation.z });
+        previousPawnLocation = pawnLocation;
+        havePreviousPawnStep = true;
+    } else {
+        havePreviousPawnStep = false;
+    }
+
     char trips[128] = "";
     auto trip = [&](const char* tag) {
         strcat_s(trips, sizeof(trips), " ");
@@ -8846,6 +8938,8 @@ static void MonitorArmContinuity(uintptr_t pawn, const P13PoseSnapshot& pose)
     HandContinuity now[2]{};
     bool ownedWas[2]{}, rotationWas[2]{};
     float targetStep[2] = { -1.0f, -1.0f };
+    float worldTargetStep[2] = { -1.0f, -1.0f };
+    float chainDistance[2] = { -1.0f, -1.0f };
     float handStep[2] = { -1.0f, -1.0f };
     float rawStep[2] = { -1.0f, -1.0f };
     float forearmStep[2] = { -1.0f, -1.0f };
@@ -8867,6 +8961,10 @@ static void MonitorArmContinuity(uintptr_t pawn, const P13PoseSnapshot& pose)
             cur.targetFromPawn = { handPose.worldPosition.x - pawnLocation.x,
                                    handPose.worldPosition.y - pawnLocation.y,
                                    handPose.worldPosition.z - pawnLocation.z };
+        }
+        if (handPose.worldValid) {
+            cur.haveWorldTarget = true;
+            cur.worldTarget = handPose.worldPosition;
         }
         // The raw view-space grip orientation, straight from the runtime. When the written hand
         // steps but this does too, the step arrived in tracking; when this is quiet and the
@@ -8920,6 +9018,22 @@ static void MonitorArmContinuity(uintptr_t pawn, const P13PoseSnapshot& pose)
                 cur.targetFromPawn.z - prev.targetFromPawn.z });
             if (targetStep[hand] > 10.0f) trip(left ? "L-tgt" : "R-tgt");
         }
+        if (prev.haveWorldTarget && cur.haveWorldTarget) {
+            worldTargetStep[hand] = VecLength({
+                cur.worldTarget.x - prev.worldTarget.x,
+                cur.worldTarget.y - prev.worldTarget.y,
+                cur.worldTarget.z - prev.worldTarget.z });
+            if (worldTargetStep[hand] > 10.0f) trip(left ? "L-wtgt" : "R-wtgt");
+        }
+        // Distance from the (one-tick-stale) chain root to the raw world target: the clamp
+        // holds the solver at 47 UU from THIS estimate, so values at ~50+ here mean the true
+        // distance can still cross the 50.38 singular zone - the suspected residual of run 21's
+        // at-rest forearm flip.
+        if (cur.haveWorldTarget && g_armChainRootValid[hand])
+            chainDistance[hand] = VecLength({
+                cur.worldTarget.x - g_armChainRoot[hand].x,
+                cur.worldTarget.y - g_armChainRoot[hand].y,
+                cur.worldTarget.z - g_armChainRoot[hand].z });
         if (prev.haveHand && cur.haveHand) {
             handStep[hand] = QuatAngleDeg(prev.hand, cur.hand);
             if (handStep[hand] > 15.0f) trip(left ? "L-hand" : "R-hand");
@@ -8953,23 +9067,31 @@ static void MonitorArmContinuity(uintptr_t pawn, const P13PoseSnapshot& pose)
 
     last[0] = now[0];
     last[1] = now[1];
-    if (!trips[0] || updates - lastLogged < 15) return;
+    // A user marker overrides both the trip requirement and the rate limit: the player said
+    // "now", so every update in the window is worth a line.
+    const bool marked = InterlockedCompareExchange(&g_markerBurst, 0, 0) > 0;
+    if (marked) {
+        InterlockedDecrement(&g_markerBurst);
+        trip("MARK");
+    }
+    if (!trips[0] || (!marked && updates - lastLogged < 15)) return;
     lastLogged = updates;
-    Log("*** [hands-spazz] upd %ld head f/r %.1f/%.1f hmd %.1f deg age %ld stick %d |"
-        " L own %d>%d rot %d>%d tgt %.1f raw %.1f hand %.1f farm %.1f roll %.1f jt %.1f"
-        " sh %.2f |"
-        " R own %d>%d rot %d>%d tgt %.1f raw %.1f hand %.1f farm %.1f roll %.1f jt %.1f"
-        " sh %.2f | trip:%s",
+    Log("*** [hands-spazz] upd %ld head f/r %.1f/%.1f hmd %.1f deg age %ld stick %d"
+        " pawn %.1f |"
+        " L own %d>%d rot %d>%d tgt %.1f wtgt %.1f cd %.1f raw %.1f hand %.1f farm %.1f"
+        " roll %.1f jt %.1f sh %.2f |"
+        " R own %d>%d rot %d>%d tgt %.1f wtgt %.1f cd %.1f raw %.1f hand %.1f farm %.1f"
+        " roll %.1f jt %.1f sh %.2f | trip:%s",
         updates, headStepDeg, headRollStepDeg, hmdStepDeg, g_frames - pose.presentFrame,
-        stickLook ? 1 : 0,
+        stickLook ? 1 : 0, pawnStep,
         ownedWas[0] ? 1 : 0, now[0].owned ? 1 : 0,
         rotationWas[0] ? 1 : 0, now[0].rotationActive ? 1 : 0,
-        targetStep[0], rawStep[0], handStep[0], forearmStep[0], rollStep[0], jointStep[0],
-        shoulderStep[0],
+        targetStep[0], worldTargetStep[0], chainDistance[0], rawStep[0], handStep[0],
+        forearmStep[0], rollStep[0], jointStep[0], shoulderStep[0],
         ownedWas[1] ? 1 : 0, now[1].owned ? 1 : 0,
         rotationWas[1] ? 1 : 0, now[1].rotationActive ? 1 : 0,
-        targetStep[1], rawStep[1], handStep[1], forearmStep[1], rollStep[1], jointStep[1],
-        shoulderStep[1],
+        targetStep[1], worldTargetStep[1], chainDistance[1], rawStep[1], handStep[1],
+        forearmStep[1], rollStep[1], jointStep[1], shoulderStep[1],
         trips);
 }
 
@@ -9731,6 +9853,24 @@ static void SampleLivePivot()
         const float dy = cl[1] - g_livePivot[1];
         const float dz = cl[2] - g_livePivot[2];
         g_pivotStep = sqrtf(dx*dx + dy*dy + dz*dz);
+
+        // Fine-grained camera-motion census for the run-23 world tremble: the user marked the
+        // floor itself juddering, which points at THIS value dithering at a scale the existing
+        // whole-UU "camera step" line rounds away. Mean, max, and the count of frames in the
+        // dither band say whether the game camera is the source, with 0.01 UU resolution.
+        static float stepMax = 0.0f, stepSum = 0.0f;
+        static long stepCount = 0, ditherFrames = 0;
+        if (std::isfinite(g_pivotStep)) {
+            if (g_pivotStep > stepMax) stepMax = g_pivotStep;
+            stepSum += g_pivotStep;
+            if (g_pivotStep > 0.2f && g_pivotStep < 5.0f) ++ditherFrames;
+            if (++stepCount >= 600) {
+                Log("[vm] camera position steps over 600 frames: mean %.2f max %.2f UU,"
+                    " %ld frames in the 0.2-5.0 dither band",
+                    stepSum / (float)stepCount, stepMax, ditherFrames);
+                stepMax = 0.0f; stepSum = 0.0f; stepCount = 0; ditherFrames = 0;
+            }
+        }
     }
     g_livePivot[0] = cl[0]; g_livePivot[1] = cl[1]; g_livePivot[2] = cl[2];
     g_livePivotValid = true;
