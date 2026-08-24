@@ -96,6 +96,7 @@ enum {
     DEV_CreateVertexBuffer     = 26,
     DEV_CreateIndexBuffer      = 27,
     DEV_SetRenderTarget        = 37,
+    DEV_Clear                  = 43,
     DEV_CreateQuery            = 118,
     DEV_DrawPrimitive          = 81,
     DEV_DrawIndexedPrimitive  = 82,
@@ -596,6 +597,9 @@ struct MotionPoseSample {
     int reportedStatus = -1;
 };
 static MotionPoseSample g_poseLGrip, g_poseRGrip, g_poseLAim, g_poseRAim;
+// Located once by the existing stereo frame path before controller poses are sampled.
+static XrView g_views[2]{};
+static bool g_viewsValid = false;
 
 // Present owns OpenXR and publishes one immutable position sample for the next game tick.
 // Update1pArms can run on the game thread, so a sequence lock prevents it from observing a
@@ -636,11 +640,11 @@ static bool FiniteVec(const MEVR_Vec3& v);
 // Live debug calibration in degrees, [left/right][pitch/yaw/roll]. Preserve the values measured
 // in the headset for the wrists. Selection order is Right P/Y/R, then Left P/Y/R.
 static int g_wristCalibrationDeg[2][3] = { { -30, 0, 0 }, { 150, 0, 0 } };
-// Rest rotations tuned in-headset on AT_C1P's visible forearm-roll helper bones.
-static int g_forearmRollCalibrationDeg[2] = { -65, -150 };
-// The helper bones cannot safely accept a controller's full +/-180-degree roll. Preserve full
-// wrist tracking but limit visible forearm pronation/supination around the tuned rest pose.
-static int g_forearmTwistLimitDeg = 55;
+// Trim added to each ForeArmRoll helper's twist, in degrees about the forearm axis. P1.4d
+// drives the helper as forearm-swing + measured hand twist + this trim, and run 7 measured the
+// authored helper twist matching the hand's twist at neutral on both sides, so zero is the
+// correct default and the overlay slots exist only for taste.
+static int g_forearmRollCalibrationDeg[2] = { 0, 0 };
 static int g_handTuneSelected = 0;
 
 static void PublishP13PoseSnapshot()
@@ -714,6 +718,16 @@ static MEVR_Vec3 RotateByQuaternion(const XrQuaternionf& q, const MEVR_Vec3& v)
     return { v.x + q.w*t.x + (q.y*t.z - q.z*t.y),
              v.y + q.w*t.y + (q.z*t.x - q.x*t.z),
              v.z + q.w*t.z + (q.x*t.y - q.y*t.x) };
+}
+
+static XrQuaternionf MultiplyQuaternion(const XrQuaternionf& a, const XrQuaternionf& b)
+{
+    return {
+        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
+    };
 }
 
 // OpenXR VIEW: +X right, +Y up, -Z forward. UE3 camera-local: +X forward, +Y right, +Z up.
@@ -1926,6 +1940,14 @@ extern int               g_rtSeenCount;
 // The name for this is already in the history: "the backbuffer is not what the engine renders
 // at - rung 9's premise was wrong". Same premise, a different consequence.
 UINT                     g_sceneW = 0, g_sceneH = 0;
+// The game has moved the world into a scene buffer whose size cannot carry side-by-side
+// stereo (run 14: 1280x720 against a 2560x1440 backbuffer). Duplicating the backbuffer's
+// leftover draws in that mode smears the right eye, and adopting the mono buffer fights the
+// game's own full-width draws - the only coherent presentation is mono until the mode ends.
+bool                     g_sceneSplitMono = false;
+// Per-frame scene-draw tallies for the split-flip detector, reset every Present.
+long                     g_frameSceneOnBackbuffer = 0;
+long                     g_frameSceneOffscreen = 0;
 
 // The scene's rectangle within the captured backbuffer. Every one of these collapses to the
 // whole backbuffer while g_sceneW/H are unset or equal to it, so every use below is an identity
@@ -1987,9 +2009,6 @@ bool                     g_camCacheValid = false;
 volatile LONG            g_vmAccepted = 0;
 volatile LONG            g_vmRejected = 0;
 bool                     g_vmValidate = true;   // F12 turns the per-upload filter off
-static XrView            g_views[2]{};
-static bool              g_viewsValid = false;
-
 static bool EnsureEyeSwapchains(uint32_t w, uint32_t h)
 {
     if (g_eyeSwap[0] != XR_NULL_HANDLE && w == g_eyeW && h == g_eyeH) return true;
@@ -2168,6 +2187,9 @@ static void SubmitTestQuad()
     XrCompositionLayerProjection      proj{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
     XrCompositionLayerProjectionView  projViews[2]{};
     bool stereoSubmitted = false;
+    // Validity is per frame, not a lifetime latch: a frame that skips stereo view location must
+    // not leave last frame's eye poses looking current to later consumers.
+    g_viewsValid = false;
 
     if (g_stereoMode == 1 && g_haveFrame) {
         uint32_t viewCount = 0;
@@ -2451,6 +2473,7 @@ static bool      g_nameWide = false;      // offset of the char data inside FNam
 static uintptr_t g_gobjAddr = 0;
 static int       g_offName = -1;
 static bool      g_objModelDone = false;
+static volatile LONG g_objModelThreadFinished = 0;
 
 static bool SafeRead(uintptr_t addr, void* out, size_t n)
 {
@@ -3218,6 +3241,7 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
 
     if (!located) {
         Log("[obj] GIVING UP after 20 attempts - no rung above the object model can run");
+        InterlockedExchange(&g_objModelThreadFinished, 1);
         return 0;
     }
 
@@ -3307,6 +3331,7 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
     Log("======== layout derivation took %.1f ms (off the render thread) ========",
         NowMs() - t0);
     Log("");
+    InterlockedExchange(&g_objModelThreadFinished, 1);
     return 0;
 }
 
@@ -3739,52 +3764,93 @@ static int LookupProp(const char* className, const char* propName, bool verbose)
     return -1;
 }
 
-// Find a cooked property object that still exists for script bytecode but is detached from its
-// owner's Children chain. Name alone is not enough: common Engine fields repeat everywhere.
-// Require the exact UProperty subclass and an Outer UClass with the requested name, then accept
-// only a single offset (multiple matching objects may exist when imports are duplicated, but
-// they must all agree). This remains UE3-derived data, not a hard-coded game layout.
-static int LookupDetachedProp(const char* className, const char* propName,
-                              const char* propertyClass, bool verbose)
+struct DetachedPropRequest {
+    const char* ownerClass;
+    const char* propertyName;
+    const char* propertyClass;
+    int* destination;
+    int foundOffset;
+    int matches;
+    bool disagreement;
+};
+
+// Resolve every missing cooked property in ONE GObjects pass. The former call site invoked
+// LookupDetachedProp separately for 23 fields. Each invocation walked roughly 115,000 objects,
+// turning identical validation work into a measured 44-second hand-activation delay.
+static void LookupDetachedPropsBatch(DetachedPropRequest* requests, int requestCount)
 {
-    if (!g_gobjAddr || g_offName < 0 || g_offOuter < 0 || g_offPropOff < 0) return -1;
+    if (!requests || requestCount <= 0 || !g_gobjAddr || g_offName < 0 ||
+        g_offOuter < 0 || g_offPropOff < 0) return;
     uint32_t data = 0, count = 0;
-    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return -1;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return;
 
-    int foundOffset = -1;
-    int matches = 0;
-    bool disagreement = false;
+    const double started = NowMs();
+    for (int r = 0; r < requestCount; ++r) {
+        requests[r].foundOffset = -1;
+        requests[r].matches = 0;
+        requests[r].disagreement = false;
+    }
+
     for (uint32_t i = 0; i < count; ++i) {
-        uint32_t obj = 0, vt = 0, propCls = 0, outer = 0, off = 0;
-        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
-        if (!SafeU32(obj, &vt) || !InModule(vt) || !ObjNameIs(obj, propName)) continue;
+        uint32_t obj = 0, vt = 0;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000 ||
+            !SafeU32(obj, &vt) || !InModule(vt)) continue;
+
+        char objectName[96] = "?";
+        if (!ReadObjName(obj, objectName, sizeof(objectName))) continue;
+        bool nameWanted = false;
+        for (int r = 0; r < requestCount; ++r) {
+            if (*requests[r].destination < 0 &&
+                strcmp(objectName, requests[r].propertyName) == 0) {
+                nameWanted = true; break;
+            }
+        }
+        if (!nameWanted) continue;
+
+        uint32_t propCls = 0, outer = 0, ownerClass = 0, off = 0;
         if (!SafeU32(obj + 0x34, &propCls) || propCls < 0x10000 ||
-            !ObjNameIs(propCls, propertyClass)) continue;
-        if (!SafeU32(obj + g_offOuter, &outer) || outer < 0x10000 ||
-            !ObjNameIs(outer, className)) continue;
-        // Its owner must itself be a UClass, not an unrelated object with the same name.
-        uint32_t ownerClass = 0;
-        if (!SafeU32(outer + 0x34, &ownerClass) || ownerClass < 0x10000 ||
-            !ObjNameIs(ownerClass, "Class")) continue;
-        if (!SafeU32(obj + g_offPropOff, &off) || off >= 0x8000) continue;
+            !SafeU32(obj + g_offOuter, &outer) || outer < 0x10000 ||
+            !SafeU32(outer + 0x34, &ownerClass) || ownerClass < 0x10000 ||
+            !ObjNameIs(ownerClass, "Class") ||
+            !SafeU32(obj + g_offPropOff, &off) || off >= 0x8000) continue;
 
-        if (foundOffset < 0) foundOffset = (int)off;
-        else if (foundOffset != (int)off) disagreement = true;
-        matches++;
+        char propertyClassName[96] = "?", ownerName[96] = "?";
+        if (!ReadObjName(propCls, propertyClassName, sizeof(propertyClassName)) ||
+            !ReadObjName(outer, ownerName, sizeof(ownerName))) continue;
+
+        for (int r = 0; r < requestCount; ++r) {
+            DetachedPropRequest& request = requests[r];
+            if (*request.destination >= 0 ||
+                strcmp(objectName, request.propertyName) != 0 ||
+                strcmp(propertyClassName, request.propertyClass) != 0 ||
+                strcmp(ownerName, request.ownerClass) != 0) continue;
+            if (request.foundOffset < 0) request.foundOffset = (int)off;
+            else if (request.foundOffset != (int)off) request.disagreement = true;
+            request.matches++;
+        }
     }
 
-    if (matches > 0 && !disagreement) {
-        Log("*** [prop] %s::%s at +0x%04X from %d detached %s object%s"
-            " (Outer validated)", className, propName, foundOffset, matches, propertyClass,
-            matches == 1 ? "" : "s");
-        return foundOffset;
+    int resolved = 0;
+    for (int r = 0; r < requestCount; ++r) {
+        DetachedPropRequest& request = requests[r];
+        if (*request.destination >= 0) continue;
+        if (request.matches > 0 && !request.disagreement) {
+            *request.destination = request.foundOffset;
+            ++resolved;
+            Log("*** [prop] %s::%s at +0x%04X from %d detached %s object%s"
+                " (batched, Outer validated)", request.ownerClass, request.propertyName,
+                request.foundOffset, request.matches, request.propertyClass,
+                request.matches == 1 ? "" : "s");
+        } else {
+            Log("[prop] detached %s::%s %s (%d owner-validated %s object%s)",
+                request.ownerClass, request.propertyName,
+                request.disagreement ? "DISAGREED ON OFFSET" : "NOT FOUND",
+                request.matches, request.propertyClass,
+                request.matches == 1 ? "" : "s");
+        }
     }
-    if (verbose) {
-        Log("[prop] detached %s::%s %s (%d owner-validated %s object%s)",
-            className, propName, disagreement ? "DISAGREED ON OFFSET" : "NOT FOUND",
-            matches, propertyClass, matches == 1 ? "" : "s");
-    }
-    return -1;
+    Log("[prop] batched detached-property pass resolved %d fields over %u objects in %.1f ms",
+        resolved, count, NowMs() - started);
 }
 
 // ================================================================ P1.3 update timing hook
@@ -3804,13 +3870,46 @@ static void RestoreWristRotationOverridesBeforeGame(uintptr_t pawn);
 static void RestoreDetachedArmOverridesBeforeGame(uintptr_t pawn);
 static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose);
 static void ApplyWristRotations(uintptr_t pawn, const P13PoseSnapshot& pose);
+static void MonitorArmContinuity(uintptr_t pawn, const P13PoseSnapshot& pose);
 
-static bool LateReanchorOneHand(const RenderedHeadFrame& head,
+static bool LateReanchorOneHand(const RenderedHeadFrame& head, bool leftHand,
                                 P13HandPoseSnapshot* pose)
 {
     if (!pose || !pose->worldValid || !FiniteVec(pose->cameraLocal)) return false;
     XrQuaternionf view{};
     if (!NormalizedQuaternion(pose->viewOrientation, &view)) return false;
+
+    // Close to the headset the optical and inertial trackers disagree: run 19 measured the RAW
+    // view-space grip orientation stepping 15-21 degrees per update with the controller held
+    // still near the face, identical to the written hand's steps - the judder arrives from the
+    // runtime. Reject one isolated large step and hold the last accepted orientation; a step
+    // that persists is real motion and is accepted one update late (>20 deg per update is
+    // ~1400 deg/s, faster than any deliberate wrist flick).
+    auto stepDeg = [](const XrQuaternionf& a, const XrQuaternionf& b) {
+        float dot = fabsf(a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w);
+        if (dot > 1.0f) dot = 1.0f;
+        return 2.0f * acosf(dot) * 57.2957795f;
+    };
+    const int hand = leftHand ? 0 : 1;
+    static bool haveAccepted[2] = { false, false };
+    static bool haveRejected[2] = { false, false };
+    static XrQuaternionf accepted[2]{};
+    static XrQuaternionf rejected[2]{};
+    if (haveAccepted[hand] && stepDeg(view, accepted[hand]) > 20.0f) {
+        const bool persisted = haveRejected[hand] &&
+                               stepDeg(view, rejected[hand]) < 15.0f;
+        if (!persisted) {
+            rejected[hand] = view;
+            haveRejected[hand] = true;
+            view = accepted[hand];
+        } else {
+            haveRejected[hand] = false;
+        }
+    } else {
+        haveRejected[hand] = false;
+    }
+    accepted[hand] = view;
+    haveAccepted[hand] = true;
     const MEVR_Vec3 worldOffset = CameraVectorToWorld(head, pose->cameraLocal);
     const MEVR_Vec3 worldPosition{ head.position.x + worldOffset.x,
                                    head.position.y + worldOffset.y,
@@ -3834,6 +3933,47 @@ static bool LateReanchorOneHand(const RenderedHeadFrame& head,
 static void LateReanchorP13Pose(uintptr_t pawn, P13PoseSnapshot* pose)
 {
     if (!pose) return;
+
+    MEVR_Vec3 pawnLocation{};
+    const bool havePawn = g_offActorLocation >= 0 &&
+        SafeRead(pawn + g_offActorLocation, &pawnLocation, sizeof(pawnLocation)) &&
+        FiniteVec(pawnLocation);
+
+    // Crouch entry/exit moves the pawn ORIGIN about 29 UU in a single game tick while the
+    // camera keeps its own smoothed height - run 9 measured Walking<->Crouch flapping with
+    // exactly that signature, and the locomotion correction below faithfully injected every
+    // snap into both hand targets: the reported "whole arm snapping up and down". Velocity is
+    // continuous under genuine locomotion (sprint, falling), so a JERK above threshold marks
+    // an origin discontinuity; the correction pauses for the few updates whose snapshot can
+    // straddle the snap, and the smooth camera anchor carries the hands across it.
+    static bool havePreviousPawn = false;
+    static MEVR_Vec3 previousPawn{}, previousStep{};
+    static int suppressCorrections = 0;
+    if (havePawn) {
+        if (havePreviousPawn) {
+            const MEVR_Vec3 step{ pawnLocation.x - previousPawn.x,
+                                  pawnLocation.y - previousPawn.y,
+                                  pawnLocation.z - previousPawn.z };
+            const float jerk = VecLength({ step.x - previousStep.x,
+                                           step.y - previousStep.y,
+                                           step.z - previousStep.z });
+            if (std::isfinite(jerk) && jerk > 15.0f) {
+                suppressCorrections = 4;
+                static long lastJerkReport = -1000;
+                if (g_frames - lastJerkReport >= 90) {
+                    lastJerkReport = g_frames;
+                    Log("*** [hands-late] pawn origin discontinuity (jerk %.1f UU/update);"
+                        " locomotion correction paused over the snap", jerk);
+                }
+            }
+            previousStep = step;
+        }
+        previousPawn = pawnLocation;
+        havePreviousPawn = true;
+    } else {
+        havePreviousPawn = false;
+    }
+
     RenderedHeadFrame lateHead{};
     bool haveLateHead = false;
     float correction = 0.0f;
@@ -3841,13 +3981,10 @@ static void LateReanchorP13Pose(uintptr_t pawn, P13PoseSnapshot* pose)
     if (pose->sampledHeadValid) {
         lateHead = pose->sampledHead;
         haveLateHead = true;
-        MEVR_Vec3 currentPawn{};
-        if (pose->sampledPawnValid && g_offActorLocation >= 0 &&
-            SafeRead(pawn + g_offActorLocation, &currentPawn, sizeof(currentPawn)) &&
-            FiniteVec(currentPawn)) {
-            const MEVR_Vec3 delta{ currentPawn.x - pose->sampledPawnLocation.x,
-                                   currentPawn.y - pose->sampledPawnLocation.y,
-                                   currentPawn.z - pose->sampledPawnLocation.z };
+        if (pose->sampledPawnValid && havePawn && suppressCorrections == 0) {
+            const MEVR_Vec3 delta{ pawnLocation.x - pose->sampledPawnLocation.x,
+                                   pawnLocation.y - pose->sampledPawnLocation.y,
+                                   pawnLocation.z - pose->sampledPawnLocation.z };
             correction = VecLength(delta);
             // A normal one-to-three-frame locomotion delta is small. A level teleport is not a
             // pose to extrapolate across; eligibility will shortly hand ownership back anyway.
@@ -3860,6 +3997,7 @@ static void LateReanchorP13Pose(uintptr_t pawn, P13PoseSnapshot* pose)
             }
         }
     }
+    if (suppressCorrections > 0) --suppressCorrections;
 
     // Camera rotation can also advance between Present and the arm update. Its position may
     // still describe the preceding rendered frame, so only take the fresher axes when a sampled
@@ -3877,8 +4015,34 @@ static void LateReanchorP13Pose(uintptr_t pawn, P13PoseSnapshot* pose)
     }
     if (!haveLateHead) return;
 
-    const bool left = LateReanchorOneHand(lateHead, &pose->left);
-    const bool right = LateReanchorOneHand(lateHead, &pose->right);
+    const bool left = LateReanchorOneHand(lateHead, true, &pose->left);
+    const bool right = LateReanchorOneHand(lateHead, false, &pose->right);
+
+    // A stale camera anchor during menu/level transitions can put the world target tens of
+    // thousands of UU from the pawn for a few frames: the first eligible frame of run 5
+    // measured 21,328 UU and slammed both detached shoulders to the reach cap. A tracked hand
+    // is never far from the pawn that owns the mesh, so treat an implausible target exactly
+    // like lost tracking until the anchor is coherent again.
+    if (havePawn) {
+        P13HandPoseSnapshot* hands[2] = { &pose->left, &pose->right };
+        for (int i = 0; i < 2; ++i) {
+            if (!hands[i]->worldValid) continue;
+            const float distance = VecLength({
+                hands[i]->worldPosition.x - pawnLocation.x,
+                hands[i]->worldPosition.y - pawnLocation.y,
+                hands[i]->worldPosition.z - pawnLocation.z });
+            if (std::isfinite(distance) && distance <= 250.0f) continue;
+            hands[i]->worldValid = false;
+            static long lastReport = -1000;
+            if (g_frames - lastReport >= 90) {
+                lastReport = g_frames;
+                Log("*** [hands-late] %s world target %.0f UU from pawn rejected:"
+                    " camera anchor is not coherent with the pawn yet",
+                    i == 0 ? "LEFT" : "RIGHT", distance);
+            }
+        }
+    }
+
     if (g_motionHandsDebug && (left || right)) {
         static long samples = 0;
         static float worstCorrection = 0.0f;
@@ -3922,6 +4086,7 @@ static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, voi
     ApplyMotionHandPosition(reinterpret_cast<uintptr_t>(self), pose);
     ApplyDetachedShoulders(reinterpret_cast<uintptr_t>(self), pose);
     ApplyWristRotations(reinterpret_cast<uintptr_t>(self), pose);
+    MonitorArmContinuity(reinterpret_cast<uintptr_t>(self), pose);
 }
 
 static int DeriveUFunctionFuncOffset(uintptr_t* sharedScriptTarget)
@@ -4092,25 +4257,57 @@ static void ResolveMotionRigOffsets()
 
     // Mirror's Edge's retail cook detaches editinline and native controller properties from
     // Children. They remain real UProperty objects because the shipped bytecode uses them.
-    // Recover only objects whose property type and owning UClass both match exactly.
-    if (g_offLeftHandWorldIK < 0)
-        g_offLeftHandWorldIK = LookupDetachedProp(
-            "TdPawn", "LeftHandWorldIKController", "ObjectProperty", true);
-    if (g_offRightHandWorldIK < 0)
-        g_offRightHandWorldIK = LookupDetachedProp(
-            "TdPawn", "RightHandWorldIKController", "ObjectProperty", true);
-    if (g_offLeftHandRotation < 0)
-        g_offLeftHandRotation = LookupDetachedProp(
-            "TdPawn", "LeftHandRotationController", "ObjectProperty", true);
-    if (g_offRightHandRotation < 0)
-        g_offRightHandRotation = LookupDetachedProp(
-            "TdPawn", "RightHandRotationController", "ObjectProperty", true);
-    if (g_offLeftForeArmRoll < 0)
-        g_offLeftForeArmRoll = LookupDetachedProp(
-            "TdPawn", "LeftForeArmRollRotationController", "ObjectProperty", true);
-    if (g_offRightForeArmRoll < 0)
-        g_offRightForeArmRoll = LookupDetachedProp(
-            "TdPawn", "RightForeArmRollRotationController", "ObjectProperty", true);
+    // Resolve every missing field in one census; each candidate still has to match its exact
+    // name, UProperty subclass, Outer UClass, and offset agreement.
+    DetachedPropRequest detached[] = {
+        { "TdPawn", "LeftHandWorldIKController", "ObjectProperty",
+          &g_offLeftHandWorldIK },
+        { "TdPawn", "RightHandWorldIKController", "ObjectProperty",
+          &g_offRightHandWorldIK },
+        { "TdPawn", "LeftHandRotationController", "ObjectProperty",
+          &g_offLeftHandRotation },
+        { "TdPawn", "RightHandRotationController", "ObjectProperty",
+          &g_offRightHandRotation },
+        { "TdPawn", "LeftForeArmRollRotationController", "ObjectProperty",
+          &g_offLeftForeArmRoll },
+        { "TdPawn", "RightForeArmRollRotationController", "ObjectProperty",
+          &g_offRightForeArmRoll },
+        { "SkelControlLimb", "EffectorLocation", "StructProperty",
+          &g_offLimbEffector },
+        { "SkelControlLimb", "EffectorLocationSpace", "ByteProperty",
+          &g_offLimbEffectorSpace },
+        { "SkelControlLimb", "JointTargetLocation", "StructProperty",
+          &g_offLimbJointTarget },
+        { "SkelControlLimb", "JointTargetLocationSpace", "ByteProperty",
+          &g_offLimbJointTargetSpace },
+        { "SkelControlBase", "ControlStrength", "FloatProperty",
+          &g_offSkelControlStrength },
+        { "SkelControlBase", "StrengthTarget", "FloatProperty",
+          &g_offSkelStrengthTarget },
+        { "SkelControlBase", "BlendTimeToGo", "FloatProperty",
+          &g_offSkelBlendTimeToGo },
+        { "SkelControlSingleBone", "BoneRotation", "StructProperty",
+          &g_offSingleBoneRotation },
+        { "SkelControlSingleBone", "BoneRotationSpace", "ByteProperty",
+          &g_offSingleBoneRotationSpace },
+        { "SkeletalMeshComponent", "Animations", "ObjectProperty",
+          &g_offMeshAnimations },
+        { "SkeletalMeshComponent", "SkelControlIndex", "ArrayProperty",
+          &g_offMeshSkelControlIndex },
+        { "SkeletalMeshComponent", "SpaceBases", "ArrayProperty",
+          &g_offMeshSpaceBases },
+        { "PrimitiveComponent", "LocalToWorld", "StructProperty",
+          &g_offPrimitiveLocalToWorld },
+        { "AnimTree", "SkelControlLists", "ArrayProperty",
+          &g_offAnimTreeSkelControlLists },
+        { "SkelControlBase", "NextControl", "ObjectProperty",
+          &g_offSkelNextControl },
+        { "SkelControlSingleBone", "BoneTranslation", "StructProperty",
+          &g_offSingleBoneTranslation },
+        { "SkelControlSingleBone", "BoneTranslationSpace", "ByteProperty",
+          &g_offSingleBoneTranslationSpace },
+    };
+    LookupDetachedPropsBatch(detached, (int)(sizeof(detached) / sizeof(detached[0])));
 
     // This one property object is absent from the retail live object table, while its right
     // neighbor survives at +0x0414. The cooked TdPawn declaration places the two object pointers
@@ -4122,58 +4319,6 @@ static void ResolveMotionRigOffsets()
             " (adjacent after owner-validated Right; live class validation required)",
             g_offLeftForeArmRoll);
     }
-
-    if (g_offLimbEffector < 0)
-        g_offLimbEffector = LookupDetachedProp(
-            "SkelControlLimb", "EffectorLocation", "StructProperty", true);
-    if (g_offLimbEffectorSpace < 0)
-        g_offLimbEffectorSpace = LookupDetachedProp(
-            "SkelControlLimb", "EffectorLocationSpace", "ByteProperty", true);
-    if (g_offLimbJointTarget < 0)
-        g_offLimbJointTarget = LookupDetachedProp(
-            "SkelControlLimb", "JointTargetLocation", "StructProperty", true);
-    if (g_offLimbJointTargetSpace < 0)
-        g_offLimbJointTargetSpace = LookupDetachedProp(
-            "SkelControlLimb", "JointTargetLocationSpace", "ByteProperty", true);
-    if (g_offSkelControlStrength < 0)
-        g_offSkelControlStrength = LookupDetachedProp(
-            "SkelControlBase", "ControlStrength", "FloatProperty", true);
-    if (g_offSkelStrengthTarget < 0)
-        g_offSkelStrengthTarget = LookupDetachedProp(
-            "SkelControlBase", "StrengthTarget", "FloatProperty", true);
-    if (g_offSkelBlendTimeToGo < 0)
-        g_offSkelBlendTimeToGo = LookupDetachedProp(
-            "SkelControlBase", "BlendTimeToGo", "FloatProperty", true);
-    if (g_offSingleBoneRotation < 0)
-        g_offSingleBoneRotation = LookupDetachedProp(
-            "SkelControlSingleBone", "BoneRotation", "StructProperty", true);
-    if (g_offSingleBoneRotationSpace < 0)
-        g_offSingleBoneRotationSpace = LookupDetachedProp(
-            "SkelControlSingleBone", "BoneRotationSpace", "ByteProperty", true);
-    if (g_offMeshAnimations < 0)
-        g_offMeshAnimations = LookupDetachedProp(
-            "SkeletalMeshComponent", "Animations", "ObjectProperty", true);
-    if (g_offMeshSkelControlIndex < 0)
-        g_offMeshSkelControlIndex = LookupDetachedProp(
-            "SkeletalMeshComponent", "SkelControlIndex", "ArrayProperty", true);
-    if (g_offMeshSpaceBases < 0)
-        g_offMeshSpaceBases = LookupDetachedProp(
-            "SkeletalMeshComponent", "SpaceBases", "ArrayProperty", true);
-    if (g_offPrimitiveLocalToWorld < 0)
-        g_offPrimitiveLocalToWorld = LookupDetachedProp(
-            "PrimitiveComponent", "LocalToWorld", "StructProperty", true);
-    if (g_offAnimTreeSkelControlLists < 0)
-        g_offAnimTreeSkelControlLists = LookupDetachedProp(
-            "AnimTree", "SkelControlLists", "ArrayProperty", true);
-    if (g_offSkelNextControl < 0)
-        g_offSkelNextControl = LookupDetachedProp(
-            "SkelControlBase", "NextControl", "ObjectProperty", true);
-    if (g_offSingleBoneTranslation < 0)
-        g_offSingleBoneTranslation = LookupDetachedProp(
-            "SkelControlSingleBone", "BoneTranslation", "StructProperty", true);
-    if (g_offSingleBoneTranslationSpace < 0)
-        g_offSingleBoneTranslationSpace = LookupDetachedProp(
-            "SkelControlSingleBone", "BoneTranslationSpace", "ByteProperty", true);
 
     // A cooked import can disappear from the live object table even while adjacent native fields
     // remain. EffectorLocationSpace did so in the first post-Update1pArms test, after resolving
@@ -4589,7 +4734,14 @@ static bool LooksLikeSwanInstance(uintptr_t obj)
 static long g_swanNextTry = 0;          // frame number before which we do not search again
 static const long kSwanBackoffFrames = 600;
 static bool g_swanMissLogged = false;
+static uint32_t g_swanCursor = 0;       // resume slot of the amortized walk, 0 = fresh pass
+static double g_swanWalkMs = 0.0;       // accumulated cost of the pass in progress
 
+// The one-shot walk was measured at 1084 ms over 88678 slots ON THE RENDER THREAD - a visible
+// one-second world freeze on every level transition, exactly the size of the worst single-frame
+// stalls in the run-12 pacing histograms. This caller runs every frame, so walk a small
+// time-budgeted slice per call and resume at the cursor: the instance is found within a few
+// seconds of wall time while no individual frame pays more than the budget.
 static uintptr_t FindSwanNeck()
 {
     if (LooksLikeSwanInstance(g_swanNeck)) return g_swanNeck;
@@ -4600,6 +4752,8 @@ static uintptr_t FindSwanNeck()
         g_swanAppliedMode = -1;
         g_swanSavedOk = false;
         g_swanNextTry = 0;
+        g_swanCursor = 0;
+        g_swanWalkMs = 0.0;
     }
     if (g_frames < g_swanNextTry) return 0;
 
@@ -4610,25 +4764,36 @@ static uintptr_t FindSwanNeck()
     }
 
     const double t0 = NowMs();
-    for (uint32_t i = 0; i < count; ++i) {
+    const double kBudgetMs = 3.0;
+    if (g_swanCursor >= count) g_swanCursor = 0;
+    uint32_t i = g_swanCursor;
+    for (; i < count; ++i) {
+        if ((i & 0x3F) == 0 && NowMs() - t0 > kBudgetMs) break;
         uint32_t obj;
         if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
         if (!LooksLikeSwanInstance(obj)) continue;
         g_swanNeck = obj;
         g_swanMissLogged = false;
-        Log("[swan] live instance at %p (search took %.1f ms over %u slots)",
-            (void*)obj, NowMs() - t0, count);
+        Log("[swan] live instance at %p (amortized walk: %.1f ms total, found at"
+            " slot %u of %u)", (void*)obj, g_swanWalkMs + NowMs() - t0, i, count);
+        g_swanCursor = 0;
+        g_swanWalkMs = 0.0;
         return obj;
     }
+    g_swanWalkMs += NowMs() - t0;
+    g_swanCursor = i;
+    if (i < count) return 0;               // pass continues next frame at the cursor
 
-    // Cost is reported the first time, because a search that finds nothing still costs the
-    // full walk and that number is the reason the backoff exists.
+    // One COMPLETE pass found nothing. Cost is reported the first time, because a pass that
+    // finds nothing still walks every slot and that number is the reason the backoff exists.
+    g_swanCursor = 0;
     g_swanNextTry = g_frames + kSwanBackoffFrames;
     if (!g_swanMissLogged) {
         g_swanMissLogged = true;
-        Log("[swan] no live TdSwanNeck yet - %.1f ms wasted over %u slots; backing off %ld frames",
-            NowMs() - t0, count, kSwanBackoffFrames);
+        Log("[swan] no live TdSwanNeck yet - %.1f ms spread over a %u-slot pass;"
+            " backing off %ld frames", g_swanWalkMs, count, kSwanBackoffFrames);
     }
+    g_swanWalkMs = 0.0;
     return 0;
 }
 
@@ -5742,7 +5907,7 @@ static void CheckHeadHotkeys()
     const bool d3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
     if (d3 && !p3) { g_overlay = !g_overlay; Log("[hud] F3 -> overlay %s", g_overlay ? "ON" : "OFF"); }
 
-    // Live calibration. Left/Right walks wrist R/L P/Y/R, forearm R/L rest roll, then limit.
+    // Live calibration. Left/Right walks wrist R/L P/Y/R, then forearm R/L roll offset.
     static bool pLeft = false, pRight = false, pUp = false, pDown = false;
     const bool dLeft  = (GetAsyncKeyState(VK_LEFT)  & 0x8000) != 0;
     const bool dRight = (GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0;
@@ -5750,10 +5915,10 @@ static void CheckHeadHotkeys()
     const bool dDown  = (GetAsyncKeyState(VK_DOWN)  & 0x8000) != 0;
     if (g_overlay && g_motionHands) {
         if (dLeft && !pLeft) {
-            g_handTuneSelected = (g_handTuneSelected + 8) % 9;
+            g_handTuneSelected = (g_handTuneSelected + 7) % 8;
         }
         if (dRight && !pRight) {
-            g_handTuneSelected = (g_handTuneSelected + 1) % 9;
+            g_handTuneSelected = (g_handTuneSelected + 1) % 8;
         }
         if ((dLeft && !pLeft) || (dRight && !pRight)) {
             if (g_handTuneSelected < 6) {
@@ -5761,45 +5926,34 @@ static void CheckHeadHotkeys()
                 Log("[hands-tune] selected WRIST %s %s",
                     g_handTuneSelected < 3 ? "RIGHT" : "LEFT",
                     axis == 0 ? "PITCH" : (axis == 1 ? "YAW" : "ROLL"));
-            } else if (g_handTuneSelected < 8) {
+            } else {
                 Log("[hands-tune] selected FOREARM %s ROLL",
                     g_handTuneSelected == 6 ? "RIGHT" : "LEFT");
-            } else {
-                Log("[hands-tune] selected FOREARM TWIST LIMIT (+/-%d deg)",
-                    g_forearmTwistLimitDeg);
             }
         }
         int delta = 0;
         if (dUp && !pUp) delta += 5;
         if (dDown && !pDown) delta -= 5;
         if (delta) {
-            const bool limit = g_handTuneSelected == 8;
-            const bool forearm = g_handTuneSelected >= 6 && !limit;
+            const bool forearm = g_handTuneSelected >= 6;
             const int hand = forearm ? (g_handTuneSelected == 6 ? 1 : 0)
                                       : (g_handTuneSelected < 3 ? 1 : 0);
             const int axis = forearm ? 2 : (g_handTuneSelected % 3);
-            if (limit) {
-                g_forearmTwistLimitDeg += delta;
-                if (g_forearmTwistLimitDeg < 20) g_forearmTwistLimitDeg = 20;
-                if (g_forearmTwistLimitDeg > 90) g_forearmTwistLimitDeg = 90;
-            } else {
-                int& value = forearm ? g_forearmRollCalibrationDeg[hand]
-                                      : g_wristCalibrationDeg[hand][axis];
-                value += delta;
-                if (value > 180) value -= 360;
-                if (value < -180) value += 360;
-            }
+            int& value = forearm ? g_forearmRollCalibrationDeg[hand]
+                                  : g_wristCalibrationDeg[hand][axis];
+            value += delta;
+            if (value > 180) value -= 360;
+            if (value < -180) value += 360;
             Log("*** [hands-tune] WRIST R %+d %+d %+d L %+d %+d %+d |"
-                " FOREARM ROLL R %+d L %+d LIMIT +/-%d"
+                " FOREARM ROLL R %+d L %+d"
                 " (selected %s %s %s, %+d deg)",
                 g_wristCalibrationDeg[1][0], g_wristCalibrationDeg[1][1],
                 g_wristCalibrationDeg[1][2], g_wristCalibrationDeg[0][0],
                 g_wristCalibrationDeg[0][1], g_wristCalibrationDeg[0][2],
                 g_forearmRollCalibrationDeg[1], g_forearmRollCalibrationDeg[0],
-                g_forearmTwistLimitDeg,
-                limit ? "FOREARM" : (forearm ? "FOREARM" : "WRIST"),
-                limit ? "BOTH" : (hand ? "RIGHT" : "LEFT"),
-                limit ? "LIMIT" : (axis == 0 ? "PITCH" : (axis == 1 ? "YAW" : "ROLL")),
+                forearm ? "FOREARM" : "WRIST",
+                hand ? "RIGHT" : "LEFT",
+                axis == 0 ? "PITCH" : (axis == 1 ? "YAW" : "ROLL"),
                 delta);
         }
     }
@@ -6249,6 +6403,35 @@ static bool DeriveMotionRigPointerOffsets(uintptr_t pawn)
         return true;
     }
 
+    // Some first-person construction frames leave one of the five nonessential middle objects
+    // null, so the nine-slot fingerprint above can miss even though the two world limbs are
+    // already live. The cook still exposes LeftForeArmRoll's exact storage offset. Its authored
+    // declaration is 32 bytes after LeftHandWorldIK; derive only that measured adjacency, then
+    // require two distinct live TdSkelControlLimb objects before accepting it. This is a retryable
+    // fallback, not a blind baked offset.
+    if (g_offLeftForeArmRoll >= 0x60) {
+        const int off = g_offLeftForeArmRoll - 32;
+        const bool rightRollAgrees = g_offRightForeArmRoll < 0 ||
+                                     g_offRightForeArmRoll == off + 28;
+        uint32_t leftWorld = 0, rightWorld = 0;
+        if (rightRollAgrees && off >= 0x40 && off + 36 <= g_offMesh1p &&
+            SafeU32(pawn + off, &leftWorld) &&
+            SafeU32(pawn + off + 4, &rightWorld) &&
+            leftWorld != rightWorld &&
+            LooksLikeRigObject(leftWorld, "TdSkelControlLimb") &&
+            LooksLikeRigObject(rightWorld, "TdSkelControlLimb")) {
+            g_offLeftHandWorldIK = off;
+            g_offRightHandWorldIK = off + 4;
+            g_offRightHandRotation = off + 16;
+            g_offLeftHandRotation = off + 20;
+            g_offRightForeArmRoll = off + 28;
+            g_offLeftForeArmRoll = off + 32;
+            Log("*** [hands-rig] recovered controller block at +0x%04X from reflected"
+                " LeftForeArmRoll + bilateral live world-IK validation", off);
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -6426,7 +6609,7 @@ enum P13BlockReason {
 static const char* P13ReasonName(P13BlockReason reason)
 {
     switch (reason) {
-        case P13_READY:         return "eligible: unarmed Walking/Jump/Falling + tracked grip";
+        case P13_READY:         return "eligible: unarmed Walking/Jump/Falling/Crouch/180Turn/Balance/LedgeWalk + tracked grip";
         case P13_LAYOUT:        return "rig/controller layout is not ready";
         case P13_RIG:           return "no validated live position rig";
         case P13_VIEW:          return "ViewTarget is not the player pawn";
@@ -6454,6 +6637,65 @@ static bool CurrentViewTargetIsPawn(uintptr_t pawn)
     uint32_t camera = 0, target = 0;
     return SafeU32(g_playerCtl + g_offCtlCamera, &camera) && camera >= 0x10000 &&
            SafeU32(camera + g_offCamViewTarget, &target) && target == (uint32_t)pawn;
+}
+
+static volatile LONG g_viewTargetRetryRunning = 0;
+static volatile LONG g_motionInitRetryRunning = 0;
+
+static DWORD WINAPI ViewTargetRetryThread(LPVOID)
+{
+    Log("[view] TdPlayerCamera::ViewTarget was unavailable during startup; retrying in background");
+    const int recovered = LookupProp("TdPlayerCamera", "ViewTarget", true);
+    if (recovered >= 0) {
+        g_offCamViewTarget = recovered;
+        Log("*** [view] recovered ViewTarget offset +0x%04X; hand eligibility unblocked",
+            recovered);
+    }
+    InterlockedExchange(&g_viewTargetRetryRunning, 0);
+    return 0;
+}
+
+static void RetryViewTargetOffset()
+{
+    if (g_offCamViewTarget >= 0 || g_offCtlCamera < 0 ||
+        InterlockedCompareExchange(&g_objModelThreadFinished, 0, 0) != 1) return;
+    static long nextTry = 0;
+    if (g_frames < nextTry) return;
+    nextTry = g_frames + 600;
+    if (InterlockedCompareExchange(&g_viewTargetRetryRunning, 1, 0) != 0) return;
+    HANDLE thread = CreateThread(nullptr, 0, ViewTargetRetryThread, nullptr, 0, nullptr);
+    if (thread) {
+        CloseHandle(thread);
+    } else {
+        InterlockedExchange(&g_viewTargetRetryRunning, 0);
+        Log("[view] could not start ViewTarget retry thread (error %lu)", GetLastError());
+    }
+}
+
+static DWORD WINAPI MotionInitRetryThread(LPVOID)
+{
+    Log("[hands-rig] startup metadata was incomplete; retrying arm layout in background");
+    ResolveMotionRigOffsets();
+    InstallUpdate1pArmsHook();
+    InterlockedExchange(&g_motionInitRetryRunning, 0);
+    return 0;
+}
+
+static void RetryMotionArmInitialization()
+{
+    if (g_update1pArmsTarget ||
+        InterlockedCompareExchange(&g_objModelThreadFinished, 0, 0) != 1) return;
+    static long nextTry = 0;
+    if (g_frames < nextTry) return;
+    nextTry = g_frames + 600;
+    if (InterlockedCompareExchange(&g_motionInitRetryRunning, 1, 0) != 0) return;
+    HANDLE thread = CreateThread(nullptr, 0, MotionInitRetryThread, nullptr, 0, nullptr);
+    if (thread) {
+        CloseHandle(thread);
+    } else {
+        InterlockedExchange(&g_motionInitRetryRunning, 0);
+        Log("[hands-rig] could not start arm-layout retry thread (error %lu)", GetLastError());
+    }
 }
 
 static bool SetP13Strength(uintptr_t controller, float strength)
@@ -6518,6 +6760,8 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13HandPoseSnapshot& 
     if (!strengthLayoutHonest) return P13_LAYOUT;
     if (outController) *outController = leftHand ? leftController : rightController;
 
+    if (!g_playerCtl || g_offCtlCamera < 0 || g_offCamViewTarget < 0)
+        return P13_LAYOUT;
     if (!CurrentViewTargetIsPawn(pawn)) return P13_VIEW;
     if (g_offWeapon < 0 || g_offWeaponAnimState < 0) return P13_WEAPON_LAYOUT;
 
@@ -6529,8 +6773,15 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13HandPoseSnapshot& 
     if (weapon != 0 || weaponAnim != 0) return P13_ARMED;
 
     uint8_t movement = 0xFF;
+    // State 24 is EMovement's 180Turn (the quick-turn move players make when stopping a run).
+    // Run 8 measured it holding about a second and forcing a release+reacquire double snap of
+    // both arms; the camera sweep carries the hand targets through the turn naturally, so VR
+    // keeps the arms rather than snapping to animation and back. 29 Balance (narrow beams) and
+    // 30 LedgeWalk are slow deliberate locomotion where the player asked to keep the hands -
+    // both confirmed as the blocking states in run 18.
     if (g_offMoveState < 0 || !SafeRead(pawn + g_offMoveState, &movement, 1) ||
-        !(movement == 1 || movement == 2 || movement == 11)) {
+        !(movement == 1 || movement == 2 || movement == 11 || movement == 15 ||
+          movement == 24 || movement == 29 || movement == 30)) {
         if (outMovement) *outMovement = movement;
         return P13_MOVEMENT;
     }
@@ -6553,11 +6804,20 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13HandPoseSnapshot& 
     return P13_READY;
 }
 
+// The arm chain's effective root this tick: authored shoulder socket plus the detachment offset
+// being applied. Published by ApplyDetachedShoulders for the effector singularity clamp, which
+// runs one tick later (socket sway per tick is ~1-2 UU, well inside the clamp's margin).
+static bool g_armChainRootValid[2] = { false, false };
+static MEVR_Vec3 g_armChainRoot[2]{};
+
 struct P13LimbControlSave {
     bool active = false;
     uintptr_t pawn = 0, controller = 0;
     MEVR_Vec3 effector{};
     uint8_t effectorSpace = 0;
+    bool jointValid = false;
+    MEVR_Vec3 jointTarget{};
+    uint8_t jointTargetSpace = 0;
     float strength = 0.0f, strengthTarget = 0.0f, blendTimeToGo = 0.0f;
 };
 
@@ -6595,6 +6855,14 @@ static bool CaptureP13LimbControl(uintptr_t pawn, uintptr_t controller,
         !std::isfinite(save.strengthTarget) || save.strengthTarget < 0.0f ||
         save.strengthTarget > 1.0f || !std::isfinite(save.blendTimeToGo) ||
         save.blendTimeToGo < 0.0f || save.blendTimeToGo > 60.0f) return false;
+    // The joint target is optional: its authored value is a constant (0,0,0) space 3, but it
+    // must round-trip exactly like every other field the arm-update overwrites.
+    if (g_offLimbJointTarget >= 0 && g_offLimbJointTargetSpace >= 0 &&
+        SafeRead(controller + g_offLimbJointTarget,
+                 &save.jointTarget, sizeof(save.jointTarget)) &&
+        SafeRead(controller + g_offLimbJointTargetSpace, &save.jointTargetSpace, 1) &&
+        FiniteVec(save.jointTarget) && save.jointTargetSpace <= 5)
+        save.jointValid = true;
     *out = save;
     return true;
 }
@@ -6619,6 +6887,11 @@ static bool RestoreOneP13PositionOverride(uintptr_t pawn, P13HandState& state,
                       &save.effector, sizeof(save.effector)) &&
         WriteRigBytes(save.controller + g_offLimbEffectorSpace,
                       &save.effectorSpace, 1) &&
+        (!save.jointValid ||
+         (WriteRigBytes(save.controller + g_offLimbJointTarget,
+                        &save.jointTarget, sizeof(save.jointTarget)) &&
+          WriteRigBytes(save.controller + g_offLimbJointTargetSpace,
+                        &save.jointTargetSpace, 1))) &&
         WriteRigBytes(save.controller + g_offSkelControlStrength,
                       &save.strength, sizeof(save.strength)) &&
         WriteRigBytes(save.controller + g_offSkelStrengthTarget,
@@ -6720,11 +6993,38 @@ static void ApplyOneMotionHandPosition(uintptr_t pawn, const P13HandPoseSnapshot
     }
     state.override = before;
 
+    // Beyond the chain's 50.38 UU the two-bone solve sits at its straight-arm singularity: the
+    // bend plane is undefined and FK dither flips it per update. Run 17 measured exactly that -
+    // 16-17 degree forearm steps with hand, target, and head all still while socket-to-target
+    // read 53-57 UU (and every jump-window flip ever logged sat in the same 44-57 band).
+    // TdSkelControlLimb also provably ignores JointTargetLocation (a written world pole changed
+    // nothing), so the one lever is the effector itself: keep it strictly inside the reachable
+    // sphere and let the detached shoulder cover the remainder - the job it exists for.
+    MEVR_Vec3 effector = pose.worldPosition;
+    const int rootIndex = leftHand ? 0 : 1;
+    if (g_armChainRootValid[rootIndex]) {
+        const MEVR_Vec3& root = g_armChainRoot[rootIndex];
+        const MEVR_Vec3 delta{ effector.x - root.x, effector.y - root.y, effector.z - root.z };
+        const float distance = VecLength(delta);
+        const float maxSolvable = 47.0f;
+        if (std::isfinite(distance) && distance > maxSolvable) {
+            const float scale = maxSolvable / distance;
+            effector = { root.x + delta.x * scale, root.y + delta.y * scale,
+                         root.z + delta.z * scale };
+            static long clampReported = -1000;
+            if (g_motionHandsDebug && distance > 52.0f && g_frames - clampReported >= 900) {
+                clampReported = g_frames;
+                Log("[hands-p1.3] %s effector clamped %.1f -> %.1f UU from the chain root:"
+                    " straight-arm singularity guard", hand, distance, maxSolvable);
+            }
+        }
+    }
+
     const uint8_t worldSpace = 0;
     const float strength = 1.0f;
     const bool wrote =
         WriteRigBytes(controller + g_offLimbEffector,
-                      &pose.worldPosition, sizeof(pose.worldPosition)) &&
+                      &effector, sizeof(effector)) &&
         WriteRigBytes(controller + g_offLimbEffectorSpace, &worldSpace, sizeof(worldSpace)) &&
         SetP13Strength(controller, strength);
 
@@ -6738,9 +7038,9 @@ static void ApplyOneMotionHandPosition(uintptr_t pawn, const P13HandPoseSnapshot
         SafeRead(controller + g_offSkelStrengthTarget,
                  &readStrengthTarget, sizeof(readStrengthTarget)) &&
         SafeRead(controller + g_offSkelBlendTimeToGo, &readBlend, sizeof(readBlend));
-    const MEVR_Vec3 error{ readTarget.x - pose.worldPosition.x,
-                           readTarget.y - pose.worldPosition.y,
-                           readTarget.z - pose.worldPosition.z };
+    const MEVR_Vec3 error{ readTarget.x - effector.x,
+                           readTarget.y - effector.y,
+                           readTarget.z - effector.z };
     const bool honest = readBack && readSpace == 0 &&
                         fabsf(readStrength - 1.0f) < 0.001f &&
                         fabsf(readStrengthTarget - 1.0f) < 0.001f &&
@@ -6844,10 +7144,25 @@ struct DetachedHandSolver {
     bool reachEngaged = false;
     bool reportedDetached = false;
     long writes = 0;
+    float diagnosticDistance = 0.0f;
+    float diagnosticExcess = 0.0f;
+};
+
+struct ArmGeometryDiagnostic {
+    bool valid = false;
+    bool forearmAxisValid = false;
+    bool bendNormalValid = false;
+    float shoulderToTarget = 0.0f;
+    float meshHandToTarget = 0.0f;
+    float upperLength = 0.0f;
+    float lowerLength = 0.0f;
+    MEVR_Vec3 forearmAxis{};
+    MEVR_Vec3 bendNormal{};
 };
 
 static DetachedOverrideState g_detachedOverride{};
 static DetachedHandSolver g_leftDetach{}, g_rightDetach{};
+static ArmGeometryDiagnostic g_armGeometryDiag[2]{};
 static bool g_detachedWriteFault = false;
 static const char* g_detachedDiscoveryFailure = nullptr;
 static uintptr_t g_detachedReportedMesh = 0;
@@ -7096,8 +7411,7 @@ static bool DiscoverDetachedRig(uintptr_t pawn, DetachedRigFrame* out)
     return true;
 }
 
-static bool ShoulderWorldPosition(const DetachedRigFrame& rig, int boneIndex,
-                                  const MEVR_Vec3& previousOffset, MEVR_Vec3* out)
+static bool BoneWorldPosition(const DetachedRigFrame& rig, int boneIndex, MEVR_Vec3* out)
 {
     if (!out || boneIndex < 0 || boneIndex >= rig.spaceBaseCount) return false;
     UE3Matrix44 bone{};
@@ -7112,41 +7426,57 @@ static bool ShoulderWorldPosition(const DetachedRigFrame& rig, int boneIndex,
         x*rig.localToWorld.m[0][2] + y*rig.localToWorld.m[1][2] +
             z*rig.localToWorld.m[2][2] + rig.localToWorld.m[3][2]
     };
-    // SpaceBases still describes the preceding evaluated frame. Remove the translation we
-    // supplied for that frame to recover the authored shoulder socket before solving again.
-    world.x -= previousOffset.x;
-    world.y -= previousOffset.y;
-    world.z -= previousOffset.z;
     if (!FiniteVec(world)) return false;
     *out = world;
     return true;
 }
 
+static bool ShoulderWorldPosition(const DetachedRigFrame& rig, int boneIndex,
+                                  const MEVR_Vec3& previousOffset, MEVR_Vec3* out)
+{
+    if (!BoneWorldPosition(rig, boneIndex, out)) return false;
+    // SpaceBases still describes the preceding evaluated frame. Remove the translation we
+    // supplied for that frame to recover the authored shoulder socket before solving again.
+    out->x -= previousOffset.x;
+    out->y -= previousOffset.y;
+    out->z -= previousOffset.z;
+    return FiniteVec(*out);
+}
+
+static bool MotionTurnInputActive();
+
 static MEVR_Vec3 SolveDetachedOffset(DetachedHandSolver& solver,
                                     const MEVR_Vec3& socket,
-                                    const MEVR_Vec3& target, bool eligible)
+                                    const MEVR_Vec3& target, bool eligible,
+                                    bool holdEngagement)
 {
     if (!eligible) {
         solver.filtered = {};
         solver.lastApplied = {};
         solver.lastMs = 0.0;
         solver.reachEngaged = false;
+        solver.diagnosticDistance = 0.0f;
+        solver.diagnosticExcess = 0.0f;
         return {};
     }
 
     const MEVR_Vec3 delta{ target.x - socket.x, target.y - socket.y, target.z - socket.z };
     const float distance = VecLength(delta);
+    solver.diagnosticDistance = distance;
     // SkelControlLimb rotates Hand + ForeArm around Arm: 25.81 + 24.57 = 50.38 UU. The old
     // shoulder-to-hand value incorrectly included the 13.43-UU Shoulder->Arm link, producing the
     // exact dead zone reported in headset testing. Keep 1.58 UU in reserve so shoulder motion
     // begins just before the two-bone solver locks perfectly straight.
     const float usableReach = 48.8f;
-    if (!solver.reachEngaged && std::isfinite(distance) && distance > usableReach)
+    // Legitimate distances top out near usableReach plus the 60-UU excess cap. Far beyond that
+    // is not a reachable pose but a reference glitch; never engage or integrate toward one.
+    const bool plausible = std::isfinite(distance) && distance < 150.0f;
+    if (!holdEngagement && !solver.reachEngaged && plausible && distance > usableReach)
         solver.reachEngaged = true;
-    float excess = solver.reachEngaged && std::isfinite(distance)
-        ? distance - usableReach : 0.0f;
+    float excess = solver.reachEngaged && plausible ? distance - usableReach : 0.0f;
     if (excess < 0.0f) excess = 0.0f;
     if (excess > 60.0f) excess = 60.0f;
+    solver.diagnosticExcess = excess;
     MEVR_Vec3 desired{};
     if (distance > 0.01f && excess > 0.0f) {
         const float scale = excess / distance;
@@ -7165,7 +7495,7 @@ static MEVR_Vec3 SolveDetachedOffset(DetachedHandSolver& solver,
     if (VecLength(solver.filtered) < 0.05f) solver.filtered = {};
     // Do not chatter between two skeletal topologies at full extension. Once engaged, require the
     // controller to come a real 2 UU back inside the boundary before arming a future detach.
-    if (solver.reachEngaged && distance < usableReach - 2.0f &&
+    if (!holdEngagement && solver.reachEngaged && distance < usableReach - 2.0f &&
         VecLength(solver.filtered) < 0.05f)
         solver.reachEngaged = false;
     return solver.filtered;
@@ -7231,17 +7561,77 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
         rig, 17, g_leftDetach.lastApplied, &leftSocket);
     const bool haveRightSocket = ShoulderWorldPosition(
         rig, 46, g_rightDetach.lastApplied, &rightSocket);
+    auto updateGeometry = [&](int hand, int armBone, const MEVR_Vec3& socket,
+                              const MEVR_Vec3& target, bool haveSocket) {
+        ArmGeometryDiagnostic diag{};
+        MEVR_Vec3 arm{}, elbow{}, meshHand{};
+        if (haveSocket && BoneWorldPosition(rig, armBone, &arm) &&
+            BoneWorldPosition(rig, armBone + 1, &elbow) &&
+            BoneWorldPosition(rig, armBone + 2, &meshHand)) {
+            diag.valid = true;
+            diag.shoulderToTarget = VecLength({ target.x - socket.x,
+                                                target.y - socket.y,
+                                                target.z - socket.z });
+            diag.meshHandToTarget = VecLength({ target.x - meshHand.x,
+                                                target.y - meshHand.y,
+                                                target.z - meshHand.z });
+            diag.upperLength = VecLength({ elbow.x - arm.x, elbow.y - arm.y,
+                                           elbow.z - arm.z });
+            diag.lowerLength = VecLength({ meshHand.x - elbow.x,
+                                           meshHand.y - elbow.y,
+                                           meshHand.z - elbow.z });
+            if (diag.lowerLength > 1.0f && std::isfinite(diag.lowerLength)) {
+                const float inverseLength = 1.0f / diag.lowerLength;
+                diag.forearmAxis = { (meshHand.x - elbow.x) * inverseLength,
+                                     (meshHand.y - elbow.y) * inverseLength,
+                                     (meshHand.z - elbow.z) * inverseLength };
+                diag.forearmAxisValid = FiniteVec(diag.forearmAxis);
+                if (diag.upperLength > 1.0f && std::isfinite(diag.upperLength)) {
+                    const MEVR_Vec3 upper{
+                        (elbow.x - arm.x) / diag.upperLength,
+                        (elbow.y - arm.y) / diag.upperLength,
+                        (elbow.z - arm.z) / diag.upperLength
+                    };
+                    MEVR_Vec3 normal{
+                        upper.y*diag.forearmAxis.z - upper.z*diag.forearmAxis.y,
+                        upper.z*diag.forearmAxis.x - upper.x*diag.forearmAxis.z,
+                        upper.x*diag.forearmAxis.y - upper.y*diag.forearmAxis.x
+                    };
+                    const float normalLength = VecLength(normal);
+                    // At a straight elbow the bend plane is undefined. Hold the preceding
+                    // anatomical twist rather than letting numerical noise choose a plane.
+                    if (normalLength > 0.10f && std::isfinite(normalLength)) {
+                        normal.x /= normalLength; normal.y /= normalLength;
+                        normal.z /= normalLength;
+                        diag.bendNormal = normal;
+                        diag.bendNormalValid = FiniteVec(normal);
+                    }
+                }
+            }
+        }
+        g_armGeometryDiag[hand] = diag;
+    };
+    updateGeometry(0, 17, leftSocket, pose.left.worldPosition, haveLeftSocket);
+    updateGeometry(1, 46, rightSocket, pose.right.worldPosition, haveRightSocket);
+    const bool holdShoulderEngagement = MotionTurnInputActive();
     const MEVR_Vec3 leftOffset = SolveDetachedOffset(
         g_leftDetach, leftSocket, pose.left.worldPosition,
-        leftEligible && haveLeftSocket);
+        leftEligible && haveLeftSocket, holdShoulderEngagement);
     const MEVR_Vec3 rightOffset = SolveDetachedOffset(
         g_rightDetach, rightSocket, pose.right.worldPosition,
-        rightEligible && haveRightSocket);
-    // Keep the same skeletal topology for the whole hysteresis interval. Keying this decision
-    // off the filtered offset made it cross the 0.05-UU cutoff repeatedly near full extension,
-    // even though SolveDetachedOffset deliberately kept reachEngaged latched for another 2 UU.
-    const bool useLeft = leftEligible && g_leftDetach.reachEngaged;
-    const bool useRight = rightEligible && g_rightDetach.reachEngaged;
+        rightEligible && haveRightSocket, holdShoulderEngagement);
+    g_armChainRootValid[0] = leftEligible && haveLeftSocket;
+    g_armChainRootValid[1] = rightEligible && haveRightSocket;
+    g_armChainRoot[0] = { leftSocket.x + leftOffset.x, leftSocket.y + leftOffset.y,
+                          leftSocket.z + leftOffset.z };
+    g_armChainRoot[1] = { rightSocket.x + rightOffset.x, rightSocket.y + rightOffset.y,
+                          rightSocket.z + rightOffset.z };
+    // Keep one render topology for the entire interval in which VR owns each arm. The reach
+    // solver now changes only shoulder translation. Switching between authored and detached
+    // routing at the extension threshold produced the visible spasms even when the new offset
+    // was effectively zero; eligibility/animation handoff is the only legitimate topology edge.
+    const bool useLeft = leftEligible;
+    const bool useRight = rightEligible;
 
     if (!useLeft && g_leftDetach.reportedDetached) {
         Log("*** [hands-detach] LEFT reattached at authored shoulder socket");
@@ -7433,18 +7823,9 @@ static bool DiscoverWristSide(const DetachedRigFrame& rig, bool left,
     return true;
 }
 
-static XrQuaternionf MultiplyQuaternion(const XrQuaternionf& a, const XrQuaternionf& b)
-{
-    return {
-        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
-        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
-        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
-        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
-    };
-}
-
 static bool GripQuaternionToUERotator(const XrQuaternionf& raw, bool leftHand,
-                                     const int calibrationDeg[2][3], int32_t out[3])
+                                     const int calibrationDeg[2][3], int32_t out[3],
+                                     XrQuaternionf* outOrientation = nullptr)
 {
     if (!out || !std::isfinite(raw.x) || !std::isfinite(raw.y) ||
         !std::isfinite(raw.z) || !std::isfinite(raw.w)) return false;
@@ -7474,6 +7855,7 @@ static bool GripQuaternionToUERotator(const XrQuaternionf& raw, bool leftHand,
     if (!std::isfinite(norm2) || norm2 < 0.98f || norm2 > 1.02f) return false;
     const float inv = 1.0f / sqrtf(norm2);
     const XrQuaternionf n{ q.x*inv, q.y*inv, q.z*inv, q.w*inv };
+    if (outOrientation) *outOrientation = n;
     const MEVR_Vec3 forward = RotateByQuaternion(n, { 1.0f, 0.0f, 0.0f });
     const MEVR_Vec3 right   = RotateByQuaternion(n, { 0.0f, 1.0f, 0.0f });
     const MEVR_Vec3 up      = RotateByQuaternion(n, { 0.0f, 0.0f, 1.0f });
@@ -7689,120 +8071,141 @@ struct DedicatedRotationRig {
     uintptr_t pawn = 0, mesh = 0;
     int flagsOffset = -1;
     uint32_t rotationOnlyFlags = 0;
+    // Carried from the validated base rig so diagnostics can read composed bone frames.
+    uint32_t spaceBaseData = 0;
+    int spaceBaseCount = 0;
+    UE3Matrix44 localToWorld{};
     DedicatedRotationRuntimeSide left{}, right{};
 };
+
+// Why the most recent DiscoverDedicatedRotationRig returned false. A transient failure swaps
+// the whole rotation topology to the borrowed-wrist fallback for that frame, which is a visible
+// arm snap - the transition log must therefore say exactly which invariant broke.
+static const char* g_dedicatedRotationFailure = "never attempted";
+
+// Rows 0..2 of a SpaceBases matrix are the bone's local axes in component space - the same
+// row-vector convention BoneWorldPosition uses for its translation row. Compose with
+// LocalToWorld and normalize away component scale to recover the bone's world basis.
+static bool BoneWorldBasis(uint32_t spaceBaseData, int spaceBaseCount,
+                           const UE3Matrix44& localToWorld, int boneIndex,
+                           MEVR_Vec3 axes[3])
+{
+    if (!axes || boneIndex < 0 || boneIndex >= spaceBaseCount || !spaceBaseData) return false;
+    UE3Matrix44 bone{};
+    if (!SafeRead(spaceBaseData + (uint32_t)boneIndex * sizeof(UE3Matrix44),
+                  &bone, sizeof(bone))) return false;
+    for (int r = 0; r < 3; ++r) {
+        const float x = bone.m[r][0], y = bone.m[r][1], z = bone.m[r][2];
+        const MEVR_Vec3 world{
+            x*localToWorld.m[0][0] + y*localToWorld.m[1][0] + z*localToWorld.m[2][0],
+            x*localToWorld.m[0][1] + y*localToWorld.m[1][1] + z*localToWorld.m[2][1],
+            x*localToWorld.m[0][2] + y*localToWorld.m[1][2] + z*localToWorld.m[2][2]
+        };
+        const float length = VecLength(world);
+        if (!std::isfinite(length) || length < 1.0e-6f) return false;
+        axes[r] = { world.x / length, world.y / length, world.z / length };
+    }
+    return FiniteVec(axes[0]) && FiniteVec(axes[1]) && FiniteVec(axes[2]);
+}
+
+// Same axis conventions as GripQuaternionToUERotator: X forward, Y right, Z up.
+static void UERotatorDegFromBasis(const MEVR_Vec3 axes[3], float out[3])
+{
+    const float horizontal = sqrtf(axes[0].x*axes[0].x + axes[0].y*axes[0].y);
+    out[0] = atan2f(axes[0].z, horizontal) * 57.2957795f;
+    out[1] = atan2f(axes[0].y, axes[0].x) * 57.2957795f;
+    out[2] = atan2f(-axes[1].z, axes[2].z) * 57.2957795f;
+}
+
+// The exact rotator extraction GripQuaternionToUERotator performs, reusable for any world
+// orientation that must be delivered through a SkelControlSingleBone rotator.
+static void UERotatorFromQuaternion(const XrQuaternionf& q, int32_t out[3])
+{
+    const MEVR_Vec3 forward = RotateByQuaternion(q, { 1.0f, 0.0f, 0.0f });
+    const MEVR_Vec3 right   = RotateByQuaternion(q, { 0.0f, 1.0f, 0.0f });
+    const MEVR_Vec3 up      = RotateByQuaternion(q, { 0.0f, 0.0f, 1.0f });
+    const float horizontal = sqrtf(forward.x*forward.x + forward.y*forward.y);
+    const float unrealUnits = 32768.0f / 3.14159265358979323846f;
+    out[0] = (int32_t)lroundf(atan2f(forward.z, horizontal) * unrealUnits);
+    out[1] = (int32_t)lroundf(atan2f(forward.y, forward.x) * unrealUnits);
+    out[2] = (int32_t)lroundf(atan2f(-right.z, up.z) * unrealUnits);
+}
+
+static float QuatAngleDeg(const XrQuaternionf& a, const XrQuaternionf& b)
+{
+    float dot = fabsf(a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w);
+    if (dot > 1.0f) dot = 1.0f;
+    return 2.0f * acosf(dot) * 57.2957795f;
+}
+
+// Twist of target relative to reference about the reference's local +X, in radians.
+static float RelativeTwistAboutXRad(const XrQuaternionf& reference,
+                                    const XrQuaternionf& target)
+{
+    const XrQuaternionf inverse{ -reference.x, -reference.y, -reference.z, reference.w };
+    XrQuaternionf rel = MultiplyQuaternion(inverse, target);
+    if (rel.w < 0.0f) { rel.x = -rel.x; rel.y = -rel.y; rel.z = -rel.z; rel.w = -rel.w; }
+    return 2.0f * atan2f(rel.x, rel.w);
+}
+
+// Decompose target-relative-to-reference into the twist about the reference's local X and the
+// total separation angle. The twist is the exact number an ideal roll helper would carry.
+static void RelativeTwistDeg(const XrQuaternionf& reference, const XrQuaternionf& target,
+                             float* twistDeg, float* totalDeg)
+{
+    if (twistDeg) *twistDeg = RelativeTwistAboutXRad(reference, target) * 57.2957795f;
+    if (totalDeg) *totalDeg = QuatAngleDeg(reference, target);
+}
 
 static DedicatedRotationOverrideState g_dedicatedRotationOverride{};
 static bool g_dedicatedRotationWriteFault = false;
 static uintptr_t g_dedicatedRotationReportedMesh = 0;
 static long g_dedicatedLeftWrites = 0, g_dedicatedRightWrites = 0;
-struct ForearmTwistLimiter {
-    bool calibrated = false;
-    bool active = false;
-    bool reportedClamped = false;
-    bool reportedTrackingLoss = false;
-    bool alternateEulerBranch = false;
-    int32_t centerWrapped = 0;
-    int32_t lastWrapped = 0;
-    int32_t lastLimitedDelta = 0;
+struct ForearmDiagnostic {
+    bool valid = false;
+    bool haveOrientation = false;
+    bool outputJump = false;
+    int32_t wrist[3]{};
+    int32_t forearmRotator[3]{};
+    // The game's own freshly computed ForeArmRoll control value, captured after its update and
+    // before our overwrite. Its space and values document the helper's authored convention.
+    bool gameForearmValid = false;
+    uint8_t gameForearmSpace = 0xFF;
+    int32_t gameForearm[3]{};
+    XrQuaternionf handOrientation{};
+    bool haveForearmBone = false;
+    XrQuaternionf forearmBoneOrientation{};
+    XrQuaternionf lastOrientation{};
+    // What was written on the PRECEDING update, for comparison against SpaceBases: the composed
+    // skeleton available during this update is that older frame's result.
+    bool havePreviousOrientation = false;
+    XrQuaternionf previousOrientation{};
 };
-static ForearmTwistLimiter g_forearmTwistLimiter[2]{};
+static ForearmDiagnostic g_forearmDiagnostic[2]{};
+// Continuity reference for the forearm twist. The measured twist is circular, and run 19
+// caught the written roll target flipping 170 degrees while the hand moved 2: the shortest
+// representation changes sign at the +/-180 antipode, which the soft cap then amplifies into a
+// +95 -> -95 flip. Unwrapping against the previous update keeps it continuous; anatomy keeps
+// it bounded; eligibility gaps reset it alongside the jump diagnostic.
+static bool g_forearmTwistUnwrapValid[2] = { false, false };
+static float g_forearmTwistUnwrap[2] = { 0.0f, 0.0f };
 
-static int32_t ShortestRotatorDelta(int32_t value, int32_t from)
+static bool MotionTurnInputActive()
 {
-    int64_t delta = (int64_t)value - from;
-    while (delta > 32768) delta -= 65536;
-    while (delta < -32768) delta += 65536;
-    return (int32_t)delta;
-}
-
-static int32_t ClampForearmDelta(int32_t delta)
-{
-    const int32_t limit = (int32_t)lroundf(
-        g_forearmTwistLimitDeg * (32768.0f / 180.0f));
-    if (delta > limit) return limit;
-    if (delta < -limit) return -limit;
-    return delta;
-}
-
-static void SuspendForearmTwistLimiter(int hand, bool trackingLost)
-{
-    if (hand < 0 || hand > 1) return;
-    ForearmTwistLimiter& state = g_forearmTwistLimiter[hand];
-    state.active = false;
-    if (trackingLost && state.calibrated && !state.reportedTrackingLoss) {
-        Log("[hands-forearm] %s twist suspended: controller orientation is not tracked",
-            hand == 0 ? "LEFT" : "RIGHT");
-        state.reportedTrackingLoss = true;
+    if (!g_padEnabled || !g_padLockReady) return false;
+    EnterCriticalSection(&g_padLock);
+    const SHORT lookX = g_pad.Gamepad.sThumbRX;
+    LeaveCriticalSection(&g_padLock);
+    const double now = NowMs();
+    static double settleUntilMs = 0.0;
+    if (abs((int)lookX) > 4096) { // outside the game's normal stick dead zone
+        // SpaceBases describes the preceding game evaluation while the controller target is the
+        // newest published render pose. Let those reference spaces settle after artificial yaw
+        // before shoulder reach engagement resumes.
+        settleUntilMs = now + 150.0;
+        return true;
     }
-}
-
-// The forearm must follow the exact roll that was just written to the wrist. The first limiter
-// accumulated quaternion increments around a guessed controller axis; the runtime evidence was
-// unambiguous—it crossed the clamp repeatedly while the visible wrist did not make that motion.
-// Measure the shortest wrapped delta directly from the wrist's healthy starting roll instead.
-// At an extreme pitch, the same physical orientation can switch to the equivalent Euler form
-// whose yaw and roll are both 180 degrees away. Track that discrete branch bit separately: it
-// preserves direct wrist following without accumulating ordinary per-frame Euler noise.
-static int32_t LimitForearmTwist(int32_t wrappedWristRoll, bool leftHand)
-{
-    const int hand = leftHand ? 0 : 1;
-    ForearmTwistLimiter& state = g_forearmTwistLimiter[hand];
-    if (!state.calibrated) {
-        state.calibrated = true;
-        state.centerWrapped = wrappedWristRoll;
-        state.lastWrapped = wrappedWristRoll;
-    }
-    if (!state.active) {
-        state.active = true;
-        // A game-owned animation can hide the exact frame on which the Euler representation
-        // changes. Choose whichever equivalent branch resumes nearest the last visible forearm.
-        const int32_t ordinary = ClampForearmDelta(ShortestRotatorDelta(
-            wrappedWristRoll + (state.alternateEulerBranch ? 32768 : 0),
-            state.centerWrapped));
-        const int32_t alternate = ClampForearmDelta(ShortestRotatorDelta(
-            wrappedWristRoll + (state.alternateEulerBranch ? 0 : 32768),
-            state.centerWrapped));
-        if (abs(alternate - state.lastLimitedDelta) <
-            abs(ordinary - state.lastLimitedDelta))
-            state.alternateEulerBranch = !state.alternateEulerBranch;
-        state.lastWrapped = wrappedWristRoll;
-        if (state.reportedTrackingLoss) {
-            Log("[hands-forearm] %s controller orientation tracked again; twist resumed",
-                leftHand ? "LEFT" : "RIGHT");
-            state.reportedTrackingLoss = false;
-        }
-    } else {
-        const int32_t frameDelta =
-            ShortestRotatorDelta(wrappedWristRoll, state.lastWrapped);
-        // No human wrist moves 120 degrees between adjacent 72+ Hz arm updates. A jump this
-        // large is the Euler decomposition selecting its other equivalent branch.
-        const int32_t branchThreshold = (int32_t)lroundf(120.0f * (32768.0f / 180.0f));
-        if (abs(frameDelta) >= branchThreshold) {
-            state.alternateEulerBranch = !state.alternateEulerBranch;
-            Log("*** [hands-forearm] %s corrected a %+.1f deg wrist Euler branch flip",
-                leftHand ? "LEFT" : "RIGHT",
-                frameDelta * (180.0f / 32768.0f));
-        }
-        state.lastWrapped = wrappedWristRoll;
-    }
-
-    const int32_t effectiveRoll = wrappedWristRoll +
-                                  (state.alternateEulerBranch ? 32768 : 0);
-    const int32_t delta = ShortestRotatorDelta(effectiveRoll, state.centerWrapped);
-    const int32_t limited = ClampForearmDelta(delta);
-    const bool clamped = limited != delta;
-    if (clamped && !state.reportedClamped) {
-        Log("*** [hands-forearm] %s entered anatomical +/-%d deg clamp;"
-            " wrist remains full range",
-            leftHand ? "LEFT" : "RIGHT", g_forearmTwistLimitDeg);
-    } else if (!clamped && state.reportedClamped) {
-        Log("*** [hands-forearm] %s left anatomical clamp; forearm motion resumed",
-            leftHand ? "LEFT" : "RIGHT");
-    }
-    state.reportedClamped = clamped;
-    state.lastLimitedDelta = limited;
-    return state.centerWrapped + limited;
+    return now < settleUntilMs;
 }
 
 static bool DiscoverDedicatedRotationSide(const DetachedRigFrame& rig,
@@ -7825,8 +8228,12 @@ static bool DiscoverDedicatedRotationSide(const DetachedRigFrame& rig,
         !LooksLikeRigObject(source.controlHead, "SkelControlSingleBone") ||
         !LooksLikeRigObject(roll.controlHead, "SkelControlSingleBone") ||
         !LooksLikeLiveUObject(hand.controlHead) ||
-        source.controlHead == roll.controlHead || source.controlHead == hand.controlHead)
+        source.controlHead == roll.controlHead || source.controlHead == hand.controlHead) {
+        g_dedicatedRotationFailure = leftHand
+            ? "left source/roll/hand control-list slots or classes"
+            : "right source/roll/hand control-list slots or classes";
         return false;
+    }
 
     uint8_t sourceMap = 0xFF, rollMap = 0xFF;
     uint32_t donorNext = ~0u, forearmNext = ~0u;
@@ -7835,18 +8242,33 @@ static bool DiscoverDedicatedRotationSide(const DetachedRigFrame& rig,
     if (!ReadMappedControl(indices, sourceBoneIndex, &sourceMap) ||
         !ReadMappedControl(indices, rollBoneIndex, &rollMap) ||
         sourceMap != (uint8_t)(sourceSlot + rig.mapBias) ||
-        rollMap != (uint8_t)(rollSlot + rig.mapBias) ||
-        !SafeU32(source.controlHead + g_offSkelNextControl, &donorNext) ||
+        rollMap != (uint8_t)(rollSlot + rig.mapBias)) {
+        g_dedicatedRotationFailure = leftHand
+            ? "left source/roll SkelControlIndex map bytes"
+            : "right source/roll SkelControlIndex map bytes";
+        return false;
+    }
+    if (!SafeU32(source.controlHead + g_offSkelNextControl, &donorNext) ||
         !SafeU32(roll.controlHead + g_offSkelNextControl, &forearmNext) ||
         forearmNext != 0 ||
         !SafeU32(source.controlHead + flagsOffset, &donorFlags) ||
         !SafeU32(roll.controlHead + flagsOffset, &forearmFlags) ||
-        !FindHandControlTail(hand.controlHead, source.controlHead, &handTail)) return false;
+        !FindHandControlTail(hand.controlHead, source.controlHead, &handTail)) {
+        g_dedicatedRotationFailure = leftHand
+            ? "left donor/forearm links, flags, or hand chain tail"
+            : "right donor/forearm links, flags, or hand chain tail";
+        return false;
+    }
 
     // HipsControl is a one-node list. SwingControl can still point at RootControl when the left
     // shoulder is attached, or be cut to zero by this frame's validated detachment override.
     if ((leftHand && donorNext != 0) ||
-        (!leftHand && donorNext != 0 && donorNext != rig.leftControl)) return false;
+        (!leftHand && donorNext != 0 && donorNext != rig.leftControl)) {
+        g_dedicatedRotationFailure = leftHand
+            ? "left donor NextControl topology"
+            : "right donor NextControl topology";
+        return false;
+    }
 
     DedicatedRotationRuntimeSide side{};
     side.donor = source.controlHead;
@@ -7865,17 +8287,27 @@ static bool DiscoverDedicatedRotationSide(const DetachedRigFrame& rig,
 static bool DiscoverDedicatedRotationRig(uintptr_t pawn, DedicatedRotationRig* out)
 {
     if (!out || g_dedicatedRotationWriteFault ||
-        g_offSingleBoneTranslation < 4 || !LooksLikePlayerPawn(pawn)) return false;
+        g_offSingleBoneTranslation < 4 || !LooksLikePlayerPawn(pawn)) {
+        g_dedicatedRotationFailure = "write fault latched, layout missing, or pawn invalid";
+        return false;
+    }
     DetachedRigFrame base{};
-    if (!DiscoverDetachedRig(pawn, &base)) return false;
+    if (!DiscoverDetachedRig(pawn, &base)) {
+        g_dedicatedRotationFailure = "base detached rig (mesh/tree/lists/SpaceBases)";
+        return false;
+    }
     const UE3Array32 lists{ base.listData, base.listCount, base.listCount };
     const UE3Array32 indices{ base.indexData, base.indexCount, base.indexCount };
     const int flagsOffset = g_offSingleBoneTranslation - 4;
     DedicatedRotationRuntimeSide left{}, right{};
     if (!DiscoverDedicatedRotationSide(base, lists, indices, true, flagsOffset, &left) ||
-        !DiscoverDedicatedRotationSide(base, lists, indices, false, flagsOffset, &right) ||
-        left.forearmFlags == 0 || left.forearmFlags != right.forearmFlags ||
-        left.donor == right.donor || left.forearm == right.forearm) return false;
+        !DiscoverDedicatedRotationSide(base, lists, indices, false, flagsOffset, &right))
+        return false;   // the side discovery already recorded the exact failed invariant
+    if (left.forearmFlags == 0 || left.forearmFlags != right.forearmFlags ||
+        left.donor == right.donor || left.forearm == right.forearm) {
+        g_dedicatedRotationFailure = "bilateral forearm flag agreement or object identity";
+        return false;
+    }
 
     // Both authored ForeArmRoll controls independently agreeing on this word is the runtime
     // validation for the otherwise stripped packed-bool metadata. Copy the complete known-good
@@ -7884,6 +8316,9 @@ static bool DiscoverDedicatedRotationRig(uintptr_t pawn, DedicatedRotationRig* o
     rig.pawn = pawn; rig.mesh = base.mesh;
     rig.flagsOffset = flagsOffset;
     rig.rotationOnlyFlags = left.forearmFlags;
+    rig.spaceBaseData = base.spaceBaseData;
+    rig.spaceBaseCount = base.spaceBaseCount;
+    rig.localToWorld = base.localToWorld;
     rig.left = left; rig.right = right;
     *out = rig;
     return true;
@@ -7920,29 +8355,6 @@ static bool WriteDedicatedHandControl(uintptr_t control, int flagsOffset,
            readFlags == rotationOnlyFlags;
 }
 
-static bool WriteDedicatedForearmControl(uintptr_t control, const int32_t handRotation[3],
-                                         bool leftHand)
-{
-    const int hand = leftHand ? 0 : 1;
-    const int32_t rest = (int32_t)lroundf(
-        g_forearmRollCalibrationDeg[hand] * (32768.0f / 180.0f));
-    const int32_t safeTwist = LimitForearmTwist(handRotation[2], leftHand);
-    const int32_t rotation[3] = { 0, 0, safeTwist + rest };
-    const uint8_t boneSpace = 4;
-    const float one = 1.0f, zero = 0.0f;
-    if (!WriteRigBytes(control + g_offSingleBoneRotation, rotation, sizeof(rotation)) ||
-        !WriteRigBytes(control + g_offSingleBoneRotationSpace, &boneSpace, 1) ||
-        !WriteRigBytes(control + g_offSkelStrengthTarget, &one, sizeof(one)) ||
-        !WriteRigBytes(control + g_offSkelBlendTimeToGo, &zero, sizeof(zero)) ||
-        !WriteRigBytes(control + g_offSkelControlStrength, &one, sizeof(one))) return false;
-    int32_t readRotation[3]{};
-    uint8_t readSpace = 0xFF;
-    return SafeRead(control + g_offSingleBoneRotation, readRotation, sizeof(readRotation)) &&
-           SafeRead(control + g_offSingleBoneRotationSpace, &readSpace, 1) &&
-           readRotation[0] == rotation[0] && readRotation[1] == rotation[1] &&
-           readRotation[2] == rotation[2] && readSpace == boneSpace;
-}
-
 static bool ApplyOneDedicatedRotationSide(const DedicatedRotationRig& rig,
                                           const DedicatedRotationRuntimeSide& runtime,
                                           const P13HandPoseSnapshot& pose, bool leftHand,
@@ -7950,11 +8362,111 @@ static bool ApplyOneDedicatedRotationSide(const DedicatedRotationRig& rig,
 {
     if (!out) return false;
     int32_t rotation[3]{};
+    XrQuaternionf handOrientation{};
     if (!GripQuaternionToUERotator(pose.worldOrientation, leftHand,
-                                   g_wristCalibrationDeg, rotation)) return false;
+                                   g_wristCalibrationDeg, rotation,
+                                   &handOrientation)) return false;
+
+    // MEASURED rig convention (run 7's [hands-bones]): the composed ForeArmRoll helper always
+    // carries the FOREARM's swing, the game's own control contributes a pure roll (space-4
+    // {0,0,+25} left / {0,-4,+95} right), and at the authored neutral pose the helper's twist
+    // essentially equals the hand's twist relative to the forearm (-26 vs -26 L, -19 vs -14 R).
+    // Writing the hand's full world orientation here instead put the helper up to 168 degrees
+    // from its parent and corkscrewed the visible forearm away from the hand. Build the target
+    // the way the rig expects: the forearm bone's swing composed with the hand's twist about
+    // the forearm axis, plus the tunable rest trim. SpaceBases is one update stale, which lags
+    // only the swing component by one update; the twist follows the live controller. The
+    // world-space write path is kept because run 7 proved it lands exactly as commanded.
+    const int hand = leftHand ? 0 : 1;
+    const int armBone = leftHand ? 17 : 46;
+    bool haveForearmTarget = false;
+    bool haveForearmBone = false;
+    XrQuaternionf forearmBoneQ{};
+    int32_t forearmRotation[3]{};
+    XrQuaternionf forearmOrientation{};
+    MEVR_Vec3 forearmAxes[3];
+    if (BoneWorldBasis(rig.spaceBaseData, rig.spaceBaseCount, rig.localToWorld,
+                       armBone + 1, forearmAxes)) {
+        const XrQuaternionf forearmQ =
+            QuaternionFromUEBasis(forearmAxes[0], forearmAxes[1], forearmAxes[2]);
+        forearmBoneQ = forearmQ;
+        haveForearmBone = true;
+        float twist = RelativeTwistAboutXRad(forearmQ, handOrientation) +
+                      g_forearmRollCalibrationDeg[hand] *
+                          (3.14159265358979323846f / 180.0f);
+        // Take the branch nearest the previous update's twist (see g_forearmTwistUnwrap).
+        if (g_forearmTwistUnwrapValid[hand]) {
+            float unwrapDelta = twist - g_forearmTwistUnwrap[hand];
+            while (unwrapDelta > 3.14159265358979323846f)
+                unwrapDelta -= 6.28318530717958647692f;
+            while (unwrapDelta < -3.14159265358979323846f)
+                unwrapDelta += 6.28318530717958647692f;
+            twist = g_forearmTwistUnwrap[hand] + unwrapDelta;
+        }
+        g_forearmTwistUnwrap[hand] = twist;
+        g_forearmTwistUnwrapValid[hand] = true;
+        // Candy-wrapper guard, sized from measurement: run 8 reached -139 degrees of
+        // hand-in-forearm twist and the skin spanning helper-to-elbow visibly collapsed
+        // ("towel getting wrung"). Carry twist 1:1 below the knee so everyday poses stay
+        // exact, then compress smoothly toward an asymptote the skinning tolerates; the short
+        // wrist band absorbs the remainder. Unlike the retired hard +/-55 limiter, there is
+        // no stop and no reference state: motion never freezes, it only loses gain.
+        const float knee = 55.0f * (3.14159265358979323846f / 180.0f);
+        const float ceiling = 95.0f * (3.14159265358979323846f / 180.0f);
+        const float magnitude = fabsf(twist);
+        if (magnitude > knee) {
+            const float span = ceiling - knee;
+            const float compressed = knee + span * tanhf((magnitude - knee) / span);
+            twist = twist < 0.0f ? -compressed : compressed;
+        }
+        const XrQuaternionf twistQ{ sinf(twist * 0.5f), 0.0f, 0.0f, cosf(twist * 0.5f) };
+        XrQuaternionf target = MultiplyQuaternion(forearmQ, twistQ);
+        if (NormalizedQuaternion(target, &target)) {
+            forearmOrientation = target;
+            UERotatorFromQuaternion(target, forearmRotation);
+            haveForearmTarget = true;
+        }
+    }
+
+    ForearmDiagnostic& diag = g_forearmDiagnostic[hand];
+    diag.valid = true;
+    diag.haveForearmBone = haveForearmBone;
+    diag.forearmBoneOrientation = forearmBoneQ;
+    diag.wrist[0] = rotation[0];
+    diag.wrist[1] = rotation[1];
+    diag.wrist[2] = rotation[2];
+    diag.handOrientation = handOrientation;
+    if (haveForearmTarget) {
+        diag.forearmRotator[0] = forearmRotation[0];
+        diag.forearmRotator[1] = forearmRotation[1];
+        diag.forearmRotator[2] = forearmRotation[2];
+        if (diag.haveOrientation) {
+            // Measured between quaternions, not rotator components: the full-rotator write is
+            // immune to Euler branch flips, so only a real orientation step may count as a jump.
+            float dot = fabsf(forearmOrientation.x*diag.lastOrientation.x +
+                              forearmOrientation.y*diag.lastOrientation.y +
+                              forearmOrientation.z*diag.lastOrientation.z +
+                              forearmOrientation.w*diag.lastOrientation.w);
+            if (dot > 1.0f) dot = 1.0f;
+            diag.outputJump = diag.outputJump ||
+                2.0f * acosf(dot) > 15.0f * (3.14159265358979323846f / 180.0f);
+        }
+        diag.previousOrientation = diag.lastOrientation;
+        diag.havePreviousOrientation = diag.haveOrientation;
+        diag.lastOrientation = forearmOrientation;
+        diag.haveOrientation = true;
+    }
+
     DedicatedRotationSideFrame save{};
     save.active = CaptureDetachedControl(runtime.donor, &save.donorSaved) &&
                   CaptureDetachedControl(runtime.forearm, &save.forearmSaved);
+    diag.gameForearmValid = save.active;
+    if (save.active) {
+        diag.gameForearm[0] = save.forearmSaved.rotation[0];
+        diag.gameForearm[1] = save.forearmSaved.rotation[1];
+        diag.gameForearm[2] = save.forearmSaved.rotation[2];
+        diag.gameForearmSpace = save.forearmSaved.rotationSpace;
+    }
     save.donor = runtime.donor; save.forearm = runtime.forearm;
     save.handTail = runtime.handTail;
     save.sourceMapAddress = runtime.sourceMapAddress;
@@ -7972,7 +8484,11 @@ static bool ApplyOneDedicatedRotationSide(const DedicatedRotationRig& rig,
         WriteRigBytes(runtime.handTail + g_offSkelNextControl, &appended, sizeof(appended)) &&
         WriteDedicatedHandControl(runtime.donor, rig.flagsOffset,
                                   rig.rotationOnlyFlags, rotation) &&
-        WriteDedicatedForearmControl(runtime.forearm, rotation, leftHand);
+        // WriteWristControl is byte-for-byte the P1.4c write that already drove these exact
+        // ForeArmRoll SkelControlSingleBone objects in world space with their authored flags,
+        // so the helper's authored flags and translation stay put. On a tick where the forearm
+        // basis is unreadable the game's own captured value simply remains in effect.
+        (!haveForearmTarget || WriteWristControl(runtime.forearm, forearmRotation));
     uint8_t readMap = 0xFF;
     uint32_t readDonorNext = ~0u, readTailNext = 0;
     if (!wrote || !SafeRead(runtime.sourceMapAddress, &readMap, 1) ||
@@ -8024,13 +8540,130 @@ static void RestoreDedicatedHandForearmOverridesBeforeGame(uintptr_t pawn)
     }
 }
 
+// One measured snapshot of what the skeleton actually composed, against what was commanded.
+// SpaceBases is the PRECEDING update's composition, so the roll bone is compared with
+// previousOrientation - the value written on that update - making "roll composed vs prior
+// write" a direct test that world-space replacement semantics hold on this control. The
+// hand/roll twists relative to the forearm are the numbers that decide the correct roll-helper
+// construction; the game ctrl value shows the authored convention for the same tick.
+static void ReportForearmBoneFrames(const DedicatedRotationRig& rig)
+{
+    const float toDeg = 180.0f / 32768.0f;
+    for (int hand = 0; hand < 2; ++hand) {
+        const ForearmDiagnostic& diag = g_forearmDiagnostic[hand];
+        if (!diag.valid) continue;
+        const int armBone = hand == 0 ? 17 : 46;
+        const int rollBone = hand == 0 ? 41 : 71;
+        MEVR_Vec3 forearmAxes[3], handAxes[3], rollAxes[3];
+        if (!BoneWorldBasis(rig.spaceBaseData, rig.spaceBaseCount, rig.localToWorld,
+                            armBone + 1, forearmAxes) ||
+            !BoneWorldBasis(rig.spaceBaseData, rig.spaceBaseCount, rig.localToWorld,
+                            armBone + 2, handAxes) ||
+            !BoneWorldBasis(rig.spaceBaseData, rig.spaceBaseCount, rig.localToWorld,
+                            rollBone, rollAxes)) {
+            Log("[hands-bones] %s bone bases unreadable", hand == 0 ? "LEFT" : "RIGHT");
+            continue;
+        }
+        float forearmRot[3], handRot[3], rollRot[3];
+        UERotatorDegFromBasis(forearmAxes, forearmRot);
+        UERotatorDegFromBasis(handAxes, handRot);
+        UERotatorDegFromBasis(rollAxes, rollRot);
+        const XrQuaternionf forearmQ =
+            QuaternionFromUEBasis(forearmAxes[0], forearmAxes[1], forearmAxes[2]);
+        const XrQuaternionf handQ =
+            QuaternionFromUEBasis(handAxes[0], handAxes[1], handAxes[2]);
+        const XrQuaternionf rollQ =
+            QuaternionFromUEBasis(rollAxes[0], rollAxes[1], rollAxes[2]);
+        float handTwist = 0.0f, handTotal = 0.0f, rollTwist = 0.0f, rollTotal = 0.0f;
+        RelativeTwistDeg(forearmQ, handQ, &handTwist, &handTotal);
+        RelativeTwistDeg(forearmQ, rollQ, &rollTwist, &rollTotal);
+        Log("[hands-bones] %s composed P/Y/R deg: forearm(%+.1f,%+.1f,%+.1f)"
+            " hand(%+.1f,%+.1f,%+.1f) roll(%+.1f,%+.1f,%+.1f) |"
+            " written hand(%+.1f,%+.1f,%+.1f) roll(%+.1f,%+.1f,%+.1f)",
+            hand == 0 ? "LEFT" : "RIGHT",
+            forearmRot[0], forearmRot[1], forearmRot[2],
+            handRot[0], handRot[1], handRot[2],
+            rollRot[0], rollRot[1], rollRot[2],
+            diag.wrist[0] * toDeg, diag.wrist[1] * toDeg, diag.wrist[2] * toDeg,
+            diag.forearmRotator[0] * toDeg, diag.forearmRotator[1] * toDeg,
+            diag.forearmRotator[2] * toDeg);
+        Log("[hands-bones] %s relative deg: hand-in-forearm twist %+.1f of %.1f,"
+            " roll-in-forearm twist %+.1f of %.1f |"
+            " roll composed vs prior write %.1f | game ctrl (%+.1f,%+.1f,%+.1f) space %u",
+            hand == 0 ? "LEFT" : "RIGHT",
+            handTwist, handTotal, rollTwist, rollTotal,
+            diag.havePreviousOrientation
+                ? QuatAngleDeg(rollQ, diag.previousOrientation) : -1.0f,
+            diag.gameForearmValid ? diag.gameForearm[0] * toDeg : -999.0f,
+            diag.gameForearmValid ? diag.gameForearm[1] * toDeg : -999.0f,
+            diag.gameForearmValid ? diag.gameForearm[2] * toDeg : -999.0f,
+            diag.gameForearmValid ? (unsigned)diag.gameForearmSpace : 255u);
+        uint32_t limbController = 0;
+        const int limbOffset = hand == 0 ? g_offLeftHandWorldIK : g_offRightHandWorldIK;
+        MEVR_Vec3 jointTarget{};
+        uint8_t jointSpace = 0xFF;
+        if (limbOffset >= 0 && g_offLimbJointTarget >= 0 && g_offLimbJointTargetSpace >= 0 &&
+            SafeU32(rig.pawn + limbOffset, &limbController) && limbController >= 0x10000 &&
+            SafeRead(limbController + g_offLimbJointTarget, &jointTarget,
+                     sizeof(jointTarget)) &&
+            SafeRead(limbController + g_offLimbJointTargetSpace, &jointSpace, 1)) {
+            Log("[hands-bones] %s joint target (%+.1f,%+.1f,%+.1f) space %u",
+                hand == 0 ? "LEFT" : "RIGHT",
+                jointTarget.x, jointTarget.y, jointTarget.z, (unsigned)jointSpace);
+        }
+    }
+}
+
+static void ReportForearmDiagnostics(const DedicatedRotationRig& rig,
+                                     const uint8_t movement[2], const float reach[2],
+                                     const bool eligible[2])
+{
+    if (!g_motionHandsDebug) return;
+    static long samples = 0, lastClose = -1000, lastJump = -1000;
+    ++samples;
+    const bool close = (eligible[0] && reach[0] > 0.0f && reach[0] < 25.0f) ||
+                       (eligible[1] && reach[1] > 0.0f && reach[1] < 25.0f) ||
+                       (g_armGeometryDiag[0].valid &&
+                        g_armGeometryDiag[0].meshHandToTarget > 12.0f) ||
+                       (g_armGeometryDiag[1].valid &&
+                        g_armGeometryDiag[1].meshHandToTarget > 12.0f);
+    const bool jumped = g_forearmDiagnostic[0].outputJump ||
+                        g_forearmDiagnostic[1].outputJump;
+    const bool report = (samples % 120) == 0 ||
+                        (close && samples - lastClose >= 15) ||
+                        (jumped && samples - lastJump >= 10);
+    if (close && report) lastClose = samples;
+    if (jumped && report) lastJump = samples;
+    if (report) {
+        const float toDeg = 180.0f / 32768.0f;
+        for (int hand = 0; hand < 2; ++hand) {
+            const ForearmDiagnostic& diag = g_forearmDiagnostic[hand];
+            const ArmGeometryDiagnostic& geometry = g_armGeometryDiag[hand];
+            const DetachedHandSolver& detach = hand == 0 ? g_leftDetach : g_rightDetach;
+            Log("[hands-diag] %s mv=%u elig=%d reach=%.1f shoulder=%.1f meshErr=%.1f"
+                " upper/lower=%.1f/%.1f det=%d excess=%.1f |"
+                " wrist P%+.1f Y%+.1f R%+.1f forearm R%+.1f geomAxis=%d jump=%d",
+                hand == 0 ? "LEFT" : "RIGHT", (unsigned)movement[hand],
+                eligible[hand] ? 1 : 0, reach[hand],
+                geometry.valid ? geometry.shoulderToTarget : -1.0f,
+                geometry.valid ? geometry.meshHandToTarget : -1.0f,
+                geometry.valid ? geometry.upperLength : -1.0f,
+                geometry.valid ? geometry.lowerLength : -1.0f,
+                detach.reachEngaged ? 1 : 0, detach.diagnosticExcess,
+                diag.wrist[0] * toDeg, diag.wrist[1] * toDeg,
+                diag.wrist[2] * toDeg, diag.forearmRotator[2] * toDeg,
+                geometry.forearmAxisValid ? 1 : 0,
+                diag.outputJump ? 1 : 0);
+        }
+        ReportForearmBoneFrames(rig);
+    }
+    g_forearmDiagnostic[0].outputJump = false;
+    g_forearmDiagnostic[1].outputJump = false;
+}
+
 static bool ApplyDedicatedHandForearmRotations(uintptr_t pawn, const P13PoseSnapshot& pose)
 {
-    if (!g_motionHands || g_dedicatedRotationWriteFault) {
-        g_forearmTwistLimiter[0] = {};
-        g_forearmTwistLimiter[1] = {};
-        return false;
-    }
+    if (!g_motionHands || g_dedicatedRotationWriteFault) return false;
     DedicatedRotationRig rig{};
     if (!DiscoverDedicatedRotationRig(pawn, &rig)) {
         static bool reported = false;
@@ -8039,8 +8672,6 @@ static bool ApplyDedicatedHandForearmRotations(uintptr_t pawn, const P13PoseSnap
                 " using stable borrowed-wrist fallback");
             reported = true;
         }
-        g_forearmTwistLimiter[0] = {};
-        g_forearmTwistLimiter[1] = {};
         return false;
     }
     if (g_dedicatedRotationReportedMesh != rig.mesh) {
@@ -8055,39 +8686,50 @@ static bool ApplyDedicatedHandForearmRotations(uintptr_t pawn, const P13PoseSnap
         XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
         XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
     uintptr_t ignored = 0;
+    uint8_t leftMovement = 0xFF, rightMovement = 0xFF;
+    float leftReach = 0.0f, rightReach = 0.0f;
     const P13BlockReason leftReason =
         P13Eligibility(pawn, pose.left, pose.presentFrame, true,
-                       &ignored, nullptr, nullptr);
+                       &ignored, &leftMovement, &leftReach);
     const P13BlockReason rightReason =
         P13Eligibility(pawn, pose.right, pose.presentFrame, false,
-                       &ignored, nullptr, nullptr);
+                       &ignored, &rightMovement, &rightReach);
     const bool leftOrientationTracked =
         (pose.left.flags & orientationNeed) == orientationNeed;
     const bool rightOrientationTracked =
         (pose.right.flags & orientationNeed) == orientationNeed;
     const bool leftEligible = leftReason == P13_READY && leftOrientationTracked;
     const bool rightEligible = rightReason == P13_READY && rightOrientationTracked;
-    if (!leftEligible)
-        SuspendForearmTwistLimiter(0, leftReason == P13_TRACKING ||
-                                     !leftOrientationTracked);
-    if (!rightEligible)
-        SuspendForearmTwistLimiter(1, rightReason == P13_TRACKING ||
-                                     !rightOrientationTracked);
+    // The world-space helper write carries almost no per-frame state; only the jump
+    // diagnostic's continuity sample and the twist unwrap reference must forget poses from
+    // before an ownership gap.
+    if (!leftEligible) {
+        g_forearmDiagnostic[0].haveOrientation = false;
+        g_forearmTwistUnwrapValid[0] = false;
+    }
+    if (!rightEligible) {
+        g_forearmDiagnostic[1].haveOrientation = false;
+        g_forearmTwistUnwrapValid[1] = false;
+    }
     if (!leftEligible && !rightEligible) return true;
 
     DedicatedRotationOverrideState frame{};
     frame.active = true; frame.pawn = pawn; frame.flagsOffset = rig.flagsOffset;
     bool wrote = true;
     if (leftEligible)
-        wrote = ApplyOneDedicatedRotationSide(rig, rig.left, pose.left, true, &frame.left);
+        wrote = ApplyOneDedicatedRotationSide(rig, rig.left, pose.left, true,
+                                              &frame.left);
     if (rightEligible && wrote)
-        wrote = ApplyOneDedicatedRotationSide(rig, rig.right, pose.right, false, &frame.right);
+        wrote = ApplyOneDedicatedRotationSide(rig, rig.right, pose.right, false,
+                                              &frame.right);
+    const uint8_t movement[2] = { leftMovement, rightMovement };
+    const float reach[2] = { leftReach, rightReach };
+    const bool eligible[2] = { leftEligible, rightEligible };
+    ReportForearmDiagnostics(rig, movement, reach, eligible);
     g_dedicatedRotationOverride = frame;
     if (!wrote) {
         RestoreDedicatedHandForearmOverridesBeforeGame(pawn);
         g_dedicatedRotationWriteFault = true;
-        g_forearmTwistLimiter[0] = {};
-        g_forearmTwistLimiter[1] = {};
         Log("[hands-forearm] dedicated WRITE/READ-BACK FAILED; using borrowed-wrist fallback");
         return false;
     }
@@ -8104,8 +8746,231 @@ static bool ApplyDedicatedHandForearmRotations(uintptr_t pawn, const P13PoseSnap
 
 static void ApplyWristRotations(uintptr_t pawn, const P13PoseSnapshot& pose)
 {
-    if (!ApplyDedicatedHandForearmRotations(pawn, pose))
-        ApplyBorrowedWristRotations(pawn, pose);
+    // Which rotation topology ran this arm update. Before this log existed, a transient
+    // discovery failure silently swapped dedicated -> borrowed for exactly one frame; that
+    // swap re-routes the Hand chains and unmaps the roll bones, so even one frame of it is a
+    // visible arm snap that no other line records.
+    static int reportedPath = -1;
+    const int path = ApplyDedicatedHandForearmRotations(pawn, pose) ? 1 : 0;
+    if (path == 0) ApplyBorrowedWristRotations(pawn, pose);
+    if (path != reportedPath) {
+        if (path == 1)
+            Log("*** [hands-path] rotation topology -> dedicated Hips/Swing donors"
+                " + world-space ForeArmRoll");
+        else
+            Log("*** [hands-path] rotation topology -> borrowed-wrist fallback"
+                " (roll bones unmapped); dedicated failed at: %s",
+                g_dedicatedRotationFailure);
+        reportedPath = path;
+    }
+}
+
+// Per-update discontinuity watchdog for the "arm spasms while the controller is tracked"
+// report. The 2-second [hands-diag] cadence cannot catch a one-update flap of ownership,
+// rotation writes, target, written hand orientation, shoulder offset, or the camera anchor.
+// Log the exact update on which any of them steps, with every candidate's value, so the
+// guilty quantity is identified by measurement instead of hypothesis.
+static void MonitorArmContinuity(uintptr_t pawn, const P13PoseSnapshot& pose)
+{
+    if (!g_motionHandsDebug) return;
+    struct HandContinuity {
+        bool haveTarget = false;
+        MEVR_Vec3 targetFromPawn{};
+        bool owned = false;
+        bool rotationActive = false;
+        bool haveHand = false;
+        XrQuaternionf hand{};
+        bool haveRaw = false;
+        XrQuaternionf raw{};
+        bool haveForearm = false;
+        XrQuaternionf forearm{};
+        bool haveRoll = false;
+        XrQuaternionf roll{};
+        bool haveJoint = false;
+        MEVR_Vec3 joint{};
+        MEVR_Vec3 shoulderOffset{};
+    };
+    static HandContinuity last[2]{};
+    static bool haveHeadBasis = false;
+    static MEVR_Vec3 lastHeadForward{}, lastHeadRight{};
+    static long updates = 0, lastLogged = -1000;
+    ++updates;
+
+    // Track forward AND right axes: run 7 proved a forward-only check is blind to a pure
+    // camera roll step, which rotates every hand orientation while the targets barely move.
+    float headStepDeg = -1.0f, headRollStepDeg = -1.0f;
+    RenderedHeadFrame head{};
+    if (GetRenderedHeadFrame(&head)) {
+        if (haveHeadBasis) {
+            auto axisStep = [](const MEVR_Vec3& a, const MEVR_Vec3& b) {
+                float dot = a.x*b.x + a.y*b.y + a.z*b.z;
+                if (dot > 1.0f) dot = 1.0f;
+                if (dot < -1.0f) dot = -1.0f;
+                return acosf(dot) * 57.2957795f;
+            };
+            headStepDeg = axisStep(head.forward, lastHeadForward);
+            headRollStepDeg = axisStep(head.right, lastHeadRight);
+        }
+        lastHeadForward = head.forward;
+        lastHeadRight = head.right;
+        haveHeadBasis = true;
+    }
+    // The PHYSICAL head's per-update step, for the rotation-ghosting report: with stick look
+    // the game camera and the camera-anchored hands rotate together, but with physical rotation
+    // the world follows the HMD smoothly while the anchor advances by injected yaw writes. If
+    // the anchor step above is lumpy while this HMD step is smooth, the hands snap against a
+    // smooth world - which is exactly what run 18 captured once (anchor 14.4 deg in one update).
+    static bool haveHmd = false;
+    static XrQuaternionf lastHmd{};
+    float hmdStepDeg = -1.0f;
+    if (g_viewsValid) {
+        const XrQuaternionf hmd = g_views[0].pose.orientation;
+        if (haveHmd) hmdStepDeg = QuatAngleDeg(hmd, lastHmd);
+        lastHmd = hmd;
+        haveHmd = true;
+    } else {
+        haveHmd = false;
+    }
+    const bool stickLook = MotionTurnInputActive();
+
+    MEVR_Vec3 pawnLocation{};
+    const bool havePawn = g_offActorLocation >= 0 &&
+        SafeRead(pawn + g_offActorLocation, &pawnLocation, sizeof(pawnLocation)) &&
+        FiniteVec(pawnLocation);
+
+    char trips[128] = "";
+    auto trip = [&](const char* tag) {
+        strcat_s(trips, sizeof(trips), " ");
+        strcat_s(trips, sizeof(trips), tag);
+    };
+    HandContinuity now[2]{};
+    bool ownedWas[2]{}, rotationWas[2]{};
+    float targetStep[2] = { -1.0f, -1.0f };
+    float handStep[2] = { -1.0f, -1.0f };
+    float rawStep[2] = { -1.0f, -1.0f };
+    float forearmStep[2] = { -1.0f, -1.0f };
+    float rollStep[2] = { -1.0f, -1.0f };
+    float jointStep[2] = { -1.0f, -1.0f };
+    float shoulderStep[2] = { -1.0f, -1.0f };
+    for (int hand = 0; hand < 2; ++hand) {
+        const P13HandPoseSnapshot& handPose = hand == 0 ? pose.left : pose.right;
+        const P13HandState& state = hand == 0 ? g_p13LeftState : g_p13RightState;
+        const DetachedHandSolver& detach = hand == 0 ? g_leftDetach : g_rightDetach;
+        const ForearmDiagnostic& diag = g_forearmDiagnostic[hand];
+        HandContinuity& cur = now[hand];
+        cur.owned = state.owned;
+        cur.rotationActive = hand == 0 ? g_dedicatedRotationOverride.left.active
+                                       : g_dedicatedRotationOverride.right.active;
+        cur.shoulderOffset = detach.filtered;
+        if (havePawn && handPose.worldValid) {
+            cur.haveTarget = true;
+            cur.targetFromPawn = { handPose.worldPosition.x - pawnLocation.x,
+                                   handPose.worldPosition.y - pawnLocation.y,
+                                   handPose.worldPosition.z - pawnLocation.z };
+        }
+        // The raw view-space grip orientation, straight from the runtime. When the written hand
+        // steps but this does too, the step arrived in tracking; when this is quiet and the
+        // written hand steps, our conversion made it. Run 18's close-to-face snapping needs
+        // exactly that discrimination.
+        if (handPose.active) {
+            XrQuaternionf raw{};
+            if (NormalizedQuaternion(handPose.viewOrientation, &raw)) {
+                cur.haveRaw = true;
+                cur.raw = raw;
+            }
+        }
+        if (cur.rotationActive) {
+            cur.haveHand = true;
+            cur.hand = diag.handOrientation;
+            // The IK-driven forearm bone and the written roll target: run 8's right-arm spasm
+            // showed nothing in target/hand/shoulder/head, so these are the remaining movers.
+            if (diag.haveForearmBone) {
+                cur.haveForearm = true;
+                cur.forearm = diag.forearmBoneOrientation;
+            }
+            if (diag.haveOrientation) {
+                cur.haveRoll = true;
+                cur.roll = diag.lastOrientation;
+            }
+        }
+        // The joint target steers SkelControlLimb's bend plane; it is the one solve input this
+        // mod never writes. Run 10 showed the forearm bone flip-flopping 12-22 deg per update
+        // against a still hand while jumping - if the game re-aims this vector per tick from
+        // its own jump animation, the step will show here in lockstep with the farm step.
+        uint32_t limbController = 0;
+        const int limbOffset = hand == 0 ? g_offLeftHandWorldIK : g_offRightHandWorldIK;
+        if (limbOffset >= 0 && g_offLimbJointTarget >= 0 &&
+            SafeU32(pawn + limbOffset, &limbController) && limbController >= 0x10000 &&
+            SafeRead(limbController + g_offLimbJointTarget, &cur.joint, sizeof(cur.joint)) &&
+            FiniteVec(cur.joint))
+            cur.haveJoint = true;
+
+        const HandContinuity& prev = last[hand];
+        ownedWas[hand] = prev.owned;
+        rotationWas[hand] = prev.rotationActive;
+        const bool left = hand == 0;
+        if (cur.owned != prev.owned) trip(left ? "L-own" : "R-own");
+        // Ownership held but the rotation writes skipped or resumed: exactly the silent flap.
+        if (cur.owned == prev.owned && cur.rotationActive != prev.rotationActive)
+            trip(left ? "L-rot" : "R-rot");
+        if (prev.haveTarget && cur.haveTarget) {
+            targetStep[hand] = VecLength({
+                cur.targetFromPawn.x - prev.targetFromPawn.x,
+                cur.targetFromPawn.y - prev.targetFromPawn.y,
+                cur.targetFromPawn.z - prev.targetFromPawn.z });
+            if (targetStep[hand] > 10.0f) trip(left ? "L-tgt" : "R-tgt");
+        }
+        if (prev.haveHand && cur.haveHand) {
+            handStep[hand] = QuatAngleDeg(prev.hand, cur.hand);
+            if (handStep[hand] > 15.0f) trip(left ? "L-hand" : "R-hand");
+        }
+        if (prev.haveRaw && cur.haveRaw) {
+            rawStep[hand] = QuatAngleDeg(prev.raw, cur.raw);
+            if (rawStep[hand] > 15.0f) trip(left ? "L-raw" : "R-raw");
+        }
+        if (prev.haveForearm && cur.haveForearm) {
+            forearmStep[hand] = QuatAngleDeg(prev.forearm, cur.forearm);
+            if (forearmStep[hand] > 15.0f) trip(left ? "L-farm" : "R-farm");
+        }
+        if (prev.haveRoll && cur.haveRoll) {
+            rollStep[hand] = QuatAngleDeg(prev.roll, cur.roll);
+            if (rollStep[hand] > 15.0f) trip(left ? "L-roll" : "R-roll");
+        }
+        if (prev.haveJoint && cur.haveJoint) {
+            jointStep[hand] = VecLength({ cur.joint.x - prev.joint.x,
+                                          cur.joint.y - prev.joint.y,
+                                          cur.joint.z - prev.joint.z });
+            if (jointStep[hand] > 6.0f) trip(left ? "L-joint" : "R-joint");
+        }
+        shoulderStep[hand] = VecLength({
+            cur.shoulderOffset.x - prev.shoulderOffset.x,
+            cur.shoulderOffset.y - prev.shoulderOffset.y,
+            cur.shoulderOffset.z - prev.shoulderOffset.z });
+        if (shoulderStep[hand] > 3.0f) trip(left ? "L-sh" : "R-sh");
+    }
+    if (headStepDeg > 8.0f) trip("head");
+    if (headRollStepDeg > 8.0f) trip("head-roll");
+
+    last[0] = now[0];
+    last[1] = now[1];
+    if (!trips[0] || updates - lastLogged < 15) return;
+    lastLogged = updates;
+    Log("*** [hands-spazz] upd %ld head f/r %.1f/%.1f hmd %.1f deg age %ld stick %d |"
+        " L own %d>%d rot %d>%d tgt %.1f raw %.1f hand %.1f farm %.1f roll %.1f jt %.1f"
+        " sh %.2f |"
+        " R own %d>%d rot %d>%d tgt %.1f raw %.1f hand %.1f farm %.1f roll %.1f jt %.1f"
+        " sh %.2f | trip:%s",
+        updates, headStepDeg, headRollStepDeg, hmdStepDeg, g_frames - pose.presentFrame,
+        stickLook ? 1 : 0,
+        ownedWas[0] ? 1 : 0, now[0].owned ? 1 : 0,
+        rotationWas[0] ? 1 : 0, now[0].rotationActive ? 1 : 0,
+        targetStep[0], rawStep[0], handStep[0], forearmStep[0], rollStep[0], jointStep[0],
+        shoulderStep[0],
+        ownedWas[1] ? 1 : 0, now[1].owned ? 1 : 0,
+        rotationWas[1] ? 1 : 0, now[1].rotationActive ? 1 : 0,
+        targetStep[1], rawStep[1], handStep[1], forearmStep[1], rollStep[1], jointStep[1],
+        shoulderStep[1],
+        trips);
 }
 
 #if 0
@@ -9100,7 +9965,36 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                         float d = rollNow - g_headRoll;
                         while (d >  3.14159265f) d -= 6.28318531f;
                         while (d < -3.14159265f) d += 6.28318531f;
-                        g_headRoll += rollWeight * d;
+                        // ORIENTATION_VALID also survived the same tracking discontinuity that
+                        // produced the 1.31 m position jump. It reported about 171 degrees of
+                        // roll for one frame, rotating both logical hand anchors around the head.
+                        // Reject one isolated >45-degree step. If a new value persists for two
+                        // samples it is a real reference change and is accepted on the second.
+                        static bool haveRejectedRoll = false;
+                        static float rejectedRoll = 0.0f;
+                        const float maxPhysicalStep = 45.0f *
+                            (3.14159265358979323846f / 180.0f);
+                        bool acceptRoll = fabsf(d) <= maxPhysicalStep;
+                        if (!acceptRoll) {
+                            float fromRejected = rollNow - rejectedRoll;
+                            while (fromRejected >  3.14159265f) fromRejected -= 6.28318531f;
+                            while (fromRejected < -3.14159265f) fromRejected += 6.28318531f;
+                            if (haveRejectedRoll && fabsf(fromRejected) <
+                                15.0f * (3.14159265358979323846f / 180.0f)) {
+                                acceptRoll = true;
+                                Log("*** [head] large roll change persisted for two samples;"
+                                    " accepting new tracking reference");
+                            } else {
+                                rejectedRoll = rollNow;
+                                haveRejectedRoll = true;
+                                Log("*** [head] rejected isolated %+.1f deg roll discontinuity",
+                                    d * 57.2957795f);
+                            }
+                        }
+                        if (acceptRoll) {
+                            g_headRoll += rollWeight * d;
+                            haveRejectedRoll = false;
+                        }
                     }
 
                     // ---- and the pitch target, for the same reason ----
@@ -9520,13 +10414,30 @@ static void AdoptSceneTarget()
 
     int  best = -1;
     long bestScene = 0;
-    bool backbufferIsLive = false;
+    long bestBackbufferScene = 0;
     for (int i = 0; i < g_rtSeenCount; ++i) {
         const long sd = g_rtSeen[i].sceneDraws;
-        if (sd > 0 && g_rtSeen[i].w == g_capW && g_rtSeen[i].h == g_capH) backbufferIsLive = true;
+        if (g_rtSeen[i].w == g_capW && g_rtSeen[i].h == g_capH) {
+            if (sd > bestBackbufferScene) bestBackbufferScene = sd;
+        }
         else if (sd > bestScene) { bestScene = sd; best = i; }
     }
     for (int i = 0; i < g_rtSeenCount; ++i) g_rtSeen[i].sceneDraws = 0;
+
+    // A handful of matrices on a full-size shadow/composite target is not evidence that the
+    // scene moved back. Run 2 had 10 such draws against 177,092 on the real 1280x720 scene and
+    // the old any-nonzero rule oscillated the target until stereo disengaged. The test must
+    // also be competitive in BOTH directions: run 13 measured the SPLIT mode, where the world
+    // renders into a 1280x720 scene buffer (151,275 scene draws per window) while the backbuffer
+    // still legitimately carries the first-person arms and post passes (61,099). The old
+    // backbuffer-times-4 test kept stereo on the backbuffer there, so only its minority draws
+    // were duplicated and the right eye accumulated them over never-repainted pixels - the
+    // run-13 smear trails. Backbuffer ownership now requires PARITY with the busiest offscreen
+    // candidate; adoption below requires a decisive 2x majority; between the two bands the
+    // current choice holds, which is the hysteresis that prevents oscillation.
+    const long kMinimumSceneDraws = 200;
+    const bool backbufferIsLive = bestBackbufferScene >= kMinimumSceneDraws &&
+        (bestScene < kMinimumSceneDraws || bestBackbufferScene >= bestScene);
 
     // The original premise holds: the scene is going where it always did. Revert if we had
     // previously followed it elsewhere, so a resolution change cannot strand us on a stale size.
@@ -9536,13 +10447,50 @@ static void AdoptSceneTarget()
                 g_capW, g_capH);
             g_sceneW = g_sceneH = 0;
         }
+        if (g_sceneSplitMono) {
+            g_sceneSplitMono = false;
+            Log("*** [rt] the world renders into the backbuffer again - stereo duplication"
+                " resumed");
+        }
         return;
     }
 
     // Enough draws to be a scene pass rather than a stray probe or a two-triangle blit.
-    if (best < 0 || bestScene < 200) return;
+    if (best < 0 || bestScene < kMinimumSceneDraws) return;
+    // Adoption needs a decisive majority over the backbuffer, not a merely busier offscreen
+    // pass. Both measured split windows clear this comfortably (2.47x and 2.57x).
+    if (bestScene < bestBackbufferScene * 2) return;
 
     const UINT w = g_rtSeen[best].w, h = g_rtSeen[best].h;
+    // Side-by-side duplication needs the scene surface to share the backbuffer's double-wide
+    // geometry. Run 14 adopted a genuinely MONO half-size scene buffer and the per-eye
+    // viewports fought the game's own full-width draws: lower resolution AND the smear, then
+    // mono, then a crash, across three checkpoint loads. A size-matched candidate is followed
+    // as designed; a mismatched one means the game is in a reduced-resolution scene mode where
+    // the only coherent presentation is mono, with backbuffer duplication suppressed so the
+    // right eye cannot accumulate the leftovers.
+    if (w != g_capW || h != g_capH) {
+        if (!g_sceneSplitMono) {
+            g_sceneSplitMono = true;
+            Log("");
+            Log("*** [rt] the world renders into a %ux%u buffer while the backbuffer is %ux%u."
+                " Side-by-side stereo cannot follow a half-size mono scene; presenting MONO"
+                " with duplication suppressed so the eyes stay coherent.",
+                w, h, g_capW, g_capH);
+            // The trigger hunt: run 20's onset had both arms hanging 0.84 m below the head
+            // with the shoulders dragged ~24 UU - a maximally stretched 1p mesh. Snapshot the
+            // hand state at every onset so the posture correlation proves or disproves itself
+            // across natural occurrences without a dedicated test session.
+            Log("[rt] onset hand state: L det=%d excess=%.1f dist=%.1f |"
+                " R det=%d excess=%.1f dist=%.1f  (UU; dist is socket-to-target)",
+                g_leftDetach.reachEngaged ? 1 : 0, g_leftDetach.diagnosticExcess,
+                g_leftDetach.diagnosticDistance,
+                g_rightDetach.reachEngaged ? 1 : 0, g_rightDetach.diagnosticExcess,
+                g_rightDetach.diagnosticDistance);
+        }
+        return;
+    }
+
     if (w == g_sceneW && h == g_sceneH) return;
     g_sceneW = w; g_sceneH = h;
     Log("");
@@ -9550,9 +10498,6 @@ static void AdoptSceneTarget()
         " the scene goes to %ux%u (%ld draws with the scene matrix this window).",
         g_capW, g_capH, w, h, bestScene);
     Log("[rt] following it there, so stereo works instead of silently falling back to mono.");
-    if (g_capW != w || g_capH != h)
-        Log("[rt] ⚠️ this is a LETTERBOXED mode. The eyes are cut out of the PRESENTED frame, so"
-            " the crop assumes the bars are centred. A 16:9 game resolution avoids the guess.");
 }
 
 static void ReportRenderTargets()
@@ -9566,6 +10511,54 @@ static void ReportRenderTargets()
             g_rtSeen[i].draws, g_rtSeen[i].sceneDraws,   // sceneDraws is a live window, not a total
             (g_rtSeen[i].w == sw && g_rtSeen[i].h == sh) ? "<- scene-sized, DUPLICATED" : "");
         g_rtSeen[i].draws = 0;
+    }
+}
+
+// ---- Clear census, for the run-16 trails ----
+//
+// The trails look like stale colour or depth surviving between frames: ghost copies of exactly
+// the nearest, highest-contrast content (arms, billboards) stacked along their motion history.
+// Whether the game's clears still cover the main target - and with which flags - while the
+// half-res effect pass is active is a measurement the mod never made. Bucketed by the target
+// bound at the call and the clear flags; a partial (rect-limited) clear is marked in the key,
+// because a clear that no longer covers the full surface is precisely the suspected defect.
+typedef HRESULT (STDMETHODCALLTYPE *PFN_Clear)(IDirect3DDevice9*, DWORD, const D3DRECT*,
+                                               DWORD, D3DCOLOR, float, DWORD);
+static PFN_Clear g_origClear = nullptr;
+struct ClearBucket { UINT w, h; DWORD key; long count; };
+static ClearBucket g_clearBuckets[12];
+static int g_clearBucketCount = 0;
+
+static HRESULT STDMETHODCALLTYPE Hook_Clear(IDirect3DDevice9* dev, DWORD rectCount,
+                                            const D3DRECT* rects, DWORD flags,
+                                            D3DCOLOR color, float z, DWORD stencil)
+{
+    const UINT w = g_rtCurrent ? g_rtCurrent->w : 0;
+    const UINT h = g_rtCurrent ? g_rtCurrent->h : 0;
+    const DWORD key = flags | (rectCount ? 0x80000000ul : 0ul);
+    int slot = -1;
+    for (int i = 0; i < g_clearBucketCount; ++i)
+        if (g_clearBuckets[i].w == w && g_clearBuckets[i].h == h &&
+            g_clearBuckets[i].key == key) { slot = i; break; }
+    if (slot < 0 && g_clearBucketCount < 12) {
+        slot = g_clearBucketCount++;
+        g_clearBuckets[slot] = { w, h, key, 0 };
+    }
+    if (slot >= 0) ++g_clearBuckets[slot].count;
+    return g_origClear(dev, rectCount, rects, flags, color, z, stencil);
+}
+
+static void ReportClears()
+{
+    Log("[clear] Clear calls this window by bound target"
+        " (flags: 1=target 2=zbuffer 4=stencil, R=rect-limited):");
+    for (int i = 0; i < g_clearBucketCount; ++i) {
+        Log("[clear]   %4ux%-4u flags=0x%lX%s  x%ld",
+            g_clearBuckets[i].w, g_clearBuckets[i].h,
+            (unsigned long)(g_clearBuckets[i].key & 0x7FFFFFFFul),
+            (g_clearBuckets[i].key & 0x80000000ul) ? " R" : "",
+            g_clearBuckets[i].count);
+        g_clearBuckets[i].count = 0;
     }
 }
 
@@ -9723,10 +10716,13 @@ bool         g_sixDof = true;
 bool         g_haveCentre = false;
 static float g_centre[3] = { 0, 0, 0 };
 float        g_dofOffset[3] = { 0, 0, 0 };   // head-local, UE3 units
+static bool  g_haveLastSixDofPosition = false;
+static XrVector3f g_lastSixDofPosition{};
 
 void RecenterSixDof()
 {
     g_haveCentre = false;
+    g_haveLastSixDofPosition = false;
     // The old offset must not survive the frame in which PAGE UP is pressed. The next valid head
     // pose becomes the new centre; until then both the camera and hands use the neutral anchor.
     g_dofOffset[0] = g_dofOffset[1] = g_dofOffset[2] = 0.0f;
@@ -9744,16 +10740,38 @@ void UpdateSixDof(XrTime when)
     if (!posOk || !g_sixDof) {
         // Decay home over roughly a second rather than holding a stale offset.
         for (int i = 0; i < 3; ++i) g_dofOffset[i] *= 0.97f;
+        g_haveLastSixDofPosition = false;
         return;
     }
 
     const XrVector3f p = loc.pose.position;
     if (!g_haveCentre) {
         g_centre[0] = p.x; g_centre[1] = p.y; g_centre[2] = p.z;
+        g_lastSixDofPosition = p;
+        g_haveLastSixDofPosition = true;
         g_haveCentre = true;
         Log("[6dof] centre set at (%.3f, %.3f, %.3f) m", p.x, p.y, p.z);
         return;
     }
+
+    // POSITION_VALID is not a continuity guarantee. On the reported spazz frame OpenXR moved
+    // the head 1.31 metres between adjacent 120 Hz samples while leaving the valid bit set, and
+    // both controller targets inherited that exact jump. A human head cannot translate 25 cm
+    // in one frame. Treat a larger step as the tracking origin being reacquired: move the centre
+    // by the same amount so the rendered offset is continuous in the new coordinate frame.
+    if (g_haveLastSixDofPosition) {
+        const float sx = p.x - g_lastSixDofPosition.x;
+        const float sy = p.y - g_lastSixDofPosition.y;
+        const float sz = p.z - g_lastSixDofPosition.z;
+        const float step = sqrtf(sx*sx + sy*sy + sz*sz);
+        if (step > 0.25f) {
+            g_centre[0] += sx; g_centre[1] += sy; g_centre[2] += sz;
+            Log("*** [6dof] rejected %.2f m one-frame head-position discontinuity;"
+                " tracking centre rebased without moving camera/hands", step);
+        }
+    }
+    g_lastSixDofPosition = p;
+    g_haveLastSixDofPosition = true;
 
     const float dx = p.x - g_centre[0], dy = p.y - g_centre[1], dz = p.z - g_centre[2];
 
@@ -10438,9 +11456,23 @@ static bool ShouldDuplicate()
         // Counted BEFORE the gate, deliberately: this is what AdoptSceneTarget reads, and if it
         // only counted draws that were already being duplicated it could never discover a target
         // that duplication is not reaching - which is the entire situation it exists for.
-        if (g_c0IsScene) g_rtCurrent->sceneDraws++;
+        if (g_c0IsScene) {
+            g_rtCurrent->sceneDraws++;
+            // Per-frame split-flip detector feed. The 12-second census proved the split mode
+            // engages mid-gameplay with no load, no posture, no settings change - but its
+            // granularity hides the flip MOMENT. These are read and reset every Present.
+            if (g_rtCurrent->w == g_capW && g_rtCurrent->h == g_capH)
+                ++g_frameSceneOnBackbuffer;
+            else
+                ++g_frameSceneOffscreen;
+        }
     }
-    if (!(g_simulStereo && !g_inDupDraw && g_sceneMatValid && g_c0IsScene && g_rtIsScene &&
+    const bool currentTargetMatchesScene = g_rtCurrent
+        ? (g_rtCurrent->w == (g_sceneW ? g_sceneW : g_capW) &&
+           g_rtCurrent->h == (g_sceneH ? g_sceneH : g_capH))
+        : g_rtIsScene;
+    if (!(g_simulStereo && !g_sceneSplitMono && !g_inDupDraw && g_sceneMatValid &&
+          g_c0IsScene && currentTargetMatchesScene &&
           g_vmReg >= 0 && g_halfIpdUU > 0.0f && g_capW > 0)) return false;
 
     // ---- INSERT bisects WHICH scene-sized target gets duplicated ----
@@ -11066,7 +12098,7 @@ static void DrawOverlay(IDirect3DDevice9* dev)
                 (int)(g_capSamples ? (g_capMsTotal / g_capSamples) : 0.0));
     // Put the active test at the top. TextRects intentionally caps work; late diagnostic rows
     // may truncate on a dense frame, but the controls the player is actively using must not.
-    char rp[12], ry[12], rr[12], lp[12], ly[12], lr[12], lim[12];
+    char rp[12], ry[12], rr[12], lp[12], ly[12], lr[12];
     FormatHandTuneValue(rp, sizeof(rp), g_wristCalibrationDeg[1][0],
                         g_handTuneSelected == 0);
     FormatHandTuneValue(ry, sizeof(ry), g_wristCalibrationDeg[1][1],
@@ -11085,10 +12117,8 @@ static void DrawOverlay(IDirect3DDevice9* dev)
                         g_handTuneSelected == 6);
     FormatHandTuneValue(lr, sizeof(lr), g_forearmRollCalibrationDeg[0],
                         g_handTuneSelected == 7);
-    FormatHandTuneValue(lim, sizeof(lim), g_forearmTwistLimitDeg,
-                        g_handTuneSelected == 8);
     _snprintf_s(lines[nl++], 64, _TRUNCATE,
-                "FOREARM R R%s L R%s LIMIT %s", rr, lr, lim);
+                "FOREARM R R%s L R%s", rr, lr);
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "ARROWS L/R SELECT  U/D CHANGE 5 DEG");
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "OBJ %s  PROP %s",
                 g_offName >= 0 ? "OK" : "NO", g_offPropOff >= 0 ? "OK" : "NO");
@@ -11348,12 +12378,11 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
 
     // ---- the object model scan, once, well into the run ----
     //
-    // Frame 900 rather than a low number, on the Singularity project's evidence: it dumped at
-    // frame 120 for three runs, which lands in the MAIN MENU before any level is loaded, and
-    // saw only UClass objects and zero live instances. GNames and GObjects themselves exist
-    // from startup, so the scan is still valid there - but the class probe is far more useful
-    // once a level is up, and 900 frames is cheap insurance either way.
-    if (f == 900) RunObjectModelScan();
+    // Start at frame 120. The old frame-900 delay was useful when this was only a census of live
+    // instances, but motion setup needs class/property/UFunction metadata, all of which exists
+    // without a spawned pawn. Live rig discovery already waits independently for gameplay. If
+    // a package is genuinely late, the targeted arm-layout retry below handles it off-thread.
+    if (f == 120) RunObjectModelScan();
 
     // Cheap once the object model is up: re-resolves only when the cached pointer stops
     // looking like a TdSwanNeck, which is on level transitions.
@@ -11372,17 +12401,52 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     // two together, and splitting them across different windows would mean pairing them by
     // frame number in a text editor.
     ProbeInputGates();
+    {
+        // Frame-precise split-flip detector: the first frames where the world's draws migrate
+        // off the backbuffer, logged with the frame number so whatever else the game did in
+        // that instant sits adjacent in the log. Three consecutive majority frames filter
+        // menus and loading screens, which legitimately carry no backbuffer scene draws.
+        static int offscreenStreak = 0, backbufferStreak = 0;
+        static bool offscreenMajority = false;
+        const bool off = g_frameSceneOffscreen > 50 &&
+                         g_frameSceneOffscreen > g_frameSceneOnBackbuffer;
+        const bool bb = g_frameSceneOnBackbuffer > 50 &&
+                        g_frameSceneOnBackbuffer >= g_frameSceneOffscreen;
+        offscreenStreak = off ? offscreenStreak + 1 : 0;
+        backbufferStreak = bb ? backbufferStreak + 1 : 0;
+        if (!offscreenMajority && offscreenStreak == 3) {
+            offscreenMajority = true;
+            Log("*** [rt] scene draws FLIPPED off the backbuffer at frame %ld"
+                " (this frame: offscreen %ld vs backbuffer %ld)",
+                f, g_frameSceneOffscreen, g_frameSceneOnBackbuffer);
+        } else if (offscreenMajority && backbufferStreak == 3) {
+            offscreenMajority = false;
+            Log("*** [rt] scene draws returned to the backbuffer at frame %ld"
+                " (this frame: backbuffer %ld vs offscreen %ld)",
+                f, g_frameSceneOnBackbuffer, g_frameSceneOffscreen);
+        }
+        g_frameSceneOnBackbuffer = 0;
+        g_frameSceneOffscreen = 0;
+    }
+
     if ((f % 900) == 0) {
         ReportCameraAnimation();
         ReportPadState();
         ReportInputGates();
         if (g_simulStereo) ReportRenderTargets();
+        if (g_simulStereo) ReportClears();
+        // Alongside the target census: if the engine ever falls back to half-size LDR buffers
+        // again (run 14), the headroom trend here says whether VRAM pressure did it.
+        Log("[vram] approx available texture memory: %u MB",
+            dev->GetAvailableTextureMem() / (1024u * 1024u));
     }
 
     // Six times a second is fast enough to place a transition against the acceptance windows it
     // is meant to explain, and it costs three reads on the frames it runs. It logs only when the
     // target CHANGES, so the rate sets resolution, not volume.
     if ((f % 10) == 0) {
+        RetryMotionArmInitialization();
+        RetryViewTargetOffset();
         ReportViewTarget();
         UpdateMotionRigDiscovery();
     }
@@ -11597,7 +12661,22 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateTexture(IDirect3DDevice9* dev, UINT 
         }
         return hr;
     }
-    return g_origCreateTex(dev, w, h, levels, usage, fmt, pool, out, shared);
+    HRESULT hr = g_origCreateTex(dev, w, h, levels, usage, fmt, pool, out, shared);
+    // Run 14 entered a half-resolution LDR scene mode with a byte-identical config to the
+    // full-resolution HDR runs, which points at a RUNTIME resource fallback: a UE3 engine that
+    // cannot allocate its full-size HDR targets quietly builds smaller LDR ones instead. If
+    // that is what happens, the refusal lands exactly here - name it and the VRAM headroom.
+    if (FAILED(hr) &&
+        ((usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) != 0 ||
+         (w >= 512 && h >= 512))) {
+        static LONG reported = 0;
+        if (InterlockedIncrement(&reported) <= 30)
+            Log("*** [vram] CreateTexture FAILED hr=0x%08lX  %ux%u levels=%u usage=0x%08lX"
+                " fmt=%d pool=%d  |  approx available texture mem %u MB",
+                (unsigned long)hr, w, h, levels, (unsigned long)usage, (int)fmt, (int)pool,
+                dev->GetAvailableTextureMem() / (1024u * 1024u));
+    }
+    return hr;
 }
 
 // ⚠️ Cube and volume textures take a pool too, and missing them is what crashed the first Ex run.
@@ -11704,6 +12783,7 @@ static void PatchDeviceOnce(IDirect3DDevice9* dev)
     g_origCreateCubeTex = (PFN_CreateCubeTex)PatchVTable(dev, DEV_CreateCubeTexture,
                                                          (void*)&Hook_CreateCubeTex);
     g_origSetRenderTarget = (PFN_SetRenderTarget) PatchVTable(dev, DEV_SetRenderTarget, (void*)&Hook_SetRenderTarget);
+    g_origClear           = (PFN_Clear)           PatchVTable(dev, DEV_Clear, (void*)&Hook_Clear);
     g_origCreateQuery     = (PFN_CreateQuery)     PatchVTable(dev, DEV_CreateQuery, (void*)&Hook_CreateQuery);
     g_origDrawPrim    = (PFN_DrawPrim)    PatchVTable(dev, DEV_DrawPrimitive, (void*)&Hook_DrawPrim);
     g_origDrawIndexed = (PFN_DrawIndexed) PatchVTable(dev, DEV_DrawIndexedPrimitive, (void*)&Hook_DrawIndexed);
@@ -11720,7 +12800,8 @@ static void PatchDeviceOnce(IDirect3DDevice9* dev)
 
     // A null original is a patch that silently did nothing, and calling through it would
     // crash on the first frame. Say so loudly rather than discovering it in a minidump.
-    if (!g_origPresent || !g_origReset || !g_origCreateTex || !g_origCreateVB || !g_origCreateIB)
+    if (!g_origPresent || !g_origReset || !g_origCreateTex || !g_origCreateVB ||
+        !g_origCreateIB || !g_origClear)
         Log("[patch] *** ONE OR MORE ORIGINALS ARE NULL - a patch failed, expect a crash ***");
 }
 
