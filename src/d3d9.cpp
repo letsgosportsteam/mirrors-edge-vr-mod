@@ -4652,13 +4652,17 @@ static uintptr_t g_swanNeck = 0;
 // worse), and a lag spring under the camera is a flatscreen comfort feature that a headset
 // actively does not want. F7 still cycles for A/B.
 static int  g_swanMode = 1;
-static int  g_swanAppliedMode = -1;  // -1 = nothing written yet
 static float g_swanSaved[4] = { 0, 0, 0, 0 };
 static bool  g_swanSavedOk = false;
-// Freeze-hunt state: the frame the game was seen rewriting the spring outside a calm state
-// (start of a stand-down episode), -1 when idle. Cleared by the reassert that ends the
-// episode, or by a first-apply on a replacement instance (the episode died with its object).
+// Occupancy state. g_swanStandDownFrame: frame the current game-owned span began (the calm-
+// exit edge), -1 when the mod occupies the spring; the assert that retakes it stamps the
+// span's length. g_swanGameMoveLogged: the once-per-span telemetry latch for the game moving
+// the spring off the originals the exit edge left standing.
 static long  g_swanStandDownFrame = -1;
+static bool  g_swanGameMoveLogged = false;
+// ~0.6 s at 72 Hz. The marked hard land stayed locked for seconds past Landing->Walking, so
+// the recovery's camera tail outlives the state flip; the dwell keeps the re-zero out of it.
+static const long kSwanCalmDwell = 45;
 static const char* MoveName(int st);    // kMoveNames lookup, defined beside the table
 
 static bool ObjNameIs(uintptr_t obj, const char* want)
@@ -4713,8 +4717,9 @@ static uintptr_t FindSwanNeck()
         Log("[swan] cached instance %p is no longer valid at frame %ld t=%.2fs, re-resolving",
             (void*)g_swanNeck, g_frames, LogSecs());
         g_swanNeck = 0;
-        g_swanAppliedMode = -1;
         g_swanSavedOk = false;
+        g_swanStandDownFrame = -1;      // the span's bookkeeping died with its object
+        g_swanGameMoveLogged = false;
         g_swanNextTry = 0;
         g_swanCursor = 0;
         g_swanWalkMs = 0.0;
@@ -4808,129 +4813,134 @@ static void ApplySwanNeck()
         }
     }
 
-    if (g_swanMode == g_swanAppliedMode) {
-        // Applied is not the same as STILL applied. Run 25 measured the judder returning while
-        // nominally zeroed, fixed by any re-application: the game swaps camera parameter
-        // profiles on its own schedule and rewrites the spring on the same instance, which the
-        // mode check alone never notices. Verify the live values EVERY FRAME and re-assert.
-        //
-        // But NOT while airborne or landing. The every-frame war taught run 26 an expensive
-        // lesson: the fall/landing flow both writes and reads these fields as part of executing
-        // itself, and same-frame reverts stalled it - long falls stuck, a death-fall frozen in
-        // place, a hard freeze on touchdown, the landing roll never firing. Mid-air the lag
-        // spring cannot judder-loop anyway, so the override stands down for the whole fall
-        // family (originals restored, the game owns its spring) and re-asserts on the first
-        // grounded frame.
-        if (g_swanMode == 0 || !g_swanSavedOk) return;
-        // WHITELIST, not blacklist. Run 27 proved the polarity matters: covered landing states
-        // (Landing/RumpSlide) worked while the uncovered impact family (Stumble, death falls,
-        // pawn churn) still stalled - and an unreadable movement state defaulted to ASSERTING,
-        // the worst possible default mid-death. The judder this override exists for lives only
-        // in sustained grounded play, so assert exactly there - Walking, Crouch, Balance,
-        // LedgeWalk, with a readable state - and let the game own its spring in every other
-        // state, known or unknown.
-        // Stand-down means STOP WRITING - nothing else. The first version restored the
-        // original values on the calm->move transition frame, which is exactly when the move
-        // logic stages its own camera state, and run 29's marked captures showed the cost:
-        // character stuck for one to two seconds at landings and grabs (pawn flat, everything
-        // else running) until the game's logic timed out. The game rewrites this spring
-        // whenever it wants one - 37 measured reassertions in a single run - so outside the
-        // calm states the mod now touches nothing at all, and the calm-frame verify loop
-        // re-zeroes on return.
-        const float mul = (g_swanMode == 1) ? 0.0f : 8.0f;
+    if (!g_swanSavedOk) return;
+
+    // ---- occupancy, not write timing: zeros stand ONLY in sustained calm ----
+    //
+    // The phase-1 marked run overturned the write-fight theory of the transition freezes.
+    // All three - a death fall stuck 4.3 s in out-of-enum state 72 until the pawn was
+    // destroyed, a hard-land recovery locked for seconds past Landing->Walking, a pipe-grab
+    // Climb mount stuck 10.7 s against full stick input (InputSize 1.0, ignore flags clear) -
+    // ran with ZERO swan writes inside the stall window, while 30+ ordinary jumps and small
+    // falls sailed through the identical stand-down machinery. What the frozen states shared
+    // was the spring's CONTENTS: linear still held the mod's zeros. The span telemetry shows
+    // the game rewriting the quadratic pair (35/30) at every airborne entry and never once
+    // touching linear - linear is read-only config to the game - and the states that froze
+    // are exactly the scripted recoveries long known to READ the spring to execute (run 26).
+    // Standing zeros starve those reads. So the rule is occupancy: zeros may occupy the
+    // spring only while the pawn is provably calm, and every calm exit puts the originals
+    // back before a sequence can read starvation values.
+    //
+    // Run 25 still applies inside calm (the game swaps camera profiles on its own schedule
+    // and rewrites the spring on the same instance), so calm occupancy is verify-and-assert
+    // every frame, not write-once. Run 27's polarity also still applies: calm is a WHITELIST
+    // (Walking/Crouch/Balance/LedgeWalk with a readable state); everything else - state 72
+    // and unreadable bytes included - belongs to the game.
+    static long calmStreak = 0;
+    static bool wasCalm = false;
+    static int  prevMode = 1;           // matches g_swanMode's initial value
+    const bool modeChanged = (g_swanMode != prevMode);
+    prevMode = g_swanMode;
+    calmStreak = calm ? calmStreak + 1 : 0;
+
+    if (wasCalm && !calm && g_swanMode != 0) {
+        // Calm-exit edge: one restore, field-by-field, skipping fields already at their
+        // original value - so the quadratic pair the game routinely stages on this very
+        // frame is never re-written and a value race cannot occur even in principle. In
+        // practice this writes the two linear fields (zeros out, originals in), which the
+        // game has never been observed to write; there is nothing to fight.
         const uint32_t offs[4] = { SWAN_LinearFwd, SWAN_LinearDown, SWAN_QuadFwd, SWAN_QuadDown };
-        bool drifted = false;
-        float now[4] = { 0, 0, 0, 0 };
+        int wrote = 0;
+        bool ok = true;
         for (int i = 0; i < 4; ++i) {
-            if (!SafeRead(obj + offs[i], &now[i], sizeof(float))) return;  // instance validator's job
-            if (fabsf(now[i] - g_swanSaved[i] * mul) > 0.01f) drifted = true;
+            float now = 0.0f;
+            if (!SafeRead(obj + offs[i], &now, sizeof(float))) { ok = false; break; }
+            if (fabsf(now - g_swanSaved[i]) <= 0.01f) continue;
+            if (WriteF32(obj + offs[i], g_swanSaved[i])) ++wrote; else ok = false;
         }
-        // Freeze-hunt instrumentation, logging only - the write rules above are unchanged.
-        // The game rewriting the spring IS the transition signal, so standing down logs its
-        // edges instead of returning silently: one line when the game takes the spring (with
-        // the values IT wrote), one on the reassert that takes it back. And every reassert
-        // logs unthrottled with the frame, the movement state the gate saw, and the values it
-        // overwrote - the old 900-frame rate limit hid two of the last run's four
-        // reassertions, and an invisible write is exactly what a write landing inside a
-        // transition would be. 37 per run measured; the log can afford them all.
-        if (drifted && !calm) {
-            if (g_swanStandDownFrame < 0) {
-                g_swanStandDownFrame = g_frames;
-                Log("*** [swan] game took the spring at frame %ld t=%.2fs (move %s(%d)):"
-                    " linear %.1f/%.1f quadratic %.1f/%.1f - standing down",
-                    g_frames, LogSecs(), MoveName(move), (int)move,
-                    now[0], now[1], now[2], now[3]);
+        Log("*** [swan] EXIT-RESTORE at frame %ld t=%.2fs (move %s(%d)): originals back in"
+            " %d field%s%s", g_frames, LogSecs(), MoveName(move), (int)move,
+            wrote, wrote == 1 ? "" : "s", ok ? "" : "  <- A READ/WRITE FAILED");
+        g_swanStandDownFrame = g_frames;
+        g_swanGameMoveLogged = false;
+    }
+    wasCalm = calm;
+
+    if (!calm) {
+        // Game-owned span: no writes. Telemetry only - one line the first time the game
+        // moves the spring away from the originals the exit edge left standing, so any
+        // transition profile that differs from the shipped values finally becomes visible.
+        if (g_swanStandDownFrame >= 0 && !g_swanGameMoveLogged) {
+            const uint32_t offs[4] = { SWAN_LinearFwd, SWAN_LinearDown, SWAN_QuadFwd, SWAN_QuadDown };
+            float now[4] = { 0, 0, 0, 0 };
+            bool moved = false, readable = true;
+            for (int i = 0; i < 4; ++i) {
+                if (!SafeRead(obj + offs[i], &now[i], sizeof(float))) { readable = false; break; }
+                if (fabsf(now[i] - g_swanSaved[i]) > 0.01f) moved = true;
             }
-            return;
-        }
-        if (!drifted) {
-            if (g_swanStandDownFrame >= 0 && calm) {
-                Log("[swan] spring already back at mode-%d values on return to calm at"
-                    " frame %ld t=%.2fs (stood down %ld frames)", g_swanMode, g_frames,
-                    LogSecs(), g_frames - g_swanStandDownFrame);
-                g_swanStandDownFrame = -1;
+            if (readable && moved) {
+                g_swanGameMoveLogged = true;
+                Log("*** [swan] game moved the spring at frame %ld t=%.2fs (move %s(%d)):"
+                    " linear %.1f/%.1f quadratic %.1f/%.1f", g_frames, LogSecs(),
+                    MoveName(move), (int)move, now[0], now[1], now[2], now[3]);
             }
-            return;
         }
-        const bool ok = WriteF32(obj + SWAN_LinearFwd,  g_swanSaved[0] * mul) &&
-                        WriteF32(obj + SWAN_LinearDown, g_swanSaved[1] * mul) &&
-                        WriteF32(obj + SWAN_QuadFwd,    g_swanSaved[2] * mul) &&
-                        WriteF32(obj + SWAN_QuadDown,   g_swanSaved[3] * mul);
-        static long reasserted = 0;
-        ++reasserted;
-        char ends[48] = "";
-        if (g_swanStandDownFrame >= 0) {
-            sprintf_s(ends, " - ends %ld-frame stand-down", g_frames - g_swanStandDownFrame);
-            g_swanStandDownFrame = -1;
-        }
-        Log("*** [swan] REASSERT #%ld mode %d at frame %ld t=%.2fs (move %s(%d)): overwrote"
-            " linear %.1f/%.1f quadratic %.1f/%.1f%s%s", reasserted, g_swanMode, g_frames,
-            LogSecs(), MoveName(move), (int)move, now[0], now[1], now[2], now[3], ends,
-            ok ? "" : "  <- A WRITE FAILED");
         return;
     }
-    if (!g_swanSavedOk) return;
-    g_swanStandDownFrame = -1;   // any stand-down episode belonged to the departed instance
 
-    // ---- three states, not two, and the third is the one that proves anything ----
-    //
-    // Zeroing produces a subtle ABSENCE: the player is asked to notice that something they
-    // never consciously noticed has stopped. That is a test which struggles to fail, and this
-    // project has already lost runs to exactly that shape - it is why the ini experiment used
-    // an absurd value rather than zero.
-    //
-    // The exaggerated state makes the channel's existence unmistakable. Once an 8x lean is
-    // obviously there, "zeroed" becomes trustworthy, because the lever is known to reach the
-    // camera. Reporting "I could tell something happened" is honest and soft; this turns it
-    // into a yes or no.
-    const float mul = (g_swanMode == 1) ? 0.0f : (g_swanMode == 2 ? 8.0f : 1.0f);
-    // This branch runs on F7 mode changes AND on every instance replacement - FindSwanNeck
-    // resets the applied mode when the game recreates the object, which the marked runs show
-    // it does DURING fall and grab transitions - and unlike the verify loop above it carries
-    // no calm gate. Until the freeze is settled it stays ungated ON PURPOSE (instrumentation
-    // must observe the suspect, not reform it), but every write now records the frame, the
-    // movement state at write time, and the values it overwrote - enough to convict or clear
-    // this path from one marked run.
-    float before[4] = { 0, 0, 0, 0 };
+    if (g_swanMode == 0) {
+        // Vanilla mode. Its only write ever is putting originals back if an F7 change to
+        // mode 0 caught zeros still standing in calm; a non-calm change needs nothing (the
+        // exit edge already restored), and after the catch-up the game is never touched -
+        // even its own calm-state profile swaps (run 25) are left alone.
+        if (modeChanged) {
+            const uint32_t offs[4] = { SWAN_LinearFwd, SWAN_LinearDown, SWAN_QuadFwd, SWAN_QuadDown };
+            int wrote = 0;
+            for (int i = 0; i < 4; ++i) {
+                float now = 0.0f;
+                if (!SafeRead(obj + offs[i], &now, sizeof(float))) break;
+                if (fabsf(now - g_swanSaved[i]) <= 0.01f) continue;
+                if (WriteF32(obj + offs[i], g_swanSaved[i])) ++wrote;
+            }
+            if (wrote > 0)
+                Log("*** [swan] mode 0: originals restored in %d field%s at frame %ld t=%.2fs",
+                    wrote, wrote == 1 ? "" : "s", g_frames, LogSecs());
+        }
+        g_swanStandDownFrame = -1;
+        return;
+    }
+
+    // Calm, non-vanilla mode. Sit out the dwell before re-zeroing: the assert used to fire
+    // on the exact Landing->Walking / Climb->Walking frame - by construction, the first calm
+    // frame - and the marked hard land stayed locked for seconds PAST that write, because
+    // the recovery's camera tail runs on into Walking. The dwell keeps the write out of the
+    // tail; against a judder that needs sustained standing to build, ~0.6 s is invisible.
+    if (calmStreak < kSwanCalmDwell) return;
+
+    const float mul = (g_swanMode == 1) ? 0.0f : 8.0f;
     const uint32_t offs[4] = { SWAN_LinearFwd, SWAN_LinearDown, SWAN_QuadFwd, SWAN_QuadDown };
-    for (int i = 0; i < 4; ++i)
-        if (!SafeRead(obj + offs[i], &before[i], sizeof(float))) before[i] = -999.0f;
+    bool drifted = false;
+    float now[4] = { 0, 0, 0, 0 };
+    for (int i = 0; i < 4; ++i) {
+        if (!SafeRead(obj + offs[i], &now[i], sizeof(float))) return;  // instance validator's job
+        if (fabsf(now[i] - g_swanSaved[i] * mul) > 0.01f) drifted = true;
+    }
+    if (!drifted) { g_swanStandDownFrame = -1; return; }
     const bool ok = WriteF32(obj + SWAN_LinearFwd,  g_swanSaved[0] * mul) &&
                     WriteF32(obj + SWAN_LinearDown, g_swanSaved[1] * mul) &&
                     WriteF32(obj + SWAN_QuadFwd,    g_swanSaved[2] * mul) &&
                     WriteF32(obj + SWAN_QuadDown,   g_swanSaved[3] * mul);
-
-    const char* what = (g_swanMode == 1) ? "ZEROED - looking down should feel flat"
-                     : (g_swanMode == 2) ? "EXAGGERATED 8x - looking down should LURCH forward and down"
-                                         : "ORIGINAL values restored";
-    Log("*** [swan] FIRST-APPLY at frame %ld t=%.2fs (move %s(%d)): %s  (linear %.1f/%.1f"
-        " quadratic %.1f/%.1f, was %.1f/%.1f %.1f/%.1f)%s",
-        g_frames, LogSecs(), MoveName(move), (int)move, what,
-        g_swanSaved[0] * mul, g_swanSaved[1] * mul,
-        g_swanSaved[2] * mul, g_swanSaved[3] * mul,
-        before[0], before[1], before[2], before[3],
-        ok ? "" : "  <- A WRITE FAILED");
-    g_swanAppliedMode = g_swanMode;
+    static long asserted = 0;
+    ++asserted;
+    char ends[48] = "";
+    if (g_swanStandDownFrame >= 0) {
+        sprintf_s(ends, " - ends %ld-frame game-owned span", g_frames - g_swanStandDownFrame);
+        g_swanStandDownFrame = -1;
+    }
+    Log("*** [swan] ASSERT #%ld mode %d at frame %ld t=%.2fs (move %s(%d), calm %ld frames):"
+        " overwrote linear %.1f/%.1f quadratic %.1f/%.1f%s%s", asserted, g_swanMode,
+        g_frames, LogSecs(), MoveName(move), (int)move, calmStreak,
+        now[0], now[1], now[2], now[3], ends, ok ? "" : "  <- A WRITE FAILED");
 }
 
 // F7 toggles it. A raw key read, like PAUSE - this is a test lever, and an A/B the player can
