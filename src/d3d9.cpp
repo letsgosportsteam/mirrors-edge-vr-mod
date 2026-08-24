@@ -193,6 +193,17 @@ static double NowMs()
     QueryPerformanceCounter(&c);
     return (double)c.QuadPart * 1000.0 / g_qpcFreq;
 }
+// Seconds since the first stamped line, for the t= field on [swan]/[move]/[mark] lines.
+// Frame numbers alone cannot measure a stall - a frozen game still numbers its frames one
+// per Present - so duration claims need wall clock, and one shared epoch keeps every stamp
+// subtractable from every other.
+static double g_logSecs0 = 0.0;
+static double LogSecs()
+{
+    const double n = NowMs();
+    if (g_logSecs0 == 0.0) g_logSecs0 = n;
+    return (n - g_logSecs0) / 1000.0;
+}
 static uint32_t             g_recEyeW = 0, g_recEyeH = 0;
 static bool                 g_xrReady   = false;   // session + space exist
 static bool                 g_xrRunning = false;   // xrBeginSession succeeded
@@ -4644,6 +4655,11 @@ static int  g_swanMode = 1;
 static int  g_swanAppliedMode = -1;  // -1 = nothing written yet
 static float g_swanSaved[4] = { 0, 0, 0, 0 };
 static bool  g_swanSavedOk = false;
+// Freeze-hunt state: the frame the game was seen rewriting the spring outside a calm state
+// (start of a stand-down episode), -1 when idle. Cleared by the reassert that ends the
+// episode, or by a first-apply on a replacement instance (the episode died with its object).
+static long  g_swanStandDownFrame = -1;
+static const char* MoveName(int st);    // kMoveNames lookup, defined beside the table
 
 static bool ObjNameIs(uintptr_t obj, const char* want)
 {
@@ -4694,7 +4710,8 @@ static uintptr_t FindSwanNeck()
     if (LooksLikeSwanInstance(g_swanNeck)) return g_swanNeck;
 
     if (g_swanNeck) {          // had one, lost it - a level transition, so try again promptly
-        Log("[swan] cached instance %p is no longer valid, re-resolving", (void*)g_swanNeck);
+        Log("[swan] cached instance %p is no longer valid at frame %ld t=%.2fs, re-resolving",
+            (void*)g_swanNeck, g_frames, LogSecs());
         g_swanNeck = 0;
         g_swanAppliedMode = -1;
         g_swanSavedOk = false;
@@ -4725,8 +4742,9 @@ static uintptr_t FindSwanNeck()
         if (!LooksLikeSwanInstance(obj)) continue;
         g_swanNeck = obj;
         g_swanMissLogged = false;
-        Log("[swan] live instance at %p (amortized walk: %.1f ms total, found at"
-            " slot %u of %u)", (void*)obj, g_swanWalkMs + NowMs() - t0, i, count);
+        Log("[swan] live instance at %p at frame %ld t=%.2fs (amortized walk: %.1f ms total,"
+            " found at slot %u of %u)", (void*)obj, g_frames, LogSecs(),
+            g_swanWalkMs + NowMs() - t0, i, count);
         g_swanCursor = 0;
         g_swanWalkMs = 0.0;
         return obj;
@@ -4760,6 +4778,15 @@ static void ApplySwanNeck()
     const uintptr_t obj = FindSwanNeck();
     if (!obj) return;
 
+    // One movement-state read shared by every gate and log line below. The byte changes on
+    // the game thread mid-frame; two reads disagreeing inside one call would make the log lie
+    // about what the gate saw. 0xFF = unreadable, and unreadable is never calm.
+    uint8_t move = 0xFF;
+    if (!(g_playerPawn && g_offMoveState >= 0 &&
+          SafeRead(g_playerPawn + g_offMoveState, &move, 1)))
+        move = 0xFF;
+    const bool calm = (move == 1 || move == 15 || move == 29 || move == 30);
+
     // Saved on first sight so the original values can be put back, rather than assuming the
     // shipped defaults - the player may have a config that differs from DefaultGame.ini.
     if (!g_swanSavedOk) {
@@ -4771,7 +4798,12 @@ static void ApplySwanNeck()
         if (all) {
             for (int i = 0; i < 4; ++i) g_swanSaved[i] = tmp[i];
             g_swanSavedOk = true;
-            Log("[swan] original values: linear %.1f/%.1f  quadratic %.1f/%.1f",
+            // Move-stamped because this capture is UNGATED: on an instance the game recreated
+            // mid-transition these "originals" may be a transition profile's values, and a
+            // later restore would then restore the wrong spring. 25/25/35/30 every time so
+            // far - the stamp is here to catch the day that stops being true.
+            Log("[swan] original values at frame %ld t=%.2fs (move %s(%d)): linear %.1f/%.1f"
+                "  quadratic %.1f/%.1f", g_frames, LogSecs(), MoveName(move), (int)move,
                 tmp[0], tmp[1], tmp[2], tmp[3]);
         }
     }
@@ -4805,36 +4837,60 @@ static void ApplySwanNeck()
         // whenever it wants one - 37 measured reassertions in a single run - so outside the
         // calm states the mod now touches nothing at all, and the calm-frame verify loop
         // re-zeroes on return.
-        uint8_t move = 0xFF;
-        const bool calm = g_playerPawn && g_offMoveState >= 0 &&
-            SafeRead(g_playerPawn + g_offMoveState, &move, 1) &&
-            (move == 1 || move == 15 || move == 29 || move == 30);
-        if (!calm) return;
         const float mul = (g_swanMode == 1) ? 0.0f : 8.0f;
         const uint32_t offs[4] = { SWAN_LinearFwd, SWAN_LinearDown, SWAN_QuadFwd, SWAN_QuadDown };
         bool drifted = false;
+        float now[4] = { 0, 0, 0, 0 };
         for (int i = 0; i < 4; ++i) {
-            float now = 0.0f;
-            if (!SafeRead(obj + offs[i], &now, sizeof(now))) return;   // instance validator's job
-            if (fabsf(now - g_swanSaved[i] * mul) > 0.01f) { drifted = true; break; }
+            if (!SafeRead(obj + offs[i], &now[i], sizeof(float))) return;  // instance validator's job
+            if (fabsf(now[i] - g_swanSaved[i] * mul) > 0.01f) drifted = true;
         }
-        if (!drifted) return;
+        // Freeze-hunt instrumentation, logging only - the write rules above are unchanged.
+        // The game rewriting the spring IS the transition signal, so standing down logs its
+        // edges instead of returning silently: one line when the game takes the spring (with
+        // the values IT wrote), one on the reassert that takes it back. And every reassert
+        // logs unthrottled with the frame, the movement state the gate saw, and the values it
+        // overwrote - the old 900-frame rate limit hid two of the last run's four
+        // reassertions, and an invisible write is exactly what a write landing inside a
+        // transition would be. 37 per run measured; the log can afford them all.
+        if (drifted && !calm) {
+            if (g_swanStandDownFrame < 0) {
+                g_swanStandDownFrame = g_frames;
+                Log("*** [swan] game took the spring at frame %ld t=%.2fs (move %s(%d)):"
+                    " linear %.1f/%.1f quadratic %.1f/%.1f - standing down",
+                    g_frames, LogSecs(), MoveName(move), (int)move,
+                    now[0], now[1], now[2], now[3]);
+            }
+            return;
+        }
+        if (!drifted) {
+            if (g_swanStandDownFrame >= 0 && calm) {
+                Log("[swan] spring already back at mode-%d values on return to calm at"
+                    " frame %ld t=%.2fs (stood down %ld frames)", g_swanMode, g_frames,
+                    LogSecs(), g_frames - g_swanStandDownFrame);
+                g_swanStandDownFrame = -1;
+            }
+            return;
+        }
         const bool ok = WriteF32(obj + SWAN_LinearFwd,  g_swanSaved[0] * mul) &&
                         WriteF32(obj + SWAN_LinearDown, g_swanSaved[1] * mul) &&
                         WriteF32(obj + SWAN_QuadFwd,    g_swanSaved[2] * mul) &&
                         WriteF32(obj + SWAN_QuadDown,   g_swanSaved[3] * mul);
         static long reasserted = 0;
         ++reasserted;
-        static long lastReport = -1000000;
-        if (g_frames - lastReport >= 900) {
-            lastReport = g_frames;
-            Log("*** [swan] game rewrote the spring; re-asserted mode %d"
-                " (%ld reassertions so far)%s", g_swanMode, reasserted,
-                ok ? "" : "  <- A WRITE FAILED");
+        char ends[48] = "";
+        if (g_swanStandDownFrame >= 0) {
+            sprintf_s(ends, " - ends %ld-frame stand-down", g_frames - g_swanStandDownFrame);
+            g_swanStandDownFrame = -1;
         }
+        Log("*** [swan] REASSERT #%ld mode %d at frame %ld t=%.2fs (move %s(%d)): overwrote"
+            " linear %.1f/%.1f quadratic %.1f/%.1f%s%s", reasserted, g_swanMode, g_frames,
+            LogSecs(), MoveName(move), (int)move, now[0], now[1], now[2], now[3], ends,
+            ok ? "" : "  <- A WRITE FAILED");
         return;
     }
     if (!g_swanSavedOk) return;
+    g_swanStandDownFrame = -1;   // any stand-down episode belonged to the departed instance
 
     // ---- three states, not two, and the third is the one that proves anything ----
     //
@@ -4848,6 +4904,17 @@ static void ApplySwanNeck()
     // camera. Reporting "I could tell something happened" is honest and soft; this turns it
     // into a yes or no.
     const float mul = (g_swanMode == 1) ? 0.0f : (g_swanMode == 2 ? 8.0f : 1.0f);
+    // This branch runs on F7 mode changes AND on every instance replacement - FindSwanNeck
+    // resets the applied mode when the game recreates the object, which the marked runs show
+    // it does DURING fall and grab transitions - and unlike the verify loop above it carries
+    // no calm gate. Until the freeze is settled it stays ungated ON PURPOSE (instrumentation
+    // must observe the suspect, not reform it), but every write now records the frame, the
+    // movement state at write time, and the values it overwrote - enough to convict or clear
+    // this path from one marked run.
+    float before[4] = { 0, 0, 0, 0 };
+    const uint32_t offs[4] = { SWAN_LinearFwd, SWAN_LinearDown, SWAN_QuadFwd, SWAN_QuadDown };
+    for (int i = 0; i < 4; ++i)
+        if (!SafeRead(obj + offs[i], &before[i], sizeof(float))) before[i] = -999.0f;
     const bool ok = WriteF32(obj + SWAN_LinearFwd,  g_swanSaved[0] * mul) &&
                     WriteF32(obj + SWAN_LinearDown, g_swanSaved[1] * mul) &&
                     WriteF32(obj + SWAN_QuadFwd,    g_swanSaved[2] * mul) &&
@@ -4856,9 +4923,12 @@ static void ApplySwanNeck()
     const char* what = (g_swanMode == 1) ? "ZEROED - looking down should feel flat"
                      : (g_swanMode == 2) ? "EXAGGERATED 8x - looking down should LURCH forward and down"
                                          : "ORIGINAL values restored";
-    Log("*** [swan] %s  (linear %.1f/%.1f quadratic %.1f/%.1f) %s",
-        what, g_swanSaved[0] * mul, g_swanSaved[1] * mul,
+    Log("*** [swan] FIRST-APPLY at frame %ld t=%.2fs (move %s(%d)): %s  (linear %.1f/%.1f"
+        " quadratic %.1f/%.1f, was %.1f/%.1f %.1f/%.1f)%s",
+        g_frames, LogSecs(), MoveName(move), (int)move, what,
+        g_swanSaved[0] * mul, g_swanSaved[1] * mul,
         g_swanSaved[2] * mul, g_swanSaved[3] * mul,
+        before[0], before[1], before[2], before[3],
         ok ? "" : "  <- A WRITE FAILED");
     g_swanAppliedMode = g_swanMode;
 }
@@ -5943,8 +6013,8 @@ static void CheckHeadHotkeys()
     if (dMark && !pMark) {
         static long markerCount = 0;
         ++markerCount;
-        Log("*** [mark] ======== USER MARKER #%ld at frame %ld ========"
-            " (next ~40 arm updates logged densely)", markerCount, g_frames);
+        Log("*** [mark] ======== USER MARKER #%ld at frame %ld t=%.2fs ========"
+            " (next ~40 arm updates logged densely)", markerCount, g_frames, LogSecs());
         InterlockedExchange(&g_markerBurst, 40);
     }
     pMark = dMark;
@@ -11965,6 +12035,43 @@ static const char* kMoveNames[] = {
     "StumbleHard","BotRoll","BotFlip",
 };
 static const int kMoveCount = (int)(sizeof(kMoveNames) / sizeof(kMoveNames[0]));
+
+// Shared spelling for a movement state in log lines: the table name when the byte is in
+// range, "?" when it is not. Out-of-enum values are real - state 72 was logged at a fall
+// entry - and must stay visibly distinct from every named state.
+static const char* MoveName(int st)
+{
+    return (st >= 0 && st < kMoveCount) ? kMoveNames[st] : "?";
+}
+
+// The authoritative what-state-when timeline. Every other line that mentions a movement
+// state does so as a side effect of its own gate, rate limit, or eligibility check; the
+// transitions BETWEEN those moments were invisible, and the fall/grab freezes live exactly
+// there. One byte read per frame, a line only on change - and a pawn swap is a change even
+// at the same state, because a replacement pawn is a new rig generation.
+static void LogMoveTransitions()
+{
+    static int lastState = -1;          // -1 = unreadable / nothing seen yet
+    static uintptr_t lastPawn = 0;
+    const uintptr_t pawn = g_playerPawn;
+    uint8_t st = 0xFF;
+    if (!pawn || g_offMoveState < 0 || !SafeRead(pawn + g_offMoveState, &st, 1)) {
+        if (lastState != -1) {
+            Log("[move] frame %ld t=%.2fs: %s(%d) -> UNREADABLE (pawn %p)",
+                g_frames, LogSecs(), MoveName(lastState), lastState, (void*)pawn);
+            lastState = -1;
+            lastPawn = 0;
+        }
+        return;
+    }
+    if ((int)st != lastState || pawn != lastPawn) {
+        Log("[move] frame %ld t=%.2fs: %s(%d) -> %s(%d)%s", g_frames, LogSecs(),
+            MoveName(lastState), lastState, MoveName(st), (int)st,
+            (lastPawn != 0 && pawn != lastPawn) ? "  (new pawn)" : "");
+        lastState = (int)st;
+        lastPawn = pawn;
+    }
+}
 static float g_statePeakRoll[64] = { 0 };       // worst roll seen in each movement state
 static float g_statePeakPitch[64] = { 0 };
 static long  g_animSamples = 0;
@@ -12529,7 +12636,10 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     InstallXInputHook();
 
     // AutoArm last, so a manual keypress on this frame is seen before the sequence acts on it.
+    // Move-transition log first, so a state change and the [swan] reaction it provokes land
+    // in cause-then-effect order within the frame.
     if (g_offName >= 0) {
+        LogMoveTransitions();
         CheckSwanHotkey(); ApplySwanNeck(); CheckHeadHotkeys(); CheckVMHotkey();
         CheckVMWatchdog(); AutoArm();
     }
