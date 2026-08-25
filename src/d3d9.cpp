@@ -1962,6 +1962,8 @@ long                     g_frameSceneOffscreen = 0;
 // Set by the HOME-key user marker; while positive, the arm-continuity watchdog logs every
 // update unconditionally and decrements it. Render thread sets, game thread consumes.
 volatile LONG            g_markerBurst = 0;
+// Render thread only: [cam] freeze-probe burst frames remaining after a user marker.
+long                     g_camBurst = 0;
 
 // The scene's rectangle within the captured backbuffer. Every one of these collapses to the
 // whole backbuffer while g_sceneW/H are unset or equal to it, so every use below is an identity
@@ -6088,6 +6090,7 @@ static void CheckHeadHotkeys()
         Log("*** [mark] ======== USER MARKER #%ld at frame %ld t=%.2fs ========"
             " (next ~40 arm updates logged densely)", markerCount, g_frames, LogSecs());
         InterlockedExchange(&g_markerBurst, 40);
+        g_camBurst = 300;    // ~4 s of dense [cam] freeze-probe lines around the marked moment
     }
     pMark = dMark;
 
@@ -10018,6 +10021,106 @@ static void SampleLivePivot()
     g_livePivotValid = true;
 }
 
+// Extract the camera position from a world->clip matrix without a 4x4 inverse: the x, y and
+// w output rows are each a SCALED camera basis vector with offset -(basis . C), so the three
+// planes x=0, y=0, w=0 all pass through the camera and their bases are mutually orthogonal.
+// Normalize-and-recombine solves C exactly in ~30 flops.
+static bool CameraFromVP(const float* q, bool colIsOutput, float out[3])
+{
+    const int outs[3] = { 0, 1, 3 };            // clip x, y, w
+    float C[3] = { 0, 0, 0 };
+    for (int r = 0; r < 3; ++r) {
+        const int j = outs[r];
+        float a, b, c, d;
+        if (colIsOutput) { a = q[j]; b = q[4 + j]; c = q[8 + j]; d = q[12 + j]; }
+        else             { a = q[j * 4]; b = q[j * 4 + 1]; c = q[j * 4 + 2]; d = q[j * 4 + 3]; }
+        const float len2 = a * a + b * b + c * c;
+        if (len2 < 1e-12f) return false;
+        const float k = -d / len2;
+        C[0] += a * k; C[1] += b * k; C[2] += c * k;
+    }
+    if (!std::isfinite(C[0]) || !std::isfinite(C[1]) || !std::isfinite(C[2])) return false;
+    out[0] = C[0]; out[1] = C[1]; out[2] = C[2];
+    return true;
+}
+
+// ---- which link freezes: the pawn's camera fields, or the matrix actually rendered? ----
+//
+// The head-steering stand-down engaged exactly as designed through a full marked run and the
+// player still saw every freeze, which exonerates the controller writes and leaves a fork
+// the existing telemetry cannot split: either the GAME freezes its render camera during
+// these sequences (and vanilla hides that behind presentation the VR path strips), or the
+// game camera moves and some display-side link pins the view. This probe logs the motion of
+// both candidates against a snapshot taken when the window opens - the camera fields via
+// ReadCameraAnchor, the render camera extracted from the last accepted scene matrix.
+// Whichever delta flatlines while the player reports a frozen view is the broken link; if
+// BOTH move, the freeze lives further down (capture/submit). Runs every 15th frame inside a
+// game-owned movement state, and every 3rd frame for ~4 s after a user marker - the death
+// freeze begins in Falling, an OWNED state, so marker bursts must sample there too.
+extern long g_camBurst;
+static void LogCameraMotionProbe()
+{
+    static bool  sampling = false;
+    static float entryCam[3] = { 0, 0, 0 };
+    static float entryMat[3] = { 0, 0, 0 };
+    static bool  entryMatOk = false;
+    static int32_t entryPitch = 0, entryYaw = 0;
+    static long  tick = 0;
+
+    uint8_t move = 0xFF;
+    if (!(g_playerPawn && g_offMoveState >= 0 &&
+          SafeRead(g_playerPawn + g_offMoveState, &move, 1)))
+        move = 0xFF;
+    const bool owned = (move == 1 || move == 2 || move == 11 || move == 15 ||
+                        move == 24 || move == 29 || move == 30);
+    const bool burst = g_camBurst > 0;
+    if (burst) --g_camBurst;
+
+    if (owned && !burst) { sampling = false; return; }
+
+    float cl[3];
+    int32_t rr[3];
+    const bool anchorOk = ReadCameraAnchor(cl, rr);
+    float mat[3];
+    const bool matOk = g_sceneMatValid && CameraFromVP(g_sceneMat, g_vmRow, mat);
+
+    if (!sampling) {
+        sampling = true;
+        tick = 0;
+        entryCam[0] = anchorOk ? cl[0] : 0; entryCam[1] = anchorOk ? cl[1] : 0;
+        entryCam[2] = anchorOk ? cl[2] : 0;
+        entryPitch = anchorOk ? rr[0] : 0; entryYaw = anchorOk ? rr[1] : 0;
+        entryMatOk = matOk;
+        if (matOk) { entryMat[0] = mat[0]; entryMat[1] = mat[1]; entryMat[2] = mat[2]; }
+        Log("[cam] probe opens at frame %ld t=%.2fs (move %s(%d)): camLoc (%.1f,%.1f,%.1f)"
+            " matrixCam (%.1f,%.1f,%.1f)%s%s", g_frames, LogSecs(), MoveName((int)move),
+            (int)move, entryCam[0], entryCam[1], entryCam[2],
+            entryMatOk ? entryMat[0] : -1.0f, entryMatOk ? entryMat[1] : -1.0f,
+            entryMatOk ? entryMat[2] : -1.0f,
+            anchorOk ? "" : "  <- camera fields UNREADABLE",
+            matOk ? "" : "  <- no scene matrix yet");
+        return;
+    }
+    if ((tick++ % (burst ? 3 : 15)) != 0) return;
+
+    const float kDeg = 360.0f / 65536.0f;
+    float dcam = -1.0f, dmat = -1.0f, dp = 0.0f, dy = 0.0f;
+    if (anchorOk) {
+        dcam = sqrtf((cl[0] - entryCam[0]) * (cl[0] - entryCam[0]) +
+                     (cl[1] - entryCam[1]) * (cl[1] - entryCam[1]) +
+                     (cl[2] - entryCam[2]) * (cl[2] - entryCam[2]));
+        dp = (float)(int16_t)(rr[0] - entryPitch) * kDeg;
+        dy = (float)(int16_t)(rr[1] - entryYaw) * kDeg;
+    }
+    if (matOk && entryMatOk)
+        dmat = sqrtf((mat[0] - entryMat[0]) * (mat[0] - entryMat[0]) +
+                     (mat[1] - entryMat[1]) * (mat[1] - entryMat[1]) +
+                     (mat[2] - entryMat[2]) * (mat[2] - entryMat[2]));
+    Log("[cam] frame %ld t=%.2fs move %s(%d): camLoc %+0.1f UU from entry, rot dP %+0.1f"
+        " dY %+0.1f deg | matrixCam %+0.1f UU from entry", g_frames, LogSecs(),
+        MoveName((int)move), (int)move, dcam, dp, dy, dmat);
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
                                                   const float* data, UINT count)
 {
@@ -12712,6 +12815,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     // in cause-then-effect order within the frame.
     if (g_offName >= 0) {
         LogMoveTransitions();
+        LogCameraMotionProbe();
         CheckSwanHotkey(); ApplySwanNeck(); CheckHeadHotkeys(); CheckVMHotkey();
         CheckVMWatchdog(); AutoArm();
     }
