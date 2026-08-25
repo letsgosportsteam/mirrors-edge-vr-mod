@@ -1960,6 +1960,10 @@ bool                     g_sceneSplitMono = false;
 long                     g_frameSceneOnBackbuffer = 0;
 long                     g_frameSceneOffscreen = 0;
 extern int               g_vmReg;                // for the [eye] duplication-gate breakdown
+// c0 classification tallies for the freeze hunt, cumulative, render thread only; the [cam]
+// probe and the [eye] gate breakdown print deltas since their own last line.
+long g_c0Uploads = 0, g_c0Pass = 0, g_c0FailW = 0, g_c0FailDir = 0, g_c0Degen = 0,
+     g_c0NoCache = 0;
 // Set by the HOME-key user marker; while positive, the arm-continuity watchdog logs every
 // update unconditionally and decrements it. Render thread sets, game thread consumes.
 volatile LONG            g_markerBurst = 0;
@@ -2211,12 +2215,19 @@ static void SubmitTestQuad()
         if (frameIsStereo) monoTick = 0; else ++monoTick;
         if ((flipped && g_vmReg >= 0) ||
             (!frameIsStereo && g_vmReg >= 0 && (monoTick % 60) == 0)) {
+            static long lastUp = 0, lastPass = 0, lastW = 0, lastDir = 0, lastDegen = 0,
+                        lastNoC = 0;
             Log("[eye]   gates: dup %d this frame | scene draws: backbuffer %ld offscreen %ld"
                 " | c0IsScene %d sceneMatValid %d splitMono %d | vmReg %d halfIpd %.2f |"
-                " cap %ux%u scene %ux%u",
+                " cap %ux%u scene %ux%u | c0 since last: %ld up = %ld pass %ld wpos %ld dir"
+                " %ld degen %ld nocache",
                 dupThisFrame, g_frameSceneOnBackbuffer, g_frameSceneOffscreen,
                 g_c0IsScene ? 1 : 0, g_sceneMatValid ? 1 : 0, g_sceneSplitMono ? 1 : 0,
-                g_vmReg, g_halfIpdUU, g_capW, g_capH, g_sceneW, g_sceneH);
+                g_vmReg, g_halfIpdUU, g_capW, g_capH, g_sceneW, g_sceneH,
+                g_c0Uploads - lastUp, g_c0Pass - lastPass, g_c0FailW - lastW,
+                g_c0FailDir - lastDir, g_c0Degen - lastDegen, g_c0NoCache - lastNoC);
+            lastUp = g_c0Uploads; lastPass = g_c0Pass; lastW = g_c0FailW;
+            lastDir = g_c0FailDir; lastDegen = g_c0Degen; lastNoC = g_c0NoCache;
         }
     }
 
@@ -10137,9 +10148,15 @@ static void LogCameraMotionProbe()
         dmat = sqrtf((mat[0] - entryMat[0]) * (mat[0] - entryMat[0]) +
                      (mat[1] - entryMat[1]) * (mat[1] - entryMat[1]) +
                      (mat[2] - entryMat[2]) * (mat[2] - entryMat[2]));
+    static long lastUp = 0, lastPass = 0, lastW = 0, lastDir = 0, lastDegen = 0, lastNoC = 0;
     Log("[cam] frame %ld t=%.2fs move %s(%d): camLoc %+0.1f UU from entry, rot dP %+0.1f"
-        " dY %+0.1f deg | matrixCam %+0.1f UU from entry", g_frames, LogSecs(),
-        MoveName((int)move), (int)move, dcam, dp, dy, dmat);
+        " dY %+0.1f deg | matrixCam %+0.1f UU from entry | c0 since last: %ld up = %ld pass"
+        " %ld wpos %ld dir %ld degen %ld nocache", g_frames, LogSecs(),
+        MoveName((int)move), (int)move, dcam, dp, dy, dmat,
+        g_c0Uploads - lastUp, g_c0Pass - lastPass, g_c0FailW - lastW,
+        g_c0FailDir - lastDir, g_c0Degen - lastDegen, g_c0NoCache - lastNoC);
+    lastUp = g_c0Uploads; lastPass = g_c0Pass; lastW = g_c0FailW;
+    lastDir = g_c0FailDir; lastDegen = g_c0Degen; lastNoC = g_c0NoCache;
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
@@ -10196,13 +10213,24 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
             // pose during a fast turn, tight enough that the 45 and 90 degree impostors cannot
             // get through.
             float dirOk = 1.0f;
+            float dirLen = 0.0f;
             {
                 const float mx = g_vmRow ? q[3]  : q[12];
                 const float my = g_vmRow ? q[7]  : q[13];
                 const float mz = g_vmRow ? q[11] : q[14];
-                const float ml = sqrtf(mx*mx + my*my + mz*mz);
-                if (ml > 1e-6f)
-                    dirOk = (mx*g_camFwd[0] + my*g_camFwd[1] + mz*g_camFwd[2]) / ml;
+                dirLen = sqrtf(mx*mx + my*my + mz*mz);
+                // ⚠️ A near-zero forward row must REJECT, not default to passing. The old
+                // fallback left dirOk at 1.0, and the w test is no help there either: a
+                // degenerate or orthographic matrix has w = q[15], a constant that trivially
+                // sits inside any tolerance. So ortho and zeroed uploads - death effects,
+                // landing post - passed BOTH tests by construction, were cached as the scene
+                // matrix, and every eye was then rendered from garbage. The [cam] probe
+                // measured the result: matrixCam unextractable for entire Landing and
+                // state-72 windows while the camera fields moved perfectly.
+                if (dirLen > 1e-6f)
+                    dirOk = (mx*g_camFwd[0] + my*g_camFwd[1] + mz*g_camFwd[2]) / dirLen;
+                else
+                    dirOk = -1.0f;   // no forward direction = not a perspective view at all
             }
             // Tolerance from the measurement rather than a fixed number: whatever distance the
             // camera covered last frame bounds how far this frame's true position can be from
@@ -10212,6 +10240,14 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
             const float tol = 25.0f + g_pivotStep * 1.5f;
             const bool isScene = (g_camCacheValid && fabsf(w) <= tol && dirOk >= 0.90f);
             g_c0IsScene = isScene;   // tracked even when validation is off, for ShouldDuplicate
+            // Freeze-hunt classification tallies, printed as deltas by the [cam] probe and
+            // the [eye] gate breakdown: WHICH test fails, per window, measured.
+            ++g_c0Uploads;
+            if (isScene)                      ++g_c0Pass;
+            else if (dirLen <= 1e-6f)         ++g_c0Degen;
+            else if (!g_camCacheValid)        ++g_c0NoCache;
+            else if (!(fabsf(w) <= tol))      ++g_c0FailW;
+            else                              ++g_c0FailDir;
 
             // ---- acceptance, reported where duplication can see it ----
             //
