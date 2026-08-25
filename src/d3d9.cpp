@@ -5100,63 +5100,17 @@ static long      g_headJumpsRejected = 0;
 // The shortest signed path between two UE3 angles. Never subtract them raw.
 static inline int32_t YawDelta(int32_t a, int32_t b) { return (int16_t)((int32_t)(a - b)); }
 
-// ---- does the player own the camera right now? ----
-//
-// The transition-freeze investigation's endpoint (runs 19:20/20:14 plus the player's report:
-// the fall's audio completes while the view hangs mid-air; head-look dead on the pipe). The
-// game runs its scripted-camera sequences - the slow-motion death fall (out-of-enum state
-// 72), the hard-land recovery (Landing), the pipe-catch dangle (IntoClimb/Climb) - through
-// the same controller/camera fields the steering below writes every frame, and the [vm]
-// windows prove the game kept rendering from those fields through every freeze (0.0-0.5%
-// rejection, tolerance auto-widening as designed). Re-asserting the headset pose into the
-// controller there is the swan lesson (run 26) replayed on the camera path: an every-frame
-// fight with a game-side value inside states whose logic round-trips through it. The result
-// was not judder this time but a frozen view over a running game.
-//
-// The steering therefore stands down outside states where the player demonstrably owns the
-// camera. The whitelist is the hands-eligibility family INCLUDING the airborne states -
-// head-look during ordinary jumps and falls is core VR function, and those states measured
-// clean across 30+ transitions in the marked runs. Unreadable and unknown states (72
-// included) fail CLOSED, the polarity run 27 proved on the swan. Re-entry waits out a dwell
-// so the resume cannot land inside a sequence's tail - the same reasoning as kSwanCalmDwell,
-// and cheap here because pitch stays display-corrected in the matrix regardless; only the
-// yaw steering pauses perceptibly, for under a second.
-//
-// This deliberately narrows the older rule above the absolute-pitch write ("the frames where
-// something else moved the camera need it most"): that reasoning holds for calm-state camera
-// profile swaps, and standing down here does not touch it - the absolute anchor still runs
-// every owned frame. It was wrong only where the "something else" is a sequence the game is
-// executing through these fields.
-static const long kHeadOwnDwell = 45;
-static bool HeadSteeringOwned()
-{
-    static long ownedStreak = 0;
-    static long standDownFrame = -1;    // frame the current game-owned window began, -1 = none
-    uint8_t move = 0xFF;
-    if (!(g_playerPawn && g_offMoveState >= 0 &&
-          SafeRead(g_playerPawn + g_offMoveState, &move, 1)))
-        move = 0xFF;
-    const bool owned = (move == 1 || move == 2 || move == 11 || move == 15 ||
-                        move == 24 || move == 29 || move == 30);
-    if (!owned) {
-        if (standDownFrame < 0) {
-            standDownFrame = g_frames;
-            Log("*** [head] camera is game-owned (move %s(%d)) at frame %ld t=%.2fs -"
-                " steering stands down", MoveName((int)move), (int)move, g_frames, LogSecs());
-        }
-        ownedStreak = 0;
-        return false;
-    }
-    ++ownedStreak;
-    if (ownedStreak < kHeadOwnDwell) return false;
-    if (standDownFrame >= 0) {
-        Log("[head] steering resumes at frame %ld t=%.2fs (move %s(%d)) after %ld-frame"
-            " game-owned window", g_frames, LogSecs(), MoveName((int)move), (int)move,
-            g_frames - standDownFrame);
-        standDownFrame = -1;
-    }
-    return true;
-}
+// A steering stand-down for "game-owned camera" states lived here for two builds and is
+// deliberately GONE. It was built on the write-fight theory of the transition freezes - and
+// the [cam] probe disproved that theory outright: the game ran every death, landing and
+// climb sequence to completion with steering active, camera fields tracking perfectly; the
+// freezes were degenerate c0 uploads poisoning the cached scene matrix (see the dirLen
+// rejection in the injection hook). With the real cause fixed, the stand-down only
+// subtracted function: on a pipe hang (Climb, not whitelisted) it silenced the head-yaw
+// writes the game would have honoured - vanilla allows free look while hanging - which left
+// the display-side yaw-lag correction alone at full head-turn amplitude, a regime it was
+// never calibrated for, and the player measured the result as inverted look. Steering runs
+// everywhere again, as it did for every run before the stand-down.
 
 static bool LooksLikePlayerController(uintptr_t obj)
 {
@@ -5455,10 +5409,6 @@ static void ApplyHeadTracking(XrTime when)
     int32_t dYaw   = YawDelta(hy, g_lastHeadYaw)   * g_yawSign;
     int32_t dPitch = YawDelta(hp, g_lastHeadPitch) * g_pitchSign;
     g_lastHeadYaw = hy; g_lastHeadPitch = hp;
-    // Stand down while the game owns its camera (death, hard-land recovery, scripted catch).
-    // The reference above keeps tracking the head through the window, so the resume starts
-    // from the current pose with nothing banked - the same no-jump property as priming.
-    if (!HeadSteeringOwned()) return;
     // An absolute pitch has to be re-asserted every frame even when the head has not moved -
     // that IS the correction, and it is the frames where something else moved the camera that
     // need it most. Only the relative path can skip a still head.
