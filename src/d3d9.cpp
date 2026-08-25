@@ -1959,6 +1959,7 @@ bool                     g_sceneSplitMono = false;
 // Per-frame scene-draw tallies for the split-flip detector, reset every Present.
 long                     g_frameSceneOnBackbuffer = 0;
 long                     g_frameSceneOffscreen = 0;
+extern int               g_vmReg;                // for the [eye] duplication-gate breakdown
 // Set by the HOME-key user marker; while positive, the arm-continuity watchdog logs every
 // update unconditionally and decrements it. Render thread sets, game thread consumes.
 volatile LONG            g_markerBurst = 0;
@@ -2190,12 +2191,32 @@ static void SubmitTestQuad()
     if (dupThisFrame >= 4) monoRun = 0; else if (monoRun < 1000) ++monoRun;
     const bool frameIsStereo = (monoRun < 10);
     {
+        // Freeze-hunt: the MONO fallback engaging mid-run IS the reported freeze - the quad
+        // is head-locked, so the world stops answering the head - and in the marked runs
+        // every death window flipped here while [rt] logged no split transition. So some
+        // OTHER ShouldDuplicate gate starves duplication during game-owned sequences, and
+        // this breakdown names it: this frame's scene-classified draw tallies by target size
+        // (the per-draw truth, unlike g_c0IsScene which is only the LAST upload's verdict)
+        // plus every input the gate consults. On each flip, and every 60th frame while mono
+        // persists in-gameplay, because one transient flip line cannot show a sustained cause.
         static bool wasStereo = false;
-        if (frameIsStereo != wasStereo) {
+        static long monoTick = 0;
+        const bool flipped = (frameIsStereo != wasStereo);
+        if (flipped) {
             wasStereo = frameIsStereo;
             Log("[eye] frame is %s - presenting the %s",
                 frameIsStereo ? "side-by-side" : "MONO (nothing duplicated)",
                 frameIsStereo ? "stereo projection" : "head-locked quad");
+        }
+        if (frameIsStereo) monoTick = 0; else ++monoTick;
+        if ((flipped && g_vmReg >= 0) ||
+            (!frameIsStereo && g_vmReg >= 0 && (monoTick % 60) == 0)) {
+            Log("[eye]   gates: dup %d this frame | scene draws: backbuffer %ld offscreen %ld"
+                " | c0IsScene %d sceneMatValid %d splitMono %d | vmReg %d halfIpd %.2f |"
+                " cap %ux%u scene %ux%u",
+                dupThisFrame, g_frameSceneOnBackbuffer, g_frameSceneOffscreen,
+                g_c0IsScene ? 1 : 0, g_sceneMatValid ? 1 : 0, g_sceneSplitMono ? 1 : 0,
+                g_vmReg, g_halfIpdUU, g_capW, g_capH, g_sceneW, g_sceneH);
         }
     }
 
