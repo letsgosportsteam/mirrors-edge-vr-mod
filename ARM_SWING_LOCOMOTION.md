@@ -253,7 +253,11 @@ a feel complaint. Two regimes with an explicit hold window is the shape that sat
 Additionally: the physical stick pulled backwards past its dead zone collapses `speed_held`
 immediately. That is the emergency stop, and it needs to be a reflex the player can trust.
 
-### ⚠️ The floor is 0.7, not zero — and it changes the mapping
+### ⚠️ The floor is 0.784, not zero — and it changes the mapping
+
+*Written as 0.7 before AS.1a measured a 0.280 stick dead band. The game's limits are in
+post-deadzone units; the raw value that reaches them is 0.784. Everything below stands, with
+that correction — see the AS.1a result for the measured curve.*
 
 The envelope was specified above to stop the stick reaching *zero* at each swing reversal. That
 is not the real requirement. `InputMaxSprintRaduisLimit = 0.7` means sprint is gated on near-full
@@ -467,6 +471,68 @@ than a refusal.
 
 **Pass:** the deflection→speed curve is known, the gate's real position is known, and the time
 from 400 to 630 under sustained full deflection is measured.
+
+### AS.1a result, 2026-08-27 — ✅ all eight curve steps completed
+
+| raw deflection | ground speed, UU/s |
+|---|---|
+| 0.30 | **0** — nothing at all, for the full six seconds |
+| 0.50 | 122 |
+| 0.65 | 205 |
+| 0.69 | 227 |
+| 0.71 | 238 |
+| 0.75 | 261 |
+| 0.85 | **703** |
+| 1.00 | **703–708** |
+
+**There is a 0.280 dead band on the raw stick, and the remainder is renormalised.** The five
+linear points fit
+
+```text
+base speed = 400 × (raw − 0.280) / 0.720
+```
+
+to within 1 UU/s each — and it extrapolates to **exactly 400 at full deflection**, which is
+`SpeedMaxBaseVelocity` on the nose. That is the model confirming itself against a number it was
+not fitted to.
+
+**The 0.7 limits are in post-deadzone units, so the raw stick value that crosses the sprint gate
+is 0.784, not 0.700.** Predicted from the fit: `0.280 + 0.7 × 0.720`. Measured: 0.75 raw
+(0.653 normalised) does not sprint, 0.85 raw (0.792) does. The gate is bracketed between them and
+0.700 sits inside. Comparing a raw stick value against the ini's 0.7 would have put the gate 0.08
+too low — enough to sit permanently just under it.
+
+**Above the gate, deflection stops mattering entirely.** The 0.85 and 1.00 ramps are identical at
+every sample: 423/425, 523/524, 574/574, 599/600, 624/625, 647/648, 667/667, 681/681, 691/691,
+699/699. There is no analogue control above the gate — you are either on the proportional curve at
+≤400, or ramping to ~707.
+
+**The sprint ramp, and it does not stop at 630.** ~400 within 0.5 s, then asymptotic to **~707**
+over about five seconds, with 82 % of the extra gained in the first three. `SprintVelocity = 630`
+is passed straight through, so it is not a cap.
+
+The 15 s hold never completed — the rooftop ran out — but six independent partial runs peaked at
+706, 706, 708, 708, 707, 707 and none exceeded it, so the plateau is established regardless. The
+missing step cost nothing.
+
+**Correction this rung forced.** The three input limits were looked up on `TdPawn` and reported
+`NOT FOUND after walking 1064 fields`. They are on **`TdPlayerController`** — `DefaultGame.ini`
+puts them under `[TdGame.TdPlayerController]`, several sections below the `[TdGame.TdPawn]` block
+holding the velocities. `Velocity` itself is the pawn's. Fixed; the live values will be reported
+on the next run.
+
+### What this settles for AS.1
+
+- The **deadband is 0.280 raw**, not a swing threshold that happens to produce a small deflection.
+  Anything below it is discarded by the game before the mod's mapping has any say.
+- The **usable proportional band is 0.280 → 0.784**, carrying 0 → 400 UU/s.
+- Above 0.784, **assert 1.0, not 0.79.** Behaviour is identical either way, so the extra 0.216 is
+  free margin against an envelope dip. There is no reason to sit near a cliff edge.
+- **Envelope sag is a cliff, not a gradient.** Dropping below 0.784 does not cost a little speed —
+  it drops out of sprint and bleeds the accumulated energy over three seconds, so the entire
+  400→707 range is gated on one threshold. The hold window has to clear it with margin, and the
+  swing→sprint decision needs hysteresis so a swing hovering near the threshold cannot chatter
+  across it.
 
 ### AS.1 — speed
 

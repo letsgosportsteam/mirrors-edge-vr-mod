@@ -646,6 +646,7 @@ static bool g_motionPoseHeadValid = false;
 extern uintptr_t g_playerPawn;
 extern int g_offActorLocation;
 extern int g_offVelocity;
+extern uintptr_t g_playerCtl;
 extern int g_offSprintRadiusLimit;
 extern int g_offSprintHeightLimit;
 extern int g_offWalkRadiusLimit;
@@ -1580,19 +1581,27 @@ static void SweepStart(XrTime when)
 static void ReportSprintLimitsOnce()
 {
     static bool done = false;
-    if (done || !g_playerPawn) return;
+    if (done || !g_playerCtl) return;
     float sr = 0.0f, sh = 0.0f, wr = 0.0f;
     const bool haveSr = g_offSprintRadiusLimit >= 0 &&
-        SafeRead(g_playerPawn + g_offSprintRadiusLimit, &sr, sizeof(sr));
+        SafeRead(g_playerCtl + g_offSprintRadiusLimit, &sr, sizeof(sr));
     const bool haveSh = g_offSprintHeightLimit >= 0 &&
-        SafeRead(g_playerPawn + g_offSprintHeightLimit, &sh, sizeof(sh));
+        SafeRead(g_playerCtl + g_offSprintHeightLimit, &sh, sizeof(sh));
     const bool haveWr = g_offWalkRadiusLimit >= 0 &&
-        SafeRead(g_playerPawn + g_offWalkRadiusLimit, &wr, sizeof(wr));
+        SafeRead(g_playerCtl + g_offWalkRadiusLimit, &wr, sizeof(wr));
     if (!haveSr && !haveSh && !haveWr) return;
     done = true;
-    Log("*** [sweep] live TdPawn input limits: sprint radius %.3f, sprint height %.3f,"
-        " walk radius %.3f  (shipped ini says 0.700 / 0.700 / 0.690)",
+    Log("*** [sweep] live TdPlayerController input limits: sprint radius %.3f, sprint height"
+        " %.3f, walk radius %.3f  (shipped ini says 0.700 / 0.700 / 0.690)",
         haveSr ? sr : -1.0f, haveSh ? sh : -1.0f, haveWr ? wr : -1.0f);
+    // ⚠️ These are in POST-DEADZONE units. The AS.1a sweep measured a 0.280 dead band on the
+    // raw stick and a renormalisation of what is left, so the raw deflection that reaches a
+    // 0.7 limit is 0.280 + 0.7 x 0.720 = 0.784, not 0.700. Comparing a raw stick value against
+    // these numbers directly would put the gate 0.08 too low.
+    if (haveSr)
+        Log("[sweep]   -> raw stick needed to cross the sprint gate: %.3f"
+            "  (deadzone 0.280, renormalised over the remaining 0.720)",
+            0.280f + sr * 0.720f);
 }
 
 // Read the controllers and build a 360 pad out of them. Called once per frame from the XR loop.
@@ -3956,14 +3965,21 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                 // through TdPlayerController - the offset of an inherited property does not
                 // depend on which subclass the walk started from.
                 //
-                // The three limits are TdPawn's own, so the sweep reports the thresholds this
-                // build actually enforces instead of the numbers in a shipped ini that a patch
-                // or a config override could disagree with. DefaultGame.ini has all three at
-                // 0.7 / 0.7 / 0.69; if the live object says otherwise, the live object wins.
+                // ⚠️ The three input limits are on TdPlayerController, NOT TdPawn - they were
+                // looked up on the pawn first and reported NOT FOUND after walking 1064 fields,
+                // which is what the property dump is for. DefaultGame.ini agrees: they sit under
+                // [TdGame.TdPlayerController] at 0.7 / 0.7 / 0.69, several sections below the
+                // [TdGame.TdPawn] block that holds the velocities. Velocity itself IS the pawn's.
+                //
+                // Reading them live rather than trusting the ini, because a shipped default is
+                // not a measurement of the running build.
                 g_offVelocity = LookupProp("TdPawn", "Velocity", true);
-                g_offSprintRadiusLimit = LookupProp("TdPawn", "InputMaxSprintRaduisLimit", true);
-                g_offSprintHeightLimit = LookupProp("TdPawn", "InputMaxSprintHeightLimit", true);
-                g_offWalkRadiusLimit   = LookupProp("TdPawn", "InputMaxWalkRadiusLimit", true);
+                g_offSprintRadiusLimit =
+                    LookupProp("TdPlayerController", "InputMaxSprintRaduisLimit", true);
+                g_offSprintHeightLimit =
+                    LookupProp("TdPlayerController", "InputMaxSprintHeightLimit", true);
+                g_offWalkRadiusLimit =
+                    LookupProp("TdPlayerController", "InputMaxWalkRadiusLimit", true);
 
                 // ---- the lookup that replaces a search with a read ----
                 //
@@ -5685,7 +5701,7 @@ bool      GetCameraPose(float* loc, float* fwd);
 // int16 gives the shortest signed path for free, because 65536 IS 2^16.
 
 // g_viewSpace is declared up with the other XR handles, since InitXR creates it.
-static uintptr_t g_playerCtl = 0;
+uintptr_t g_playerCtl = 0;   // non-static: the AS.1a sweep reads TdPlayerController fields
 static long      g_ctlNextTry = 0;
 static bool      g_ctlMissLogged = false;
 static bool      g_headTracking = true;
