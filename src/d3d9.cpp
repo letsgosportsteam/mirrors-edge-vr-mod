@@ -645,6 +645,10 @@ static bool g_motionPoseHeadValid = false;
 // a guarded FVector read, so forward declarations keep the ownership boundary explicit.
 extern uintptr_t g_playerPawn;
 extern int g_offActorLocation;
+extern int g_offVelocity;
+extern int g_offSprintRadiusLimit;
+extern int g_offSprintHeightLimit;
+extern int g_offWalkRadiusLimit;
 static bool SafeRead(uintptr_t addr, void* out, size_t n);
 static bool FiniteVec(const MEVR_Vec3& v);
 
@@ -1338,6 +1342,179 @@ static void ArmSwingSample(XrTime when, bool actionsSynced)
     }
 }
 
+// ================================================================ AS.1a: the deflection curve
+//
+// What does the game actually DO with a given left-stick deflection? The plan was about to
+// answer that from DefaultGame.ini, which says SpeedMaxBaseVelocity=400, SprintVelocity=630,
+// and InputMaxSprintRaduisLimit=0.7. Those are defaults in a shipped config, not a measurement
+// of this build, and the shape of the curve BETWEEN them is not in the file at all.
+//
+// So measure it. Hold one deflection, log the speed it produces, step to the next. What comes
+// out is the real map from the only quantity we can emit to the only quantity that matters:
+//
+//     stick deflection (0..1)  ->  pawn speed (UU/s)
+//
+// and with it the two things AS.1's mapping has to be built around - where the sprint gate
+// really sits, and how long the energy accumulator takes to carry 400 up to 630.
+//
+// ---- ⚠️ this is the first code here that drives the pad on its own ----
+//
+// Everything before it converted a physical control into a synthetic one. This invents input
+// the player did not give, and it does it in a game where the failure mode is a rooftop. The
+// safety envelope is therefore not decoration:
+//
+//   - every hold is bounded by its own duration and released by the clock, not by a key;
+//   - any physical left-stick deflection aborts instantly, so letting go of the mod is the
+//     same reflex as taking the stick;
+//   - losing the pawn, the pad, or session focus aborts;
+//   - one step per keypress, so nothing starts on its own.
+//
+// The player positions themselves at the head of a straight, presses NUMPAD +, is carried
+// forward for a few seconds, and walks back. Eight steps, one key.
+
+struct SweepStep { float deflection; float seconds; };
+static const SweepStep kSweepSteps[] = {
+    { 0.30f,  6.0f },   // walk band
+    { 0.50f,  6.0f },
+    { 0.65f,  6.0f },
+    { 0.69f,  6.0f },   // InputMaxWalkRadiusLimit, per the shipped ini
+    { 0.71f,  6.0f },   // just over InputMaxSprintRaduisLimit - the pair either side of the
+    { 0.75f,  6.0f },   //   gate is the whole point of choosing these two
+    { 0.85f,  6.0f },
+    { 1.00f,  6.0f },
+    // The energy accumulator decays over SpeedEnergyDecelerationTime=3 s, so the ramp up is of
+    // that order too. Six seconds shows it starting; fifteen shows where it stops.
+    { 1.00f, 15.0f },
+};
+static const int kSweepCount = (int)(sizeof(kSweepSteps) / sizeof(kSweepSteps[0]));
+
+static bool   g_sweepActive = false;
+static int    g_sweepStep = 0;
+static XrTime g_sweepStarted = 0;
+static XrTime g_sweepNextSample = 0;
+static float  g_sweepPeakSpeed = 0.0f;
+static float  g_sweepLastSpeed = 0.0f;
+
+// Horizontal speed, in Unreal units per second. UE3 is Z-up, so the vertical component is
+// dropped: the numbers this is being compared against - JogVelocity 260, RunVelocity 400,
+// SprintVelocity 630 - are all ground speeds, and a fall would otherwise dominate them.
+static bool ReadPawnGroundSpeed(float* out)
+{
+    if (!g_playerPawn || g_offVelocity < 0) return false;
+    MEVR_Vec3 v{};
+    if (!SafeRead(g_playerPawn + g_offVelocity, &v, sizeof(v)) || !FiniteVec(v)) return false;
+    *out = sqrtf(v.x * v.x + v.y * v.y);
+    return true;
+}
+
+static void SweepStop(const char* why)
+{
+    if (!g_sweepActive) return;
+    g_sweepActive = false;
+    Log("*** [sweep] step %d/%d (deflection %.2f) ENDED - %s | peak %.0f UU/s, last %.0f UU/s",
+        g_sweepStep + 1, kSweepCount, kSweepSteps[g_sweepStep].deflection, why,
+        g_sweepPeakSpeed, g_sweepLastSpeed);
+    // Advance only on a clean finish. An abort repeats the same step, because the run it
+    // abandoned produced no usable number and silently skipping it would leave a hole in the
+    // curve that looks like a measurement.
+    if (strcmp(why, "completed") == 0 && g_sweepStep + 1 < kSweepCount) {
+        g_sweepStep++;
+        Log("[sweep]   next: step %d/%d at deflection %.2f for %.0f s - press NUMPAD + when in position",
+            g_sweepStep + 1, kSweepCount, kSweepSteps[g_sweepStep].deflection,
+            kSweepSteps[g_sweepStep].seconds);
+    } else if (strcmp(why, "completed") == 0) {
+        Log("*** [sweep] all %d steps done. The curve is in the lines above.", kSweepCount);
+    }
+}
+
+// Returns the deflection to assert this frame, or 0 when the sweep is not running. Called with
+// the physical stick already read, so it can stand down the moment the player takes over.
+static float SweepTick(XrTime when, float physicalX, float physicalY)
+{
+    if (!g_sweepActive) return 0.0f;
+
+    // The player taking the stick outranks everything. Deliberately a low threshold: this is
+    // the manual override, and it has to work when reached for in a hurry rather than aimed.
+    if (fabsf(physicalX) > 0.2f || fabsf(physicalY) > 0.2f) {
+        SweepStop("physical stick input - player took over");
+        return 0.0f;
+    }
+    if (!g_padEnabled)  { SweepStop("pad disabled");     return 0.0f; }
+    if (!g_playerPawn)  { SweepStop("pawn went away");   return 0.0f; }
+
+    const float elapsed = (float)((double)(when - g_sweepStarted) * 1e-9);
+    const SweepStep& step = kSweepSteps[g_sweepStep];
+
+    float speed = 0.0f;
+    const bool haveSpeed = ReadPawnGroundSpeed(&speed);
+    if (haveSpeed) {
+        g_sweepLastSpeed = speed;
+        if (speed > g_sweepPeakSpeed) g_sweepPeakSpeed = speed;
+    }
+
+    // Twice a second. The ramp shape is the interesting part - a single steady-state number
+    // would not distinguish "reached 400 immediately" from "climbed there over four seconds",
+    // and the second of those is what the energy accumulator looks like.
+    if (when >= g_sweepNextSample) {
+        g_sweepNextSample = when + 500000000LL;
+        Log("[sweep]   t=%.1fs  deflection %.2f  speed %.0f UU/s%s",
+            elapsed, step.deflection, speed,
+            haveSpeed ? "" : "  (velocity unreadable)");
+    }
+
+    if (elapsed >= step.seconds) { SweepStop("completed"); return 0.0f; }
+    return step.deflection;
+}
+
+static void SweepStart(XrTime when)
+{
+    if (g_sweepActive) { SweepStop("restarted by hand"); return; }
+    // ⚠️ A zero start time is not a small error. SweepTick would measure elapsed against the
+    // epoch, find it far past the step's duration, and "complete" the step on its first frame -
+    // advancing the curve past a deflection it never actually held. A missing point that looks
+    // like a measured one is worse than a refusal.
+    if (when == 0) {
+        Log("*** [sweep] cannot start: no predicted display time yet. Let the game render a"
+            " frame first.");
+        return;
+    }
+    if (g_offVelocity < 0) {
+        Log("*** [sweep] cannot start: Actor::Velocity was never resolved, so there would be"
+            " nothing to measure. The curve needs the speed, not just the input.");
+        return;
+    }
+    g_sweepActive = true;
+    g_sweepStarted = when;
+    g_sweepNextSample = when;
+    g_sweepPeakSpeed = 0.0f;
+    g_sweepLastSpeed = 0.0f;
+    Log("*** [sweep] step %d/%d STARTED - holding deflection %.2f for %.0f s."
+        " Push the stick to abort.",
+        g_sweepStep + 1, kSweepCount, kSweepSteps[g_sweepStep].deflection,
+        kSweepSteps[g_sweepStep].seconds);
+}
+
+// The thresholds this build actually enforces, read once from the live pawn. The shipped ini
+// says 0.7 / 0.7 / 0.69; a build that disagrees would silently invalidate every conclusion
+// drawn from those numbers, so the log states which it is rather than leaving it assumed.
+static void ReportSprintLimitsOnce()
+{
+    static bool done = false;
+    if (done || !g_playerPawn) return;
+    float sr = 0.0f, sh = 0.0f, wr = 0.0f;
+    const bool haveSr = g_offSprintRadiusLimit >= 0 &&
+        SafeRead(g_playerPawn + g_offSprintRadiusLimit, &sr, sizeof(sr));
+    const bool haveSh = g_offSprintHeightLimit >= 0 &&
+        SafeRead(g_playerPawn + g_offSprintHeightLimit, &sh, sizeof(sh));
+    const bool haveWr = g_offWalkRadiusLimit >= 0 &&
+        SafeRead(g_playerPawn + g_offWalkRadiusLimit, &wr, sizeof(wr));
+    if (!haveSr && !haveSh && !haveWr) return;
+    done = true;
+    Log("*** [sweep] live TdPawn input limits: sprint radius %.3f, sprint height %.3f,"
+        " walk radius %.3f  (shipped ini says 0.700 / 0.700 / 0.690)",
+        haveSr ? sr : -1.0f, haveSh ? sh : -1.0f, haveWr ? wr : -1.0f);
+}
+
 // Read the controllers and build a 360 pad out of them. Called once per frame from the XR loop.
 //
 // `when` is the frame's predictedDisplayTime, threaded through because the arm swing sampler
@@ -1419,6 +1596,22 @@ static bool XrSyncInput(XrTime when)
     s.Gamepad.sThumbLY = axis(my);
     s.Gamepad.sThumbRX = axis(lx);
     s.Gamepad.sThumbRY = axis(ly);
+
+    // ---- AS.1a: the curve sweep OVERRIDES the left stick while it runs ----
+    //
+    // Override rather than add, and X is zeroed rather than left alone. The gate being measured
+    // is expressed on the stick's RADIUS and HEIGHT, so a stray strafe component would make the
+    // radius differ from the number this thinks it is holding and quietly measure the wrong
+    // deflection. With X at zero, radius and height are both exactly the asserted value.
+    //
+    // The physical stick is passed in first, so the override can stand down in the same frame
+    // the player reaches for it.
+    ReportSprintLimitsOnce();
+    const float sweep = SweepTick(when, mx, my);
+    if (sweep > 0.0f) {
+        s.Gamepad.sThumbLX = 0;
+        s.Gamepad.sThumbLY = axis(sweep);
+    }
     s.Gamepad.bLeftTrigger  = (BYTE)(flt(g_aLTrig) * 255.0f);
     s.Gamepad.bRightTrigger = (BYTE)(flt(g_aRTrig) * 255.0f);
 
@@ -3676,6 +3869,21 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                 // ordinary byte/pointer fields; P1.3 only admits Weapon=None and Unarmed(0).
                 g_offWeapon = LookupProp("TdPawn", "Weapon", true);
                 g_offWeaponAnimState = LookupProp("TdPawn", "WeaponAnimState", true);
+
+                // ---- AS.1a: the deflection-to-speed curve, measured rather than inferred ----
+                //
+                // Actor::Velocity, reached through TdPawn the same way Location is reached
+                // through TdPlayerController - the offset of an inherited property does not
+                // depend on which subclass the walk started from.
+                //
+                // The three limits are TdPawn's own, so the sweep reports the thresholds this
+                // build actually enforces instead of the numbers in a shipped ini that a patch
+                // or a config override could disagree with. DefaultGame.ini has all three at
+                // 0.7 / 0.7 / 0.69; if the live object says otherwise, the live object wins.
+                g_offVelocity = LookupProp("TdPawn", "Velocity", true);
+                g_offSprintRadiusLimit = LookupProp("TdPawn", "InputMaxSprintRaduisLimit", true);
+                g_offSprintHeightLimit = LookupProp("TdPawn", "InputMaxSprintHeightLimit", true);
+                g_offWalkRadiusLimit   = LookupProp("TdPawn", "InputMaxWalkRadiusLimit", true);
 
                 // ---- the lookup that replaces a search with a read ----
                 //
@@ -6369,6 +6577,26 @@ static void CheckHeadHotkeys()
             g_armSwingDebug ? "" : "  (ArmSwingDebug is off, so no metric lines will follow)");
     }
     pNMul = dNMul;
+
+    // AS.1a curve sweep. NUMPAD + runs the current step, NUMPAD - rewinds to the first.
+    //
+    // One step per press, never a whole automatic run: each step needs a straight to run down
+    // and the player has to walk back between them, so a timer that marched through all nine
+    // would spend most of them in a wall.
+    //
+    // g_predTime is the time the pad is being built for; the sweep clocks its holds against the
+    // same one so a step's duration means the same thing to both.
+    static bool pNAdd = false, pNSub = false;
+    const bool dNAdd = (GetAsyncKeyState(VK_ADD) & 0x8000) != 0;
+    const bool dNSub = (GetAsyncKeyState(VK_SUBTRACT) & 0x8000) != 0;
+    if (dNAdd && !pNAdd) SweepStart(g_predTime);
+    if (dNSub && !pNSub) {
+        if (g_sweepActive) SweepStop("rewound by hand");
+        g_sweepStep = 0;
+        Log("*** [sweep] NUMPAD - -> rewound to step 1/%d (deflection %.2f)",
+            kSweepCount, kSweepSteps[0].deflection);
+    }
+    pNAdd = dNAdd; pNSub = dNSub;
 
     static bool pN8 = false;
     const bool dN8 = (GetAsyncKeyState(VK_NUMPAD8) & 0x8000) != 0;
@@ -12554,6 +12782,10 @@ static HRESULT STDMETHODCALLTYPE Hook_DrawIndexed(IDirect3DDevice9* dev, D3DPRIM
 int  g_offMoveState = -1;
 int  g_offWeapon = -1;
 int  g_offWeaponAnimState = -1;
+int  g_offVelocity = -1;             // Actor::Velocity, for the AS.1a curve sweep
+int  g_offSprintRadiusLimit = -1;    // TdPawn::InputMaxSprintRaduisLimit  (the game's typo)
+int  g_offSprintHeightLimit = -1;    // TdPawn::InputMaxSprintHeightLimit
+int  g_offWalkRadiusLimit = -1;      // TdPawn::InputMaxWalkRadiusLimit
 static float g_animPeak[3] = { 0, 0, 0 };       // degrees, |pitch| |yaw| |roll| since last report
 float        g_animNow[3]  = { 0, 0, 0 };       // live, for the overlay and the pitch anchor
 static int   g_animState   = -1;

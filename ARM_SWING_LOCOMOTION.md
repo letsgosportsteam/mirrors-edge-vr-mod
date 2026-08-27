@@ -199,6 +199,29 @@ a feel complaint. Two regimes with an explicit hold window is the shape that sat
 Additionally: the physical stick pulled backwards past its dead zone collapses `speed_held`
 immediately. That is the emergency stop, and it needs to be a reflex the player can trust.
 
+### ⚠️ The floor is 0.7, not zero — and it changes the mapping
+
+The envelope was specified above to stop the stick reaching *zero* at each swing reversal. That
+is not the real requirement. `InputMaxSprintRaduisLimit = 0.7` means sprint is gated on near-full
+deflection in both radius and forward height, and the energy accumulator decays over three
+seconds. So an envelope that sags to 0.6 twice a second drops `SprintRequested` twice a second,
+and the accumulator never gets anywhere: **the player is capped at a jog permanently, however
+hard they swing.** The hold window has to keep the deflection pinned above 0.7 through every
+reversal, not merely above nothing.
+
+It also rules out a linear `deadband → full` map, which would put a moderate jog-cadence swing at
+roughly 0.55 — under the gate — and leave sprint reachable only at the very top of the player's
+physical range. That is exhausting and it inverts the game: in Mirror's Edge running is the
+default traversal mode, not the exceptional one.
+
+So the curve is anchored at 0.7 rather than falling out of its endpoints: a narrow band from the
+deadband up to 0.7 covering walk and jog, with most of the usable swing range sitting *above* it,
+so a comfortable sustained run-swing lands near 0.8 with headroom left above.
+
+The exact anchor points come from AS.1a's measured curve, not from these numbers — and the 0.7
+itself is read from the live `TdPawn`, not hard-coded, because a shipped ini default is not a
+measurement of the running build.
+
 ### Composition
 
 ```text
@@ -330,6 +353,57 @@ enough margin that the threshold does not have to be placed precisely.
 **Stop/go gate A:** if no candidate separates them, do not build the rest on grip motion alone.
 The next thing to try is requiring left/right **anti-phase** — a real swing alternates and a
 gesture does not — before anything more elaborate.
+
+### AS.1a — what does the game do with a deflection?
+
+**Question:** What is the real map from left-stick deflection to pawn speed, where does the
+sprint gate actually sit, and how long does the energy accumulator take?
+
+This rung measures *the game*, not the player, so it is independent of AS.0 and can be run in
+either order.
+
+Mirror's Edge has **no sprint button** — verified, not assumed: the package's complete `GBA_*`
+list has no sprint action, and the only speed modifier, `GBA_WalkMod`, is bound to `LeftControl`
+with no pad binding at all. Speed is a derived state. `DefaultGame.ini`, under `[TdGame.TdPawn]`:
+
+| | |
+|---|---|
+| `SneakVelocity` / `WalkVelocity` / `JogVelocity` | 5 / 50 / 260 |
+| `RunVelocity` = `SpeedMaxBaseVelocity` | **400** — the ceiling from deflection alone |
+| `SprintVelocity` | **630** — only reachable through accumulated speed energy |
+| `SpeedSprintVelocityAccelerationFactor` | 30 |
+| `SpeedEnergyDecelerationTime` / `Exponent` | 3 s / 0.5 |
+| `InputMaxSprintRaduisLimit` / `HeightLimit` | 0.7 / 0.7 *(the game's typo)* |
+| `InputMaxWalkRadiusLimit` | 0.69 |
+
+The package also carries `SprintRequested` and `SprintActivated` as separate identifiers — the
+shape of "the input asked" versus "the game granted".
+
+What is **not** in the ini is the curve between those numbers, and defaults in a shipped config
+are not a measurement of this build. So: hold one deflection, log the speed, step to the next.
+
+Work:
+
+- Resolve `Actor::Velocity` and the three `TdPawn` input limits, and report the live limits once
+  rather than trusting the ini's 0.7.
+- Nine steps: 0.30, 0.50, 0.65, **0.69**, **0.71**, 0.75, 0.85, 1.00 for six seconds each, then
+  1.00 for fifteen. The pair either side of the gate is the point of choosing 0.69 and 0.71; the
+  long hold is what shows where the energy ramp stops.
+- One step per `NUMPAD +`, because each needs a straight to run down and the player walks back
+  between them.
+- Log ground speed twice a second, so the ramp *shape* is visible — "reached 400 immediately" and
+  "climbed there over four seconds" are different findings and a steady-state number alone
+  cannot tell them apart.
+
+**Safety.** This is the first code here that invents input the player did not give, in a game
+whose failure mode is a rooftop. Every hold is released by its own clock and not by a key; any
+physical stick deflection past 0.2 aborts instantly; losing the pawn or the pad aborts; nothing
+starts without a keypress; and the hotkeys sit behind `Debug = on`, so a release run cannot reach
+it. An aborted step repeats rather than advancing — a missing point that looks measured is worse
+than a refusal.
+
+**Pass:** the deflection→speed curve is known, the gate's real position is known, and the time
+from 400 to 630 under sustained full deflection is measured.
 
 ### AS.1 — speed
 
@@ -504,12 +578,13 @@ the same one.
 
 1. `swing: locate grips in room space and report four candidate swing metrics`
 2. `swing: choose the metric the measurement supports and name it in the log`
-3. `swing: drive the left stick from a hold-then-collapse swing envelope`
-4. `swing: compose the swing vector with the physical stick`
-5. `swing: jump on a hands-overhead edge, held for the contextual up-actions`
-6. `swing: crouch and slide from head height against a standing baseline`
-7. `swing: gate on focus, tracking and cinematic input, and decay every failure to zero`
-8. `swing: add config, hotkeys, overlay and bounded diagnostics`
+3. `swing: measure the game's deflection-to-speed curve with a bounded sweep`
+4. `swing: drive the left stick from a hold-then-collapse swing envelope`
+5. `swing: compose the swing vector with the physical stick`
+6. `swing: jump on a hands-overhead edge, held for the contextual up-actions`
+7. `swing: crouch and slide from head height against a standing baseline`
+8. `swing: gate on focus, tracking and cinematic input, and decay every failure to zero`
+9. `swing: add config, hotkeys, overlay and bounded diagnostics`
 
 ## Completion criteria
 
