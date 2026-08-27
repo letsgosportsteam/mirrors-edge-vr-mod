@@ -58,6 +58,24 @@ MotionHands = off
 MotionHandsDebug = off
 
 
+; ---------------------------------------------------------------- arm swing locomotion (measuring)
+;
+; Swing your arms to run, raise both hands to jump, crouch to crouch. None of that is built yet.
+;
+; What is here is rung AS.0, which MEASURES and moves nothing: it works out whether a real arm
+; swing can be told apart from a head turn, a body turn, a gesture and a crouch, by logging four
+; candidate ways of scoring the motion. The pad is not touched, so a run with this on plays
+; exactly as it does with it off.
+;
+; ArmSwingDebug is the one that produces the data - a line a second, to mevr.log. Leave both off
+; unless you are helping with the measurement.
+;
+; Hotkey: NUMPAD * toggles ArmSwing.
+
+ArmSwing = off
+ArmSwingDebug = off
+
+
 ; ---------------------------------------------------------------- frame pacing
 
 ; The engine's MaxSmoothedFrameRate. NUMPAD7 cycles 60 / 72 / 90 / 120 / 144 / 250 / 62.

@@ -150,7 +150,7 @@ static bool  g_devicePatched = false;   // IDirect3DDevice9 vtable patched
 static bool  g_devIsEx       = false;   // the device really is D3D9Ex
 // Rung 10, defined below the call sites in the XR setup and the frame loop.
 static void  XrInitActions();
-static bool  XrSyncInput();
+static bool  XrSyncInput(XrTime when);
 static void  InstallXInputHook();
 void         RecenterSixDof();
 static long  g_frames        = 0;
@@ -1017,8 +1017,333 @@ static void XrInitActions()
         g_sRAimPose  != XR_NULL_HANDLE ? "yes" : "NO");
 }
 
+// ================================================================ AS.0: the swing metric
+//
+// Arm swing locomotion, rung 0. This measures and INJECTS NOTHING. Its whole purpose is to
+// answer one question before anything is built on top of it: is there a signal here that
+// separates a real arm swing from a head turn, a body turn, a gesture and a crouch?
+//
+// ---- why the poses are located again, against a different space ----
+//
+// XrSampleMotionPose already locates both grips - against g_viewSpace, because the arm rig
+// wants the hand relative to the head it is attached to. That is the wrong frame to
+// DIFFERENTIATE in: g_viewSpace turns with the head, so a stationary hand acquires a velocity
+// the moment the player looks around. Every head turn would read as a swing.
+//
+// So this locates both grips AND the head against g_xrSpace (LOCAL, room-fixed) and forms
+//
+//     rel = grip - head
+//
+// in room axes. No rotating basis appears anywhere. rel is immune to head rotation, and -
+// because the head is subtracted - it is also immune to the player walking around the play
+// space, and to the tracking origin being rebased under everyone's feet.
+//
+// ⚠️ The head pose UpdateSixDof already has is NOT reusable here. It runs on the render
+// thread, from inside the constant-injection hook, at g_predTime + g_predPeriod - a different
+// thread, and one frame further ahead than the pad is built for. Subtracting a head position
+// sampled at one instant from a hand position sampled at another puts the gap between the two
+// sample times straight into rel, and rel is about to be differentiated over that same 8 ms.
+// The saved xrLocateSpace would corrupt the only number this rung exists to measure.
+//
+// ---- four candidates, because the right one is a measurement and not an argument ----
+//
+//   A  |d rel/dt|              full head-relative speed. Most sensitive. Vulnerable to turning
+//                              on the spot: arms at the sides sit ~0.2 m off the head's
+//                              vertical axis, so a brisk 180 deg/s turn moves them at about
+//                              0.6 m/s - plausibly above any usable deadband.
+//   B  |d(rel.y)/dt|           vertical only. Immune to turning on the spot as well, because an
+//                              orbit is horizontal. Gives up some of a real swing's amplitude.
+//   C  |d(rel.y)/dt| + radial  B plus the horizontal component ALONG rel, discarding the
+//                              component perpendicular to it. An orbiting hand is purely
+//                              tangential, so a body turn contributes nothing; a swing moves
+//                              the hand toward and away from the body axis, so some of it
+//                              survives. More state, more to get wrong.
+//   D  A x anti-phase          mean A scaled by how opposed the two hands' velocities are.
+//                              A swing ALTERNATES - the hands move in opposite directions, so
+//                              the cosine between their velocities sits near -1. A body turn
+//                              carries both hands the same way round, cosine near +1, and D
+//                              collapses to zero.
+//
+// D is not in the plan's table of three. It is here because it implements the plan's own
+// stop/go gate A fallback - "require left/right anti-phase" - which means one headset session
+// answers both the metric question and the question of what to do if all three lose, instead
+// of two sessions in series.
+//
+// Nothing here writes to the pad, so a build carrying it is safe to play normally.
+
+static bool  g_armSwing = false;            // ArmSwing;      NUMPAD * toggles
+static bool  g_armSwingDebug = false;       // ArmSwingDebug; the per-second metric report
+
+// One physical constant, shared by the discontinuity guard below and by UpdateSixDof, which
+// learnt it the hard way: OpenXR was measured moving the head 1.31 m between adjacent 120 Hz
+// samples with the position-valid bit still set. A human limb cannot travel 25 cm in one frame.
+// Through a differentiator that glitch is not a wobble, it is an instantaneous full sprint.
+static const float kSwingMaxStepM = 0.25f;
+
+struct ArmSwingHand {
+    bool       havePrev = false;
+    XrVector3f prevRel{};                   // grip - head, room axes, metres
+    XrVector3f vel{};                       // filtered, m/s
+    bool       tracked = false;
+    XrVector3f rel{};
+    float      a = 0.0f, b = 0.0f, c = 0.0f;
+};
+
+static ArmSwingHand g_swingL, g_swingR;
+static XrTime g_swingPrevTime = 0;
+static bool   g_swingHaveBaselineY = false;
+static float  g_swingBaselineY = 0.0f;      // head height at the first valid sample, metres
+
+// Report accumulators. Written and read on the Present thread only, like the pad's own window
+// counters, so no lock.
+static long   g_swingSamples = 0;
+static float  g_swingSum[2][4] = {};        // [hand][metric A,B,C,D] - D is stored on hand 0
+static float  g_swingPeak[2][4] = {};
+static float  g_swingAltSum = 0.0f;         // mean cosine between the two hands' velocities
+static long   g_swingAltSamples = 0;
+static float  g_swingHeadYMin = 0.0f, g_swingHeadYMax = 0.0f;
+static long   g_swingRejDt = 0, g_swingRejStep = 0, g_swingRejUntracked = 0;
+static XrTime g_swingReportAt = 0;
+static bool   g_swingStartupLogged = false;
+
+static void ArmSwingForgetHistory()
+{
+    g_swingL.havePrev = false;
+    g_swingR.havePrev = false;
+    g_swingL.vel = {}; g_swingR.vel = {};
+    g_swingL.tracked = false; g_swingR.tracked = false;
+    g_swingL.a = g_swingL.b = g_swingL.c = 0.0f;
+    g_swingR.a = g_swingR.b = g_swingR.c = 0.0f;
+    g_swingPrevTime = 0;
+    // The window goes with the history. Without this, re-enabling after a long gap finds
+    // `when` far past the deadline and emits a report built from a single sample, which reads
+    // in the log exactly like a real one-second window and is not.
+    g_swingReportAt = 0;
+    g_swingSamples = 0;
+    for (int i = 0; i < 2; ++i)
+        for (int m = 0; m < 4; ++m) { g_swingSum[i][m] = 0.0f; g_swingPeak[i][m] = 0.0f; }
+    g_swingAltSum = 0.0f; g_swingAltSamples = 0;
+    g_swingRejDt = g_swingRejStep = g_swingRejUntracked = 0;
+}
+
+// The head, in the same room-fixed space and at the same instant as the grips. Position only.
+static bool ArmSwingLocateHead(XrTime when, XrVector3f* out)
+{
+    if (g_viewSpace == XR_NULL_HANDLE || g_xrSpace == XR_NULL_HANDLE) return false;
+    XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
+    if (XR_FAILED(xrLocateSpace(g_viewSpace, g_xrSpace, when, &loc))) return false;
+    if (!(loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) ||
+        !(loc.locationFlags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT)) return false;
+    *out = loc.pose.position;
+    return true;
+}
+
+// Locate one grip against the room-fixed space. Position is all this rung needs; orientation
+// belongs to the arm rig and is deliberately not read here.
+static bool ArmSwingLocateGrip(XrAction action, XrSpace space, XrTime when,
+                               bool actionsSynced, XrVector3f* out)
+{
+    if (!actionsSynced || action == XR_NULL_HANDLE || space == XR_NULL_HANDLE ||
+        g_xrSpace == XR_NULL_HANDLE) return false;
+
+    XrActionStateGetInfo gi{ XR_TYPE_ACTION_STATE_GET_INFO };
+    gi.action = action;
+    XrActionStatePose st{ XR_TYPE_ACTION_STATE_POSE };
+    if (XR_FAILED(xrGetActionStatePose(g_xrSession, &gi, &st)) || !st.isActive) return false;
+
+    XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
+    if (XR_FAILED(xrLocateSpace(space, g_xrSpace, when, &loc))) return false;
+    // TRACKED, not merely VALID. A valid-but-untracked position is the runtime's last known
+    // guess, which is a constant - and a constant differentiates to zero, so it would read as
+    // "the player stopped swinging" rather than "we stopped knowing".
+    if (!(loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) ||
+        !(loc.locationFlags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT)) return false;
+
+    *out = loc.pose.position;
+    return true;
+}
+
+static inline float SwingLen(const XrVector3f& v)
+{
+    return sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
+}
+
+static void ArmSwingSample(XrTime when, bool actionsSynced)
+{
+    if (!g_armSwing && !g_armSwingDebug) return;
+
+    if (!g_swingStartupLogged) {
+        g_swingStartupLogged = true;
+        Log("*** [swing] AS.0 measurement active - metrics only, nothing is written to the pad.");
+        Log("[swing]   A = |d(grip-head)/dt|   B = vertical part of A   C = B + radial part"
+            "   D = mean A x anti-phase");
+        Log("[swing]   mark each physical action with BACKSPACE; every metric line between two"
+            " markers belongs to one action.");
+    }
+
+    XrVector3f head{}, gripL{}, gripR{};
+    const bool haveHead = actionsSynced && ArmSwingLocateHead(when, &head);
+
+    if (!haveHead) {
+        // No anchor means no rel, and a rel formed against a stale head would be a velocity the
+        // player did not produce. Drop the history rather than bridge the gap.
+        ArmSwingForgetHistory();
+        g_swingRejUntracked++;
+        return;
+    }
+
+    const bool haveL = ArmSwingLocateGrip(g_aLGripPose, g_sLGripPose, when, actionsSynced, &gripL);
+    const bool haveR = ArmSwingLocateGrip(g_aRGripPose, g_sRGripPose, when, actionsSynced, &gripR);
+
+    // ---- dt from the predicted display time, not from a frame counter or QPC ----
+    //
+    // The poses were located AT this time, so it is the only clock the difference between two
+    // of them is honest against. XrTime is nanoseconds.
+    float dt = 0.0f;
+    if (g_swingPrevTime != 0) dt = (float)((double)(when - g_swingPrevTime) * 1e-9);
+    const bool dtOk = (dt >= 0.002f && dt <= 0.050f);
+    if (g_swingPrevTime != 0 && !dtOk) g_swingRejDt++;
+    g_swingPrevTime = when;
+
+    if (!g_swingHaveBaselineY) { g_swingBaselineY = head.y; g_swingHaveBaselineY = true;
+                                 g_swingHeadYMin = g_swingHeadYMax = 0.0f; }
+
+    struct { ArmSwingHand* h; bool have; const XrVector3f* grip; } hands[2] = {
+        { &g_swingL, haveL, &gripL }, { &g_swingR, haveR, &gripR },
+    };
+
+    for (int i = 0; i < 2; ++i) {
+        ArmSwingHand* h = hands[i].h;
+        h->tracked = hands[i].have;
+        if (!hands[i].have) {
+            h->havePrev = false;
+            h->vel = {};
+            h->a = h->b = h->c = 0.0f;
+            g_swingRejUntracked++;
+            continue;
+        }
+
+        const XrVector3f g = *hands[i].grip;
+        h->rel = { g.x - head.x, g.y - head.y, g.z - head.z };
+
+        if (!h->havePrev || !dtOk) {
+            h->prevRel = h->rel;
+            h->havePrev = true;
+            continue;                       // no velocity from a single sample
+        }
+
+        const XrVector3f step = { h->rel.x - h->prevRel.x,
+                                  h->rel.y - h->prevRel.y,
+                                  h->rel.z - h->prevRel.z };
+        // ⚠️ HOLD, do not decay. A tracking glitch is not evidence that the player stopped, and
+        // the previous velocity is the best estimate available for the one frame it costs.
+        // prevRel still advances, or the next frame would differentiate across the glitch too
+        // and reproduce it exactly one frame later.
+        if (SwingLen(step) > kSwingMaxStepM) {
+            h->prevRel = h->rel;
+            g_swingRejStep++;
+            continue;
+        }
+
+        const XrVector3f raw = { step.x / dt, step.y / dt, step.z / dt };
+        // Light, deliberately. A finite difference of a tracked position at 90-120 Hz is noisy,
+        // but over-filtering here buys quiet numbers at the cost of a late one - and AS.1's
+        // envelope is where lag actually gets felt, so it is the wrong place to spend it.
+        const float k = 0.5f;
+        h->vel.x += (raw.x - h->vel.x) * k;
+        h->vel.y += (raw.y - h->vel.y) * k;
+        h->vel.z += (raw.z - h->vel.z) * k;
+        h->prevRel = h->rel;
+
+        h->a = SwingLen(h->vel);
+        h->b = fabsf(h->vel.y);
+
+        // C: B plus the horizontal velocity ALONG rel. An orbiting hand moves perpendicular to
+        // rel, so a body turn lands entirely in the component this drops.
+        const float rhx = h->rel.x, rhz = h->rel.z;
+        const float rhl = sqrtf(rhx * rhx + rhz * rhz);
+        float radial = 0.0f;
+        if (rhl > 1e-3f) radial = fabsf((h->vel.x * rhx + h->vel.z * rhz) / rhl);
+        h->c = h->b + radial;
+    }
+
+    // ---- D: anti-phase ----
+    //
+    // Needs both hands, and needs both of them actually moving - the cosine between two
+    // near-zero velocities is numerically meaningless and would otherwise dominate the mean
+    // while the player stands still.
+    float alt = 0.0f;
+    bool  haveAlt = false;
+    if (g_swingL.tracked && g_swingR.tracked) {
+        const float ll = SwingLen(g_swingL.vel), rl = SwingLen(g_swingR.vel);
+        if (ll > 0.05f && rl > 0.05f) {
+            const float dot = g_swingL.vel.x * g_swingR.vel.x +
+                              g_swingL.vel.y * g_swingR.vel.y +
+                              g_swingL.vel.z * g_swingR.vel.z;
+            alt = dot / (ll * rl);          // -1 fully opposed, +1 moving together
+            haveAlt = true;
+        }
+    }
+    float d = 0.0f;
+    if (haveAlt) {
+        const float opposed = (-alt < 0.0f) ? 0.0f : -alt;
+        d = 0.5f * (g_swingL.a + g_swingR.a) * opposed;
+    }
+
+    // ---- accumulate the window ----
+    const float metrics[2][4] = {
+        { g_swingL.a, g_swingL.b, g_swingL.c, d },
+        { g_swingR.a, g_swingR.b, g_swingR.c, 0.0f },
+    };
+    for (int i = 0; i < 2; ++i)
+        for (int m = 0; m < 4; ++m) {
+            g_swingSum[i][m] += metrics[i][m];
+            if (metrics[i][m] > g_swingPeak[i][m]) g_swingPeak[i][m] = metrics[i][m];
+        }
+    if (haveAlt) { g_swingAltSum += alt; g_swingAltSamples++; }
+    const float headDy = head.y - g_swingBaselineY;
+    if (headDy < g_swingHeadYMin) g_swingHeadYMin = headDy;
+    if (headDy > g_swingHeadYMax) g_swingHeadYMax = headDy;
+    g_swingSamples++;
+
+    // ---- report ----
+    //
+    // Roughly once a second, not on the fifteen-second window the pad and animation reports
+    // use. A swing cycles at about 2 Hz, so a fifteen-second mean is an average over the whole
+    // session and says nothing about the action the player was performing; and the six AS.0
+    // actions are ten seconds each, so a fifteen-second window is guaranteed to straddle two of
+    // them. One line per second gives each action about ten of its own.
+    if (g_swingReportAt == 0) g_swingReportAt = when + 1000000000LL;
+    if (g_armSwingDebug && when >= g_swingReportAt && g_swingSamples > 0) {
+        g_swingReportAt = when + 1000000000LL;
+        const float n = (float)g_swingSamples;
+        Log("[swing] %ld samples  A L %.2f/%.2f R %.2f/%.2f | B L %.2f/%.2f R %.2f/%.2f  (mean/peak m/s)",
+            g_swingSamples,
+            g_swingSum[0][0] / n, g_swingPeak[0][0], g_swingSum[1][0] / n, g_swingPeak[1][0],
+            g_swingSum[0][1] / n, g_swingPeak[0][1], g_swingSum[1][1] / n, g_swingPeak[1][1]);
+        Log("[swing]   C L %.2f/%.2f R %.2f/%.2f | D %.2f/%.2f | anti-phase %+.2f over %ld"
+            " | head Y %+.2f..%+.2f m | rejects dt %ld step %ld untracked %ld",
+            g_swingSum[0][2] / n, g_swingPeak[0][2], g_swingSum[1][2] / n, g_swingPeak[1][2],
+            g_swingSum[0][3] / n, g_swingPeak[0][3],
+            g_swingAltSamples ? (g_swingAltSum / (float)g_swingAltSamples) : 0.0f,
+            g_swingAltSamples, g_swingHeadYMin, g_swingHeadYMax,
+            g_swingRejDt, g_swingRejStep, g_swingRejUntracked);
+
+        g_swingSamples = 0;
+        for (int i = 0; i < 2; ++i)
+            for (int m = 0; m < 4; ++m) { g_swingSum[i][m] = 0.0f; g_swingPeak[i][m] = 0.0f; }
+        g_swingAltSum = 0.0f; g_swingAltSamples = 0;
+        g_swingHeadYMin = g_swingHeadYMax = headDy;
+        g_swingRejDt = g_swingRejStep = g_swingRejUntracked = 0;
+    }
+}
+
 // Read the controllers and build a 360 pad out of them. Called once per frame from the XR loop.
-static bool XrSyncInput()
+//
+// `when` is the frame's predictedDisplayTime, threaded through because the arm swing sampler
+// differentiates positions located at it. Head tracking is applied for the same instant at the
+// call site, so the pad, the view and the swing metrics all describe one moment.
+static bool XrSyncInput(XrTime when)
 {
     if (!g_actionsReady) return false;
 
@@ -1028,7 +1353,19 @@ static bool XrSyncInput()
     si.activeActionSets = &aas;
     // Returns SESSION_NOT_FOCUSED whenever the headset menu is up. Not an error, and not worth
     // logging every frame - the actions simply report inactive and the pad reads as centred.
-    if (XR_FAILED(xrSyncActions(g_xrSession, &si))) return false;
+    const XrResult synced = xrSyncActions(g_xrSession, &si);
+
+    // ---- before the two early returns below, and deliberately ----
+    //
+    // On the failure path it is handed actionsSynced=false, finds no poses, and drops its
+    // velocity history - which is the point. A menu dismissed after ten seconds would otherwise
+    // hand the differentiator two samples ten seconds apart across a body that has moved.
+    //
+    // And it runs while the pad is disabled for the same reason: NUMPAD9 is a toggle, and
+    // re-enabling must not resume against a position from before it was pressed.
+    ArmSwingSample(when, XR_SUCCEEDED(synced));
+
+    if (XR_FAILED(synced)) return false;
     // Pose actions share this action set. They remain live when NUMPAD9 disables pad synthesis.
     if (!g_padEnabled) return true;
 
@@ -2384,7 +2721,7 @@ static void SubmitTestQuad()
     ApplyHeadTracking(fs.predictedDisplayTime);
     // Once a frame, beside the head sample. Both read the same runtime and both describe the same
     // instant, so keeping them together is what stops the sticks from lagging the view.
-    const bool actionsSynced = XrSyncInput();
+    const bool actionsSynced = XrSyncInput(fs.predictedDisplayTime);
     XrSampleMotionPoses(fs.predictedDisplayTime, actionsSynced);
     // The first position test proved that a write made here is reset by Update1pArms before the
     // skeleton evaluates. Publish instead; the native arm hook consumes this exact sample after
@@ -6014,6 +6351,24 @@ static void CheckHeadHotkeys()
             g_padEnabled ? "ON (acting as a gamepad)" : "OFF (keyboard and mouse only)");
     }
     pN9 = dN9;
+
+    // NUMPAD * toggles arm swing measurement. An operator key because every F-key, every numpad
+    // DIGIT and the whole navigation cluster is already assigned - checked before binding, which
+    // is the standing rule here.
+    //
+    // At AS.0 this changes nothing the player can feel; it exists so the metrics can be turned
+    // off and on around a marker without leaving the headset, and so the key is already the
+    // right one when AS.1 gives it something to switch.
+    static bool pNMul = false;
+    const bool dNMul = (GetAsyncKeyState(VK_MULTIPLY) & 0x8000) != 0;
+    if (dNMul && !pNMul) {
+        g_armSwing = !g_armSwing;
+        // History, not just the flag: re-enabling must not differentiate across the gap.
+        ArmSwingForgetHistory();
+        Log("*** [swing] NUMPAD * -> arm swing %s%s", g_armSwing ? "ON" : "OFF",
+            g_armSwingDebug ? "" : "  (ArmSwingDebug is off, so no metric lines will follow)");
+    }
+    pNMul = dNMul;
 
     static bool pN8 = false;
     const bool dN8 = (GetAsyncKeyState(VK_NUMPAD8) & 0x8000) != 0;
@@ -13687,6 +14042,19 @@ static void LoadSettings()
                 Log("[cfg]   MotionHandsDebug = %s", b ? "on" : "off");
                 applied++;
             } else { Log("[cfg]   MotionHandsDebug '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ArmSwing") == 0) {
+            if (SettingBool(val, &b)) {
+                g_armSwing = b;
+                Log("[cfg]   ArmSwing = %s%s", b ? "on" : "off",
+                    b ? "  (AS.0: metrics are measured and logged; the pad is NOT driven yet)" : "");
+                applied++;
+            } else { Log("[cfg]   ArmSwing '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ArmSwingDebug") == 0) {
+            if (SettingBool(val, &b)) {
+                g_armSwingDebug = b;
+                Log("[cfg]   ArmSwingDebug = %s", b ? "on" : "off");
+                applied++;
+            } else { Log("[cfg]   ArmSwingDebug '%s' is not a boolean - ignored", val); rejected++; }
         } else if (_stricmp(key, "D3D9Ex") == 0) {
             // ⚠️ Not a hotkey, and cannot be. A device's TYPE is fixed when it is created, so
             // switching it later would mean destroying every resource in the game. This is the
