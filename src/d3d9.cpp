@@ -1093,6 +1093,64 @@ struct ArmSwingHand {
     float      a = 0.0f, b = 0.0f, c = 0.0f;
 };
 
+// ---- the chosen metric: B, vertical head-relative hand speed ----
+//
+// AS.0 ran the six-action protocol on 2026-08-27 over 22,404 samples. Per-second medians, m/s:
+//
+//                          A full   B vertical   C vert+radial   D anti-phase
+//   look around (neck)      0.18       0.04          0.17            0.00
+//   turn on the spot        0.29       0.03          0.09            0.19
+//   crouch x2               0.23       0.18          0.26            0.00
+//   gesture / reach         0.77       0.42          0.80            0.03
+//   walk-cadence swing      0.97       0.57          0.90            0.61
+//   run-cadence swing       2.66       1.58          2.51            1.07
+//
+// B wins on the only comparison that matters for a game played in a headset: it is blind to
+// looking around (0.04) and to turning on the spot (0.03) - the two things the player does
+// every second of actual play - while a walking swing reads 0.57. That is a 14-19x margin
+// against the constant background, and no other candidate is close.
+//
+// ---- ⚠️ D is removed, and the reason is worth keeping ----
+//
+// The plan predicted D would be immune to body turns because a turn "carries both hands the
+// same way round". That is wrong twice over.
+//
+// First, geometrically: two points on opposite sides of a rotation axis move in OPPOSITE
+// directions, so a turn looks strongly anti-phase - the measured cosine reached -0.95 while
+// turning on the spot, which is a swing's signature exactly.
+//
+// Second, and fatally: anti-phase WEAKENS AS CADENCE RISES. It measured -0.35..-0.67 at
+// walking cadence but only about -0.15 at running cadence, where the arms follow more complex
+// paths than a simple opposed pair. Multiplying a speed by it therefore compresses the top of
+// the range - D's run/walk ratio is 1.75x where A's is 2.7x. A speed metric that grows less
+// sensitive the harder you swing is the wrong shape, and every anti-phase variant inherits it:
+// B x anti-phase actually INVERTS, scoring the run swing (0.24) below the walk swing (0.30).
+//
+// The cosine itself is still logged. It is a real measurement, it is what disproved D, and it
+// costs one number.
+//
+// ---- what B does not solve, left for AS.1 ----
+//
+//   crouch (0.18, worst second 0.30). Squatting drops the head while the hands stay put, which
+//   IS a large relative vertical velocity - the metric is not wrong, the intent is. The crouch
+//   detector already knows when this is happening and will suppress the swing during it.
+//
+//   sustained gesturing (0.42). The discriminator the data actually shows is steadiness, not
+//   magnitude: the walk swing held 0.90-1.15 for 28 consecutive seconds while gesturing lurched
+//   0.10 -> 2.19 -> 2.73 -> 0.35 -> 2.89 within seconds. A sustain gate belongs with the
+//   envelope. Large SUSTAINED arm motion moving the player is inherent to arm-swing locomotion
+//   and is not a defect to be engineered away.
+
+// One player, one session. These are the starting anchors, not constants of nature: AS.1 scales
+// the top of the range to the reach and cadence it actually observes, and these are what it
+// starts from and floors at.
+static const float kSwingDeadbandMS = 0.35f;   // above crouch's worst second (0.30)
+static const float kSwingWalkMS     = 0.57f;   // walk-cadence swing
+static const float kSwingFullMS     = 1.58f;   // run-cadence swing -> full deflection
+
+// The chosen metric this frame, m/s. AS.1's envelope consumes exactly this and nothing else.
+static float  g_swingNow = 0.0f;
+
 static ArmSwingHand g_swingL, g_swingR;
 static XrTime g_swingPrevTime = 0;
 static bool   g_swingHaveBaselineY = false;
@@ -1101,8 +1159,10 @@ static float  g_swingBaselineY = 0.0f;      // head height at the first valid sa
 // Report accumulators. Written and read on the Present thread only, like the pad's own window
 // counters, so no lock.
 static long   g_swingSamples = 0;
-static float  g_swingSum[2][4] = {};        // [hand][metric A,B,C,D] - D is stored on hand 0
-static float  g_swingPeak[2][4] = {};
+static float  g_swingSum[2][3] = {};        // [hand][metric A,B,C]
+static float  g_swingPeak[2][3] = {};
+static float  g_swingNowSum = 0.0f;         // the CHOSEN metric, over the report window
+static float  g_swingNowPeak = 0.0f;
 static float  g_swingAltSum = 0.0f;         // mean cosine between the two hands' velocities
 static long   g_swingAltSamples = 0;
 static float  g_swingHeadYMin = 0.0f, g_swingHeadYMax = 0.0f;
@@ -1125,7 +1185,8 @@ static void ArmSwingForgetHistory()
     g_swingReportAt = 0;
     g_swingSamples = 0;
     for (int i = 0; i < 2; ++i)
-        for (int m = 0; m < 4; ++m) { g_swingSum[i][m] = 0.0f; g_swingPeak[i][m] = 0.0f; }
+        for (int m = 0; m < 3; ++m) { g_swingSum[i][m] = 0.0f; g_swingPeak[i][m] = 0.0f; }
+    g_swingNow = 0.0f; g_swingNowSum = 0.0f; g_swingNowPeak = 0.0f;
     g_swingAltSum = 0.0f; g_swingAltSamples = 0;
     g_swingRejDt = g_swingRejStep = g_swingRejUntracked = 0;
 }
@@ -1178,11 +1239,14 @@ static void ArmSwingSample(XrTime when, bool actionsSynced)
 
     if (!g_swingStartupLogged) {
         g_swingStartupLogged = true;
-        Log("*** [swing] AS.0 measurement active - metrics only, nothing is written to the pad.");
-        Log("[swing]   A = |d(grip-head)/dt|   B = vertical part of A   C = B + radial part"
-            "   D = mean A x anti-phase");
-        Log("[swing]   mark each physical action with BACKSPACE; every metric line between two"
-            " markers belongs to one action.");
+        Log("*** [swing] arm swing active - metrics only, nothing is written to the pad yet.");
+        Log("[swing]   metric B, vertical head-relative hand speed, chosen by the AS.0"
+            " measurement of 2026-08-27 over 22404 samples.");
+        Log("[swing]   anchors: deadband %.2f, walk %.2f, full %.2f m/s. Measured on one body -"
+            " AS.1 rescales to the reach it sees and floors here.",
+            kSwingDeadbandMS, kSwingWalkMS, kSwingFullMS);
+        Log("[swing]   A and C are still reported for comparison; D is gone (anti-phase weakens"
+            " as cadence rises, so it compressed the top of the range).");
     }
 
     XrVector3f head{}, gripL{}, gripR{};
@@ -1271,7 +1335,7 @@ static void ArmSwingSample(XrTime when, bool actionsSynced)
         h->c = h->b + radial;
     }
 
-    // ---- D: anti-phase ----
+    // ---- the anti-phase cosine, kept as a diagnostic and no longer a metric ----
     //
     // Needs both hands, and needs both of them actually moving - the cosine between two
     // near-zero velocities is numerically meaningless and would otherwise dominate the mean
@@ -1288,22 +1352,28 @@ static void ArmSwingSample(XrTime when, bool actionsSynced)
             haveAlt = true;
         }
     }
-    float d = 0.0f;
-    if (haveAlt) {
-        const float opposed = (-alt < 0.0f) ? 0.0f : -alt;
-        d = 0.5f * (g_swingL.a + g_swingR.a) * opposed;
-    }
+
+    // ---- the chosen metric ----
+    //
+    // The louder hand, over hands that are actually TRACKED. Not the mean of both: losing a
+    // controller mid-swing would otherwise halve the reading and read as the player slowing
+    // down, when all that changed is how much we can see.
+    g_swingNow = 0.0f;
+    if (g_swingL.tracked) g_swingNow = g_swingL.b;
+    if (g_swingR.tracked && g_swingR.b > g_swingNow) g_swingNow = g_swingR.b;
 
     // ---- accumulate the window ----
-    const float metrics[2][4] = {
-        { g_swingL.a, g_swingL.b, g_swingL.c, d },
-        { g_swingR.a, g_swingR.b, g_swingR.c, 0.0f },
+    const float metrics[2][3] = {
+        { g_swingL.a, g_swingL.b, g_swingL.c },
+        { g_swingR.a, g_swingR.b, g_swingR.c },
     };
     for (int i = 0; i < 2; ++i)
-        for (int m = 0; m < 4; ++m) {
+        for (int m = 0; m < 3; ++m) {
             g_swingSum[i][m] += metrics[i][m];
             if (metrics[i][m] > g_swingPeak[i][m]) g_swingPeak[i][m] = metrics[i][m];
         }
+    g_swingNowSum += g_swingNow;
+    if (g_swingNow > g_swingNowPeak) g_swingNowPeak = g_swingNow;
     if (haveAlt) { g_swingAltSum += alt; g_swingAltSamples++; }
     const float headDy = head.y - g_swingBaselineY;
     if (headDy < g_swingHeadYMin) g_swingHeadYMin = headDy;
@@ -1321,21 +1391,31 @@ static void ArmSwingSample(XrTime when, bool actionsSynced)
     if (g_armSwingDebug && when >= g_swingReportAt && g_swingSamples > 0) {
         g_swingReportAt = when + 1000000000LL;
         const float n = (float)g_swingSamples;
-        Log("[swing] %ld samples  A L %.2f/%.2f R %.2f/%.2f | B L %.2f/%.2f R %.2f/%.2f  (mean/peak m/s)",
-            g_swingSamples,
+        // The chosen metric leads, and is named, so a log reader does not have to know which
+        // column won to read the line. Where it sits against the three measured anchors is
+        // spelled out rather than left to be worked out from the numbers.
+        const float mean = g_swingNowSum / n;
+        Log("[swing] SWING %.2f/%.2f m/s (mean/peak)  %s  | %ld samples",
+            mean, g_swingNowPeak,
+            g_swingNowPeak < kSwingDeadbandMS ? "below deadband" :
+            (g_swingNowPeak < kSwingWalkMS ? "deadband..walk" :
+             (g_swingNowPeak < kSwingFullMS ? "walk..full" : "at or over full")),
+            g_swingSamples);
+        Log("[swing]   A L %.2f/%.2f R %.2f/%.2f | B L %.2f/%.2f R %.2f/%.2f"
+            " | C L %.2f/%.2f R %.2f/%.2f   (B is the chosen metric)",
             g_swingSum[0][0] / n, g_swingPeak[0][0], g_swingSum[1][0] / n, g_swingPeak[1][0],
-            g_swingSum[0][1] / n, g_swingPeak[0][1], g_swingSum[1][1] / n, g_swingPeak[1][1]);
-        Log("[swing]   C L %.2f/%.2f R %.2f/%.2f | D %.2f/%.2f | anti-phase %+.2f over %ld"
+            g_swingSum[0][1] / n, g_swingPeak[0][1], g_swingSum[1][1] / n, g_swingPeak[1][1],
+            g_swingSum[0][2] / n, g_swingPeak[0][2], g_swingSum[1][2] / n, g_swingPeak[1][2]);
+        Log("[swing]   anti-phase %+.2f over %ld (diagnostic only - see the note at the metric)"
             " | head Y %+.2f..%+.2f m | rejects dt %ld step %ld untracked %ld",
-            g_swingSum[0][2] / n, g_swingPeak[0][2], g_swingSum[1][2] / n, g_swingPeak[1][2],
-            g_swingSum[0][3] / n, g_swingPeak[0][3],
             g_swingAltSamples ? (g_swingAltSum / (float)g_swingAltSamples) : 0.0f,
             g_swingAltSamples, g_swingHeadYMin, g_swingHeadYMax,
             g_swingRejDt, g_swingRejStep, g_swingRejUntracked);
 
         g_swingSamples = 0;
         for (int i = 0; i < 2; ++i)
-            for (int m = 0; m < 4; ++m) { g_swingSum[i][m] = 0.0f; g_swingPeak[i][m] = 0.0f; }
+            for (int m = 0; m < 3; ++m) { g_swingSum[i][m] = 0.0f; g_swingPeak[i][m] = 0.0f; }
+        g_swingNowSum = 0.0f; g_swingNowPeak = 0.0f;
         g_swingAltSum = 0.0f; g_swingAltSamples = 0;
         g_swingHeadYMin = g_swingHeadYMax = headDy;
         g_swingRejDt = g_swingRejStep = g_swingRejUntracked = 0;

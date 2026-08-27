@@ -115,32 +115,86 @@ model, and it means `ArmSwing = off` is provably inert.
    in a menu — must still be able to play. The stick composes additively and, pushed backwards,
    suppresses the swing contribution outright.
 
-## The swing metric
+## The swing metric — SETTLED by AS.0
 
 All candidates operate on `r_i(t) = grip_i(t) − head(t)`, expressed in LOCAL room axes, in
 metres. None of them rotates a basis, so none of them can turn a head rotation into a velocity.
 
-| | Metric | Immune to | Vulnerable to |
-|---|---|---|---|
-| **A** | `\|d r_i/dt\|` — full head-relative speed | room-scale translation, head yaw/pitch/roll | turning on the spot (hands orbit the head), large gestures |
-| **B** | `\|d(r_i·up)/dt\|` — vertical only | all of A, plus turning on the spot | head bob while marching in place, reaching overhead |
-| **C** | B, plus the horizontal component *along* `r_i`, discarding the perpendicular part | all of B; an orbit is purely tangential so a body turn contributes nothing | more state, more to get wrong; keeps only part of a swing |
-| **D** | mean A × anti-phase, where anti-phase is `clamp01(−cos∠(v_L, v_R))` | all of B and C, by construction — a body turn carries both hands the same way round and D collapses | needs both controllers tracked and both hands moving |
+| | Metric |
+|---|---|
+| **A** | `\|d r_i/dt\|` — full head-relative speed |
+| **B** | `\|d(r_i·up)/dt\|` — vertical only |
+| **C** | B, plus the horizontal component *along* `r_i`, discarding the perpendicular part |
+| **D** | mean A × anti-phase, `clamp01(−cos∠(v_L, v_R))` — added during AS.0 as gate A's fallback |
 
-A is the most sensitive and the most obviously correct-looking; B is the most robust and is what
-several shipped arm-swingers settle on; C is the compromise.
+### The measurement, 2026-08-27, 22,404 samples
 
-**D was added during AS.0 and is not in the original three.** It is the plan's own stop/go gate A
-fallback — "require left/right anti-phase" — promoted into the same measurement. A real swing
-alternates, so the cosine between the two hands' velocities sits near −1; a body turn moves both
-hands the same way round, cosine near +1. Logging it alongside the others means one headset
-session answers both *which metric* and *what to do if all of them lose*, instead of two sessions
-in series. It costs about ten floating-point operations.
+Per-second medians, m/s, over the six-action protocol:
 
-The estimated failure case for A is worth stating in advance so the measurement can confirm or
-kill it: arms hanging at the sides sit roughly 0.2 m from the head's vertical axis, so a brisk
-180°/s turn on the spot moves them at about 0.6 m/s — plausibly above a swing deadband. If AS.0
-measures that, A is out.
+| action | A full | **B vertical** | C vert+radial | D anti-phase |
+|---|---|---|---|---|
+| look around (neck only) | 0.18 | **0.04** | 0.17 | 0.00 |
+| turn on the spot | 0.29 | **0.03** | 0.09 | 0.19 |
+| crouch ×2 | 0.23 | 0.18 | 0.26 | 0.00 |
+| gesture / reach | 0.77 | 0.42 | 0.80 | 0.03 |
+| **walk-cadence swing** | 0.97 | **0.57** | 0.90 | 0.61 |
+| **run-cadence swing** | 2.66 | **1.58** | 2.51 | 1.07 |
+
+**B wins**, on the only comparison that decides a game played in a headset: it is blind to
+looking around (0.04) and to turning on the spot (0.03) — the two things the player does every
+second of actual play — while a walking swing reads 0.57. A 14–19× margin against the constant
+background, and nothing else is close.
+
+### What the measurement overturned
+
+**The prediction about A was right in its number and wrong in its conclusion.** A brisk turn on
+the spot was estimated at ~0.6 m/s and measured at 0.58 peak. But a real swing is much faster
+than assumed — 0.97 at walking cadence — so A clears turning anyway. The estimate was sound; the
+inference from it was not.
+
+**D is dead, and the plan's reasoning for it was wrong twice.** The table above originally
+claimed a body turn "carries both hands the same way round" so anti-phase collapses. Geometrically
+false: two points on opposite sides of a rotation axis move in *opposite* directions, and the
+measured cosine reached −0.95 while turning on the spot — a swing's signature exactly.
+
+The fatal defect is different and would not have been guessed. **Anti-phase weakens as cadence
+rises**: −0.35…−0.67 at walking cadence, but only ≈−0.15 at running cadence, where the arms
+follow more complex paths than a simple opposed pair. Multiplying a speed by it compresses the
+top of the range — D's run/walk ratio is 1.75× where A's is 2.7×. A speed metric that grows
+*less* sensitive the harder you swing is the wrong shape, and every anti-phase variant inherits
+it: B × anti-phase actually inverts, scoring the run swing (0.24) below the walk swing (0.30).
+
+The cosine is still logged. It is a real measurement, it is what disproved D, and it costs one
+number.
+
+### What B does not solve, and where each is handled
+
+- **Crouch, 0.18 (worst second 0.30).** Squatting drops the head while the hands stay put, which
+  genuinely *is* a large relative vertical velocity — the metric is not wrong, the intent is. The
+  crouch detector already knows when this is happening; AS.1 suppresses the swing during it.
+- **Sustained gesturing, 0.42.** The discriminator the data actually shows is steadiness, not
+  magnitude: the walk swing held 0.90–1.15 for 28 consecutive seconds while gesturing lurched
+  0.10 → 2.19 → 2.73 → 0.35 → 2.89 within seconds. AS.1 adds a sustain gate — the metric must
+  hold above the deadband for ~300 ms before the envelope engages. This catches bursts, not
+  sustained waving; large sustained arm motion moving the player is inherent to arm-swing
+  locomotion and is not a defect to engineer away.
+
+### Anchors
+
+| | m/s | why |
+|---|---|---|
+| deadband | 0.35 | above crouch's worst second (0.30), far above turn (0.04) and look (0.10) |
+| walk | 0.57 | walk-cadence swing |
+| full deflection | 1.58 | run-cadence swing |
+
+One player, one session. Per design decision 6 these are the *starting* anchors and the floor,
+not constants: AS.1 rescales the top of the range to the reach and cadence it actually observes.
+
+### Health of the signal
+
+22,404 samples: 0.5 % rejected for dt out of range, 0.6 % untracked, and **zero** discontinuity
+rejections. The 0.25 m guard never fired, so it is untested rather than proven — no tracking
+glitch happened to occur in this session.
 
 ## Runtime data to add
 
@@ -311,10 +365,13 @@ name the state in the log when doing so.
 
 Each rung answers one question and is committed separately.
 
-### AS.0 — is there a signal, and which one?
+### AS.0 — is there a signal, and which one?  ✅ DONE 2026-08-27
 
 **Question:** Does any candidate metric separate a real arm swing from head turns, body turns,
 gestures and crouches?
+
+**Answer: yes — metric B.** The result, the numbers, and what it does not solve are in
+*The swing metric* above.
 
 Work:
 
@@ -350,9 +407,15 @@ Actions, one marker press before each:
 **Pass:** one metric puts 3 and 4 clearly above a threshold that 1, 2, 5 and 6 stay under, with
 enough margin that the threshold does not have to be placed precisely.
 
-**Stop/go gate A:** if no candidate separates them, do not build the rest on grip motion alone.
-The next thing to try is requiring left/right **anti-phase** — a real swing alternates and a
-gesture does not — before anything more elaborate.
+**Stop/go gate A: PASSED, 2026-08-27.** Metric B separates a swing from looking around and from
+turning on the spot by 14–19×. See *The swing metric* for the numbers and for what B does not
+solve.
+
+⚠️ The fallback this gate named — "require left/right anti-phase" — is **closed off**, not merely
+unused. It was measured in the same session and it does not work: a body turn reads as anti-phase
+(opposite sides of a rotation axis move in opposite directions), and anti-phase weakens as cadence
+rises, which compresses exactly the part of the range a speed metric needs most. Anything reaching
+for it later should read that section first.
 
 ### AS.1a — what does the game do with a deflection?
 
