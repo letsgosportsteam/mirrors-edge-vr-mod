@@ -647,6 +647,7 @@ extern uintptr_t g_playerPawn;
 extern int g_offActorLocation;
 extern int g_offVelocity;
 extern uintptr_t g_playerCtl;
+extern bool g_moveInputBlocked;
 extern int g_offSprintRadiusLimit;
 extern int g_offSprintHeightLimit;
 extern int g_offWalkRadiusLimit;
@@ -1145,12 +1146,67 @@ struct ArmSwingHand {
 // One player, one session. These are the starting anchors, not constants of nature: AS.1 scales
 // the top of the range to the reach and cadence it actually observes, and these are what it
 // starts from and floors at.
-static const float kSwingDeadbandMS = 0.35f;   // above crouch's worst second (0.30)
+static float       g_swingDeadbandMS = 0.35f;  // above crouch's worst second (0.30); tunable
 static const float kSwingWalkMS     = 0.57f;   // walk-cadence swing
 static const float kSwingFullMS     = 1.58f;   // run-cadence swing -> full deflection
 
 // The chosen metric this frame, m/s. AS.1's envelope consumes exactly this and nothing else.
 static float  g_swingNow = 0.0f;
+static float  g_swingDt = 0.0f;             // seconds, the sampler's own validated dt
+static float  g_swingHeadVert = 0.0f;       // |head vertical speed|, m/s - the crouch tell
+
+// ================================================================ AS.1: swing to deflection
+//
+// ---- the two ends are measured, so this is arithmetic and not taste ----
+//
+// AS.1a measured the game's side exactly. There is a 0.280 dead band on the raw stick, the
+// remainder is renormalised, and
+//
+//     base speed = 400 x (raw - 0.280) / 0.720      fits every linear sample within 1 UU/s
+//
+// which extrapolates to exactly 400 at full deflection - SpeedMaxBaseVelocity, a number it was
+// not fitted to. The sprint gate is a limit of 0.7 in POST-DEADZONE units, so the raw stick
+// value that crosses it is 0.280 + 0.7 x 0.720 = 0.784. Building against the ini's bare 0.7
+// would have parked the envelope permanently just under the gate.
+static float g_padDeadzone   = 0.280f;      // below this the game does literally nothing
+// The bottom of the mapped range. NOT g_padDeadzone: that produces exactly 0 UU/s, so mapping
+// the engage threshold onto it would make the moment of engaging invisible - the player would
+// swing hard enough to pass the sustain gate and see nothing happen. 0.40 raw is about 67 UU/s,
+// a walk, so engaging always shows.
+static float g_padWalkFloor  = 0.400f;
+static float g_padSprintGate = 0.784f;      // raw stick value that crosses the sprint gate
+
+// ---- ⚠️ above the gate, assert 1.0 and not 0.784 ----
+//
+// AS.1a held 0.85 and 1.00 and got IDENTICAL ramps at every sample - 423/425, 523/524, 574/574,
+// 599/600 and so on. There is no analogue control above the gate, so the extra 0.216 costs
+// nothing and buys margin against an envelope dip. Sitting on a cliff edge for no gain would be
+// the only reason to assert 0.784.
+//
+// And it is a cliff, not a slope: dropping under the gate does not shed a little speed, it
+// leaves sprint entirely and bleeds three seconds of accumulated energy, because the whole
+// 400..707 range hangs off that one threshold. Hence the hysteresis below.
+
+// Tunable in the headset - the mapping SHAPE is the thing AS.1 exists to get right, and no
+// amount of arithmetic settles where a given body's "I mean to sprint" swing sits.
+static float g_swingSprintOnMS  = 1.10f;    // engage sprint (run-cadence measured at 1.58)
+static float g_swingSprintOffMS = 0.85f;    // release it - hysteresis, see the cliff note
+static float g_swingHoldMs      = 250.0f;   // bridge the reversal; about one swing period
+static float g_swingHeadVertMax = 0.25f;    // crouch suppression, m/s of head vertical speed
+
+static const float kSwingSustainMs  = 300.0f;   // continuous, before the envelope may engage
+static const float kSwingDecayHalfMs = 250.0f;  // inside the hold window
+static const float kSwingCollapseMs  = 120.0f;  // outside it
+
+static float  g_swingSmoothed = 0.0f;       // the metric after the envelope, m/s
+static float  g_swingDeflection = 0.0f;     // what the pad is asked for, 0..1
+static bool   g_swingEngaged = false;
+static bool   g_swingSprinting = false;
+static XrTime g_swingAboveSince = 0;
+static XrTime g_swingLastAbove = 0;
+static const char* g_swingBlock = "";       // why it is not driving, for the overlay and log
+static int    g_swingTuneSel = 0;           // which value NUMPAD +/- adjusts
+
 
 static ArmSwingHand g_swingL, g_swingR;
 static XrTime g_swingPrevTime = 0;
@@ -1188,6 +1244,7 @@ static void ArmSwingForgetHistory()
     for (int i = 0; i < 2; ++i)
         for (int m = 0; m < 3; ++m) { g_swingSum[i][m] = 0.0f; g_swingPeak[i][m] = 0.0f; }
     g_swingNow = 0.0f; g_swingNowSum = 0.0f; g_swingNowPeak = 0.0f;
+    g_swingDt = 0.0f;                  // a stale dt would integrate the envelope over a gap
     g_swingAltSum = 0.0f; g_swingAltSamples = 0;
     g_swingRejDt = g_swingRejStep = g_swingRejUntracked = 0;
 }
@@ -1245,7 +1302,7 @@ static void ArmSwingSample(XrTime when, bool actionsSynced)
             " measurement of 2026-08-27 over 22404 samples.");
         Log("[swing]   anchors: deadband %.2f, walk %.2f, full %.2f m/s. Measured on one body -"
             " AS.1 rescales to the reach it sees and floors here.",
-            kSwingDeadbandMS, kSwingWalkMS, kSwingFullMS);
+            g_swingDeadbandMS, kSwingWalkMS, kSwingFullMS);
         Log("[swing]   A and C are still reported for comparison; D is gone (anti-phase weakens"
             " as cadence rises, so it compressed the top of the range).");
     }
@@ -1255,7 +1312,8 @@ static void ArmSwingSample(XrTime when, bool actionsSynced)
 
     if (!haveHead) {
         // No anchor means no rel, and a rel formed against a stale head would be a velocity the
-        // player did not produce. Drop the history rather than bridge the gap.
+        // player did not produce. Drop the history rather than bridge the gap - and with it the
+        // dt, or AS.1's envelope would integrate across however long the gap turns out to be.
         ArmSwingForgetHistory();
         g_swingRejUntracked++;
         return;
@@ -1276,6 +1334,24 @@ static void ArmSwingSample(XrTime when, bool actionsSynced)
 
     if (!g_swingHaveBaselineY) { g_swingBaselineY = head.y; g_swingHaveBaselineY = true;
                                  g_swingHeadYMin = g_swingHeadYMax = 0.0f; }
+
+    // Published for AS.1: the envelope runs after the physical stick is read and has no dt of
+    // its own, and re-deriving one from a different clock is how two parts of the same frame
+    // start disagreeing about how long it was.
+    g_swingDt = dtOk ? dt : 0.0f;
+
+    // Head vertical speed - the crouch tell. Lightly smoothed, because it gates a hard cutoff
+    // and a single noisy sample should not drop the player out of a run.
+    {
+        static bool  havePrevY = false;
+        static float prevY = 0.0f;
+        if (havePrevY && dtOk) {
+            const float hv = fabsf((head.y - prevY) / dt);
+            g_swingHeadVert += (hv - g_swingHeadVert) * 0.3f;
+        }
+        prevY = head.y;
+        havePrevY = true;
+    }
 
     struct { ArmSwingHand* h; bool have; const XrVector3f* grip; } hands[2] = {
         { &g_swingL, haveL, &gripL }, { &g_swingR, haveR, &gripR },
@@ -1398,7 +1474,7 @@ static void ArmSwingSample(XrTime when, bool actionsSynced)
         const float mean = g_swingNowSum / n;
         Log("[swing] SWING %.2f/%.2f m/s (mean/peak)  %s  | %ld samples",
             mean, g_swingNowPeak,
-            g_swingNowPeak < kSwingDeadbandMS ? "below deadband" :
+            g_swingNowPeak < g_swingDeadbandMS ? "below deadband" :
             (g_swingNowPeak < kSwingWalkMS ? "deadband..walk" :
              (g_swingNowPeak < kSwingFullMS ? "walk..full" : "at or over full")),
             g_swingSamples);
@@ -1604,6 +1680,111 @@ static void ReportSprintLimitsOnce()
             0.280f + sr * 0.720f);
 }
 
+static void ArmSwingCollapse(const char* why)
+{
+    if (g_swingEngaged || g_swingSmoothed > 0.0f) {
+        if (g_armSwingDebug)
+            Log("[swing] released (%s) - envelope collapsed from %.2f m/s", why, g_swingSmoothed);
+    }
+    g_swingSmoothed = 0.0f;
+    g_swingDeflection = 0.0f;
+    g_swingEngaged = false;
+    g_swingSprinting = false;
+    g_swingAboveSince = 0;
+    g_swingBlock = why;
+}
+
+// Called from the pad build, AFTER the physical stick has been read, because the stick is the
+// override and an override that arrives a frame late is not one.
+static float ArmSwingDeflection(XrTime when, float physX, float physY)
+{
+    if (!g_armSwing)                       { ArmSwingCollapse("off");        return 0.0f; }
+    if (!g_padEnabled)                     { ArmSwingCollapse("pad off");    return 0.0f; }
+    if (g_sweepActive)                     { ArmSwingCollapse("sweep");      return 0.0f; }
+    if (g_moveInputBlocked)                { ArmSwingCollapse("move input ignored"); return 0.0f; }
+    if (!g_swingL.tracked && !g_swingR.tracked) { ArmSwingCollapse("no tracked hand"); return 0.0f; }
+    // Pulled backwards is the emergency stop, and it has to be a reflex that works when reached
+    // for in a hurry rather than aimed. It collapses the envelope rather than masking the
+    // output, or letting go of the stick would resume at the speed it was interrupted at.
+    if (physY < -0.2f)                     { ArmSwingCollapse("stick back");  return 0.0f; }
+    // ⚠️ Squatting drops the head while the hands stay put, which genuinely IS a large relative
+    // vertical velocity - metric B is not wrong, the intent is. AS.0 measured head vertical
+    // travel of 0.01-0.02 m through a whole hard swing against 0.7 m through a crouch, so the
+    // two are an order of magnitude apart and a plain speed gate separates them.
+    if (g_swingHeadVert > g_swingHeadVertMax) { ArmSwingCollapse("crouching"); return 0.0f; }
+
+    // ---- a rejected dt holds for a frame, but never indefinitely ----
+    //
+    // Holding is right for an isolated frame hitch: one bad dt is not evidence that the player
+    // stopped swinging. But "skip the update and keep the last value" is exactly the shape of
+    // the bug that cost this project a run on the 6-DOF path - positional tracking dropped, the
+    // update was skipped, and the stale offset persisted forever. Here the stale value is a
+    // forward stick. Every route to a missing dt should already have been caught by the tracked
+    // gate above, so this bound is for the one that has not been thought of.
+    static int held = 0;
+    const float dt = g_swingDt;
+    if (dt <= 0.0f) {
+        if (++held > 30) { ArmSwingCollapse("no fresh sample"); return 0.0f; }
+        return g_swingDeflection;
+    }
+    held = 0;
+    g_swingBlock = "";
+
+    const float raw = g_swingNow;
+    const bool above = raw >= g_swingDeadbandMS;
+    if (above) {
+        if (g_swingAboveSince == 0) g_swingAboveSince = when;
+        g_swingLastAbove = when;
+    } else {
+        g_swingAboveSince = 0;
+    }
+
+    // ---- the sustain gate engages; the hold window sustains ----
+    //
+    // These must be separate. AS.0 measured the real gesture discriminator as steadiness rather
+    // than magnitude - a walk swing held 0.90-1.15 for 28 consecutive seconds while gesturing
+    // lurched 0.10 -> 2.73 -> 0.35 -> 2.89 within seconds - so engaging needs 300 ms of
+    // continuous motion. But a swing passes through zero at every reversal, twice a second, and
+    // requiring the sustain again after each one would mean it never engages at all.
+    const float sinceAboveMs = (float)((double)(when - g_swingLastAbove) * 1e-6);
+    if (g_swingAboveSince != 0 &&
+        (float)((double)(when - g_swingAboveSince) * 1e-6) >= kSwingSustainMs)
+        g_swingEngaged = true;
+    if (!above && sinceAboveMs > g_swingHoldMs) g_swingEngaged = false;
+
+    if (g_swingEngaged && raw > g_swingSmoothed) {
+        g_swingSmoothed = raw;                     // instant attack
+    } else {
+        // Hold-then-collapse. A single exponential cannot serve both ends: slow enough to bridge
+        // a reversal is slow enough to carry the player off a roof after they have stopped, and
+        // in this game that is a death rather than a feel complaint.
+        const float halfMs = (sinceAboveMs <= g_swingHoldMs) ? kSwingDecayHalfMs
+                                                             : kSwingCollapseMs;
+        g_swingSmoothed *= powf(0.5f, (dt * 1000.0f) / halfMs);
+        if (g_swingSmoothed < 0.01f) g_swingSmoothed = 0.0f;
+    }
+
+    if (!g_swingEngaged || g_swingSmoothed < g_swingDeadbandMS) {
+        g_swingSprinting = false;
+        g_swingDeflection = 0.0f;
+        return 0.0f;
+    }
+
+    if (g_swingSmoothed >= g_swingSprintOnMS)       g_swingSprinting = true;
+    else if (g_swingSmoothed < g_swingSprintOffMS)  g_swingSprinting = false;
+
+    if (g_swingSprinting) {
+        g_swingDeflection = 1.0f;
+    } else {
+        const float span = g_swingSprintOnMS - g_swingDeadbandMS;
+        const float t = (span > 0.01f) ? ((g_swingSmoothed - g_swingDeadbandMS) / span) : 0.0f;
+        g_swingDeflection = g_padWalkFloor + t * (g_padSprintGate - g_padWalkFloor);
+    }
+    if (g_swingDeflection > 1.0f) g_swingDeflection = 1.0f;
+    (void)physX;
+    return g_swingDeflection;
+}
+
 // Read the controllers and build a 360 pad out of them. Called once per frame from the XR loop.
 //
 // `when` is the frame's predictedDisplayTime, threaded through because the arm swing sampler
@@ -1697,9 +1878,31 @@ static bool XrSyncInput(XrTime when)
     // the player reaches for it.
     ReportSprintLimitsOnce();
     const float sweep = SweepTick(when, mx, my);
+    // ⚠️ Called every frame, INCLUDING while the sweep is driving. Its own g_sweepActive guard
+    // collapses the envelope; skipping the call instead would freeze the envelope mid-charge for
+    // the whole six-second hold and resume from a stale value the moment the sweep let go.
+    const float swing = ArmSwingDeflection(when, mx, my);
     if (sweep > 0.0f) {
         s.Gamepad.sThumbLX = 0;
         s.Gamepad.sThumbLY = axis(sweep);
+    } else {
+        // ---- AS.1: the swing composes with the stick, it does not replace it ----
+        //
+        // Vector sum clamped to the unit disc. The stick keeps strafe and keeps backwards -
+        // which is the only way to walk backwards, since a swing cannot tell forward from back -
+        // and a player who cannot swing can still play. Pulled backwards it also collapses the
+        // envelope outright, inside ArmSwingDeflection.
+        //
+        // Clamped to the DISC rather than per-axis: the game's gate is on the stick's radius,
+        // so letting the sum reach 1.41 diagonally would cross a threshold the player never
+        // asked for, and clamping each axis separately would do exactly that.
+        if (swing > 0.0f) {
+            float fx = mx, fy = my + swing;
+            const float len = sqrtf(fx * fx + fy * fy);
+            if (len > 1.0f) { fx /= len; fy /= len; }
+            s.Gamepad.sThumbLX = axis(fx);
+            s.Gamepad.sThumbLY = axis(fy);
+        }
     }
     s.Gamepad.bLeftTrigger  = (BYTE)(flt(g_aLTrig) * 255.0f);
     s.Gamepad.bRightTrigger = (BYTE)(flt(g_aRTrig) * 255.0f);
@@ -5225,6 +5428,11 @@ static const char* const kGateNames[] = {
 };
 static const int kGateMax = (int)(sizeof(kGateNames) / sizeof(kGateNames[0]));
 
+// Set by ProbeInputGates each frame: UE3 zeroes aForward/aStrafe when move input is ignored
+// and touches nothing else, so this is exactly the condition under which a swing cannot move
+// the player and the envelope must not be allowed to charge.
+bool g_moveInputBlocked = false;
+
 struct Gate { const char* name; FlagRef ref; };
 static Gate g_gates[kGateMax];
 static int  g_gateCount = 0;
@@ -6682,17 +6890,55 @@ static void CheckHeadHotkeys()
     //
     // g_predTime is the time the pad is being built for; the sweep clocks its holds against the
     // same one so a step's duration means the same thing to both.
-    static bool pNAdd = false, pNSub = false;
+    // ⚠️ SHIFT, because AS.1 took the bare operators. The sweep is a measurement that has been
+    // taken; the mapping is tuned every session. The one used constantly gets the plain key.
+    static bool pNAdd = false, pNSub = false, pNDec = false;
+    const bool shift  = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
     const bool dNAdd = (GetAsyncKeyState(VK_ADD) & 0x8000) != 0;
     const bool dNSub = (GetAsyncKeyState(VK_SUBTRACT) & 0x8000) != 0;
-    if (dNAdd && !pNAdd) SweepStart(g_predTime);
-    if (dNSub && !pNSub) {
+    const bool dNDec = (GetAsyncKeyState(VK_DECIMAL) & 0x8000) != 0;
+
+    if (dNAdd && !pNAdd && shift) SweepStart(g_predTime);
+    if (dNSub && !pNSub && shift) {
         if (g_sweepActive) SweepStop("rewound by hand");
         g_sweepStep = 0;
-        Log("*** [sweep] NUMPAD - -> rewound to step 1/%d (deflection %.2f)",
+        Log("*** [sweep] SHIFT+NUMPAD - -> rewound to step 1/%d (deflection %.2f)",
             kSweepCount, kSweepSteps[0].deflection);
     }
-    pNAdd = dNAdd; pNSub = dNSub;
+
+    // ---- AS.1 live tuning ----
+    //
+    // The mapping SHAPE is what AS.1 exists to get right, and it is the one thing no
+    // measurement settles: where a given body's "I mean to sprint" swing sits is a judgement
+    // that can only be made while wearing the headset. Same discipline as the wrist
+    // calibration - tune live, then hard-code the measured value back into the default.
+    static const struct { const char* name; float* value; float step; float lo, hi; } kSwingTune[] = {
+        { "DEADBAND",   &g_swingDeadbandMS,  0.05f, 0.10f, 2.00f },
+        { "SPRINT ON",  &g_swingSprintOnMS,  0.05f, 0.40f, 3.00f },
+        { "SPRINT OFF", &g_swingSprintOffMS, 0.05f, 0.20f, 3.00f },
+        { "HOLD MS",    &g_swingHoldMs,     25.0f, 50.0f, 800.0f },
+        { "CROUCH MS",  &g_swingHeadVertMax, 0.05f, 0.05f, 2.00f },
+    };
+    static const int kSwingTuneCount = (int)(sizeof(kSwingTune) / sizeof(kSwingTune[0]));
+    if (dNDec && !pNDec) {
+        g_swingTuneSel = (g_swingTuneSel + 1) % kSwingTuneCount;
+        Log("*** [swing] NUMPAD . -> tuning %s = %.2f",
+            kSwingTune[g_swingTuneSel].name, *kSwingTune[g_swingTuneSel].value);
+    }
+    if (((dNAdd && !pNAdd) || (dNSub && !pNSub)) && !shift) {
+        const int i = g_swingTuneSel;
+        float v = *kSwingTune[i].value + (dNAdd ? kSwingTune[i].step : -kSwingTune[i].step);
+        if (v < kSwingTune[i].lo) v = kSwingTune[i].lo;
+        if (v > kSwingTune[i].hi) v = kSwingTune[i].hi;
+        *kSwingTune[i].value = v;
+        // Keep the hysteresis pair ordered. A release threshold above the engage threshold
+        // would latch sprint on at the moment it was meant to let go.
+        if (g_swingSprintOffMS >= g_swingSprintOnMS)
+            g_swingSprintOffMS = g_swingSprintOnMS - 0.05f;
+        Log("*** [swing] %s -> %s = %.2f", dNAdd ? "NUMPAD +" : "NUMPAD -",
+            kSwingTune[i].name, v);
+    }
+    pNAdd = dNAdd; pNSub = dNSub; pNDec = dNDec;
 
     static bool pN8 = false;
     const bool dN8 = (GetAsyncKeyState(VK_NUMPAD8) & 0x8000) != 0;
@@ -13029,13 +13275,24 @@ static void ProbeInputGates()
     if (!LooksLikePlayerController(ctl)) return;
 
     g_gateSamples++;
+    // Published for the arm swing envelope, which must not resume with a charged envelope the
+    // instant a cutscene hands control back. Derived here rather than re-read there because
+    // this function already validates the controller and already reads every one of these
+    // flags - a second reader would be a second chance to read a freed object.
+    bool blocked = false;
     for (int i = 0; i < g_gateCount; ++i) {
         uint32_t v = 0;
         if (!ReadFlag(ctl, g_gates[i].ref, &v)) continue;
         g_gateReads[i]++;
         g_gateLast[i] = v;
         if (v) g_gateSet[i]++;
+        if (v && (_stricmp(g_gates[i].name, "IgnoreMoveInput") == 0 ||
+                  _stricmp(g_gates[i].name, "bIgnoreMoveInput") == 0 ||
+                  _stricmp(g_gates[i].name, "bCinematicMode") == 0 ||
+                  _stricmp(g_gates[i].name, "bCinemaDisableInputMove") == 0))
+            blocked = true;
     }
+    g_moveInputBlocked = blocked;
     if (g_offInputSize >= 0) {
         float sz = 0.0f;
         // Bounded, not merely read. A stick magnitude is 0..1 and anything far outside that is
@@ -13232,6 +13489,24 @@ static void DrawOverlay(IDirect3DDevice9* dev)
     _snprintf_s(lines[nl++], 64, _TRUNCATE,
                 "FOREARM R R%s L R%s", rr, lr);
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "ARROWS L/R SELECT  U/D CHANGE 5 DEG");
+    if (g_armSwing) {
+        // Two rows, and the block reason is on the first: "why am I not moving" is the question
+        // this feature will be asked most, and it must be answerable without leaving the game.
+        _snprintf_s(lines[nl++], 64, _TRUNCATE, "SWING %d.%02d DEF %d.%02d %s",
+                    (int)g_swingSmoothed, (int)((g_swingSmoothed - (int)g_swingSmoothed) * 100.0f),
+                    (int)g_swingDeflection,
+                    (int)((g_swingDeflection - (int)g_swingDeflection) * 100.0f),
+                    g_swingBlock[0] ? g_swingBlock : (g_swingSprinting ? "SPRINT" :
+                                                     (g_swingEngaged ? "RUN" : "IDLE")));
+        static const char* kTuneNames[5] = { "DEADBAND", "SPRINT ON", "SPRINT OFF",
+                                            "HOLD MS", "CROUCH MS" };
+        const float tuneVals[5] = { g_swingDeadbandMS, g_swingSprintOnMS, g_swingSprintOffMS,
+                                    g_swingHoldMs, g_swingHeadVertMax };
+        const int ti = (g_swingTuneSel >= 0 && g_swingTuneSel < 5) ? g_swingTuneSel : 0;
+        _snprintf_s(lines[nl++], 64, _TRUNCATE, "TUNE %s (%d.%02d) NUM . + -",
+                    kTuneNames[ti], (int)tuneVals[ti],
+                    (int)((tuneVals[ti] - (int)tuneVals[ti]) * 100.0f));
+    }
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "OBJ %s  PROP %s",
                 g_offName >= 0 ? "OK" : "NO", g_offPropOff >= 0 ? "OK" : "NO");
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "HEAD %s Y%+d P%+d  ROLL %s %+d DEG",
