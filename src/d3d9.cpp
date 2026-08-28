@@ -1198,6 +1198,36 @@ static const float kSwingSustainMs  = 300.0f;   // continuous, before the envelo
 static const float kSwingDecayHalfMs = 250.0f;  // inside the hold window
 static const float kSwingCollapseMs  = 120.0f;  // outside it
 
+// ---- anti-phase returns, as a VETO rather than a multiplier ----
+//
+// AS.0 killed D because multiplying the speed by anti-phase compressed the top of the range:
+// the cosine weakens as cadence rises (-0.35..-0.67 walking, but only about -0.15 running), so
+// scaling by it made the metric least sensitive exactly where it needed to be most. All of that
+// is about MAGNITUDE, and none of it applies to a threshold.
+//
+// Swinging both arms together is not a walk cycle and should not move the player. Measured over
+// the AS.0 run, a genuine swing never came within 0.25 of this threshold - the worst second of
+// the hard swing was -0.05 - while arms moving together read close to +1. So the veto is wide of
+// anything real, and it changes no magnitude anywhere.
+static float  g_swingUnisonMax = 0.20f;     // smoothed cosine above this = arms in unison
+static float  g_swingAltSmooth = 0.0f;
+static bool   g_swingAltValid = false;
+
+// ---- telling a swing reversal apart from hands being put down ----
+//
+// The hold window bridges the reversal, and it has to: the metric passes through zero twice per
+// cycle. But it also means letting go takes the whole hold plus the collapse, which reads as
+// unresponsive - and in this game "I stopped and it kept going" is the dangerous direction.
+//
+// The physical difference is DURATION, not level. At a reversal the hands are at the extremity
+// of their travel and about to accelerate again, so the metric is near zero only briefly; hands
+// dropped to the sides sit there. A swing cycles at about 2 Hz, so the quiet part around each
+// reversal is on the order of 75-100 ms - and a stop test longer than that catches the one and
+// not the other.
+static const float kSwingStillLevel = 0.15f;  // m/s: below this the hands are not really moving
+static float  g_swingStopMs = 150.0f;         // this long still, and it is a stop, not a reversal
+static XrTime g_swingLastLoud = 0;
+
 static float  g_swingSmoothed = 0.0f;       // the metric after the envelope, m/s
 static float  g_swingDeflection = 0.0f;     // what the pad is asked for, 0..1
 static bool   g_swingEngaged = false;
@@ -1429,6 +1459,16 @@ static void ArmSwingSample(XrTime when, bool actionsSynced)
             haveAlt = true;
         }
     }
+
+    // Smoothed for the AS.1 unison veto. Roughly a 75 ms time constant at 90 Hz: fast enough to
+    // catch arms coming into unison within a stride, slow enough that one noisy frame near the
+    // threshold cannot cut the player's legs out mid-run.
+    //
+    // Only updated when the cosine means something. Held, not decayed, when it does not - a hand
+    // going still is not evidence about phase either way, and drifting the estimate toward zero
+    // during it would quietly release the veto.
+    g_swingAltValid = haveAlt;
+    if (haveAlt) g_swingAltSmooth += (alt - g_swingAltSmooth) * 0.15f;
 
     // ---- the chosen metric ----
     //
@@ -1691,6 +1731,7 @@ static void ArmSwingCollapse(const char* why)
     g_swingEngaged = false;
     g_swingSprinting = false;
     g_swingAboveSince = 0;
+    g_swingLastLoud = 0;
     g_swingBlock = why;
 }
 
@@ -1712,6 +1753,14 @@ static float ArmSwingDeflection(XrTime when, float physX, float physY)
     // travel of 0.01-0.02 m through a whole hard swing against 0.7 m through a crouch, so the
     // two are an order of magnitude apart and a plain speed gate separates them.
     if (g_swingHeadVert > g_swingHeadVertMax) { ArmSwingCollapse("crouching"); return 0.0f; }
+    // Both arms moving the same way is not a walk cycle. Vetoed outright rather than damped,
+    // because the player's complaint is that it moves them at all, not that it moves them too
+    // fast. Only when the cosine is meaningful: one hand held still makes it undefined, and a
+    // one-armed swing should still work.
+    if (g_swingAltValid && g_swingAltSmooth > g_swingUnisonMax) {
+        ArmSwingCollapse("arms in unison");
+        return 0.0f;
+    }
 
     // ---- a rejected dt holds for a frame, but never indefinitely ----
     //
@@ -1731,6 +1780,20 @@ static float ArmSwingDeflection(XrTime when, float physX, float physY)
     g_swingBlock = "";
 
     const float raw = g_swingNow;
+
+    // ---- hands put down stops it, without shortening the hold window ----
+    //
+    // Shortening the hold would have been the obvious fix and the wrong one: the hold exists to
+    // bridge the reversal, and a hold short enough to feel responsive is a hold short enough to
+    // stutter twice a second. This tests a different thing - how long the hands have been
+    // genuinely still - so responsiveness and reversal-bridging stop competing.
+    if (raw > kSwingStillLevel) g_swingLastLoud = when;
+    if (g_swingEngaged && g_swingLastLoud != 0 &&
+        (float)((double)(when - g_swingLastLoud) * 1e-6) > g_swingStopMs) {
+        ArmSwingCollapse("hands still");
+        return 0.0f;
+    }
+
     const bool above = raw >= g_swingDeadbandMS;
     if (above) {
         if (g_swingAboveSince == 0) g_swingAboveSince = when;
@@ -1748,8 +1811,12 @@ static float ArmSwingDeflection(XrTime when, float physX, float physY)
     // requiring the sustain again after each one would mean it never engages at all.
     const float sinceAboveMs = (float)((double)(when - g_swingLastAbove) * 1e-6);
     if (g_swingAboveSince != 0 &&
-        (float)((double)(when - g_swingAboveSince) * 1e-6) >= kSwingSustainMs)
+        (float)((double)(when - g_swingAboveSince) * 1e-6) >= kSwingSustainMs) {
+        // Seed the stop timer on the engaging frame. Left at zero it is treated as "never loud",
+        // and the guard above would then never arm at all.
+        if (!g_swingEngaged) g_swingLastLoud = when;
         g_swingEngaged = true;
+    }
     if (!above && sinceAboveMs > g_swingHoldMs) g_swingEngaged = false;
 
     if (g_swingEngaged && raw > g_swingSmoothed) {
@@ -6916,6 +6983,8 @@ static void CheckHeadHotkeys()
         { "DEADBAND",   &g_swingDeadbandMS,  0.05f, 0.10f, 2.00f },
         { "SPRINT ON",  &g_swingSprintOnMS,  0.05f, 0.40f, 3.00f },
         { "SPRINT OFF", &g_swingSprintOffMS, 0.05f, 0.20f, 3.00f },
+        { "STOP MS",    &g_swingStopMs,     25.0f, 50.0f, 600.0f },
+        { "UNISON",     &g_swingUnisonMax,   0.05f, -0.50f, 1.00f },
         { "HOLD MS",    &g_swingHoldMs,     25.0f, 50.0f, 800.0f },
         { "CROUCH MS",  &g_swingHeadVertMax, 0.05f, 0.05f, 2.00f },
     };
@@ -13498,14 +13567,19 @@ static void DrawOverlay(IDirect3DDevice9* dev)
                     (int)((g_swingDeflection - (int)g_swingDeflection) * 100.0f),
                     g_swingBlock[0] ? g_swingBlock : (g_swingSprinting ? "SPRINT" :
                                                      (g_swingEngaged ? "RUN" : "IDLE")));
-        static const char* kTuneNames[5] = { "DEADBAND", "SPRINT ON", "SPRINT OFF",
-                                            "HOLD MS", "CROUCH MS" };
-        const float tuneVals[5] = { g_swingDeadbandMS, g_swingSprintOnMS, g_swingSprintOffMS,
+        static const char* kTuneNames[7] = { "DEADBAND", "SPRINT ON", "SPRINT OFF", "STOP MS",
+                                            "UNISON", "HOLD MS", "CROUCH MS" };
+        const float tuneVals[7] = { g_swingDeadbandMS, g_swingSprintOnMS, g_swingSprintOffMS,
+                                    g_swingStopMs, g_swingUnisonMax,
                                     g_swingHoldMs, g_swingHeadVertMax };
-        const int ti = (g_swingTuneSel >= 0 && g_swingTuneSel < 5) ? g_swingTuneSel : 0;
-        _snprintf_s(lines[nl++], 64, _TRUNCATE, "TUNE %s (%d.%02d) NUM . + -",
-                    kTuneNames[ti], (int)tuneVals[ti],
-                    (int)((tuneVals[ti] - (int)tuneVals[ti]) * 100.0f));
+        const int ti = (g_swingTuneSel >= 0 && g_swingTuneSel < 7) ? g_swingTuneSel : 0;
+        // UNISON is the first tunable here that can go negative, and the obvious
+        // whole-plus-hundredths split renders -0.30 as "0.-30". Sign is carried separately.
+        const float tv = tuneVals[ti];
+        const int whole = (int)tv;
+        const int frac  = (int)(fabsf(tv - (float)whole) * 100.0f + 0.5f);
+        _snprintf_s(lines[nl++], 64, _TRUNCATE, "TUNE %s (%s%d.%02d) NUM . + -",
+                    kTuneNames[ti], (tv < 0.0f && whole == 0) ? "-" : "", whole, frac);
     }
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "OBJ %s  PROP %s",
                 g_offName >= 0 ? "OK" : "NO", g_offPropOff >= 0 ? "OK" : "NO");
