@@ -1862,6 +1862,49 @@ static void ArmSwingCollapse(const char* why)
     g_swingLastBlockAt = g_swingClock;
 }
 
+// ---- ⚠️ freeze and collapse are different answers, and the difference is whose state it is ----
+//
+// Every gate started out collapsing the envelope, and two field failures came straight out of
+// that. Both logs name it exactly:
+//
+//   "released (crouching) - envelope collapsed from 3.65 m/s", sixteen lines before CROUCH #7
+//   fired. Crouching at a sprint is how you SLIDE, and the suppression destroyed the speed the
+//   slide needed before the crouch was even recognised. The gesture defeated itself.
+//
+//   "released (move input ignored) - envelope collapsed from 2.45 m/s" during a ledge hop. The
+//   player kept swinging throughout, and the correct comparison - a player holding the stick
+//   forward - would still have been holding it when the animation ended.
+//
+// So the question a gate has to answer is not "can the swing move the player right now" but
+// "has the player stopped asking to move". Those come apart:
+//
+//   PLAYER stopped asking      -> collapse. Stick back, hands still, arms in unison.
+//   GAME is busy, or the metric
+//   is momentarily unreadable  -> freeze. Move input ignored, crouching, mid-jump.
+//   We cannot see              -> collapse, on safety. Tracking loss.
+//
+// Bounded, because an unbounded freeze is a stuck forward stick, which is this project's oldest
+// hazard. Long enough for a vault or a ledge hop, short enough that a cutscene collapses.
+enum SwingHold { SWING_HOLD_NONE = 0, SWING_HOLD_JUMP, SWING_HOLD_MOVEBLOCK, SWING_HOLD_CROUCH };
+static int    g_swingHoldKind = SWING_HOLD_NONE;
+static XrTime g_swingHoldSince = 0;
+
+static float ArmSwingHold(XrTime when, int kind, const char* why, float maxMs)
+{
+    if (g_swingHoldKind != kind) { g_swingHoldKind = kind; g_swingHoldSince = when; }
+    if ((float)((double)(when - g_swingHoldSince) * 1e-6) > maxMs) {
+        ArmSwingCollapse(why);
+        return 0.0f;
+    }
+    // ⚠️ Both timers advance with the freeze. They measure the player, and a freeze is the mod
+    // not looking - not the player going still. Left to accumulate, the stillness test would
+    // fire on the first frame after release and undo the whole point of having frozen.
+    g_swingLastLoud = when;
+    g_swingLastEngagedAt = when;
+    g_swingBlock = why;
+    return g_swingDeflection;
+}
+
 // Returns true while the synthesised crouch should be held. The game decides crouch or slide.
 static bool ArmSwingCrouchTick(XrTime when)
 {
@@ -1932,34 +1975,40 @@ static float ArmSwingDeflection(XrTime when, float physX, float physY)
     // Before the gates, because every one of them can collapse and the collapse stamps its
     // reason with this clock.
     g_swingClock = when;
+    // ---- collapse: the player has stopped asking ----
     if (!g_armSwing)                       { ArmSwingCollapse("off");        return 0.0f; }
     if (!g_padEnabled)                     { ArmSwingCollapse("pad off");    return 0.0f; }
     if (g_sweepActive)                     { ArmSwingCollapse("sweep");      return 0.0f; }
-    if (g_moveInputBlocked)                { ArmSwingCollapse("move input ignored"); return 0.0f; }
     if (!g_swingL.tracked && !g_swingR.tracked) { ArmSwingCollapse("no tracked hand"); return 0.0f; }
-    // Pulled backwards is the emergency stop, and it has to be a reflex that works when reached
-    // for in a hurry rather than aimed. It collapses the envelope rather than masking the
-    // output, or letting go of the stick would resume at the speed it was interrupted at.
+    // Pulled backwards is the emergency stop, and it outranks every freeze below: a reflex that
+    // the game being busy can override is not a reflex. It collapses rather than masking the
+    // output, or letting go would resume at the speed it was interrupted at.
     if (physY < -0.2f)                     { ArmSwingCollapse("stick back");  return 0.0f; }
+
+    // ---- freeze: the player is still asking; we just cannot act, or cannot see ----
+    //
+    // All three sit ABOVE the unison veto and the stillness test, which they would otherwise
+    // trip by construction - raising both hands moves them together and then stops them, and a
+    // crouch makes the metric read the head rather than the arms.
+    if (g_swingJumpGraceUntil != 0 && when < g_swingJumpGraceUntil)
+        return ArmSwingHold(when, SWING_HOLD_JUMP, "jumping", kSwingJumpGraceMs + 200.0f);
+    // A ledge hop or vault runs one to two seconds. A cutscene runs far longer and must not end
+    // by handing a full forward stick back to a player who has put the controllers down.
+    if (g_moveInputBlocked)
+        return ArmSwingHold(when, SWING_HOLD_MOVEBLOCK, "move input ignored", 2500.0f);
     // ⚠️ Squatting drops the head while the hands stay put, which genuinely IS a large relative
-    // vertical velocity - metric B is not wrong, the intent is. AS.0 measured head vertical
-    // travel of 0.01-0.02 m through a whole hard swing against 0.7 m through a crouch, so the
-    // two are an order of magnitude apart and a plain speed gate separates them.
-    if (g_swingHeadVert > g_swingHeadVertMax) { ArmSwingCollapse("crouching"); return 0.0f; }
+    // vertical velocity - metric B is not wrong, the intent is. AS.0 measured 0.01-0.02 m of
+    // head travel through a whole hard swing against 0.7 m through a crouch. Only the
+    // transition trips it, so this bound is generous next to how long it actually lasts.
+    if (g_swingHeadVert > g_swingHeadVertMax)
+        return ArmSwingHold(when, SWING_HOLD_CROUCH, "crouching", 1500.0f);
+
+    g_swingHoldKind = SWING_HOLD_NONE;
+
     // Both arms moving the same way is not a walk cycle. Vetoed outright rather than damped,
-    // because the player's complaint is that it moves them at all, not that it moves them too
+    // because the complaint is that it moves the player at all, not that it moves them too
     // fast. Only when the cosine is meaningful: one hand held still makes it undefined, and a
     // one-armed swing should still work.
-    // ⚠️ The jump freeze sits ABOVE the unison veto and the stillness test, because raising both
-    // hands trips both of them by construction - the hands travel together and then stop at the
-    // top. Ordering it below would collapse the run at the exact moment the player asked to
-    // clear a gap.
-    const bool jumpFreeze = g_swingJumpGraceUntil != 0 && when < g_swingJumpGraceUntil;
-    if (jumpFreeze) {
-        g_swingBlock = "";
-        return g_swingDeflection;      // hold everything exactly as it was
-    }
-
     if (g_swingAltValid && g_swingAltSmooth > g_swingUnisonMax) {
         ArmSwingCollapse("arms in unison");
         return 0.0f;
