@@ -1154,6 +1154,7 @@ static const float kSwingFullMS     = 1.58f;   // run-cadence swing -> full defl
 static float  g_swingNow = 0.0f;
 static float  g_swingDt = 0.0f;             // seconds, the sampler's own validated dt
 static float  g_swingHeadVert = 0.0f;       // |head vertical speed|, m/s - the crouch tell
+static float  g_swingFull = 0.0f;           // metric A, full hand speed - the stillness test
 
 // ================================================================ AS.1: swing to deflection
 //
@@ -1209,7 +1210,12 @@ static const float kSwingCollapseMs  = 120.0f;  // outside it
 // the AS.0 run, a genuine swing never came within 0.25 of this threshold - the worst second of
 // the hard swing was -0.05 - while arms moving together read close to +1. So the veto is wide of
 // anything real, and it changes no magnitude anywhere.
-static float  g_swingUnisonMax = 0.20f;     // smoothed cosine above this = arms in unison
+// 0.35 after the first run, not 0.20. The threshold was set from AS.0's per-second MEANS, which
+// never rose above -0.05 through either swing action - but it is applied to a smoothed value that
+// excurses much further than a one-second mean. Setting a threshold from one statistic and
+// testing another is the mistake; with the sampling gate and the longer window fixed above, a
+// genuine swing sits well negative and unison sits near +1, so this lands between them.
+static float  g_swingUnisonMax = 0.35f;     // smoothed cosine above this = arms in unison
 static float  g_swingAltSmooth = 0.0f;
 static bool   g_swingAltValid = false;
 
@@ -1224,9 +1230,29 @@ static bool   g_swingAltValid = false;
 // dropped to the sides sit there. A swing cycles at about 2 Hz, so the quiet part around each
 // reversal is on the order of 75-100 ms - and a stop test longer than that catches the one and
 // not the other.
-static const float kSwingStillLevel = 0.15f;  // m/s: below this the hands are not really moving
+// ⚠️ Tested on the FULL speed, not on the chosen metric. A swing is roughly circular, so at the
+// moment the vertical component passes through zero the fore-aft component is at its maximum -
+// metric B dips to nothing at every reversal while the hand is still travelling at full tilt.
+// Testing stillness on B therefore asks "is the hand at the top of its arc", and testing it on
+// the full speed asks "is the hand moving at all", which is the actual question. AS.0's
+// mean/peak ratio for A was 0.84 across a walk swing, so it barely dips over a whole cycle.
+static const float kSwingStillLevel = 0.25f;  // m/s of FULL hand speed
 static float  g_swingStopMs = 150.0f;         // this long still, and it is a stop, not a reversal
 static XrTime g_swingLastLoud = 0;
+
+// ---- getting back in must be cheaper than getting in ----
+//
+// The 300 ms sustain gate exists to reject a gesture burst from a cold start. It has no business
+// punishing someone who was demonstrably swinging a moment ago - and it did: the game ignores
+// move input through a ledge grab, which is correct and unavoidable, but the collapse that
+// followed then cost a further 300 ms of sustain before the player could move again. Reported as
+// "a big momentum killer", and in this game momentum is the whole point.
+//
+// Within the grace window the swing only has to prove itself for 80 ms. Outside it, the full
+// 300 ms still applies, so a cold start is as guarded as it ever was.
+static const float kSwingRegraceMs = 1500.0f;
+static const float kSwingSustainWarmMs = 80.0f;
+static XrTime g_swingLastEngagedAt = 0;
 
 static float  g_swingSmoothed = 0.0f;       // the metric after the envelope, m/s
 static float  g_swingDeflection = 0.0f;     // what the pad is asked for, 0..1
@@ -1234,7 +1260,10 @@ static bool   g_swingEngaged = false;
 static bool   g_swingSprinting = false;
 static XrTime g_swingAboveSince = 0;
 static XrTime g_swingLastAbove = 0;
-static const char* g_swingBlock = "";       // why it is not driving, for the overlay and log
+static const char* g_swingBlock = "";       // why it is not driving, right now
+static const char* g_swingLastBlock = "";   // ...and the last one, kept on screen for 3 s
+static XrTime      g_swingLastBlockAt = 0;
+static XrTime      g_swingClock = 0;        // latest predicted display time seen
 static int    g_swingTuneSel = 0;           // which value NUMPAD +/- adjusts
 
 
@@ -1273,7 +1302,7 @@ static void ArmSwingForgetHistory()
     g_swingSamples = 0;
     for (int i = 0; i < 2; ++i)
         for (int m = 0; m < 3; ++m) { g_swingSum[i][m] = 0.0f; g_swingPeak[i][m] = 0.0f; }
-    g_swingNow = 0.0f; g_swingNowSum = 0.0f; g_swingNowPeak = 0.0f;
+    g_swingNow = 0.0f; g_swingFull = 0.0f; g_swingNowSum = 0.0f; g_swingNowPeak = 0.0f;
     g_swingDt = 0.0f;                  // a stale dt would integrate the envelope over a gap
     g_swingAltSum = 0.0f; g_swingAltSamples = 0;
     g_swingRejDt = g_swingRejStep = g_swingRejUntracked = 0;
@@ -1451,7 +1480,14 @@ static void ArmSwingSample(XrTime when, bool actionsSynced)
     bool  haveAlt = false;
     if (g_swingL.tracked && g_swingR.tracked) {
         const float ll = SwingLen(g_swingL.vel), rl = SwingLen(g_swingR.vel);
-        if (ll > 0.05f && rl > 0.05f) {
+        // ⚠️ 0.30, not 0.05. The first version used 0.05 m/s and the unison veto then fired 61
+        // times in one session, twice collapsing a swing running at 2.4-2.8 m/s.
+        //
+        // The two arms are anti-phase in POSITION, so they reach their extremities at the same
+        // moment and are both slow at the same moment - twice per cycle. Down there the cosine
+        // between two near-zero vectors is noise, and noise reads +1 as readily as -1. A guard
+        // low enough to admit those samples hands the veto a coin flip twice a second.
+        if (ll > 0.30f && rl > 0.30f) {
             const float dot = g_swingL.vel.x * g_swingR.vel.x +
                               g_swingL.vel.y * g_swingR.vel.y +
                               g_swingL.vel.z * g_swingR.vel.z;
@@ -1460,15 +1496,19 @@ static void ArmSwingSample(XrTime when, bool actionsSynced)
         }
     }
 
-    // Smoothed for the AS.1 unison veto. Roughly a 75 ms time constant at 90 Hz: fast enough to
-    // catch arms coming into unison within a stride, slow enough that one noisy frame near the
-    // threshold cannot cut the player's legs out mid-run.
+    // Smoothed for the AS.1 unison veto, over roughly 500 ms rather than the 75 ms it started
+    // at. The cosine can only be sampled during the fast half of each stroke - the guard above
+    // discards the rest - so the estimate has to span a whole cycle before it means anything.
+    // 75 ms was barely longer than the gaps in its own input.
+    //
+    // The cost is that unison takes about a second to be recognised. That is the right trade:
+    // the failure it prevents is stopping a player who is running correctly.
     //
     // Only updated when the cosine means something. Held, not decayed, when it does not - a hand
     // going still is not evidence about phase either way, and drifting the estimate toward zero
     // during it would quietly release the veto.
     g_swingAltValid = haveAlt;
-    if (haveAlt) g_swingAltSmooth += (alt - g_swingAltSmooth) * 0.15f;
+    if (haveAlt) g_swingAltSmooth += (alt - g_swingAltSmooth) * 0.025f;
 
     // ---- the chosen metric ----
     //
@@ -1476,8 +1516,10 @@ static void ArmSwingSample(XrTime when, bool actionsSynced)
     // controller mid-swing would otherwise halve the reading and read as the player slowing
     // down, when all that changed is how much we can see.
     g_swingNow = 0.0f;
-    if (g_swingL.tracked) g_swingNow = g_swingL.b;
+    g_swingFull = 0.0f;
+    if (g_swingL.tracked) { g_swingNow = g_swingL.b; g_swingFull = g_swingL.a; }
     if (g_swingR.tracked && g_swingR.b > g_swingNow) g_swingNow = g_swingR.b;
+    if (g_swingR.tracked && g_swingR.a > g_swingFull) g_swingFull = g_swingR.a;
 
     // ---- accumulate the window ----
     const float metrics[2][3] = {
@@ -1733,12 +1775,21 @@ static void ArmSwingCollapse(const char* why)
     g_swingAboveSince = 0;
     g_swingLastLoud = 0;
     g_swingBlock = why;
+    // ⚠️ Sticky, because the live reason is useless in the field. A collapse condition is
+    // usually gone by the next frame, which clears g_swingBlock and leaves the overlay reading
+    // IDLE - which is what both field reports came back with, from two entirely different
+    // causes. The last reason has to outlive the frame that caused it.
+    g_swingLastBlock = why;
+    g_swingLastBlockAt = g_swingClock;
 }
 
 // Called from the pad build, AFTER the physical stick has been read, because the stick is the
 // override and an override that arrives a frame late is not one.
 static float ArmSwingDeflection(XrTime when, float physX, float physY)
 {
+    // Before the gates, because every one of them can collapse and the collapse stamps its
+    // reason with this clock.
+    g_swingClock = when;
     if (!g_armSwing)                       { ArmSwingCollapse("off");        return 0.0f; }
     if (!g_padEnabled)                     { ArmSwingCollapse("pad off");    return 0.0f; }
     if (g_sweepActive)                     { ArmSwingCollapse("sweep");      return 0.0f; }
@@ -1787,7 +1838,7 @@ static float ArmSwingDeflection(XrTime when, float physX, float physY)
     // bridge the reversal, and a hold short enough to feel responsive is a hold short enough to
     // stutter twice a second. This tests a different thing - how long the hands have been
     // genuinely still - so responsiveness and reversal-bridging stop competing.
-    if (raw > kSwingStillLevel) g_swingLastLoud = when;
+    if (g_swingFull > kSwingStillLevel) g_swingLastLoud = when;
     if (g_swingEngaged && g_swingLastLoud != 0 &&
         (float)((double)(when - g_swingLastLoud) * 1e-6) > g_swingStopMs) {
         ArmSwingCollapse("hands still");
@@ -1810,13 +1861,17 @@ static float ArmSwingDeflection(XrTime when, float physX, float physY)
     // continuous motion. But a swing passes through zero at every reversal, twice a second, and
     // requiring the sustain again after each one would mean it never engages at all.
     const float sinceAboveMs = (float)((double)(when - g_swingLastAbove) * 1e-6);
+    const bool warm = g_swingLastEngagedAt != 0 &&
+        (float)((double)(when - g_swingLastEngagedAt) * 1e-6) < kSwingRegraceMs;
+    const float needMs = warm ? kSwingSustainWarmMs : kSwingSustainMs;
     if (g_swingAboveSince != 0 &&
-        (float)((double)(when - g_swingAboveSince) * 1e-6) >= kSwingSustainMs) {
+        (float)((double)(when - g_swingAboveSince) * 1e-6) >= needMs) {
         // Seed the stop timer on the engaging frame. Left at zero it is treated as "never loud",
         // and the guard above would then never arm at all.
         if (!g_swingEngaged) g_swingLastLoud = when;
         g_swingEngaged = true;
     }
+    if (g_swingEngaged) g_swingLastEngagedAt = when;
     if (!above && sinceAboveMs > g_swingHoldMs) g_swingEngaged = false;
 
     if (g_swingEngaged && raw > g_swingSmoothed) {
@@ -13565,8 +13620,15 @@ static void DrawOverlay(IDirect3DDevice9* dev)
                     (int)g_swingSmoothed, (int)((g_swingSmoothed - (int)g_swingSmoothed) * 100.0f),
                     (int)g_swingDeflection,
                     (int)((g_swingDeflection - (int)g_swingDeflection) * 100.0f),
-                    g_swingBlock[0] ? g_swingBlock : (g_swingSprinting ? "SPRINT" :
-                                                     (g_swingEngaged ? "RUN" : "IDLE")));
+                    // Live reason first; failing that, the last one for three seconds. Both
+                    // field reports read IDLE because the condition had already cleared by the
+                    // frame the player looked - the state is right and the diagnosis is missing.
+                    g_swingBlock[0] ? g_swingBlock :
+                    (g_swingSprinting ? "SPRINT" :
+                     (g_swingEngaged ? "RUN" :
+                      ((g_swingLastBlockAt != 0 &&
+                        (double)(g_swingClock - g_swingLastBlockAt) * 1e-9 < 3.0)
+                         ? g_swingLastBlock : "IDLE"))));
         static const char* kTuneNames[7] = { "DEADBAND", "SPRINT ON", "SPRINT OFF", "STOP MS",
                                             "UNISON", "HOLD MS", "CROUCH MS" };
         const float tuneVals[7] = { g_swingDeadbandMS, g_swingSprintOnMS, g_swingSprintOffMS,
