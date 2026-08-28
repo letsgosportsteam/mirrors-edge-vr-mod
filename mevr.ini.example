@@ -75,6 +75,21 @@ MotionHandsDebug = off
 ArmSwing = off
 ArmSwingDebug = off
 
+; The two gestures, independently switchable because they fail differently.
+;
+; Jump needs BOTH hands clearly above your head - one hand never gets there during a swing, so
+; the gesture cannot be produced by accident while running.
+;
+; Crouch measures your head against a standing height it works out for itself over the first
+; couple of seconds. PAGE UP re-seeds it, so recentre while standing. Turn it off if you play
+; seated: a seated baseline makes leaning forward look like a crouch.
+;
+; Turning Crouch off still leaves the swing suppressed while you squat - that is not this
+; setting, it is the metric refusing to read a dropping head as arm motion.
+
+ArmSwingJump = on
+ArmSwingCrouch = on
+
 
 ; ---------------------------------------------------------------- frame pacing
 

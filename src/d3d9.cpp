@@ -1155,6 +1155,7 @@ static float  g_swingNow = 0.0f;
 static float  g_swingDt = 0.0f;             // seconds, the sampler's own validated dt
 static float  g_swingHeadVert = 0.0f;       // |head vertical speed|, m/s - the crouch tell
 static float  g_swingFull = 0.0f;           // metric A, full hand speed - the stillness test
+static float  g_swingHeadPosY = 0.0f;       // head height in room space, for the crouch test
 
 // ================================================================ AS.1: swing to deflection
 //
@@ -1253,6 +1254,68 @@ static XrTime g_swingLastLoud = 0;
 static const float kSwingRegraceMs = 1500.0f;
 static const float kSwingSustainWarmMs = 80.0f;
 static XrTime g_swingLastEngagedAt = 0;
+
+// ================================================================ AS.2: jump on hands overhead
+//
+// Synthesised as MEVR_PAD_LSHOULDER, which is GBA_Jump - and which the game also reads for
+// vault, climb-up and pull-up, so the button is HELD rather than tapped and those contextual
+// up-actions get what they expect.
+//
+// ---- ⚠️ the gesture destroys the thing it is used during ----
+//
+// Throwing both hands up is, to every AS.1 test, a player who has stopped swinging: the hands
+// go still at the top, and on the way up they move together, so the stillness test and the
+// unison veto both fire. The envelope collapses about 150 ms into the gesture - which is exactly
+// when the player is mid-air over a gap having just asked to jump, and Faith decelerates.
+//
+// So the jump freezes the envelope while it is asserted and for a short grace afterwards. This
+// is not a nicety; without it the jump gesture reliably kills the run it was made during.
+//
+// ---- why both hands, and why an absolute height ----
+//
+// Both, because a swing can put ONE hand high and never puts two hands above the head at once.
+// Requiring both makes the gesture unambiguous against the motion it has to coexist with.
+//
+// Absolute metres above the head rather than a fraction of standing height, which is what the
+// plan asked for: XR_REFERENCE_SPACE_TYPE_LOCAL puts its origin at the viewer's initial pose,
+// not on the floor, so standing height is not a quantity this space can express. A STAGE space
+// would give it and is not worth creating for one threshold.
+static bool   g_armSwingJump = true;         // ArmSwingJump in mevr.ini
+static float  g_swingJumpRise = 0.25f;       // metres above the head, both hands
+static float  g_swingJumpHyst = 0.10f;       // must drop this far below to re-arm
+static const float kSwingJumpHoldMs = 400.0f;
+static const float kSwingJumpGraceMs = 350.0f;
+static bool   g_swingJumpAsserted = false;
+static bool   g_swingJumpArmed = true;
+static XrTime g_swingJumpSince = 0;
+static XrTime g_swingJumpGraceUntil = 0;
+static long   g_swingJumps = 0;
+
+// ================================================================ AS.3: crouch and slide
+//
+// Synthesised as bLeftTrigger, which is GBA_Crouch. Slide comes free: the game picks crouch or
+// slide from the pawn's own speed, so nothing here needs to know the difference.
+//
+// ---- the baseline is tracked, not captured ----
+//
+// Measured against a STANDING baseline rather than the 6-DOF centre, because that centre is
+// taken wherever the head happened to be at the first valid pose - typically mid-air while the
+// headset is being put on - and is a coordinate, not a body measurement.
+//
+// Asymmetric: it rises toward a higher sample in about half a second and falls over twenty, so
+// it settles on standing height within a couple of seconds and does not follow the player down
+// into a crouch and quietly cancel it.
+//
+// ⚠️ Absolute metres, not the fraction of standing height the plan specified. LOCAL space puts
+// its origin at the viewer's initial pose rather than the floor, so a standing head reads about
+// zero and a fraction of it means nothing. Same constraint as the jump threshold.
+static bool   g_armSwingCrouch = true;       // ArmSwingCrouch in mevr.ini
+static float  g_swingCrouchDrop = 0.25f;     // metres below the standing baseline
+static float  g_swingCrouchHyst = 0.08f;     // release this much higher, so it cannot chatter
+static float  g_crouchBaselineY = 0.0f;
+static bool   g_haveCrouchBaseline = false;
+static bool   g_swingCrouching = false;
+static long   g_swingCrouches = 0;
 
 static float  g_swingSmoothed = 0.0f;       // the metric after the envelope, m/s
 static float  g_swingDeflection = 0.0f;     // what the pad is asked for, 0..1
@@ -1410,6 +1473,22 @@ static void ArmSwingSample(XrTime when, bool actionsSynced)
         }
         prevY = head.y;
         havePrevY = true;
+    }
+
+    // ---- AS.3: the standing baseline ----
+    //
+    // Rises in roughly half a second, falls over about twenty. Standing settles fast; a crouch
+    // held for ten seconds barely moves it, so standing back up is always measured against
+    // where the player actually stands.
+    g_swingHeadPosY = head.y;
+    if (!g_haveCrouchBaseline) {
+        g_crouchBaselineY = head.y;
+        g_haveCrouchBaseline = true;
+        if (g_armSwingDebug) Log("[swing] crouch baseline seeded at head Y %+.3f m", head.y);
+    } else if (head.y > g_crouchBaselineY) {
+        g_crouchBaselineY += (head.y - g_crouchBaselineY) * 0.02f;
+    } else {
+        g_crouchBaselineY += (head.y - g_crouchBaselineY) * 0.0005f;
     }
 
     struct { ArmSwingHand* h; bool have; const XrVector3f* grip; } hands[2] = {
@@ -1783,6 +1862,69 @@ static void ArmSwingCollapse(const char* why)
     g_swingLastBlockAt = g_swingClock;
 }
 
+// Returns true while the synthesised crouch should be held. The game decides crouch or slide.
+static bool ArmSwingCrouchTick(XrTime when)
+{
+    if (!g_armSwing || !g_armSwingCrouch || !g_padEnabled || !g_haveCrouchBaseline ||
+        !g_swingL.tracked || !g_swingR.tracked) {
+        if (g_swingCrouching) Log("*** [swing] crouch released - tracking or gate lost");
+        g_swingCrouching = false;
+        return false;
+    }
+    // Not while jumping. Hands overhead does not lower the head, but a physical hop to reach
+    // does - and landing from one dips the head well past the threshold. Crouching on the
+    // landing frame of a deliberate jump is never what was meant.
+    if (g_swingJumpGraceUntil != 0 && when < g_swingJumpGraceUntil) return g_swingCrouching;
+
+    const float drop = g_crouchBaselineY - g_swingHeadPosY;
+    if (!g_swingCrouching && drop > g_swingCrouchDrop) {
+        g_swingCrouching = true;
+        g_swingCrouches++;
+        Log("*** [swing] CROUCH #%ld - head %.2f m below the standing baseline",
+            g_swingCrouches, drop);
+    } else if (g_swingCrouching && drop < (g_swingCrouchDrop - g_swingCrouchHyst)) {
+        g_swingCrouching = false;
+        if (g_armSwingDebug) Log("[swing] crouch released at %.2f m below baseline", drop);
+    }
+    return g_swingCrouching;
+}
+
+// Returns true while the synthesised jump button should be held down.
+static bool ArmSwingJumpTick(XrTime when)
+{
+    if (!g_armSwing || !g_armSwingJump || !g_padEnabled ||
+        !g_swingL.tracked || !g_swingR.tracked) {
+        // Not re-armed here. A controller that blinks out mid-gesture must not hand back a
+        // fresh press the instant it returns, with the hands still in the air.
+        g_swingJumpAsserted = false;
+        return false;
+    }
+
+    const float lh = g_swingL.rel.y, rh = g_swingR.rel.y;
+    const float release = g_swingJumpRise - g_swingJumpHyst;
+    const bool bothUp   = (lh > g_swingJumpRise) && (rh > g_swingJumpRise);
+    const bool bothDown = (lh < release) && (rh < release);
+
+    if (g_swingJumpArmed && bothUp) {
+        g_swingJumpAsserted = true;
+        g_swingJumpArmed = false;
+        g_swingJumpSince = when;
+        g_swingJumps++;
+        Log("*** [swing] JUMP #%ld - hands at L%+.2f R%+.2f m above the head", g_swingJumps, lh, rh);
+    }
+    if (g_swingJumpAsserted) {
+        const float heldMs = (float)((double)(when - g_swingJumpSince) * 1e-6);
+        if (!bothUp || heldMs > kSwingJumpHoldMs) g_swingJumpAsserted = false;
+    }
+    // Re-arm only once both hands are clearly down, or a hand hovering at the threshold
+    // machine-guns the button.
+    if (!g_swingJumpArmed && bothDown) g_swingJumpArmed = true;
+
+    if (g_swingJumpAsserted)
+        g_swingJumpGraceUntil = when + (XrTime)(kSwingJumpGraceMs * 1e6);
+    return g_swingJumpAsserted;
+}
+
 // Called from the pad build, AFTER the physical stick has been read, because the stick is the
 // override and an override that arrives a frame late is not one.
 static float ArmSwingDeflection(XrTime when, float physX, float physY)
@@ -1808,6 +1950,16 @@ static float ArmSwingDeflection(XrTime when, float physX, float physY)
     // because the player's complaint is that it moves them at all, not that it moves them too
     // fast. Only when the cosine is meaningful: one hand held still makes it undefined, and a
     // one-armed swing should still work.
+    // ⚠️ The jump freeze sits ABOVE the unison veto and the stillness test, because raising both
+    // hands trips both of them by construction - the hands travel together and then stop at the
+    // top. Ordering it below would collapse the run at the exact moment the player asked to
+    // clear a gap.
+    const bool jumpFreeze = g_swingJumpGraceUntil != 0 && when < g_swingJumpGraceUntil;
+    if (jumpFreeze) {
+        g_swingBlock = "";
+        return g_swingDeflection;      // hold everything exactly as it was
+    }
+
     if (g_swingAltValid && g_swingAltSmooth > g_swingUnisonMax) {
         ArmSwingCollapse("arms in unison");
         return 0.0f;
@@ -2003,6 +2155,8 @@ static bool XrSyncInput(XrTime when)
     // ⚠️ Called every frame, INCLUDING while the sweep is driving. Its own g_sweepActive guard
     // collapses the envelope; skipping the call instead would freeze the envelope mid-charge for
     // the whole six-second hold and resume from a stale value the moment the sweep let go.
+    const bool  swingJump   = ArmSwingJumpTick(when);
+    const bool  swingCrouch = ArmSwingCrouchTick(when);
     const float swing = ArmSwingDeflection(when, mx, my);
     if (sweep > 0.0f) {
         s.Gamepad.sThumbLX = 0;
@@ -2027,6 +2181,10 @@ static bool XrSyncInput(XrTime when)
         }
     }
     s.Gamepad.bLeftTrigger  = (BYTE)(flt(g_aLTrig) * 255.0f);
+    // AS.3: full, and never below what the physical trigger already asked for. GBA_Crouch is
+    // a button as far as the game is concerned; a partial press would only risk sitting under
+    // whatever threshold it applies.
+    if (swingCrouch) s.Gamepad.bLeftTrigger = 0xFF;
     s.Gamepad.bRightTrigger = (BYTE)(flt(g_aRTrig) * 255.0f);
 
     WORD b = 0;
@@ -2055,6 +2213,9 @@ static bool XrSyncInput(XrTime when)
     // threshold rather than being dropped. Half pressed is deliberate: a grip is squeezed
     // decisively or not at all, unlike a trigger.
     if (flt(g_aLGrip) > 0.5f) b |= MEVR_PAD_LSHOULDER;
+    // AS.2: OR, never replace. The grip stays the reliable jump when a gesture misfires, and
+    // it is the one a player reaches for when a gap is closing.
+    if (swingJump) b |= MEVR_PAD_LSHOULDER;
     if (flt(g_aRGrip) > 0.5f) b |= MEVR_PAD_RSHOULDER;
     s.Gamepad.wButtons = b;
 
@@ -7040,6 +7201,8 @@ static void CheckHeadHotkeys()
         { "SPRINT OFF", &g_swingSprintOffMS, 0.05f, 0.20f, 3.00f },
         { "STOP MS",    &g_swingStopMs,     25.0f, 50.0f, 600.0f },
         { "UNISON",     &g_swingUnisonMax,   0.05f, -0.50f, 1.00f },
+        { "JUMP RISE",  &g_swingJumpRise,    0.05f, 0.05f, 1.00f },
+        { "CROUCH DROP",&g_swingCrouchDrop,  0.05f, 0.05f, 1.00f },
         { "HOLD MS",    &g_swingHoldMs,     25.0f, 50.0f, 800.0f },
         { "CROUCH MS",  &g_swingHeadVertMax, 0.05f, 0.05f, 2.00f },
     };
@@ -12167,6 +12330,10 @@ void RecenterSixDof()
     // The old offset must not survive the frame in which PAGE UP is pressed. The next valid head
     // pose becomes the new centre; until then both the camera and hands use the neutral anchor.
     g_dofOffset[0] = g_dofOffset[1] = g_dofOffset[2] = 0.0f;
+    // AS.3: re-seed the standing baseline on the same frame. It falls over about twenty
+    // seconds, so a recentre taken while crouched would otherwise leave the crouch gesture
+    // measuring against a wrong standing height for most of a minute.
+    g_haveCrouchBaseline = false;
     InterlockedIncrement(&g_motionRecenterSerial);
 }
 
@@ -13629,17 +13796,29 @@ static void DrawOverlay(IDirect3DDevice9* dev)
                       ((g_swingLastBlockAt != 0 &&
                         (double)(g_swingClock - g_swingLastBlockAt) * 1e-9 < 3.0)
                          ? g_swingLastBlock : "IDLE"))));
-        static const char* kTuneNames[7] = { "DEADBAND", "SPRINT ON", "SPRINT OFF", "STOP MS",
-                                            "UNISON", "HOLD MS", "CROUCH MS" };
-        const float tuneVals[7] = { g_swingDeadbandMS, g_swingSprintOnMS, g_swingSprintOffMS,
+        static const char* kTuneNames[9] = { "DEADBAND", "SPRINT ON", "SPRINT OFF", "STOP MS",
+                                            "UNISON", "JUMP RISE", "CROUCH DROP",
+                                            "HOLD MS", "CROUCH MS" };
+        const float tuneVals[9] = { g_swingDeadbandMS, g_swingSprintOnMS, g_swingSprintOffMS,
                                     g_swingStopMs, g_swingUnisonMax,
+                                    g_swingJumpRise, g_swingCrouchDrop,
                                     g_swingHoldMs, g_swingHeadVertMax };
-        const int ti = (g_swingTuneSel >= 0 && g_swingTuneSel < 7) ? g_swingTuneSel : 0;
+        const int ti = (g_swingTuneSel >= 0 && g_swingTuneSel < 9) ? g_swingTuneSel : 0;
         // UNISON is the first tunable here that can go negative, and the obvious
         // whole-plus-hundredths split renders -0.30 as "0.-30". Sign is carried separately.
         const float tv = tuneVals[ti];
         const int whole = (int)tv;
         const int frac  = (int)(fabsf(tv - (float)whole) * 100.0f + 0.5f);
+        // Hand height and head drop against their thresholds, live. Tuning either gesture
+        // blind means guessing how far "overhead" and "crouched" actually are for this body.
+        const float hi = (g_swingL.rel.y > g_swingR.rel.y) ? g_swingL.rel.y : g_swingR.rel.y;
+        const float dropNow = g_haveCrouchBaseline ? (g_crouchBaselineY - g_swingHeadPosY) : 0.0f;
+        _snprintf_s(lines[nl++], 64, _TRUNCATE, "HANDS %s%d.%02d J%ld  DROP %s%d.%02d C%ld %s",
+                    hi < 0.0f && (int)hi == 0 ? "-" : "", (int)hi,
+                    (int)(fabsf(hi - (float)(int)hi) * 100.0f + 0.5f), g_swingJumps,
+                    dropNow < 0.0f && (int)dropNow == 0 ? "-" : "", (int)dropNow,
+                    (int)(fabsf(dropNow - (float)(int)dropNow) * 100.0f + 0.5f), g_swingCrouches,
+                    g_swingCrouching ? "CROUCH" : "");
         _snprintf_s(lines[nl++], 64, _TRUNCATE, "TUNE %s (%s%d.%02d) NUM . + -",
                     kTuneNames[ti], (tv < 0.0f && whole == 0) ? "-" : "", whole, frac);
     }
@@ -14794,6 +14973,19 @@ static void LoadSettings()
                 Log("[cfg]   ArmSwingDebug = %s", b ? "on" : "off");
                 applied++;
             } else { Log("[cfg]   ArmSwingDebug '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ArmSwingJump") == 0) {
+            if (SettingBool(val, &b)) {
+                g_armSwingJump = b;
+                Log("[cfg]   ArmSwingJump = %s", b ? "on" : "off");
+                applied++;
+            } else { Log("[cfg]   ArmSwingJump '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ArmSwingCrouch") == 0) {
+            if (SettingBool(val, &b)) {
+                g_armSwingCrouch = b;
+                Log("[cfg]   ArmSwingCrouch = %s%s", b ? "on" : "off",
+                    b ? "" : "  (the swing is still suppressed while crouching)");
+                applied++;
+            } else { Log("[cfg]   ArmSwingCrouch '%s' is not a boolean - ignored", val); rejected++; }
         } else if (_stricmp(key, "D3D9Ex") == 0) {
             // ⚠️ Not a hotkey, and cannot be. A device's TYPE is fixed when it is created, so
             // switching it later would mean destroying every resource in the game. This is the
