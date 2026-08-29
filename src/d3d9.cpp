@@ -82,6 +82,12 @@
 // Rung 10. The build script reads this include to decide whether to compile MinHook's sources,
 // so it is the switch as well as the declaration - see the note in build.ps1.
 #include "MinHook.h"
+// MinHook's own length disassembler, already compiled into this build for its trampolines.
+// F1 needs to walk a handful of instructions inside a retail function to find one call, and a
+// byte scan for 0xE8 would happily match the middle of somebody else's immediate operand. A
+// real length decoder is the difference between a derivation and a guess, and this one is
+// already here. Reached by relative path: the build only puts MinHook's include/ on /I.
+#include "../third_party/minhook/src/hde/hde32.h"
 
 // ---------------------------------------------------------------- vtable slots
 
@@ -97,6 +103,13 @@ enum {
     DEV_CreateIndexBuffer      = 27,
     DEV_SetRenderTarget        = 37,
     DEV_Clear                  = 43,
+    // The half-res startup investigation: the surface-creating entry points that do NOT go
+    // through CreateTexture, the pool-sizing query, and the upscale blit. Slot numbers are
+    // d3d9.h vtable order, consistent with SetRenderTarget=37 / Clear=43 above.
+    DEV_GetAvailableTextureMem    = 4,
+    DEV_CreateRenderTarget        = 28,
+    DEV_CreateDepthStencilSurface = 29,
+    DEV_StretchRect               = 34,
     DEV_CreateQuery            = 118,
     DEV_DrawPrimitive          = 81,
     DEV_DrawIndexedPrimitive  = 82,
@@ -565,6 +578,41 @@ static bool        g_actionsReady = false;
 static bool        g_padEnabled = true;            // NUMPAD9 toggles
 static bool        g_motionHands = false;           // incomplete Phase 1 path, opt-in only
 static bool        g_motionHandsDebug = false;      // bounded pose-state and position reports
+// The finger curl, toggled by NUMPAD / - the last unbound key on the pad. Declared up here with
+// the other feature flags because the hotkey reader runs long before the pose code is defined.
+// g_curlTarget is what the key asks for and g_curlNow is where the ramp has got to; F4 replaces
+// the key with the grip axis and leaves everything below it alone.
+static bool        g_bonePokeProbe = false;    // the key's state, so the log can name it
+// Per hand, because that is the whole point once the grips drive it: the two hands are
+// independent controls and squeezing one must not close the other.
+static float       g_curlTarget[2] = { 0.0f, 0.0f };   // 0 open, 1 closed
+static float       g_curlNow[2] = { 0.0f, 0.0f };
+static long        g_bonePokeWrites = 0, g_bonePokeReadbacks = 0;
+
+// ---- freeing the two grips ----
+//
+// The synthesised pad puts GBA_Jump on LSHOULDER and GBA_LookBehind on RSHOULDER
+// (DefaultInput.ini lines 141-143), and on a Touch pair the only physical controls reaching
+// either are the two grips. Every other button is already spoken for, so the grips cannot become
+// an analogue input of their own until those two actions have somewhere else to live.
+//
+// StickJumpTurn gives them one: the right stick's Y axis. That axis currently carries
+// GBA_Look_Gamepad, which is pad PITCH - the one stick action a headset already does better, and
+// the only one on either stick that can be spent without losing something.
+//
+// Two settings rather than one because they answer different questions. StickJumpTurn asks
+// "should the right stick do this?", and a player can want the stick actions while still wanting
+// the grips to jump - both can be true at once, and the game sees the same button either way.
+// GripToGrip asks "are the grips spoken for elsewhere?", and it is the one that actually takes
+// them away. GripToGrip therefore implies StickJumpTurn and forces it on at load; the reverse
+// does not hold. If the hand pose later proves worth having by default, this pair collapses into
+// one setting - but that is a decision to make after it has been felt, not before.
+static bool        g_stickJumpTurn = false;         // StickJumpTurn in mevr.ini
+static bool        g_gripToGrip = false;            // GripToGrip in mevr.ini
+// The live squeeze, 0..1 per hand, published for the hand-pose path that will consume it. Written
+// once per pad build, on the thread that drives Present, and read nowhere else yet.
+static float       g_gripValue[2] = { 0.0f, 0.0f };  // [left, right]
+
 static MEVR_XINPUT_STATE g_pad = {};
 static CRITICAL_SECTION  g_padLock;
 static bool        g_padLockReady = false;
@@ -581,6 +629,7 @@ static float g_padLo[4] = { 0, 0, 0, 0 };      // move x, move y, look x, look y
 static float g_padHi[4] = { 0, 0, 0, 0 };
 static WORD  g_padButtonsSeen = 0;
 static BYTE  g_padTrigPeak[2] = { 0, 0 };
+static float g_gripPeak[2] = { 0.0f, 0.0f };   // squeeze extremes over the same window
 static long  g_padPollsSeen = 0;               // g_padPolls at the last report
 
 struct MEVR_Vec3 { float x = 0.0f, y = 0.0f, z = 0.0f; };
@@ -1231,6 +1280,30 @@ static bool   g_swingAltValid = false;
 // dropped to the sides sit there. A swing cycles at about 2 Hz, so the quiet part around each
 // reversal is on the order of 75-100 ms - and a stop test longer than that catches the one and
 // not the other.
+// ---- both arms have to be working, or a wave is a swing ----
+//
+// Reported from play: standing still with the left arm down and waving the right one - at a
+// helicopter - moved the player forward. That is not a tuning miss, it is a hole left open on
+// purpose. The unison veto needs BOTH hands above 0.30 m/s before the cosine means anything, so
+// with one arm hanging still it is skipped entirely, and the metric takes the MAX over tracked
+// hands, so the waving arm drives everything by itself.
+//
+// The comment that allowed it said "a one-armed swing should still work". A wave and a one-armed
+// swing are the same motion; no threshold separates them, because there is nothing to separate.
+// So the allowance goes: both arms must be participating.
+//
+// ⚠️ NOT both above the deadband on the same frame. The arms are anti-phase in POSITION, which
+// means their SPEEDS peak and trough together - requiring simultaneity would flicker at twice
+// the swing frequency. Each arm instead carries its own last-active stamp and both must be
+// recent within about one swing period, so a wave leaves the idle arm's stamp stale forever
+// while a real swing refreshes both every cycle.
+//
+// This is a condition, not a filter. Nothing about the attack, the envelope, the hold window or
+// the stop path changes, so once both arms are swinging the behaviour is what it was.
+static const float kSwingArmActiveMS = 0.30f;   // m/s of full speed: this arm is doing something
+static float  g_swingBothArmsMs = 700.0f;       // covers a swing as slow as about 0.8 Hz
+static XrTime g_swingHandLoud[2] = { 0, 0 };
+
 // ⚠️ Tested on the FULL speed, not on the chosen metric. A swing is roughly circular, so at the
 // moment the vertical component passes through zero the fore-aft component is at its maximum -
 // metric B dips to nothing at every reversal while the hand is still travelling at full tilt.
@@ -1548,6 +1621,17 @@ static void ArmSwingSample(XrTime when, bool actionsSynced)
         float radial = 0.0f;
         if (rhl > 1e-3f) radial = fabsf((h->vel.x * rhx + h->vel.z * rhz) / rhl);
         h->c = h->b + radial;
+    }
+
+    // Per-arm activity stamps for the both-arms rule.
+    //
+    // ⚠️ An arm we cannot SEE is not an arm that is idle. While a hand is untracked its stamp is
+    // held current, so a controller dropout degrades to one-armed rather than stopping the
+    // player, and a hand coming back gets a full window to prove itself instead of being judged
+    // on a staleness that accrued while it was invisible.
+    for (int i = 0; i < 2; ++i) {
+        const ArmSwingHand* h = (i == 0) ? &g_swingL : &g_swingR;
+        if (!h->tracked || h->a > kSwingArmActiveMS) g_swingHandLoud[i] = when;
     }
 
     // ---- the anti-phase cosine, kept as a diagnostic and no longer a metric ----
@@ -2005,6 +2089,23 @@ static float ArmSwingDeflection(XrTime when, float physX, float physY)
 
     g_swingHoldKind = SWING_HOLD_NONE;
 
+    // One arm idle is a wave, not a swing. Only asked of arms we can actually see - a hand that
+    // is untracked keeps its stamp current above, so this reduces to the one-armed behaviour it
+    // used to have whenever a controller is genuinely missing.
+    if (g_swingL.tracked && g_swingR.tracked) {
+        const float ageL = (float)((double)(when - g_swingHandLoud[0]) * 1e-6);
+        const float ageR = (float)((double)(when - g_swingHandLoud[1]) * 1e-6);
+        const bool staleL = ageL > g_swingBothArmsMs, staleR = ageR > g_swingBothArmsMs;
+        if (staleL || staleR) {
+            // Named apart, because they are different findings. Both stale is simply a player
+            // not swinging, and the overlay saying "one arm idle" while both arms hang at rest
+            // would send the next diagnosis looking for a fault that is not there.
+            ArmSwingCollapse((staleL && staleR) ? "not swinging"
+                                                : (staleL ? "left arm idle" : "right arm idle"));
+            return 0.0f;
+        }
+    }
+
     // Both arms moving the same way is not a walk cycle. Vetoed outright rather than damped,
     // because the complaint is that it moves the player at all, not that it moves them too
     // fast. Only when the cosine is meaningful: one hand held still makes it undefined, and a
@@ -2108,6 +2209,72 @@ static float ArmSwingDeflection(XrTime when, float physX, float physY)
     return g_swingDeflection;
 }
 
+// ================================================================ the right stick as two buttons
+//
+// StickJumpTurn turns the right stick's Y axis into GBA_Jump (up) and GBA_LookBehind (down).
+//
+// ---- why the axis has to be CONSUMED, not shared ----
+//
+// The obvious-looking alternative is to keep feeding Y to sThumbRY and fire the button on top of
+// it. That cannot work: pushing up to jump would pitch the camera up at the same time, every
+// time. One of the two has to go, and in a headset the pitch is the one nobody misses - the
+// head already carries it, and the game's own pitch is fought by the view path all frame. So
+// while this setting is on, sThumbRY is zeroed and the axis belongs to the two actions.
+//
+// X is untouched. Turn stays on the right stick, which is what the stick is for.
+//
+// ---- armed / asserted, exactly as AS.2 does it ----
+//
+// A stick held past the threshold must not machine-gun the button, and a stick PARKED past it
+// must not hold jump down forever - so the press is asserted on the crossing, held for at most
+// kStickActionHoldMs, and only re-armed once the stick has come back. That is the same shape as
+// ArmSwingJumpTick, deliberately: with both paths on there are two ways to jump and they should
+// not feel like two different buttons.
+//
+// The dominance test is insurance rather than a measurement. On a Touch stick the gate is
+// circular, so |y| > 0.75 already bounds |x| below 0.66 and a turn can never reach the
+// threshold; the simple-controller fallback profile carries no such promise, and a square-gated
+// stick would let a hard turn with a little lean on it fire a jump.
+struct StickAction {
+    bool   armed = true;
+    bool   asserted = false;
+    XrTime since = 0;
+    long   presses = 0;
+};
+static StickAction g_stickJump, g_stickTurn;
+
+static const float kStickActionOn   = 0.75f;   // push past this to fire
+static const float kStickActionOff  = 0.45f;   // and back inside this to re-arm
+static const float kStickActionHoldMs = 400.0f;   // matches AS.2's swing jump
+
+static bool StickActionTick(StickAction* a, XrTime when, float axis, float other,
+                            const char* what)
+{
+    if (!g_stickJumpTurn || !g_padEnabled) {
+        // Not re-armed here, for ArmSwingJumpTick's reason: a setting toggled or a pad disabled
+        // mid-push must not hand back a fresh press the moment it returns.
+        a->asserted = false;
+        return false;
+    }
+
+    const bool past  = axis > kStickActionOn && axis > fabsf(other);
+    const bool clear = axis < kStickActionOff;
+
+    if (a->armed && past) {
+        a->asserted = true;
+        a->armed = false;
+        a->since = when;
+        a->presses++;
+        Log("*** [stick] %s #%ld - right stick at %+.2f", what, a->presses, axis);
+    }
+    if (a->asserted) {
+        const float heldMs = (float)((double)(when - a->since) * 1e-6);
+        if (!past || heldMs > kStickActionHoldMs) a->asserted = false;
+    }
+    if (!a->armed && clear) a->armed = true;
+    return a->asserted;
+}
+
 // Read the controllers and build a 360 pad out of them. Called once per frame from the XR loop.
 //
 // `when` is the frame's predictedDisplayTime, threaded through because the arm swing sampler
@@ -2190,6 +2357,13 @@ static bool XrSyncInput(XrTime when)
     s.Gamepad.sThumbRX = axis(lx);
     s.Gamepad.sThumbRY = axis(ly);
 
+    // The right stick's Y axis belongs to jump and quick turn now, not to pad pitch. Zeroed
+    // AFTER the assignment above rather than instead of it, so the raw axis still reaches the
+    // window accumulators below and a [pad] report keeps describing the physical stick.
+    const bool stickJump = StickActionTick(&g_stickJump, when,  ly, lx, "JUMP");
+    const bool stickTurn = StickActionTick(&g_stickTurn, when, -ly, lx, "QUICK TURN");
+    if (g_stickJumpTurn) s.Gamepad.sThumbRY = 0;
+
     // ---- AS.1a: the curve sweep OVERRIDES the left stick while it runs ----
     //
     // Override rather than add, and X is zeroed rather than left alone. The gate being measured
@@ -2258,14 +2432,28 @@ static bool XrSyncInput(XrTime when)
     // refuses to start, already measured at two runs.
     if (bl(g_aLClick)) b |= MEVR_PAD_BACK;
     if (bl(g_aRClick)) b |= MEVR_PAD_RTHUMB;
+    // Read once and keep: the crossover below, the peaks in the window report, and the hand-pose
+    // path all want the same number, and calling flt() twice per grip would sample the runtime
+    // twice for one frame's answer.
+    g_gripValue[0] = flt(g_aLGrip);
+    g_gripValue[1] = flt(g_aRGrip);
+
     // Grips are analogue on Touch and shoulder buttons on a pad, so they cross over at a
     // threshold rather than being dropped. Half pressed is deliberate: a grip is squeezed
     // decisively or not at all, unlike a trigger.
-    if (flt(g_aLGrip) > 0.5f) b |= MEVR_PAD_LSHOULDER;
+    //
+    // Unless GripToGrip has claimed them for the hand pose, in which case they carry nothing to
+    // the game at all - a hand closing around nothing must not also jump.
+    if (!g_gripToGrip) {
+        if (g_gripValue[0] > 0.5f) b |= MEVR_PAD_LSHOULDER;
+        if (g_gripValue[1] > 0.5f) b |= MEVR_PAD_RSHOULDER;
+    }
     // AS.2: OR, never replace. The grip stays the reliable jump when a gesture misfires, and
-    // it is the one a player reaches for when a gap is closing.
+    // it is the one a player reaches for when a gap is closing. The stick joins on the same
+    // terms - three paths to one button, none of them the owner.
     if (swingJump) b |= MEVR_PAD_LSHOULDER;
-    if (flt(g_aRGrip) > 0.5f) b |= MEVR_PAD_RSHOULDER;
+    if (stickJump) b |= MEVR_PAD_LSHOULDER;
+    if (stickTurn) b |= MEVR_PAD_RSHOULDER;
     s.Gamepad.wButtons = b;
 
     // ---- record the window, before the lock ----
@@ -2288,6 +2476,11 @@ static bool XrSyncInput(XrTime when)
         g_padButtonsSeen |= b;
         if (s.Gamepad.bLeftTrigger  > g_padTrigPeak[0]) g_padTrigPeak[0] = s.Gamepad.bLeftTrigger;
         if (s.Gamepad.bRightTrigger > g_padTrigPeak[1]) g_padTrigPeak[1] = s.Gamepad.bRightTrigger;
+        // Peaks for the same reason the sticks keep extremes: once GripToGrip stops the grips
+        // reaching the game, a squeeze leaves no button bit behind and this is the only trace
+        // in the log that the control is alive at all.
+        for (int i = 0; i < 2; ++i)
+            if (g_gripValue[i] > g_gripPeak[i]) g_gripPeak[i] = g_gripValue[i];
     }
 
     EnterCriticalSection(&g_padLock);
@@ -2495,6 +2688,15 @@ static void ReportPadState()
     Log("[pad]   buttons this window:%s  |  triggers peak L %u R %u  |  the game read the pad %ld times",
         btns[0] ? btns : " none", (unsigned)g_padTrigPeak[0], (unsigned)g_padTrigPeak[1],
         polls - g_padPollsSeen);
+    // The peaks are this window's; the two press counts are running totals for the process, the
+    // way [swing] counts its jumps. Said outright because every other number on these lines
+    // resets, and a total read as a window figure is a different fault report entirely.
+    Log("[pad]   grips peak L %.2f R %.2f -> %s  |  right stick jump/turn %s,"
+        " %ld/%ld presses so far",
+        g_gripPeak[0], g_gripPeak[1],
+        g_gripToGrip ? "the hand pose, NOT the game" : "LSHOULDER/RSHOULDER at 0.50",
+        g_stickJumpTurn ? "on (pad pitch is spent)" : "off",
+        g_stickJump.presses, g_stickTurn.presses);
 
     // The two conclusions worth stating outright, because the numbers above are only obvious
     // once you already know which fault you are looking at.
@@ -2511,6 +2713,7 @@ static void ReportPadState()
     for (int i = 0; i < 4; ++i) g_padLo[i] = g_padHi[i] = 0.0f;
     g_padButtonsSeen = 0;
     g_padTrigPeak[0] = g_padTrigPeak[1] = 0;
+    g_gripPeak[0] = g_gripPeak[1] = 0.0f;
     g_padPollsSeen = polls;
 }
 
@@ -2885,12 +3088,23 @@ static bool EnsureSharedCapture(IDirect3DDevice9* dev, UINT w, UINT h)
     return true;
 }
 
+// The half-res investigation hooks StretchRect to census the GAME's blits; the grab below
+// runs every frame and would drown that census in its own signal, so it goes through the
+// original once the hook is live. Declared here the way g_rtSeen is - defined with the
+// census machinery it belongs to.
+typedef HRESULT (STDMETHODCALLTYPE *PFN_StretchRect)(IDirect3DDevice9*, IDirect3DSurface9*,
+                                                     const RECT*, IDirect3DSurface9*,
+                                                     const RECT*, D3DTEXTUREFILTERTYPE);
+extern PFN_StretchRect g_origStretchRect;
+
 // The fast path. Returns false to mean "fall back this frame", never to mean "give up".
 static bool CaptureFrameShared(IDirect3DDevice9* dev, IDirect3DSurface9* bb, UINT w, UINT h)
 {
     if (!EnsureSharedCapture(dev, w, h)) return false;
 
-    HRESULT hr = dev->StretchRect(bb, nullptr, g_sharedRT, nullptr, D3DTEXF_NONE);
+    HRESULT hr = g_origStretchRect
+                     ? g_origStretchRect(dev, bb, nullptr, g_sharedRT, nullptr, D3DTEXF_NONE)
+                     : dev->StretchRect(bb, nullptr, g_sharedRT, nullptr, D3DTEXF_NONE);
     if (FAILED(hr)) {
         if (!g_fastFailLogged) {
             g_fastFailLogged = true;
@@ -3110,6 +3324,13 @@ UINT                     g_sceneW = 0, g_sceneH = 0;
 // leftover draws in that mode smears the right eye, and adopting the mono buffer fights the
 // game's own full-width draws - the only coherent presentation is mono until the mode ends.
 bool                     g_sceneSplitMono = false;
+// The PARTIAL variant of the same failure, measured 2026-08-28: one render phase (~30% of
+// scene draws) moves to the half-size fp16 buffer while the backbuffer keeps the majority,
+// so the parity rule reads the run as healthy and duplication keeps going - over a frame the
+// game no longer fully repaints. That is the streak state: hands and building edges ghosting
+// along their motion history. Same answer as the full split - suppress duplication, present
+// mono - with its own entry/exit so the full split's revert logic cannot clear it early.
+bool                     g_scenePartialMono = false;
 // Per-frame scene-draw tallies for the split-flip detector, reset every Present.
 long                     g_frameSceneOnBackbuffer = 0;
 long                     g_frameSceneOffscreen = 0;
@@ -3184,6 +3405,11 @@ bool                     g_camCacheValid = false;
 volatile LONG            g_vmAccepted = 0;
 volatile LONG            g_vmRejected = 0;
 bool                     g_vmValidate = true;   // F12 turns the per-upload filter off
+// What the compositor was last HANDED: 1 projection, 0 quad, 2 nothing. Written by the
+// submit path each frame, read by the heartbeat line, so the periodic report carries the
+// truth even when no change-edge printed recently.
+static int g_submittedLayerKind = -1;
+
 static bool EnsureEyeSwapchains(uint32_t w, uint32_t h)
 {
     if (g_eyeSwap[0] != XR_NULL_HANDLE && w == g_eyeW && h == g_eyeH) return true;
@@ -3372,11 +3598,13 @@ static void SubmitTestQuad()
             static long lastUp = 0, lastPass = 0, lastW = 0, lastDir = 0, lastDegen = 0,
                         lastNoC = 0;
             Log("[eye]   gates: dup %d this frame | scene draws: backbuffer %ld offscreen %ld"
-                " | c0IsScene %d sceneMatValid %d splitMono %d | vmReg %d halfIpd %.2f |"
+                " | c0IsScene %d sceneMatValid %d splitMono %d partialMono %d | vmReg %d"
+                " halfIpd %.2f |"
                 " cap %ux%u scene %ux%u | c0 since last: %ld up = %ld pass %ld wpos %ld dir"
                 " %ld degen %ld nocache",
                 dupThisFrame, g_frameSceneOnBackbuffer, g_frameSceneOffscreen,
                 g_c0IsScene ? 1 : 0, g_sceneMatValid ? 1 : 0, g_sceneSplitMono ? 1 : 0,
+                g_scenePartialMono ? 1 : 0,
                 g_vmReg, g_halfIpdUU, g_capW, g_capH, g_sceneW, g_sceneH,
                 g_c0Uploads - lastUp, g_c0Pass - lastPass, g_c0FailW - lastW,
                 g_c0FailDir - lastDir, g_c0Degen - lastDegen, g_c0NoCache - lastNoC);
@@ -3533,6 +3761,37 @@ static void SubmitTestQuad()
         layerCount = 1;
     }
 
+    // ---- the SUBMITTED layer, logged as truth, not intent ----
+    //
+    // The [eye] "frame is side-by-side / MONO" lines report frameIsStereo - the duplication
+    // counter - and 2026-08-28's "injected real quick and then switched to flat" run proved
+    // they can lie: the log claimed a stereo projection for a whole run whose headset view
+    // was the flat quad. The projection needs five legs (mode, frame, located views, eye
+    // swapchains, both eyes filled) and every one of them fails SILENTLY into the quad, so
+    // when any leg breaks the flip detector keeps narrating stereo while the compositor gets
+    // the fallback. This line reports the layer actually handed over, with every leg's state,
+    // on every change - the one line that would have named the broken leg that run. Change
+    // storms are capped, not silenced: a flapping leg is itself the diagnosis.
+    {
+        const int layerKind = stereoSubmitted ? 1 : (layerCount ? 0 : 2);
+        static int  lastLayerKind = -1;
+        static long layerChanges  = 0;
+        if (layerKind != lastLayerKind) {
+            lastLayerKind = layerKind;
+            ++layerChanges;
+            if (layerChanges <= 20 || (layerChanges % 50) == 0)
+                Log("*** [eye] SUBMITTED -> %s  (change #%ld; legs: stereoMode %d haveFrame %d"
+                    " viewsValid %d eyeSwap %d filled %d/%d frameIsStereo %d simul %d)",
+                    layerKind == 1 ? "stereo projection"
+                                   : (layerKind == 0 ? "head-locked quad - FLAT" : "NO LAYER"),
+                    layerChanges, g_stereoMode, g_haveFrame ? 1 : 0, g_viewsValid ? 1 : 0,
+                    g_eyeSwap[0] != XR_NULL_HANDLE ? 1 : 0,
+                    g_eyeFilled[0] ? 1 : 0, g_eyeFilled[1] ? 1 : 0,
+                    frameIsStereo ? 1 : 0, g_simulStereo ? 1 : 0);
+        }
+        g_submittedLayerKind = layerKind;
+    }
+
     // Head tracking uses the SAME predicted display time the frame is submitted for, so the
     // pose the game renders from and the pose the compositor expects agree.
     ApplyHeadTracking(fs.predictedDisplayTime);
@@ -3607,9 +3866,12 @@ static void SubmitTestQuad()
         if (lastMs > 0.0) {
             const double fps = 600000.0 / (nowMs - lastMs);
             const double hz  = g_predPeriod ? (1.0e9 / (double)g_predPeriod) : 0.0;
-            Log("[xr] frame %ld  state=%d shouldRender=%d endFrame=%d  |  frame grab %.2f ms mean"
-                " over %ld  |  %.1f fps delivered, headset wants %.1f Hz",
-                n, (int)g_xrState, (int)fs.shouldRender, (int)er, mean, g_capSamples, fps, hz);
+            Log("[xr] frame %ld  state=%d shouldRender=%d endFrame=%d  layer=%s  |  frame grab"
+                " %.2f ms mean over %ld  |  %.1f fps delivered, headset wants %.1f Hz",
+                n, (int)g_xrState, (int)fs.shouldRender, (int)er,
+                g_submittedLayerKind == 1 ? "proj"
+                    : (g_submittedLayerKind == 0 ? "QUAD(flat)" : "none"),
+                mean, g_capSamples, fps, hz);
             // ---- the CADENCE, which the mean hides completely ----
             //
             // A mean of 62 is the same number whether every frame took 16.1 ms or half took 8
@@ -4305,6 +4567,26 @@ int       g_offMaxSmoothFps = -1;
 float     g_fpsCap          = 60.0f;    // NUMPAD7 cycles
 static int LookupProp(const char* className, const char* propName, bool verbose);
 
+// ---- the half-res fallback: the engine's own "too slow" machinery ----
+//
+// Every mid-run half-res flip in the logs sits a few frames after stereo engagement - the
+// end of a level load, the hitchiest moment a run has. UE3's detail scaler compares frame
+// time against Client.MinDesiredFrameRate (35 in this install's ini) and raises
+// WorldInfo.bDropDetail / bAggressiveLOD when frames run late; the working theory is that
+// TdEngine hangs its half-size scene buffer swap off that verdict. Three tools to prove or
+// disprove it without a headset: TestStall fakes the hitch, the WorldInfo flag watch shows
+// the engine's verdict changing, and PinMinDesiredFps holds the threshold at zero so the
+// verdict can never fire. Sustained slowness (FrameCap=20, measured 2026-08-28) does NOT
+// trip it, so the trigger profile is spikes, not load.
+static long      g_testStallFrame   = 0;       // ini TestStall; 0 = off
+static bool      g_pinMinDesiredFps = false;   // ini PinMinDesiredFps
+static uint32_t  g_clientObj        = 0;
+static int       g_offMinDesiredFps = -1;
+static uint32_t  g_worldInfoObj     = 0;
+static int       g_offDropDetail    = -1;
+static int       g_offAggressiveLOD = -1;
+static uint32_t  g_worldFlagsSeen   = 0xFFFFFFFFu;
+
 static void FindEngineObject()
 {
     if (g_offName < 0 || !g_gobjAddr) return;
@@ -4338,6 +4620,65 @@ static void FindEngineObject()
         return;
     }
     Log("[fps] no GameEngine object found - the frame cap cannot be moved from here");
+}
+
+// The same scan FindEngineObject does, for any class-name substring: the first live
+// (non-Default__) instance whose class name contains it. WorldInfo dies and is replaced on
+// every level load, so callers re-resolve when their cached object stops validating rather
+// than treating this answer as permanent.
+static uint32_t FindInstanceByClassSubstr(const char* substr, char* clsOut, size_t clsOutLen)
+{
+    if (g_offName < 0 || !g_gobjAddr) return 0;
+    uint32_t data, count;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t obj;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+        uint32_t vtbl;
+        if (!SafeU32(obj, &vtbl) || !InModule(vtbl)) continue;
+        uint32_t clsPtr, cn;
+        char cls[128];
+        if (!SafeU32(obj + 0x34, &clsPtr) || clsPtr < 0x10000) continue;
+        if (!SafeU32(clsPtr + g_offName, &cn) || !NameOf(cn, cls, sizeof(cls))) continue;
+        if (!strstr(cls, substr)) continue;
+        uint32_t on; char onm[128];
+        if (SafeU32(obj + g_offName, &on) && NameOf(on, onm, sizeof(onm)) &&
+            !strncmp(onm, "Default__", 9)) continue;
+        if (clsOut && clsOutLen) snprintf(clsOut, clsOutLen, "%s", cls);
+        return obj;
+    }
+    return 0;
+}
+
+static void FindClientObject()
+{
+    char cls[128] = "";
+    const uint32_t obj = FindInstanceByClassSubstr("WindowsClient", cls, sizeof(cls));
+    if (!obj) {
+        Log("[perf] no WindowsClient object found - MinDesiredFrameRate is unreachable");
+        return;
+    }
+    g_clientObj = obj;
+    g_offMinDesiredFps = LookupProp(cls, "MinDesiredFrameRate", true);
+    float v = -1.0f;
+    if (g_offMinDesiredFps >= 0)
+        SafeRead(obj + (uint32_t)g_offMinDesiredFps, &v, sizeof(v));
+    Log("*** [perf] client object %p class %s, MinDesiredFrameRate at +0x%X = %.1f%s",
+        (void*)obj, cls, g_offMinDesiredFps, v,
+        g_pinMinDesiredFps ? "  (PinMinDesiredFps: will hold it at 0)" : "");
+}
+
+static void FindWorldInfo()
+{
+    char cls[128] = "";
+    const uint32_t obj = FindInstanceByClassSubstr("WorldInfo", cls, sizeof(cls));
+    if (!obj) return;   // between levels there simply is none; the caller retries
+    g_worldInfoObj = obj;
+    g_worldFlagsSeen = 0xFFFFFFFFu;   // next poll logs the baseline
+    if (g_offDropDetail < 0)    g_offDropDetail    = LookupProp(cls, "bDropDetail", true);
+    if (g_offAggressiveLOD < 0) g_offAggressiveLOD = LookupProp(cls, "bAggressiveLOD", true);
+    Log("*** [perf] WorldInfo %p class %s, bDropDetail +0x%X bAggressiveLOD +0x%X",
+        (void*)obj, cls, g_offDropDetail, g_offAggressiveLOD);
 }
 
 static void ProbeKnownObjects()
@@ -4389,6 +4730,7 @@ static int  LookupProp(const char* className, const char* propName, bool verbose
 static void ResolveMotionRigOffsets();
 static void ResolveInputGates();
 static void InstallUpdate1pArmsHook();
+static void ProbeUpdateSkelPose();
 extern int g_offActorRotation;
 extern int g_offActorLocation;
 extern int g_offFOVAngle;
@@ -4542,6 +4884,9 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                 // controllers. Its UFunction stores the native address, derived below from the
                 // live object model rather than hard-coded for one executable layout.
                 InstallUpdate1pArmsHook();
+                // F1 rides the same derivation - it needs UFunction::Func too - and only
+                // reads. Nothing is detoured by it.
+                ProbeUpdateSkelPose();
 
                 // Nothing above this line can tell "the stick never arrived" from "the game
                 // ignored it", and the first public build produced a report that needed exactly
@@ -4549,6 +4894,8 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                 ResolveInputGates();
                 DumpClassProperties("TdPlayerController", 60);
                 FindEngineObject();
+                FindClientObject();
+                FindWorldInfo();
             }
         }
     }
@@ -5095,6 +5442,7 @@ static void RestoreDetachedArmOverridesBeforeGame(uintptr_t pawn);
 static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose);
 static void ApplyWristRotations(uintptr_t pawn, const P13PoseSnapshot& pose);
 static void MonitorArmContinuity(uintptr_t pawn, const P13PoseSnapshot& pose);
+static void ProbeFingerBones(uintptr_t pawn);
 
 static bool LateReanchorOneHand(const RenderedHeadFrame& head, bool leftHand,
                                 P13HandPoseSnapshot* pose)
@@ -5250,10 +5598,20 @@ static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, voi
     ApplyDetachedShoulders(reinterpret_cast<uintptr_t>(self), pose);
     ApplyWristRotations(reinterpret_cast<uintptr_t>(self), pose);
     MonitorArmContinuity(reinterpret_cast<uintptr_t>(self), pose);
+    // Last, so the finger span it reads has every override this frame already applied to it.
+    ProbeFingerBones(reinterpret_cast<uintptr_t>(self));
 }
+
+// Memoized once it succeeds. The census below walks up to 3000 UObjects and prints its own
+// verdict line; F1 became a second caller, and running it twice would both cost that walk again
+// and put a duplicate probe line in the log that reads like the first answer was retracted.
+static int       g_funcOffsetCached = -1;
+static uintptr_t g_scriptTargetCached = 0;
 
 static int DeriveUFunctionFuncOffset(uintptr_t* sharedScriptTarget)
 {
+    if (sharedScriptTarget) *sharedScriptTarget = g_scriptTargetCached;
+    if (g_funcOffsetCached >= 0) return g_funcOffsetCached;
     if (sharedScriptTarget) *sharedScriptTarget = 0;
     if (!g_gobjAddr || g_offName < 0 || !g_textLo || g_textHi <= g_textLo) return -1;
 
@@ -5312,8 +5670,59 @@ static int DeriveUFunctionFuncOffset(uintptr_t* sharedScriptTarget)
         Log("[hands-p1.3] Update1pArms hook refused: no majority executable Func field");
         return -1;
     }
+    g_funcOffsetCached = bestOffset;
+    g_scriptTargetCached = bestTarget;
     if (sharedScriptTarget) *sharedScriptTarget = bestTarget;
     return bestOffset;
+}
+
+// One script-exposed native, found by its own name and by the class that declares it, with its
+// UFunction::Func read through the offset the census above derived.
+//
+// Extracted from InstallUpdate1pArmsHook unchanged when F1 needed a second caller. The owner
+// check is the load-bearing half: "Update1pArms" or "ForceSkelUpdate" alone can match a
+// same-named function on another class, and every validated object must agree on one address or
+// the answer is thrown away rather than picked from.
+static uintptr_t FindNativeUFunction(const char* fnName, const char* outerName,
+                                     int funcOffset, uintptr_t scriptTarget,
+                                     const char* tag, int* matchesOut)
+{
+    if (matchesOut) *matchesOut = 0;
+    if (!fnName || !outerName || funcOffset < 0 || g_offOuter < 0) return 0;
+
+    uint32_t data = 0, count = 0;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return 0;
+
+    uintptr_t target = 0;
+    int matches = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t obj = 0, cls = 0, outer = 0, fn = 0, ownerClass = 0;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000 ||
+            !ObjNameIs(obj, fnName) ||
+            !SafeU32(obj + 0x34, &cls) || !ObjNameIs(cls, "Function") ||
+            !SafeU32(obj + g_offOuter, &outer) || outer < 0x10000 ||
+            !ObjNameIs(outer, outerName) ||
+            !SafeU32(outer + 0x34, &ownerClass) || !ObjNameIs(ownerClass, "Class") ||
+            !SafeU32(obj + funcOffset, &fn) || fn < g_textLo || fn >= g_textHi) continue;
+        if (!target) target = fn;
+        else if (target != fn) {
+            Log("[%s] %s.%s refused: owner-validated functions disagree (%p vs %p)",
+                tag, outerName, fnName, (void*)target, (void*)fn);
+            return 0;
+        }
+        ++matches;
+    }
+
+    // scriptTarget is the address thousands of NON-native UFunctions share. Landing on it means
+    // the name resolved to a script function, whose Func is the shared interpreter entry - not
+    // an implementation of anything, and catastrophic to detour.
+    if (!target || matches == 0 || target == scriptTarget) {
+        Log("[%s] %s.%s refused: native target was %p, matches=%d, shared script target=%p",
+            tag, outerName, fnName, (void*)target, matches, (void*)scriptTarget);
+        return 0;
+    }
+    if (matchesOut) *matchesOut = matches;
+    return target;
 }
 
 static void InstallUpdate1pArmsHook()
@@ -5324,34 +5733,10 @@ static void InstallUpdate1pArmsHook()
     const int funcOffset = DeriveUFunctionFuncOffset(&scriptTarget);
     if (funcOffset < 0) return;
 
-    uint32_t data = 0, count = 0;
-    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return;
-
-    uintptr_t target = 0;
     int matches = 0;
-    for (uint32_t i = 0; i < count; ++i) {
-        uint32_t obj = 0, cls = 0, outer = 0, fn = 0, ownerClass = 0;
-        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000 ||
-            !ObjNameIs(obj, "Update1pArms") ||
-            !SafeU32(obj + 0x34, &cls) || !ObjNameIs(cls, "Function") ||
-            !SafeU32(obj + g_offOuter, &outer) || outer < 0x10000 ||
-            !ObjNameIs(outer, "TdPlayerPawn") ||
-            !SafeU32(outer + 0x34, &ownerClass) || !ObjNameIs(ownerClass, "Class") ||
-            !SafeU32(obj + funcOffset, &fn) || fn < g_textLo || fn >= g_textHi) continue;
-        if (!target) target = fn;
-        else if (target != fn) {
-            Log("[hands-p1.3] Update1pArms hook refused: owner-validated functions disagree"
-                " (%p vs %p)", (void*)target, (void*)fn);
-            return;
-        }
-        ++matches;
-    }
-
-    if (!target || matches == 0 || target == scriptTarget) {
-        Log("[hands-p1.3] Update1pArms hook refused: native target was %p, matches=%d,"
-            " shared script target=%p", (void*)target, matches, (void*)scriptTarget);
-        return;
-    }
+    const uintptr_t target = FindNativeUFunction("Update1pArms", "TdPlayerPawn", funcOffset,
+                                                 scriptTarget, "hands-p1.3", &matches);
+    if (!target) return;
 
     const MH_STATUS init = MH_Initialize();
     if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
@@ -5378,6 +5763,351 @@ static void InstallUpdate1pArmsHook()
     Log("*** [hands-p1.3] hooked native TdPlayerPawn.Update1pArms at %p"
         " (UFunction::Func +0x%02X, %d owner-validated object%s)",
         (void*)target, funcOffset, matches, matches == 1 ? "" : "s");
+}
+
+// ================================================================ F1: the post-composition window
+//
+// ---- the question ----
+//
+// A finger pose cannot go through SkelControls: the authored tree has two or three dormant
+// SkelControlSingleBone donors, P1.3 and P1.4d took all of them, and a hand needs nineteen.
+// The only mechanism that scales is writing SpaceBases directly. SpaceBases is rebuilt from
+// scratch by every pose composition, so such a write lands only if it happens AFTER the
+// composition and BEFORE the render data is built from it - and Update1pArms is not that place.
+// It runs before composition, which is why the wrist path already records SpaceBases read there
+// as one update stale.
+//
+// So: where is that window, and can it be reached from here?
+//
+// ---- why ForceSkelUpdate is the way in ----
+//
+// USkeletalMeshComponent::UpdateSkelPose is the function that composes the pose, and it is not
+// exposed to script in this build - LookupProp cannot see it and the GObjects walk cannot find
+// it. ForceSkelUpdate IS exposed: TdGame calls it, so the UFunction exists, and its Func field
+// holds the address of a native exec.
+//
+// That exec is a thin wrapper. UE3 declares script natives as DECLARE_FUNCTION(execX), which
+// expands to a member function taking (FFrame&, RESULT_DECL); ForceSkelUpdate's body is P_FINISH
+// followed by the call that does the work. Walking those few instructions to the call it makes
+// yields UpdateSkelPose's address - or, if the call is indirect, its vtable slot. That is a
+// derivation from the shipped code rather than a pattern match against a build we do not have.
+//
+// ---- this rung REPORTS and does not hook ----
+//
+// A detour has to know the target's arity: on __thiscall the callee pops its own stack
+// arguments, so a hook that guesses two where the truth is zero corrupts the stack of the
+// function that called it. Nothing available here says whether this build's UpdateSkelPose takes
+// (FLOAT, UBOOL) or nothing at all. The instruction walk answers that too - the pushes standing
+// between the last register setup and the call ARE the argument count - but reading the answer
+// out of a log costs one run, and guessing it costs a crash in a scripted sequence a week later.
+// So F1 measures; the typed hook is written against what it measured.
+struct CodeCall {
+    uintptr_t at = 0;           // address of the call instruction itself
+    uintptr_t direct = 0;       // resolved target, for E8 rel32 or a tail E9/EB
+    uintptr_t absIndirect = 0;  // FF /2 with mod=00 rm=101: call [imm32], an absolute slot
+    int       vtableDisp = -1;  // FF /2 through a register, so a vtable displacement
+    int       pushesBefore = 0; // pushes since the previous call - the argument count at the site
+    bool      onThis = false;   // immediately preceded by mov ecx, <the register holding this>
+    bool      tail = false;     // reached by jmp, so the caller's own ret carries the arity
+};
+
+struct CodeWalk {
+    CodeCall calls[8]{};
+    int  callCount = 0;
+    int  retBytes = -1;         // imm16 of the first ret reached; 0 for a bare ret; -1 for none
+    int  instructions = 0;
+    bool ended = false;         // reached a ret or a tail jump rather than a bound or an error
+};
+
+// One bounded linear walk of a function, collecting its calls and its stack cleanup.
+//
+// Linear disassembly is only sound over short, straight-line code - a jump table read as
+// instructions decodes into nonsense - so every use of this is bounded, and every conclusion it
+// feeds is cross-checked against something else. `ended` says whether the walk actually reached
+// a return; a walk that ran out of budget has not proven anything.
+static bool WalkFunction(uintptr_t fn, int maxBytes, int maxInstructions, CodeWalk* out)
+{
+    if (!out || !fn || maxBytes <= 0) return false;
+    *out = CodeWalk{};
+    if (maxBytes > 512) maxBytes = 512;
+
+    uint8_t code[512]{};
+    if (!SafeRead(fn, code, (size_t)maxBytes)) return false;
+
+    int  thisReg = -1;          // the register the prologue copied ECX into
+    bool ecxIsThis = false;     // ECX is believed to still hold `this`
+    int  pushes = 0;
+    unsigned offset = 0;
+
+    while ((int)offset < maxBytes && out->instructions < maxInstructions) {
+        hde32s hs{};
+        const unsigned len = hde32_disasm(code + offset, &hs);
+        if (!len || (hs.flags & F_ERROR)) return false;
+        ++out->instructions;
+        const uintptr_t ip = fn + offset;
+
+        // ---- is ECX still carrying `this` when this call happens? ----
+        //
+        // The prologue's `mov <reg>, ecx` parks `this`, and a `mov ecx, <that reg>` hands it back
+        // before a call on the same object. Run 2 tracked that as a one-instruction flag and got
+        // it wrong on two calls out of three: MSVC interleaves the x87 store of an unrelated
+        // local between the setup and the call, so only the one adjacent pair was ever seen.
+        //
+        // It is a STATE, not an adjacency - ECX holds `this` until something writes ECX. The
+        // clear list below is the common writers plus every call, which makes this a heuristic
+        // rather than a proof, and it is used accordingly: reported as corroboration and as a
+        // tiebreak, never as the thing a target is selected by.
+        if (hs.opcode == 0x8B && (hs.flags & F_MODRM) && hs.modrm_mod == 3 &&
+            hs.modrm_rm == 1 && thisReg < 0 && hs.modrm_reg != 1) {
+            thisReg = hs.modrm_reg;                     // mov <reg>, ecx
+        } else if (hs.opcode == 0x8B && (hs.flags & F_MODRM) && hs.modrm_reg == 1) {
+            ecxIsThis = hs.modrm_mod == 3 && thisReg >= 0 &&
+                        hs.modrm_rm == (uint8_t)thisReg;    // mov ecx, <reg> - or some other load
+        } else if (hs.opcode == 0xB9 || hs.opcode == 0x59 ||
+                   ((hs.opcode == 0x8D || hs.opcode == 0x33 || hs.opcode == 0x31) &&
+                    (hs.flags & F_MODRM) && hs.modrm_reg == 1) ||
+                   (hs.opcode == 0x89 && (hs.flags & F_MODRM) && hs.modrm_mod == 3 &&
+                    hs.modrm_rm == 1)) {
+            ecxIsThis = false;                          // mov ecx,imm / pop ecx / lea / xor / mov
+        }
+        const bool wasEcxThis = ecxIsThis;
+
+        if ((hs.opcode >= 0x50 && hs.opcode <= 0x57) || hs.opcode == 0x68 || hs.opcode == 0x6A ||
+            (hs.opcode == 0xFF && (hs.flags & F_MODRM) && hs.modrm_reg == 6)) {
+            ++pushes;
+        } else if (hs.opcode == 0xE8) {                        // call rel32
+            if (out->callCount < 8) {
+                CodeCall& c = out->calls[out->callCount++];
+                c.at = ip;
+                c.direct = ip + len + (uintptr_t)(int32_t)hs.imm.imm32;
+                c.pushesBefore = pushes;
+                c.onThis = wasEcxThis;
+            }
+            pushes = 0;
+        } else if (hs.opcode == 0xFF && (hs.flags & F_MODRM) && hs.modrm_reg == 2) {
+            if (out->callCount < 8) {
+                CodeCall& c = out->calls[out->callCount++];
+                c.at = ip;
+                // mod=00 with rm=101 is not a register at all - it is `call [imm32]`, an
+                // absolute slot such as an import thunk. Reporting that displacement as a vtable
+                // offset is what produced run 1's nonsense "vtable slot 8470905".
+                if (hs.modrm_mod == 0 && hs.modrm_rm == 5)
+                    c.absIndirect = (uintptr_t)hs.disp.disp32;
+                else
+                    c.vtableDisp = (hs.flags & F_DISP32) ? (int)(int32_t)hs.disp.disp32 :
+                                   (hs.flags & F_DISP8)  ? (int)(int8_t)hs.disp.disp8 : 0;
+                c.pushesBefore = pushes;
+                c.onThis = wasEcxThis;
+            }
+            pushes = 0;
+        } else if (hs.opcode == 0xE9 || hs.opcode == 0xEB) {
+            const uintptr_t jmpTarget = ip + len + (uintptr_t)(hs.opcode == 0xE9
+                ? (int32_t)hs.imm.imm32 : (int32_t)(int8_t)hs.imm.imm8);
+            // An unconditional jump INSIDE the window is ordinary control flow, not a tail call -
+            // MSVC emits them to join branches. Run 3 reported "cleans -1 bytes (reached its
+            // return)" about the LOD helper for exactly this reason: its first internal jmp
+            // ended the walk before any epilogue. Follow a forward one and carry on; a backward
+            // one is a loop this cannot resolve linearly, so stop without claiming an answer.
+            if (jmpTarget > ip && jmpTarget < fn + (unsigned)maxBytes) {
+                offset = (unsigned)(jmpTarget - fn);
+                continue;
+            }
+            if (jmpTarget <= ip) return true;      // backward: `ended` stays false
+
+            // A genuine tail jump, and real here rather than defensive: a body whose only work is
+            // one call in tail position compiles to jmp, and a walk that looked only for calls
+            // would report "nothing found" about a function that is entirely the answer.
+            if (out->callCount < 8) {
+                CodeCall& c = out->calls[out->callCount++];
+                c.at = ip;
+                c.direct = jmpTarget;
+                c.pushesBefore = pushes;
+                c.onThis = wasEcxThis;
+                c.tail = true;
+            }
+            out->ended = true;
+            return true;
+        } else if (hs.opcode == 0xC3 || hs.opcode == 0xC2) {
+            out->retBytes = (hs.opcode == 0xC2) ? (int)hs.imm.imm16 : 0;
+            out->ended = true;
+            return true;
+        }
+        offset += len;
+    }
+    return true;      // decoded cleanly but never reached a return; `ended` stays false
+}
+
+// ---- what F1 measured, run 1 (2026-08-28) ----
+//
+//   execForceSkelUpdate   P_FINISH, then exactly one direct call on `this`, then ret 8
+//     ForceSkelUpdate     saves LastRenderTime, makes three calls, restores it
+//       call A  0 args    LOD status - writes the component's two predicted-LOD fields
+//       call B  2 args    resizes [this+0x240] at 0x40 bytes an element and [this+0x24C] at
+//                         0x20, then composes. 0x240 is exactly where the property walker
+//                         independently placed SpaceBases, and 0x40 is sizeof(FMatrix). Its own
+//                         epilogue is `ret 8`, so the two pushes are real arguments:
+//                         UpdateSkelPose(FLOAT DeltaTime, UBOOL bTickFaceFX).
+//       call C  0 args    `if (flags & 1) jmp [vtable+0x120]` - ConditionalUpdateTransform,
+//                         which is where a composed pose becomes render data.
+//
+// B sits between the composition and C's upload, so RETURNING from B is the window this rung went
+// looking for: the pose exists and nothing has read it yet.
+//
+// None of those addresses are written down. The chain is re-derived every run, and the arity is
+// taken from the callee's own stack cleanup as well as from the push count - if a build disagrees
+// with any link the hook is refused rather than installed on a guess. That matters more than
+// usual here: __thiscall makes the callee pop its own arguments, so a hook that believes two
+// where the truth is zero corrupts the stack of whatever called it.
+typedef void (__fastcall *PFN_UpdateSkelPose)(void* self, void* edx, float deltaTime,
+                                              int tickFaceFX);
+static PFN_UpdateSkelPose g_origUpdateSkelPose = nullptr;
+static uintptr_t g_updateSkelPoseTarget = 0;
+// Published by ProbeFingerBones on the game thread and consumed by the pose hook on that same
+// thread, so the hook never has to walk a pawn of its own to know which component is ours.
+static uintptr_t g_probeMesh1p = 0;
+// Alongside it, so the capture can name the movement state a fist was taken in - which is the
+// one thing that says whether it came from the run cycle or from something unrepresentative.
+static uintptr_t g_probePawn = 0;
+static void __fastcall Hook_UpdateSkelPose(void* self, void* edx, float deltaTime,
+                                           int tickFaceFX);
+
+static bool g_skelPoseProbed = false;
+
+static void ProbeUpdateSkelPose()
+{
+    if (g_skelPoseProbed || !g_motionHands) return;
+
+    uintptr_t scriptTarget = 0;
+    const int funcOffset = DeriveUFunctionFuncOffset(&scriptTarget);
+    if (funcOffset < 0) return;
+
+    int matches = 0;
+    const uintptr_t exec = FindNativeUFunction("ForceSkelUpdate", "SkeletalMeshComponent",
+                                               funcOffset, scriptTarget, "hands-f1", &matches);
+    if (!exec) return;      // FindNativeUFunction has already said why
+
+    g_skelPoseProbed = true;   // one attempt per process; a second would say the same thing
+    Log("*** [hands-f1] SkeletalMeshComponent.ForceSkelUpdate exec at %p"
+        " (%d owner-validated object%s)", (void*)exec, matches, matches == 1 ? "" : "s");
+
+    auto report = [](const char* what, const CodeWalk& w) {
+        for (int i = 0; i < w.callCount; ++i) {
+            const CodeCall& c = w.calls[i];
+            if (c.direct)
+                Log("[hands-f1]   %s %s at %p -> %p, %d push%s, %s", what,
+                    c.tail ? "tail jmp" : "call    ", (void*)c.at, (void*)c.direct,
+                    c.pushesBefore, c.pushesBefore == 1 ? " " : "es",
+                    c.onThis ? "on this" : "not on this");
+            else if (c.absIndirect)
+                Log("[hands-f1]   %s call     at %p -> [%p] absolute slot, %d push%s", what,
+                    (void*)c.at, (void*)c.absIndirect, c.pushesBefore,
+                    c.pushesBefore == 1 ? "" : "es");
+            else
+                Log("[hands-f1]   %s call     at %p -> vtable +0x%X (slot %d), %d push%s", what,
+                    (void*)c.at, c.vtableDisp, c.vtableDisp / 4, c.pushesBefore,
+                    c.pushesBefore == 1 ? "" : "es");
+        }
+        Log("[hands-f1]   %s ends: %s, cleans %d bytes", what,
+            w.ended ? "reached its return" : "RAN PAST ITS BOUND", w.retBytes);
+    };
+
+    // ---- link 1: the exec's one zero-argument call on `this` is the C++ ForceSkelUpdate ----
+    CodeWalk execWalk{};
+    if (!WalkFunction(exec, 96, 32, &execWalk) || !execWalk.ended) {
+        Log("[hands-f1] the exec did not decode to a return - probe stops here");
+        return;
+    }
+    report("exec  ", execWalk);
+    // The exec's one DIRECT call is the C++ method. Its other call is an absolute slot through
+    // .data, which is the optional-parameter path and never a member function.
+    uintptr_t forceSkelUpdate = 0;
+    int execCandidates = 0;
+    for (int i = 0; i < execWalk.callCount; ++i)
+        if (execWalk.calls[i].direct && execWalk.calls[i].direct >= g_textLo &&
+            execWalk.calls[i].direct < g_textHi) {
+            forceSkelUpdate = execWalk.calls[i].direct;
+            ++execCandidates;
+        }
+    if (execCandidates != 1) {
+        Log("[hands-f1] VERDICT: the exec makes %d direct calls into .text, not one."
+            " ForceSkelUpdate is not the wrapper this expects on this build.", execCandidates);
+        return;
+    }
+    Log("[hands-f1] ForceSkelUpdate at %p", (void*)forceSkelUpdate);
+
+    // ---- link 2 and 3: the two-argument call on `this` whose callee cleans 8 bytes ----
+    //
+    // Both ends of the same fact. The check is not ceremony: a prologue's own register saves land
+    // in the call-site push count too, so that number alone is not conclusive - on this build it
+    // makes the LastRenderTime helper look like a two-argument call as well.
+    CodeWalk bodyWalk{};
+    if (!WalkFunction(forceSkelUpdate, 160, 64, &bodyWalk) || !bodyWalk.ended) {
+        Log("[hands-f1] ForceSkelUpdate did not decode to a return - probe stops here");
+        return;
+    }
+    report("body  ", bodyWalk);
+
+    // Every direct callee gets walked and its stack cleanup printed, whether or not it is
+    // selected. Run 2 refused to install and the log could not say which link had failed; an
+    // evidence table costs four extra lines and makes the next failure legible immediately.
+    uintptr_t updateSkelPose = 0;
+    int candidates = 0;
+    bool ambiguous = false;
+    for (int i = 0; i < bodyWalk.callCount; ++i) {
+        const CodeCall& c = bodyWalk.calls[i];
+        if (!c.direct || c.direct < g_textLo || c.direct >= g_textHi) continue;
+        CodeWalk calleeWalk{};
+        const bool walked = WalkFunction(c.direct, 512, 400, &calleeWalk);
+        const bool cleans8 = walked && calleeWalk.ended && calleeWalk.retBytes == 8;
+        const bool fits = c.pushesBefore == 2 && cleans8;
+        Log("[hands-f1]   callee %p: %d push%s at the site, cleans %d bytes (%s), %s -> %s",
+            (void*)c.direct, c.pushesBefore, c.pushesBefore == 1 ? " " : "es",
+            calleeWalk.retBytes,
+            (!walked || !calleeWalk.ended) ? "no return within bounds"
+                : calleeWalk.retBytes < 0  ? "left by a tail jump, arity unknown"
+                                           : "reached its return",
+            c.onThis ? "on this" : "this not tracked to it",
+            fits ? "MATCHES UpdateSkelPose" : "no");
+        if (!fits) continue;
+        // Both ends of the same fact: two pushes at the site and `ret 8` at the callee. Neither
+        // alone is enough - a prologue's own register saves land in the push count too, which on
+        // this build makes the LastRenderTime helper look like a two-argument call as well, and
+        // only its bare `ret` tells them apart. `on this` is logged as corroboration and is
+        // deliberately not allowed to select or reject anything: run 2 refused to install
+        // because that heuristic was wrong, and a heuristic that can veto is a heuristic that
+        // can cost a run.
+        if (candidates && c.direct != updateSkelPose) ambiguous = true;
+        updateSkelPose = c.direct;
+        ++candidates;
+    }
+    if (candidates != 1 || ambiguous) {
+        Log("[hands-f1] VERDICT: %d calls inside ForceSkelUpdate take two arguments and clean 8"
+            " bytes. Exactly one is required - no hook installed.", candidates);
+        return;
+    }
+
+    const MH_STATUS init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
+        Log("[hands-f1] hook refused: MH_Initialize status %d", (int)init);
+        return;
+    }
+    if (MH_CreateHook(reinterpret_cast<void*>(updateSkelPose),
+                      reinterpret_cast<void*>(&Hook_UpdateSkelPose),
+                      reinterpret_cast<void**>(&g_origUpdateSkelPose)) != MH_OK) {
+        g_origUpdateSkelPose = nullptr;
+        Log("[hands-f1] UpdateSkelPose MH_CreateHook failed");
+        return;
+    }
+    if (MH_EnableHook(reinterpret_cast<void*>(updateSkelPose)) != MH_OK) {
+        MH_RemoveHook(reinterpret_cast<void*>(updateSkelPose));
+        g_origUpdateSkelPose = nullptr;
+        Log("[hands-f1] UpdateSkelPose MH_EnableHook failed");
+        return;
+    }
+    g_updateSkelPoseTarget = updateSkelPose;
+    Log("*** [hands-f1] VERDICT: UpdateSkelPose derived at %p and hooked. Returning from it is"
+        " the post-composition window; the census below has to prove SpaceBases really does"
+        " change across it.", (void*)updateSkelPose);
 }
 
 // Resolve every field needed to identify the first-person arm rig, plus the controller data
@@ -7214,6 +7944,20 @@ static void CheckHeadHotkeys()
     }
     pNMul = dNMul;
 
+    // F2's finger curl. NUMPAD / is the last unbound key on the pad, and this wants a key rather
+    // than an ini line: the answer is "look at your hands", so it has to be switchable while
+    // looking at them. F4 hands the same target over to the grip axis.
+    static bool pNDiv = false;
+    const bool dNDiv = (GetAsyncKeyState(VK_DIVIDE) & 0x8000) != 0;
+    if (dNDiv && !pNDiv) {
+        g_bonePokeProbe = !g_bonePokeProbe;
+        Log("*** [hands-f2] NUMPAD / -> fingers %s%s (%ld block write%s so far)",
+            g_bonePokeProbe ? "CLOSING" : "OPENING",
+            g_gripToGrip ? "  (GripToGrip is on, so the grips override this)" : "",
+            g_bonePokeWrites, g_bonePokeWrites == 1 ? "" : "s");
+    }
+    pNDiv = dNDiv;
+
     // AS.1a curve sweep. NUMPAD + runs the current step, NUMPAD - rewinds to the first.
     //
     // One step per press, never a whole automatic run: each step needs a straight to run down
@@ -7249,6 +7993,7 @@ static void CheckHeadHotkeys()
         { "SPRINT ON",  &g_swingSprintOnMS,  0.05f, 0.40f, 3.00f },
         { "SPRINT OFF", &g_swingSprintOffMS, 0.05f, 0.20f, 3.00f },
         { "STOP MS",    &g_swingStopMs,     25.0f, 50.0f, 600.0f },
+        { "BOTH ARMS",  &g_swingBothArmsMs, 50.0f, 200.0f, 2000.0f },
         { "UNISON",     &g_swingUnisonMax,   0.05f, -0.50f, 1.00f },
         { "JUMP RISE",  &g_swingJumpRise,    0.05f, 0.05f, 1.00f },
         { "CROUCH DROP",&g_swingCrouchDrop,  0.05f, 0.05f, 1.00f },
@@ -8126,6 +8871,7 @@ static DWORD WINAPI MotionInitRetryThread(LPVOID)
     Log("[hands-rig] startup metadata was incomplete; retrying arm layout in background");
     ResolveMotionRigOffsets();
     InstallUpdate1pArmsHook();
+    ProbeUpdateSkelPose();
     InterlockedExchange(&g_motionInitRetryRunning, 0);
     return 0;
 }
@@ -8631,6 +9377,1167 @@ static bool ReadUE3Array(uintptr_t object, int offset, int maxCount, UE3Array32*
         value.capacity < value.count || value.capacity > maxCount * 4) return false;
     *out = value;
     return true;
+}
+
+// ================================================================ F0: is the finger block real
+//
+// SK_UpperBody's bone order was read offline out of AS_C1P_Unarmed's TrackBoneNames, which a
+// UAnimSet stores in reference-skeleton order. It agrees with all ten bone indices this file
+// already measured in-game - root 0, Hips 1, LeftShoulder 16 through LeftHand 19, LeftForeArmRoll
+// 41, RightShoulder 45 through RightHand 48, RightForeArmRoll 71, CameraJoint 73 - which is what
+// makes it evidence rather than a table someone typed. It says there are 74 bones and that both
+// hands carry a full HumanIK finger set, nineteen bones each, contiguous.
+//
+// Two things that table cannot tell us, and that a pose would silently get wrong:
+//
+//   1. The PARENT of each finger bone. Depth-first order plus the naming makes the chains
+//      obvious, but obvious is how the movement-state ids got misread twice.
+//   2. Whether the finger SpaceBases are composed at all. SpaceBases is sized to the whole
+//      skeleton, and only the LOD's RequiredBones are written into it - a first-person mesh at
+//      arm's length should be at LOD0 with all of them, but "should" is not a measurement.
+//
+// One test answers both. A bone's distance from its parent's origin is its length, and lengths
+// do not change: if the assumed parent is right and both bones are being composed, the distance
+// is the same on every frame in every pose. A wrong parent makes it swing with the animation,
+// and an uncomposed bone makes it jump around or sit at zero.
+struct FingerBone { uint8_t index; uint8_t parent; const char* name; };
+static const FingerBone kFingerBones[] = {
+    { 21, 19, "LeftHandMiddle0"  }, { 22, 21, "LeftHandMiddle1"  },
+    { 23, 22, "LeftHandMiddle2"  }, { 24, 23, "LeftHandMiddle3"  },
+    { 25, 19, "LeftHandRing0"    }, { 26, 25, "LeftHandRing1"    },
+    { 27, 26, "LeftHandRing2"    }, { 28, 27, "LeftHandRing3"    },
+    { 29, 19, "LeftHandPinky0"   }, { 30, 29, "LeftHandPinky1"   },
+    { 31, 30, "LeftHandPinky2"   }, { 32, 31, "LeftHandPinky3"   },
+    { 33, 19, "LeftHandIndex0"   }, { 34, 33, "LeftHandIndex1"   },
+    { 35, 34, "LeftHandIndex2"   }, { 36, 35, "LeftHandIndex3"   },
+    { 37, 19, "LeftHandThumb1"   }, { 38, 37, "LeftHandThumb2"   },
+    { 39, 38, "LeftHandThumb3"   },
+    { 50, 48, "RightHandMiddle0" }, { 51, 50, "RightHandMiddle1" },
+    { 52, 51, "RightHandMiddle2" }, { 53, 52, "RightHandMiddle3" },
+    { 54, 48, "RightHandRing0"   }, { 55, 54, "RightHandRing1"   },
+    { 56, 55, "RightHandRing2"   }, { 57, 56, "RightHandRing3"   },
+    { 58, 48, "RightHandPinky0"  }, { 59, 58, "RightHandPinky1"  },
+    { 60, 59, "RightHandPinky2"  }, { 61, 60, "RightHandPinky3"  },
+    { 62, 48, "RightHandIndex0"  }, { 63, 62, "RightHandIndex1"  },
+    { 64, 63, "RightHandIndex2"  }, { 65, 64, "RightHandIndex3"  },
+    { 66, 48, "RightHandThumb1"  }, { 67, 66, "RightHandThumb2"  },
+    { 68, 67, "RightHandThumb3"  },
+};
+static const int kFingerBoneCount = (int)(sizeof(kFingerBones) / sizeof(kFingerBones[0]));
+// The first and last bone this reads, so the whole span comes back in one guarded read rather
+// than fifty of them: LeftHand through RightHandThumb3.
+static const int kFingerSpanFirst = 19;
+static const int kFingerSpanLast  = 68;
+static const int kFingerSpanCount = kFingerSpanLast - kFingerSpanFirst + 1;
+
+static float g_fingerLenMin[kFingerBoneCount];
+static float g_fingerLenMax[kFingerBoneCount];
+static long  g_fingerSamples = 0;
+static bool  g_fingerReported = false;
+
+static void ProbeFingerBones(uintptr_t pawn)
+{
+    if (!g_motionHands || g_offMesh1p <= 0 || g_offMeshSpaceBases < 0) return;
+
+    uint32_t mesh = 0;
+    UE3Array32 bases{};
+    if (!SafeU32(pawn + g_offMesh1p, &mesh) ||
+        !LooksLikeRigObject(mesh, "TdSkeletalMeshComponent")) {
+        g_probeMesh1p = 0; g_probePawn = 0; return;
+    }
+    g_probePawn = pawn;
+    // Publish it for the pose hook, which fires for every skeletal mesh in the level and needs
+    // to recognise ours. Revalidated here every arm update, so a pawn swap cannot leave the hook
+    // writing into a component that has been destroyed.
+    g_probeMesh1p = mesh;
+    if (!ReadUE3Array(mesh, g_offMeshSpaceBases, 512, &bases)) return;
+
+    // Once the table has been reported this is a 3 KB guarded read per arm update answering a
+    // question that has been answered.
+    if (g_fingerReported) return;
+
+    if (bases.count <= kFingerSpanLast) {
+        static int lastCount = -1;
+        if (bases.count != lastCount) {
+            lastCount = bases.count;
+            Log("[hands-f0] SpaceBases holds %d bones - too few for the finger block, which ends"
+                " at %d. The offline table does not describe this mesh.",
+                bases.count, kFingerSpanLast);
+        }
+        return;
+    }
+
+    UE3Matrix44 span[kFingerSpanCount];
+    if (!SafeRead(bases.data + (uint32_t)kFingerSpanFirst * sizeof(UE3Matrix44),
+                  span, sizeof(span))) return;
+    auto origin = [&](int bone) -> MEVR_Vec3 {
+        const UE3Matrix44& m = span[bone - kFingerSpanFirst];
+        return { m.m[3][0], m.m[3][1], m.m[3][2] };
+    };
+
+    if (g_fingerSamples == 0)
+        for (int i = 0; i < kFingerBoneCount; ++i) {
+            g_fingerLenMin[i] = 1.0e9f;
+            g_fingerLenMax[i] = -1.0e9f;
+        }
+
+    bool finite = true;
+    for (int i = 0; i < kFingerBoneCount && finite; ++i) {
+        const MEVR_Vec3 a = origin(kFingerBones[i].index);
+        const MEVR_Vec3 p = origin(kFingerBones[i].parent);
+        const float len = VecLength({ a.x - p.x, a.y - p.y, a.z - p.z });
+        if (!std::isfinite(len)) { finite = false; break; }
+        if (len < g_fingerLenMin[i]) g_fingerLenMin[i] = len;
+        if (len > g_fingerLenMax[i]) g_fingerLenMax[i] = len;
+    }
+    if (!finite) return;      // a half-composed frame is not evidence either way
+    ++g_fingerSamples;
+
+    // 300 arm updates is a few seconds of walking, which is long enough for the animation to have
+    // moved every finger through a real range. Reported once: this is a property of the asset,
+    // not a per-frame signal, and a repeating table would bury the [hands-bones] lines.
+    if (!g_fingerReported && g_fingerSamples >= 300) {
+        g_fingerReported = true;
+        Log("*** [hands-f0] finger block over %ld arm updates, %d bones, SpaceBases holds %d:",
+            g_fingerSamples, kFingerBoneCount, bases.count);
+        int wrong = 0;
+        for (int i = 0; i < kFingerBoneCount; ++i) {
+            const float spread = g_fingerLenMax[i] - g_fingerLenMin[i];
+            // A rigid bone under a correct parent held ~0 spread across every pose in the window.
+            // The bound is loose next to float noise on a 1-10 UU length and tight next to what a
+            // wrong parent produces, which is the whole animated swing of the joint.
+            const bool bad = spread > 0.05f || g_fingerLenMax[i] < 0.01f;
+            if (bad) ++wrong;
+            Log("[hands-f0]   %-18s bone %2u parent %2u  length %6.3f..%6.3f UU%s",
+                kFingerBones[i].name, kFingerBones[i].index, kFingerBones[i].parent,
+                g_fingerLenMin[i], g_fingerLenMax[i], bad ? "   <-- NOT RIGID" : "");
+        }
+        if (wrong == 0)
+            Log("*** [hands-f0] VERDICT: all %d finger bones are composed and rigid under the"
+                " assumed parents. The offline bone table describes this mesh, and the finger"
+                " chains are safe to drive.", kFingerBoneCount);
+        else
+            Log("*** [hands-f0] VERDICT: %d of %d bones are not rigid under their assumed parent."
+                " Either the parent map is wrong or those bones are not being composed - do not"
+                " pose fingers until this reads clean.", wrong, kFingerBoneCount);
+    }
+}
+
+// ================================================================ F2: the finger chain math
+//
+// ---- rotate a joint and everything past it, with no matrix inverses ----
+//
+// The textbook way to bend a joint is to rebuild its local atom - LocalAtom[i] = SpaceBases[i] *
+// inverse(SpaceBases[parent]) - apply a rotation there, and recompose the chain. That needs an
+// inverse per joint, and an inverse is where a silently wrong basis or an unnoticed component
+// scale turns into a hand that looks almost right.
+//
+// It is not needed. Bending a joint IS a rigid rotation of that bone and everything below it,
+// about the joint's own origin, in component space. Composed bases and origins are exactly what
+// SpaceBases already holds, so the whole operation is: pick a pivot, pick an axis, rotate the
+// rows. Bone lengths are preserved by construction rather than by care, which is the property
+// F0's rigidity check can then confirm was not lost.
+//
+// This is also the general primitive, not a stepping stone. A captured pose (F3) is a relative
+// rotation per joint; converting one to an axis and an angle in the joint's own frame and pushing
+// it through the joint's basis lands in exactly this function. What changes later is where the
+// axis comes from, not the machinery.
+struct Mat3 { float m[3][3]; };
+
+// Row-vector convention throughout, matching SpaceBases: v' = v * R, and rows 0..2 of a bone
+// matrix are its axes while row 3 is its origin.
+static Mat3 AxisAngleMatrix(const MEVR_Vec3& axis, float radians)
+{
+    const float c = cosf(radians), s = sinf(radians), C = 1.0f - c;
+    const float x = axis.x, y = axis.y, z = axis.z;
+    // Built column-convention and transposed on the way out, because that is the form the
+    // derivation is normally written in and a transposed rotation is a rotation the wrong way.
+    const float M[3][3] = {
+        { c + x*x*C,   x*y*C - z*s, x*z*C + y*s },
+        { y*x*C + z*s, c + y*y*C,   y*z*C - x*s },
+        { z*x*C - y*s, z*y*C + x*s, c + z*z*C   },
+    };
+    Mat3 R{};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) R.m[i][j] = M[j][i];
+    return R;
+}
+
+static MEVR_Vec3 RowTimesMat3(const MEVR_Vec3& v, const Mat3& R)
+{
+    return { v.x*R.m[0][0] + v.y*R.m[1][0] + v.z*R.m[2][0],
+             v.x*R.m[0][1] + v.y*R.m[1][1] + v.z*R.m[2][1],
+             v.x*R.m[0][2] + v.y*R.m[1][2] + v.z*R.m[2][2] };
+}
+
+static MEVR_Vec3 SpanOrigin(const UE3Matrix44* span, int bone)
+{
+    const UE3Matrix44& m = span[bone - kFingerSpanFirst];
+    return { m.m[3][0], m.m[3][1], m.m[3][2] };
+}
+
+static bool NormalizeVec(MEVR_Vec3* v)
+{
+    const float len = VecLength(*v);
+    if (!std::isfinite(len) || len < 1.0e-6f) return false;
+    v->x /= len; v->y /= len; v->z /= len;
+    return true;
+}
+
+// Rotate bones [first..last] rigidly about `pivot`. Callers pass a joint and the tip of its own
+// chain, which for these serial finger chains is exactly the joint's subtree.
+static void RotateSpanRange(UE3Matrix44* span, int first, int last,
+                            const MEVR_Vec3& pivot, const Mat3& R)
+{
+    for (int b = first; b <= last; ++b) {
+        UE3Matrix44& m = span[b - kFingerSpanFirst];
+        for (int r = 0; r < 3; ++r) {
+            const MEVR_Vec3 row{ m.m[r][0], m.m[r][1], m.m[r][2] };
+            const MEVR_Vec3 out = RowTimesMat3(row, R);
+            m.m[r][0] = out.x; m.m[r][1] = out.y; m.m[r][2] = out.z;
+        }
+        const MEVR_Vec3 t{ m.m[3][0] - pivot.x, m.m[3][1] - pivot.y, m.m[3][2] - pivot.z };
+        const MEVR_Vec3 out = RowTimesMat3(t, R);
+        m.m[3][0] = out.x + pivot.x; m.m[3][1] = out.y + pivot.y; m.m[3][2] = out.z + pivot.z;
+    }
+}
+
+// ---- the five chains of one hand ----
+//
+// Weights are per joint down the chain, and they are SCAFFOLDING: F3 replaces them with a fist
+// captured from the game's own animation, which is the only source that knows what Faith's hand
+// actually does. They are here so F2 can be judged at all. The shape is the honest part - F0
+// measured the metacarpals sitting 0.8-1.2 UU from the hand against 8 UU for the proximals, so
+// they are pivot helpers and barely move in a real fist.
+struct FingerChainDef { uint8_t first; uint8_t count; float weight[4]; };
+static const FingerChainDef kChains[2][5] = {
+    { { 21, 4, { 0.10f, 1.00f, 1.00f, 0.60f } },     // LeftHandMiddle0..3
+      { 25, 4, { 0.10f, 1.00f, 1.00f, 0.60f } },     // LeftHandRing0..3
+      { 29, 4, { 0.10f, 1.00f, 1.00f, 0.60f } },     // LeftHandPinky0..3
+      { 33, 4, { 0.10f, 1.00f, 1.00f, 0.60f } },     // LeftHandIndex0..3
+      { 37, 3, { 0.35f, 0.55f, 0.45f, 0.00f } } },   // LeftHandThumb1..3
+    { { 50, 4, { 0.10f, 1.00f, 1.00f, 0.60f } },
+      { 54, 4, { 0.10f, 1.00f, 1.00f, 0.60f } },
+      { 58, 4, { 0.10f, 1.00f, 1.00f, 0.60f } },
+      { 62, 4, { 0.10f, 1.00f, 1.00f, 0.60f } },
+      { 66, 3, { 0.35f, 0.55f, 0.45f, 0.00f } } },
+};
+// Per hand: the hand itself, the two metacarpals that give the knuckle line, and the middle
+// finger's proximal and distal - the pair that says how far the hand is from closed.
+struct HandBones { uint8_t hand, index0, pinky0, middle1, middle3; };
+static const HandBones kHandBones[2] = { { 19, 33, 29, 22, 24 },
+                                         { 48, 62, 58, 51, 53 } };
+static const float kCurlFullRad = 85.0f * 3.14159265358979f / 180.0f;
+
+// ---- which way is closed? ----
+//
+// Fingers are hinges and all four flex about one axis: the knuckle line. That line is in the
+// pose already - metacarpal to metacarpal - so it is read rather than assumed, and it stays
+// correct if a future mesh has a differently built hand.
+//
+// Its SIGN is not free, though. The same line read the same way on two mirrored hands points
+// opposite ways relative to each palm, so one hand would close and the other would bend
+// backwards. Rather than hard-code a flip per side, ask the pose which way it is ALREADY bent: a
+// hand that is even slightly relaxed has its distal segment angled palm-ward from its middle one,
+// and "more closed" is more of that. Each hand answers for itself, every frame, so handedness is
+// never assumed and a rebuilt mesh cannot silently invert one side.
+//
+// The obvious-looking alternative - "a closing fingertip moves towards the wrist" - was written
+// first and is worthless. A straight finger points directly away from the wrist, so the direction
+// it swings is perpendicular to the wrist and the test reads zero in exactly the neutral pose it
+// has to work in. Simulating it on a synthetic hand is what caught that, before a run did.
+static bool CurlOneHand(UE3Matrix44* span, int hand, float t, const char** why)
+{
+    const HandBones& hb = kHandBones[hand];
+
+    const MEVR_Vec3 knuckleIndex = SpanOrigin(span, hb.index0);
+    const MEVR_Vec3 knucklePinky = SpanOrigin(span, hb.pinky0);
+    MEVR_Vec3 axis{ knucklePinky.x - knuckleIndex.x,
+                    knucklePinky.y - knuckleIndex.y,
+                    knucklePinky.z - knuckleIndex.z };
+    if (!NormalizeVec(&axis)) { *why = "the knuckle line is degenerate"; return false; }
+
+    // Summed over all four fingers rather than read off one, so a single oddly-posed finger
+    // cannot decide which way the whole hand closes.
+    float evidence = 0.0f;
+    for (int c = 0; c < 4; ++c) {
+        const int p1 = kChains[hand][c].first + 1;      // proximal, middle, distal
+        MEVR_Vec3 seg1{ SpanOrigin(span, p1 + 1).x - SpanOrigin(span, p1).x,
+                        SpanOrigin(span, p1 + 1).y - SpanOrigin(span, p1).y,
+                        SpanOrigin(span, p1 + 1).z - SpanOrigin(span, p1).z };
+        MEVR_Vec3 seg2{ SpanOrigin(span, p1 + 2).x - SpanOrigin(span, p1 + 1).x,
+                        SpanOrigin(span, p1 + 2).y - SpanOrigin(span, p1 + 1).y,
+                        SpanOrigin(span, p1 + 2).z - SpanOrigin(span, p1 + 1).z };
+        MEVR_Vec3 whole{ SpanOrigin(span, p1 + 2).x - SpanOrigin(span, p1).x,
+                         SpanOrigin(span, p1 + 2).y - SpanOrigin(span, p1).y,
+                         SpanOrigin(span, p1 + 2).z - SpanOrigin(span, p1).z };
+        if (!NormalizeVec(&seg1) || !NormalizeVec(&seg2) || !NormalizeVec(&whole)) continue;
+        // Where a positive angle about the knuckle line sends the fingertip.
+        MEVR_Vec3 travel{ axis.y*whole.z - axis.z*whole.y,
+                          axis.z*whole.x - axis.x*whole.z,
+                          axis.x*whole.y - axis.y*whole.x };
+        if (!NormalizeVec(&travel)) continue;
+        // The flexion already in the finger, which points palm-ward.
+        const MEVR_Vec3 bend{ seg2.x - seg1.x, seg2.y - seg1.y, seg2.z - seg1.z };
+        evidence += travel.x*bend.x + travel.y*bend.y + travel.z*bend.z;
+    }
+    // A perfectly straight hand carries no evidence of which way it folds. Declining is correct:
+    // this has no business guessing, and the log says so once rather than every frame.
+    if (!std::isfinite(evidence) || fabsf(evidence) < 0.05f) {
+        *why = "the fingers are too straight to say which way they close";
+        return false;
+    }
+    const float sign = evidence > 0.0f ? 1.0f : -1.0f;
+
+    for (int c = 0; c < 5; ++c) {
+        const FingerChainDef& chain = kChains[hand][c];
+        const int last = chain.first + chain.count - 1;
+        for (int j = 0; j < chain.count; ++j) {
+            const float angle = sign * t * kCurlFullRad * chain.weight[j];
+            if (fabsf(angle) < 1.0e-5f) continue;
+            const int joint = chain.first + j;
+            // The pivot is read fresh, AFTER the joints above it in this chain have already
+            // moved. That is forward kinematics rather than an approximation of it: each joint
+            // turns about where it has actually ended up. The axis is not re-read, and must not
+            // be - a finger's joints are parallel hinges, so bending one does not tilt the next.
+            RotateSpanRange(span, joint, last, SpanOrigin(span, joint),
+                            AxisAngleMatrix(axis, angle));
+        }
+    }
+    return true;
+}
+
+// ================================================================ F3: capture Faith's own fist
+//
+// The hand-authored curl above is wrong in three ways at once, and they have one cause. Run 5:
+// both hands closed and stayed rigid, but the fingers folded too far, and the THUMB did not
+// visibly move at all - because it is being rotated about the knuckle line, which for a thumb
+// runs roughly along its own length, so it twists instead of folding. There is no honest set of
+// hand-picked axes and weights that fixes that. A thumb folds about its own axis, and nothing in
+// this file knows what that axis is.
+//
+// Faith's animation does. The player pointed out that the 1p run cycle already holds both hands
+// in a fist and opens them again at a sprint, which makes the game its own reference: the exact
+// pose an artist authored for this exact mesh, thumb included, free of charge, in any ordinary
+// run. So capture it rather than approximating it.
+//
+// ---- what is stored, and why it is a LOCAL rotation ----
+//
+// Not the composed bone matrices - those are wherever the arm happened to be. What is invariant
+// about a fist is each joint's rotation relative to its PARENT, which is the same whether the
+// hand is by your hip or over your head. Blending the live local rotation towards the captured
+// one therefore closes the hand correctly under any arm pose, and at t=1 reproduces the authored
+// fist exactly.
+//
+// The inverses this needs are all transposes: a bone basis is orthonormal, so B^-1 = B^T. That
+// is checked rather than assumed - a mesh with bone scaling would quietly break the identity, so
+// a basis that is not orthonormal is refused.
+static Mat3 Mat3Multiply(const Mat3& a, const Mat3& b)
+{
+    Mat3 r{};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            r.m[i][j] = a.m[i][0]*b.m[0][j] + a.m[i][1]*b.m[1][j] + a.m[i][2]*b.m[2][j];
+    return r;
+}
+
+static Mat3 Mat3Transpose(const Mat3& a)
+{
+    Mat3 r{};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) r.m[i][j] = a.m[j][i];
+    return r;
+}
+
+// A bone's axes, normalized, with the orthonormality this file's transposes depend on actually
+// verified. Row lengths near 1 and pairwise dots near 0, or it is not a rotation and the whole
+// local-rotation identity below is void.
+static bool BasisOf(const UE3Matrix44* span, int bone, Mat3* out)
+{
+    if (!out) return false;
+    const UE3Matrix44& m = span[bone - kFingerSpanFirst];
+    for (int r = 0; r < 3; ++r) {
+        MEVR_Vec3 row{ m.m[r][0], m.m[r][1], m.m[r][2] };
+        if (!NormalizeVec(&row)) return false;
+        out->m[r][0] = row.x; out->m[r][1] = row.y; out->m[r][2] = row.z;
+    }
+    for (int a = 0; a < 3; ++a)
+        for (int b = a + 1; b < 3; ++b) {
+            const float d = out->m[a][0]*out->m[b][0] + out->m[a][1]*out->m[b][1] +
+                            out->m[a][2]*out->m[b][2];
+            if (!std::isfinite(d) || fabsf(d) > 0.02f) return false;
+        }
+    return true;
+}
+
+// Row-vector convention, so the equivalent column matrix is the transpose and the usual
+// extraction reads off the other diagonal.
+static bool Mat3ToAxisAngle(const Mat3& r, MEVR_Vec3* axis, float* radians)
+{
+    if (!axis || !radians) return false;
+    const float trace = r.m[0][0] + r.m[1][1] + r.m[2][2];
+    float c = (trace - 1.0f) * 0.5f;
+    if (!std::isfinite(c)) return false;
+    if (c > 1.0f) c = 1.0f;
+    if (c < -1.0f) c = -1.0f;
+    const float angle = acosf(c);
+    if (angle < 1.0e-5f) { *axis = { 0.0f, 0.0f, 1.0f }; *radians = 0.0f; return true; }
+    // Near half a turn the off-diagonal difference vanishes and the axis cannot be recovered this
+    // way. No finger joint travels that far between its open and closed pose, so this is a
+    // corrupt input rather than a case to handle.
+    if (angle > 3.0f) return false;
+    MEVR_Vec3 a{ r.m[1][2] - r.m[2][1], r.m[2][0] - r.m[0][2], r.m[0][1] - r.m[1][0] };
+    if (!NormalizeVec(&a)) return false;
+    *axis = a;
+    *radians = angle;
+    return true;
+}
+
+static const int kJointsPerHand = kFingerBoneCount / 2;      // 19
+
+// Which bone ends the chain a given joint belongs to. kFingerBones is in chain order - four
+// four-joint fingers then the three-joint thumb - so the chain a slot belongs to is arithmetic,
+// and a serial chain's subtree is simply "everything from here to its tip".
+static int ChainLastBoneFor(int hand, int slot)
+{
+    const int c = (slot < 16) ? (slot / 4) : 4;
+    return kChains[hand][c].first + kChains[hand][c].count - 1;
+}
+
+// ---- the fist, as measured, baked in ----
+//
+// Captured on 2026-08-28 from Faith's own 1p run cycle - movement state Walking, both hands taken
+// at frame 2431 - by the runtime capture below, then printed as source and pasted here. Same
+// measure-then-hard-code loop as the wrist calibration: these are MEASUREMENTS, not tuning, and
+// they should not be "cleaned up" or rounded.
+//
+// Baked because the feature cannot depend on having seen a fist first. A player who squeezes the
+// grip in the first seconds of a level has not run anywhere yet, and a hand that does nothing
+// until you jog somewhere is a bug report, not a feature.
+//
+// What the numbers say, and why no hand-authored pose would have found it: the metacarpals barely
+// move (under 6 degrees on both hands, matching the 0.8-1.2 UU offsets F0 measured), while the
+// two hands hold genuinely DIFFERENT shapes - the left rolls into a fist with its fingertips
+// curled 43-68 degrees, the right wraps around an imaginary cylinder with its proximals at
+// 90-111 and its fingertips nearly straight. Faith's animators posed her two first-person hands
+// differently, and copying one onto the other would throw that away.
+static const Mat3 kBakedFist[2][kJointsPerHand] = {
+    {   // left hand
+        { { { +0.99594f,-0.04263f,+0.07933f }, { +0.04554f,+0.99834f,-0.03533f }, { -0.07770f,+0.03880f,+0.99622f } } },   // LeftHandMiddle0
+        { { { +0.15177f,+0.98733f,-0.04630f }, { -0.93291f,+0.15856f,+0.32333f }, { +0.32658f,-0.00588f,+0.94515f } } },   // LeftHandMiddle1
+        { { { +0.07094f,+0.99398f,-0.08344f }, { -0.99398f,+0.07744f,+0.07745f }, { +0.08344f,+0.07745f,+0.99350f } } },   // LeftHandMiddle2
+        { { { +0.60458f,+0.79375f,-0.06663f }, { -0.79375f,+0.60735f,+0.03296f }, { +0.06663f,+0.03296f,+0.99723f } } },   // LeftHandMiddle3
+        { { { +0.99748f,-0.03993f,-0.05864f }, { +0.03846f,+0.99892f,-0.02608f }, { +0.05962f,+0.02375f,+0.99794f } } },   // LeftHandRing0
+        { { { +0.02647f,+0.99944f,-0.02059f }, { -0.98369f,+0.02971f,+0.17741f }, { +0.17792f,+0.01556f,+0.98392f } } },   // LeftHandRing1
+        { { { +0.12622f,+0.98846f,-0.08372f }, { -0.98846f,+0.13244f,+0.07348f }, { +0.08372f,+0.07348f,+0.99378f } } },   // LeftHandRing2
+        { { { +0.73176f,+0.67913f,-0.05752f }, { -0.67913f,+0.73367f,+0.02256f }, { +0.05752f,+0.02256f,+0.99809f } } },   // LeftHandRing3
+        { { { +0.98388f,+0.01380f,-0.17831f }, { -0.01190f,+0.99986f,+0.01171f }, { +0.17845f,-0.00940f,+0.98390f } } },   // LeftHandPinky0
+        { { { +0.13362f,+0.99031f,+0.03784f }, { -0.98861f,+0.13053f,+0.07488f }, { +0.06921f,-0.04742f,+0.99647f } } },   // LeftHandPinky1
+        { { { +0.41585f,+0.90615f,-0.07719f }, { -0.90615f,+0.42006f,+0.04940f }, { +0.07719f,+0.04940f,+0.99579f } } },   // LeftHandPinky2
+        { { { +0.37195f,+0.92490f,-0.07878f }, { -0.92490f,+0.37647f,+0.05311f }, { +0.07878f,+0.05311f,+0.99548f } } },   // LeftHandPinky3
+        { { { +0.98136f,-0.05940f,+0.18279f }, { +0.07751f,+0.99259f,-0.09361f }, { -0.17587f,+0.10603f,+0.97869f } } },   // LeftHandIndex0
+        { { { +0.25629f,+0.96616f,-0.02905f }, { -0.88456f,+0.24655f,+0.39594f }, { +0.38970f,-0.07578f,+0.91782f } } },   // LeftHandIndex1
+        { { { +0.25329f,+0.96402f,-0.08070f }, { -0.96402f,+0.25848f,+0.06207f }, { +0.08070f,+0.06207f,+0.99480f } } },   // LeftHandIndex2
+        { { { +0.47069f,+0.87922f,-0.07360f }, { -0.87922f,+0.47437f,+0.04400f }, { +0.07360f,+0.04400f,+0.99632f } } },   // LeftHandIndex3
+        { { { +0.76709f,+0.30838f,+0.56255f }, { +0.46060f,+0.34564f,-0.81754f }, { -0.44656f,+0.88625f,+0.12310f } } },   // LeftHandThumb1
+        { { { +0.74263f,+0.64804f,-0.16895f }, { -0.66780f,+0.73559f,-0.11385f }, { +0.05050f,+0.19737f,+0.97903f } } },   // LeftHandThumb2
+        { { { +0.91099f,+0.41242f,+0.00000f }, { -0.41242f,+0.91099f,+0.00000f }, { -0.00000f,+0.00000f,+1.00000f } } },   // LeftHandThumb3
+    },
+    {   // right hand
+        { { { +0.99441f,-0.03654f,+0.09903f }, { +0.04026f,+0.99855f,-0.03580f }, { -0.09758f,+0.03959f,+0.99444f } } },   // RightHandMiddle0
+        { { { -0.13581f,+0.99019f,+0.03299f }, { -0.98650f,-0.13824f,+0.08785f }, { +0.09155f,-0.02061f,+0.99559f } } },   // RightHandMiddle1
+        { { { -0.15385f,+0.98809f,+0.00000f }, { -0.98809f,-0.15385f,-0.00000f }, { +0.00000f,+0.00000f,+1.00000f } } },   // RightHandMiddle2
+        { { { +0.96495f,+0.26244f,+0.00000f }, { -0.26244f,+0.96495f,-0.00000f }, { +0.00000f,-0.00000f,+1.00000f } } },   // RightHandMiddle3
+        { { { +0.99855f,-0.02681f,-0.04659f }, { +0.02161f,+0.99385f,-0.10863f }, { +0.04921f,+0.10746f,+0.99299f } } },   // RightHandRing0
+        { { { -0.14516f,+0.98594f,+0.08278f }, { -0.98488f,-0.13600f,-0.10728f }, { -0.09451f,-0.09710f,+0.99078f } } },   // RightHandRing1
+        { { { -0.36488f,+0.93106f,+0.00000f }, { -0.93106f,-0.36488f,+0.00000f }, { -0.00000f,+0.00000f,+1.00000f } } },   // RightHandRing2
+        { { { +0.99937f,-0.03560f,+0.00000f }, { +0.03560f,+0.99937f,+0.00000f }, { +0.00000f,+0.00000f,+1.00000f } } },   // RightHandRing3
+        { { { +0.98373f,+0.01086f,-0.17933f }, { -0.02413f,+0.99712f,-0.07195f }, { +0.17803f,+0.07511f,+0.98115f } } },   // RightHandPinky0
+        { { { -0.03687f,+0.99011f,+0.13535f }, { -0.96334f,+0.00080f,-0.26828f }, { -0.26574f,-0.14028f,+0.95379f } } },   // RightHandPinky1
+        { { { -0.00175f,+1.00000f,+0.00000f }, { -1.00000f,-0.00175f,+0.00000f }, { -0.00000f,+0.00000f,+1.00000f } } },   // RightHandPinky2
+        { { { +0.93849f,+0.34530f,+0.00000f }, { -0.34530f,+0.93849f,-0.00000f }, { +0.00000f,+0.00000f,+1.00000f } } },   // RightHandPinky3
+        { { { +0.97275f,-0.10018f,+0.20909f }, { +0.13636f,+0.97657f,-0.16647f }, { -0.18752f,+0.19044f,+0.96362f } } },   // RightHandIndex0
+        { { { +0.01059f,+0.98679f,+0.16169f }, { -0.97741f,-0.02392f,+0.20998f }, { +0.21108f,-0.16026f,+0.96424f } } },   // RightHandIndex1
+        { { { +0.04885f,+0.99881f,+0.00000f }, { -0.99881f,+0.04885f,+0.00000f }, { -0.00000f,+0.00000f,+1.00000f } } },   // RightHandIndex2
+        { { { +0.89956f,+0.43680f,+0.00000f }, { -0.43680f,+0.89956f,+0.00000f }, { +0.00000f,+0.00000f,+1.00000f } } },   // RightHandIndex3
+        { { { +0.86405f,+0.33189f,+0.37850f }, { +0.29263f,+0.28067f,-0.91411f }, { -0.40962f,+0.90060f,+0.14539f } } },   // RightHandThumb1
+        { { { +0.93864f,+0.27363f,-0.20997f }, { -0.28908f,+0.95619f,-0.04618f }, { +0.18814f,+0.10404f,+0.97662f } } },   // RightHandThumb2
+        { { { +0.70393f,+0.71027f,+0.00000f }, { -0.71027f,+0.70393f,-0.00000f }, { +0.00000f,+0.00000f,+1.00000f } } },   // RightHandThumb3
+    },
+};
+
+
+// ---- and the open hand, likewise measured ----
+//
+// Captured 2026-08-28 in the same session as the fist above. Provenance worth knowing: these came
+// from Jump (left, frame 2326) and Falling (right, frame 2160) rather than from a sprint, because
+// the capture keeps the WIDEST frame it sees and an airborne hand splays further than a sprinting
+// one. The two hands therefore come from different animations, which is a thing to remember if
+// the resting pose ever looks lopsided - it would be the capture, not the blend.
+//
+// Baked for the same reason the fist is: without it, "open" falls back to meaning whatever the
+// animation is doing, and the player gets the game's own idle hand - pinky and ring curled well
+// past the other fingers - until they happen to sprint somewhere.
+static const Mat3 kBakedOpenHand[2][kJointsPerHand] = {
+    {   // left hand
+        { { { +0.99448f,-0.06098f,+0.08537f }, { +0.06403f,+0.99738f,-0.03356f }, { -0.08310f,+0.03884f,+0.99578f } } },   // LeftHandMiddle0
+        { { { +0.99029f,+0.05654f,-0.12702f }, { -0.01782f,+0.95766f,+0.28736f }, { +0.13788f,-0.28231f,+0.94936f } } },   // LeftHandMiddle1
+        { { { +0.98478f,+0.17320f,-0.01452f }, { -0.17320f,+0.98489f,+0.00127f }, { +0.01452f,+0.00127f,+0.99989f } } },   // LeftHandMiddle2
+        { { { +0.97297f,+0.23013f,-0.01929f }, { -0.23013f,+0.97316f,+0.00225f }, { +0.01929f,+0.00225f,+0.99981f } } },   // LeftHandMiddle3
+        { { { +0.99605f,-0.03055f,-0.08340f }, { +0.02853f,+0.99927f,-0.02537f }, { +0.08411f,+0.02289f,+0.99619f } } },   // LeftHandRing0
+        { { { +0.99544f,-0.06992f,+0.06493f }, { +0.04913f,+0.95893f,+0.27936f }, { -0.08180f,-0.27489f,+0.95799f } } },   // LeftHandRing1
+        { { { +0.99841f,+0.05614f,-0.00474f }, { -0.05614f,+0.99842f,+0.00013f }, { +0.00474f,+0.00013f,+0.99999f } } },   // LeftHandRing2
+        { { { +0.99823f,+0.05931f,-0.00500f }, { -0.05931f,+0.99824f,+0.00015f }, { +0.00500f,+0.00015f,+0.99999f } } },   // LeftHandRing3
+        { { { +0.96499f,+0.10189f,-0.24168f }, { -0.09687f,+0.99476f,+0.03257f }, { +0.24373f,-0.00802f,+0.96981f } } },   // LeftHandPinky0
+        { { { +0.92461f,-0.37523f,+0.06555f }, { +0.31853f,+0.85602f,+0.40715f }, { -0.20888f,-0.35558f,+0.91101f } } },   // LeftHandPinky1
+        { { { +0.99992f,+0.01247f,-0.00107f }, { -0.01247f,+0.99992f,+0.00001f }, { +0.00107f,+0.00001f,+1.00000f } } },   // LeftHandPinky2
+        { { { +0.99823f,+0.05931f,-0.00503f }, { -0.05931f,+0.99824f,+0.00015f }, { +0.00503f,+0.00015f,+0.99999f } } },   // LeftHandPinky3
+        { { { +0.96744f,-0.07580f,+0.24148f }, { +0.09981f,+0.99104f,-0.08876f }, { -0.23259f,+0.10997f,+0.96634f } } },   // LeftHandIndex0
+        { { { +0.98357f,+0.17978f,+0.01666f }, { -0.17620f,+0.93567f,+0.30574f }, { +0.03937f,-0.30365f,+0.95197f } } },   // LeftHandIndex1
+        { { { +0.97252f,+0.23200f,-0.01937f }, { -0.23200f,+0.97271f,+0.00228f }, { +0.01937f,+0.00228f,+0.99981f } } },   // LeftHandIndex2
+        { { { +0.96566f,+0.25891f,-0.02164f }, { -0.25891f,+0.96590f,+0.00285f }, { +0.02164f,+0.00285f,+0.99976f } } },   // LeftHandIndex3
+        { { { +0.82992f,+0.33442f,+0.44655f }, { +0.35367f,+0.30365f,-0.88471f }, { -0.43146f,+0.89217f,+0.13373f } } },   // LeftHandThumb1
+        { { { +0.95541f,-0.27189f,+0.11518f }, { +0.26584f,+0.96181f,+0.06525f }, { -0.12852f,-0.03172f,+0.99120f } } },   // LeftHandThumb2
+        { { { +0.85853f,-0.51276f,-0.00000f }, { +0.51276f,+0.85853f,+0.00000f }, { +0.00000f,+0.00000f,+1.00000f } } },   // LeftHandThumb3
+    },
+    {   // right hand
+        { { { +0.99441f,-0.03654f,+0.09903f }, { +0.04026f,+0.99855f,-0.03580f }, { -0.09758f,+0.03959f,+0.99444f } } },   // RightHandMiddle0
+        { { { +0.97408f,-0.22201f,-0.04340f }, { +0.22499f,+0.97073f,+0.08404f }, { +0.02347f,-0.09163f,+0.99552f } } },   // RightHandMiddle1
+        { { { +0.94552f,+0.32557f,-0.00000f }, { -0.32557f,+0.94552f,-0.00000f }, { -0.00000f,+0.00000f,+1.00000f } } },   // RightHandMiddle2
+        { { { +0.97476f,+0.22325f,-0.00000f }, { -0.22325f,+0.97476f,-0.00000f }, { -0.00000f,+0.00000f,+1.00000f } } },   // RightHandMiddle3
+        { { { +0.99605f,-0.03055f,-0.08340f }, { +0.02139f,+0.99385f,-0.10861f }, { +0.08620f,+0.10640f,+0.99058f } } },   // RightHandRing0
+        { { { +0.99786f,-0.01891f,-0.06254f }, { +0.02876f,+0.98658f,+0.16072f }, { +0.05866f,-0.16218f,+0.98502f } } },   // RightHandRing1
+        { { { +0.97667f,+0.21474f,-0.00000f }, { -0.21474f,+0.97667f,-0.00000f }, { -0.00000f,+0.00000f,+1.00000f } } },   // RightHandRing2
+        { { { +0.97705f,+0.21303f,-0.00000f }, { -0.21303f,+0.97705f,-0.00000f }, { -0.00000f,+0.00000f,+1.00000f } } },   // RightHandRing3
+        { { { +0.97170f,+0.01603f,-0.23567f }, { -0.03342f,+0.99699f,-0.06998f }, { +0.23384f,+0.07588f,+0.96931f } } },   // RightHandPinky0
+        { { { +0.99421f,+0.07727f,-0.07470f }, { -0.06378f,+0.98361f,+0.16867f }, { +0.08651f,-0.16293f,+0.98284f } } },   // RightHandPinky1
+        { { { +0.99744f,+0.07150f,-0.00000f }, { -0.07150f,+0.99744f,+0.00000f }, { +0.00000f,+0.00000f,+1.00000f } } },   // RightHandPinky2
+        { { { +0.99844f,+0.05582f,-0.00000f }, { -0.05582f,+0.99844f,+0.00000f }, { -0.00000f,+0.00000f,+1.00000f } } },   // RightHandPinky3
+        { { { +0.96744f,-0.07580f,+0.24148f }, { +0.11919f,+0.97813f,-0.17045f }, { -0.22328f,+0.19369f,+0.95532f } } },   // RightHandIndex0
+        { { { +0.99918f,+0.00279f,+0.04030f }, { -0.01233f,+0.97107f,+0.23847f }, { -0.03847f,-0.23878f,+0.97031f } } },   // RightHandIndex1
+        { { { +0.99844f,+0.05582f,-0.00000f }, { -0.05582f,+0.99844f,+0.00000f }, { +0.00000f,+0.00000f,+1.00000f } } },   // RightHandIndex2
+        { { { +0.96456f,+0.26387f,+0.00000f }, { -0.26387f,+0.96456f,+0.00000f }, { -0.00000f,+0.00000f,+1.00000f } } },   // RightHandIndex3
+        { { { +0.74587f,+0.36417f,+0.55772f }, { +0.44934f,+0.34299f,-0.82489f }, { -0.49170f,+0.86587f,+0.09219f } } },   // RightHandThumb1
+        { { { +0.96185f,-0.22669f,-0.15318f }, { +0.15448f,+0.91209f,-0.37977f }, { +0.22580f,+0.34162f,+0.91231f } } },   // RightHandThumb2
+        { { { +0.97341f,-0.22908f,-0.00000f }, { +0.22908f,+0.97341f,-0.00000f }, { -0.00000f,+0.00000f,+1.00000f } } },   // RightHandThumb3
+    },
+};
+
+struct CapturedFist {
+    bool  valid = false;
+    Mat3  local[kJointsPerHand];       // each joint's rotation relative to its parent
+    float openness = 0.0f;             // what it measured when taken
+    int   moveState = -1;
+    long  frame = 0;
+};
+static CapturedFist g_fist[2];
+static float g_opennessMax[2] = { 0.0f, 0.0f };   // the widest the hand was seen to open
+static float g_opennessMin[2] = { 1.0e30f, 1.0e30f };
+// The OTHER end of the same range. Faith's sprint holds both hands flat and open, so the game
+// carries its own fully-open pose exactly as it carries its own fist, and neither end has to be
+// invented here. A resting hand is then simply a short way along the line between them, which is
+// what makes "a normal VR resting hand" a measurement rather than somebody's taste.
+static CapturedFist g_openHand[2];
+static long  g_captureSteadyFrames = 0;
+static bool  g_captureReported = false;
+static bool  g_fistSeeded = false;
+
+// Start from the baked measurement, so the grip works on the first frame of a level.
+//
+// Re-capturing is then a DIAGNOSTIC rather than the source of truth, and runs only under
+// MotionHandsDebug. Tighter is not the same as better - the right hand's captured fingertips are
+// nearly straight because that is the shape Faith's animator gave it, and a run that happened to
+// catch a harder grab would silently replace an authored pose with an incidental one. Re-measure
+// deliberately, read the numbers, paste them in; do not let a play session drift the pose.
+static void SeedBakedFist()
+{
+    if (g_fistSeeded) return;
+    g_fistSeeded = true;
+    for (int h = 0; h < 2; ++h) {
+        for (int k = 0; k < kJointsPerHand; ++k) {
+            g_fist[h].local[k] = kBakedFist[h][k];
+            g_openHand[h].local[k] = kBakedOpenHand[h][k];
+        }
+        g_fist[h].valid = g_openHand[h].valid = true;
+        g_fist[h].moveState = g_openHand[h].moveState = -1;
+        // 0 means "baked", which is what the reporter tests before printing constants back.
+        g_fist[h].frame = g_openHand[h].frame = 0;
+        // Not 0 and not huge respectively: openness is the bar a re-measurement has to beat, and
+        // a bar it can never clear makes the capture silently dead. The baked poses came from a
+        // different session against a differently-placed arm, so their own numbers are not
+        // comparable to this session's anyway - only the direction of the comparison matters.
+        g_fist[h].openness = 3.0e38f;
+        g_openHand[h].openness = 0.0f;
+    }
+}
+
+// How open a hand is: the total reach from wrist to the four fingertips. It needs no angles, no
+// reference pose and no assumption about which way the hand folds - a fist is simply the frame
+// where that sum is smallest. Thumb excluded, because a thumb tucks across rather than in and
+// would blunt exactly the signal being measured.
+static bool HandOpenness(const UE3Matrix44* span, int hand, float* out)
+{
+    const MEVR_Vec3 wrist = SpanOrigin(span, kHandBones[hand].hand);
+    float total = 0.0f;
+    for (int c = 0; c < 4; ++c) {
+        const int tip = kChains[hand][c].first + kChains[hand][c].count - 1;
+        const MEVR_Vec3 t = SpanOrigin(span, tip);
+        total += VecLength({ t.x - wrist.x, t.y - wrist.y, t.z - wrist.z });
+    }
+    if (!std::isfinite(total) || total <= 0.0f) return false;
+    *out = total;
+    return true;
+}
+
+// Take the pose if this frame is the most closed the hand has been seen. Only ever called while
+// the mod is NOT itself curling, or it would capture its own output and lock in its own mistakes.
+static bool CaptureFistIfTightest(const UE3Matrix44* span, int hand, int moveState)
+{
+    float openness = 0.0f;
+    if (!HandOpenness(span, hand, &openness)) return false;
+    if (openness > g_opennessMax[hand]) g_opennessMax[hand] = openness;
+
+    // Require a real fist, not merely the tightest frame so far: a hand that never closes would
+    // otherwise have its most-relaxed frame captured and blended to as though it were a fist.
+    // 25% below the widest this hand has been seen is far past animation noise and far short of
+    // what the run cycle actually does.
+    if (g_opennessMax[hand] <= 0.0f) return false;
+    if (openness > g_opennessMax[hand] * 0.75f) return false;
+    if (g_fist[hand].valid && openness >= g_fist[hand].openness) return false;
+
+    CapturedFist taken{};
+    for (int k = 0; k < kJointsPerHand; ++k) {
+        const FingerBone& fb = kFingerBones[hand * kJointsPerHand + k];
+        Mat3 child{}, parent{};
+        if (!BasisOf(span, fb.index, &child) || !BasisOf(span, fb.parent, &parent)) return false;
+        // B_child = L * B_parent, so L = B_child * B_parent^T.
+        taken.local[k] = Mat3Multiply(child, Mat3Transpose(parent));
+    }
+    taken.valid = true;
+    taken.openness = openness;
+    taken.moveState = moveState;
+    taken.frame = g_frames;
+    g_fist[hand] = taken;
+    g_captureSteadyFrames = 0;
+    g_captureReported = false;
+    return true;
+}
+
+// Blend the live pose towards the captured one. Root to tip, so each joint composes against a
+// parent that has already been placed - the same forward-kinematic order the hand-authored curl
+// uses, for the same reason.
+// ---- where an unsqueezed hand rests ----
+//
+// Not on the captured open pose, which is a sprint: fingers flat and splayed, right for pumping
+// arms and wrong for a hand that is simply not holding anything. A resting VR hand carries a
+// slight even curl, and that is this far along the line from the open hand towards the fist.
+//
+// Taste, and the only number here that is. It is a fraction of a MEASURED range rather than an
+// invented pose, so it cannot produce a shape Faith's rig does not already make.
+static const float kRestingCurl = 0.20f;
+
+// ---- and why a sprint still opens them ----
+//
+// Ordinary movement should be the controller's, but a sprint should still splay the hands, and
+// that needs a sprint signal. The game supplies one for free: the span read in the hook is always
+// the engine's own freshly composed pose, so how open the ANIMATION is holding the hand can be
+// measured every frame. Faith runs with a fist and sprints with a flat hand, so that number IS
+// the sprint signal - no speed threshold to measure, nothing new to look up, and it degrades to a
+// constant rest if the range is never established.
+//
+// It only relaxes the RESTING curl. A squeezed grip closes the hand at a sprint exactly as
+// anywhere else.
+//
+// Returns the full resting curl while the animation is anywhere below a sprint, and eases to 0 -
+// a fully open hand - only at the very top of the range.
+//
+// A THRESHOLD rather than a proportion, and that is the whole point. Mapping rest smoothly onto
+// the animation's openness would make the resting hand drift with the gait: one shape standing,
+// another jogging, another running. What was asked for is a hand that holds one resting pose all
+// the way through ordinary movement and opens only at a sprint, so only the top of the range does
+// anything.
+//
+// MEASURED, from run 9's pooled openness histogram - not a guess, because the first guess was
+// wrong. The animation's own range is trimodal: the run fist sits at 0.0-0.3, idle and jogging
+// pile up at 0.6-0.85 (p75 = 0.82), and a sprint lives at 0.9-1.0 (p90 = 0.93). The first attempt
+// put the knee at 0.80, which is inside the idle mode - so standing still already had the hand
+// creeping open. These two bracket the trough between idle and sprint instead.
+static const float kSprintOpenFrom = 0.86f;
+static const float kSprintOpenFull = 0.95f;
+
+static float RestingCurlFor(int hand, float gameOpenness)
+{
+    const float lo = g_opennessMin[hand], hi = g_opennessMax[hand];
+    if (lo > 1.0e29f || hi <= lo + 4.0f) return kRestingCurl;   // no range measured yet
+    float open01 = (gameOpenness - lo) / (hi - lo);
+    if (open01 < 0.0f) open01 = 0.0f;
+    if (open01 > 1.0f) open01 = 1.0f;
+    if (open01 <= kSprintOpenFrom) return kRestingCurl;
+    if (open01 >= kSprintOpenFull) return 0.0f;
+    const float s = (open01 - kSprintOpenFrom) / (kSprintOpenFull - kSprintOpenFrom);
+    return kRestingCurl * (1.0f - s);
+}
+
+// Same shape as the fist capture, at the far end of the range.
+static bool CaptureOpenIfWidest(const UE3Matrix44* span, int hand, int moveState)
+{
+    float openness = 0.0f;
+    if (!HandOpenness(span, hand, &openness)) return false;
+    if (g_openHand[hand].valid && openness <= g_openHand[hand].openness) return false;
+    // Only a hand that is genuinely splayed, not merely the widest frame so far. Without this the
+    // first ordinary idle frame becomes "open" and the resting pose is built off a hand that was
+    // already half closed.
+    if (g_opennessMin[hand] < 1.0e29f && openness < g_opennessMin[hand] * 1.30f) return false;
+
+    CapturedFist taken{};
+    for (int k = 0; k < kJointsPerHand; ++k) {
+        const FingerBone& fb = kFingerBones[hand * kJointsPerHand + k];
+        Mat3 child{}, parent{};
+        if (!BasisOf(span, fb.index, &child) || !BasisOf(span, fb.parent, &parent)) return false;
+        taken.local[k] = Mat3Multiply(child, Mat3Transpose(parent));
+    }
+    taken.valid = true;
+    taken.openness = openness;
+    taken.moveState = moveState;
+    taken.frame = g_frames;
+    g_openHand[hand] = taken;
+    g_captureSteadyFrames = 0;
+    g_captureReported = false;
+    return true;
+}
+
+// Interpolate between two stored local rotations. Rotations do not average componentwise, so
+// this goes the only way that means anything: the rotation carrying a to b, scaled, re-applied.
+static Mat3 BlendLocal(const Mat3& a, const Mat3& b, float u)
+{
+    if (u <= 0.0f) return a;
+    if (u >= 1.0f) return b;
+    const Mat3 delta = Mat3Multiply(Mat3Transpose(a), b);
+    MEVR_Vec3 axis{};
+    float angle = 0.0f;
+    if (!Mat3ToAxisAngle(delta, &axis, &angle) || angle < 1.0e-6f) return a;
+    return Mat3Multiply(a, AxisAngleMatrix(axis, angle * u));
+}
+
+// u = 0 is the captured OPEN hand, u = 1 is the captured fist, and everything between is a real
+// pose rather than a fade between two of them: the joints are interpolated, then the chain is
+// rebuilt from them, so the fingers are the right length at every value of u.
+//
+// Without a captured open hand this degrades to what F3 did - blend from wherever the game's
+// animation currently has the fingers, towards the fist - which is correct but leaves the
+// game's own idle pose showing at u = 0.
+static bool ApplyCapturedFist(UE3Matrix44* span, int hand, float u, const char** why)
+{
+    if (!g_fist[hand].valid) { *why = "no fist has been captured yet"; return false; }
+    const bool haveOpen = g_openHand[hand].valid;
+
+    for (int k = 0; k < kJointsPerHand; ++k) {
+        const FingerBone& fb = kFingerBones[hand * kJointsPerHand + k];
+        Mat3 child{}, parent{};
+        if (!BasisOf(span, fb.index, &child) || !BasisOf(span, fb.parent, &parent)) {
+            *why = "a bone basis is not orthonormal";
+            return false;
+        }
+        // Where this joint belongs at u, given where its parent is NOW.
+        const Mat3 wanted = haveOpen ? BlendLocal(g_openHand[hand].local[k],
+                                                  g_fist[hand].local[k], u)
+                                     : g_fist[hand].local[k];
+        const Mat3 target = Mat3Multiply(wanted, parent);
+        // The rotation carrying it there, in component space: B_cur * delta = B_target.
+        const Mat3 delta = Mat3Multiply(Mat3Transpose(child), target);
+        MEVR_Vec3 axis{};
+        float angle = 0.0f;
+        if (!Mat3ToAxisAngle(delta, &axis, &angle)) continue;   // already there, or unusable
+        // With both ends captured the blend has ALREADY happened, between the two stored poses,
+        // and what is left is just moving the live joint onto that target - so the angle is
+        // applied whole. Scaling it by u here as well would blend twice and never reach either
+        // end. Without an open pose there is nothing to blend between, and u has to do its work
+        // on this angle instead, which is exactly what F3 did.
+        const float scale = haveOpen ? 1.0f : u;
+        if (fabsf(angle * scale) < 1.0e-5f) continue;
+        RotateSpanRange(span, fb.index, ChainLastBoneFor(hand, k), SpanOrigin(span, fb.index),
+                        AxisAngleMatrix(axis, angle * scale));
+    }
+    return true;
+}
+
+// Say what was captured, once it has stopped improving, and say it as source text. The runtime
+// capture is what the pose actually uses; this exists so the numbers can be read, reviewed and
+// baked in later if a run should not have to see a fist before the grip works.
+static void ReportCapturedFist()
+{
+    // frame 0 is a baked pose. Reporting that back would print the constants this build already
+    // contains, dressed up as a fresh measurement. BOTH ends have to be freshly seen, because the
+    // open hand is the half that is still missing from the source.
+    if (g_captureReported || !g_fist[0].frame || !g_fist[1].frame ||
+        !g_openHand[0].frame || !g_openHand[1].frame) return;
+    if (++g_captureSteadyFrames < 240) return;      // a few seconds with nothing better found
+    g_captureReported = true;
+
+    const CapturedFist* ends[2] = { g_fist, g_openHand };
+    static const char* endName[2] = { "fist", "open hand" };
+    for (int e = 0; e < 2; ++e) {
+        for (int h = 0; h < 2; ++h) {
+            const CapturedFist& c = ends[e][h];
+            Log("*** [hands-f3] %s %s captured at frame %ld in movement state %s, wrist-to-tips"
+                " %.2f UU on a measured range of %.2f-%.2f:",
+                h == 0 ? "LEFT" : "RIGHT", endName[e], c.frame, MoveName(c.moveState),
+                c.openness, g_opennessMin[h], g_opennessMax[h]);
+            for (int k = 0; k < kJointsPerHand; ++k) {
+                const Mat3& m = c.local[k];
+                Log("[hands-f3]   { { { %+.5ff,%+.5ff,%+.5ff }, { %+.5ff,%+.5ff,%+.5ff },"
+                    " { %+.5ff,%+.5ff,%+.5ff } } },   // %s",
+                    m.m[0][0], m.m[0][1], m.m[0][2], m.m[1][0], m.m[1][1], m.m[1][2],
+                    m.m[2][0], m.m[2][1], m.m[2][2],
+                    kFingerBones[h * kJointsPerHand + k].name);
+            }
+        }
+    }
+}
+
+// ================================================================ F4: the grip drives the hand
+//
+// ---- where the hands are the game's, not the player's ----
+//
+// A finger write is cosmetic and self-erasing, so unlike the camera overrides it can never stall
+// a move or eat an input - the worst it can do is look wrong. It looks wrong in exactly one
+// family of states: the ones where Mirror's Edge is deliberately posing the hands itself, on a
+// ledge, a pipe, a zipline, or a face. Closing a fist over the top of an authored grab reads as a
+// glitch even though nothing is broken.
+//
+// So this is a blacklist, and deliberately, against the general rule this file follows elsewhere.
+// That rule exists because an unenumerated state that keeps ASSERTING a camera value stalls the
+// move; here an unenumerated state merely keeps letting the player close their own fingers, which
+// is the behaviour they asked for. A whitelist would instead switch the feature off during every
+// state nobody thought to list, which is the worse failure for something purely visual.
+static bool GameOwnsTheHands(int moveState)
+{
+    switch (moveState) {
+        // ⚠️ ONE PER LINE. Written two-to-a-line with a comment between them, the // ate the
+        // second case on every row and half this list silently did nothing - GrabPullUp in the
+        // run-9 log is what exposed it, posing the hands while this claimed to be standing down.
+        case 3:    // Grabbing
+        case 6:    // WallClimbing
+        case 7:    // SpringBoard
+        case 8:    // SpeedVault
+        case 9:    // VaultOver
+        case 10:   // GrabPullUp
+        case 13:   // GrabJump
+        case 14:   // IntoGrab
+        case 17:   // Melee
+        case 18:   // Snatch
+        case 19:   // Barge
+        case 21:   // Climb
+        case 22:   // IntoClimb
+        case 27:   // IntoZipLine
+        case 28:   // ZipLine
+        case 31:   // GrabTransfer
+        case 32:   // MeleeAir
+        case 36:   // Snatched
+        case 37:   // StepUp
+        case 39:   // Interact
+        case 53:   // MeleeVault
+            return true;
+        default:
+            return false;
+    }
+}
+
+// The squeeze, mapped to how closed the hand should be.
+//
+// The deadzone is at the bottom only. A grip resting under a relaxed hand reads a little above
+// zero on Touch, and without it the fingers would sit permanently half-shut - but the TOP has no
+// deadzone, because a hand that will not quite close when the control is fully squeezed is the
+// complaint this whole feature exists to avoid.
+static const float kGripDeadzone = 0.08f;
+// Just enough to take the tremble off the squeeze axis without putting lag between the hand and
+// the finger. The analogue signal is already smooth; this is for sensor noise, not for feel.
+static const float kCurlSmoothingSeconds = 0.06f;
+
+static float CurlTargetFromGrip(float grip)
+{
+    if (!std::isfinite(grip) || grip <= kGripDeadzone) return 0.0f;
+    const float t = (grip - kGripDeadzone) / (1.0f - kGripDeadzone);
+    return t > 1.0f ? 1.0f : t;
+}
+
+
+// ---- F1's window, on the other side of the composition ----
+//
+// This fires for every skeletal mesh in the level, so the first thing it does is decide whether
+// the component is ours. g_probeMesh1p is republished and revalidated by ProbeFingerBones on this
+// same thread every arm update, so a destroyed pawn cannot leave a stale pointer being written.
+//
+// ⚠️ The signature is DERIVED, not chosen - see the walk in ProbeUpdateSkelPose. __thiscall makes
+// the callee pop its own arguments, so these two must match the real function or the stack of
+// whatever called it is corrupted. The hook is only installed when both the call site's push
+// count and the callee's own `ret 8` agree that there are exactly two.
+static void __fastcall Hook_UpdateSkelPose(void* self, void* edx, float deltaTime,
+                                           int tickFaceFX)
+{
+    if (!g_origUpdateSkelPose) return;
+    const uintptr_t comp = reinterpret_cast<uintptr_t>(self);
+    const bool ours = comp && comp == g_probeMesh1p && g_offMeshSpaceBases >= 0;
+
+    // One finger bone read on the way in, so the census can say whether the call composed it.
+    UE3Array32 bases{};
+    UE3Matrix44 before{};
+    bool haveBefore = false;
+    const int kWitness = 34;    // LeftHandIndex1 - mid-chain, so any pose change moves it
+    if (ours && ReadUE3Array(comp, g_offMeshSpaceBases, 512, &bases) &&
+        bases.count > kFingerSpanLast)
+        haveBefore = SafeRead(bases.data + (uint32_t)kWitness * sizeof(UE3Matrix44),
+                              &before, sizeof(before));
+
+    g_origUpdateSkelPose(self, edx, deltaTime, tickFaceFX);
+
+    if (!ours) return;
+    if (!ReadUE3Array(comp, g_offMeshSpaceBases, 512, &bases) ||
+        bases.count <= kFingerSpanLast) return;
+
+    // ---- the census: does the pose actually change across this call? ----
+    //
+    // The whole derivation rests on this function being the one that composes. Two independent
+    // reasons already say it is - it resizes the array the property walker calls SpaceBases, at
+    // sizeof(FMatrix) - but neither is a measurement of what it DOES. This is.
+    static long calls = 0, changed = 0;
+    static bool reported = false;
+    if (haveBefore && !reported) {
+        UE3Matrix44 after{};
+        if (SafeRead(bases.data + (uint32_t)kWitness * sizeof(UE3Matrix44),
+                     &after, sizeof(after))) {
+            ++calls;
+            if (memcmp(&before, &after, sizeof(after)) != 0) ++changed;
+            // 240 calls is a few seconds. A still player composes the same pose repeatedly, so
+            // the interesting number is whether it EVER changes, not the ratio.
+            if (calls >= 240) {
+                reported = true;
+                Log("*** [hands-f1] composition census: LeftHandIndex1 differed across %ld of"
+                    " %ld calls on Mesh1p. %s", changed, calls,
+                    changed > 0 ? "This call composes the pose, so returning from it is after"
+                                  " composition - the window is real."
+                                : "It NEVER changed, so this is not the composer and the"
+                                  " derivation picked the wrong call.");
+            }
+        }
+    }
+
+    // ---- F2/F3/F4: curl the fingers, in the window F1 proved ----
+    //
+    // The crude poke this replaces did its job: 10944 writes here moved the fingers, against 7232
+    // writes before the composition that moved nothing. The window is settled, so the write is
+    // the real one now.
+    //
+    // Safe by construction, as the poke was: SpaceBases is per-frame scratch. Nothing is saved,
+    // nothing is restored, and the authored pose returns on its own the moment this stops
+    // writing - which is why a wrong curl is a bad-looking hand for one frame and never damage.
+    SeedBakedFist();
+
+    int moveState = -1;
+    if (g_offMoveState >= 0 && g_probePawn) {
+        uint8_t raw = 0;
+        if (SafeRead(g_probePawn + g_offMoveState, &raw, 1)) moveState = (int)raw;
+    }
+    // An unreadable state does not stand the fingers down. The reason the rest of this file
+    // defaults the other way is that an unenumerated camera write stalls a move; this one cannot,
+    // and switching the player's hands off because a byte was unreadable is the worse outcome.
+    const bool gameOwns = moveState >= 0 && GameOwnsTheHands(moveState);
+    {
+        static int lastOwned = -2;
+        if (gameOwns != (lastOwned == 1)) {
+            lastOwned = gameOwns ? 1 : 0;
+            if (gameOwns)
+                Log("[hands-f4] standing down: %s poses the hands itself", MoveName(moveState));
+        }
+    }
+
+    for (int h = 0; h < 2; ++h) {
+        // GripToGrip is what took the grips off LSHOULDER/RSHOULDER in the first place, so it is
+        // also what decides whether they are allowed to reach the fingers. Without it the hotkey
+        // still drives both hands together, which is how F2 and F3 were judged.
+        const float wanted = g_gripToGrip ? CurlTargetFromGrip(g_gripValue[h])
+                                          : (g_bonePokeProbe ? 1.0f : 0.0f);
+        g_curlTarget[h] = gameOwns ? 0.0f : wanted;
+    }
+
+    // ---- who owns the fingers during ordinary movement ----
+    //
+    // Once an open hand has been captured, we do: the pose is written every frame, at rest as
+    // well as squeezed, and the run cycle's fist stops leaking through. That is what makes the
+    // hands read as controller-driven rather than animated, and it is the same change that fixes
+    // the resting pose - "open" stops meaning "whatever the animation is doing" and starts
+    // meaning a pose of our own.
+    //
+    // Before an open hand has been seen there is nothing to rest ON, so t=0 stays hands-off.
+    const bool haveOpen = g_openHand[0].valid && g_openHand[1].valid;
+    const bool wantCurl = haveOpen || g_curlTarget[0] > 0.0f || g_curlNow[0] > 0.0f ||
+                          g_curlTarget[1] > 0.0f || g_curlNow[1] > 0.0f;
+    const bool wantCapture = g_motionHandsDebug && !g_captureReported;
+    if (gameOwns || (!wantCurl && !wantCapture)) return;
+
+    // Framerate-independent, and gentle: the squeeze axis is already an analogue signal, so this
+    // is taking the tremble off a sensor rather than shaping the feel. Anything slower would put
+    // visible lag between the player's hand and Faith's.
+    const double now = NowMs();
+    static double lastMs = 0.0;
+    const float dt = (lastMs > 0.0) ? (float)((now - lastMs) * 0.001) : 0.0f;
+    lastMs = now;
+    const float alpha = (dt > 0.0f && dt < 0.5f)
+        ? 1.0f - expf(-dt / kCurlSmoothingSeconds) : 1.0f;
+    for (int h = 0; h < 2; ++h) {
+        g_curlNow[h] += (g_curlTarget[h] - g_curlNow[h]) * alpha;
+        if (g_curlNow[h] < 0.001f) g_curlNow[h] = 0.0f;
+        if (g_curlNow[h] > 0.999f) g_curlNow[h] = 1.0f;
+    }
+
+    UE3Matrix44 span[kFingerSpanCount];
+    if (!SafeRead(bases.data + (uint32_t)kFingerSpanFirst * sizeof(UE3Matrix44),
+                  span, sizeof(span))) return;
+
+    // ---- how open the ANIMATION is holding each hand, and the re-measurement ----
+    //
+    // Safe to read at any time, including while we are driving the fingers, and this is worth
+    // being precise about because an earlier version of this code gated it on "we are not
+    // curling" for fear of capturing our own output. That fear was misplaced: composition rebuilds
+    // SpaceBases from scratch every frame, so the span read above is ALWAYS the engine's own pose
+    // and never last frame's write. The F1 census measured exactly that - the witness bone
+    // differed across 239 of 240 calls.
+    float gameOpenness[2] = { 0.0f, 0.0f };
+    for (int h = 0; h < 2; ++h) {
+        if (!HandOpenness(span, h, &gameOpenness[h])) continue;
+        if (gameOpenness[h] < g_opennessMin[h]) g_opennessMin[h] = gameOpenness[h];
+        if (gameOpenness[h] > g_opennessMax[h]) g_opennessMax[h] = gameOpenness[h];
+    }
+    if (wantCapture) {
+        bool took = false;
+        for (int h = 0; h < 2; ++h) {
+            took |= CaptureFistIfTightest(span, h, moveState);
+            took |= CaptureOpenIfWidest(span, h, moveState);
+        }
+        if (!took) ReportCapturedFist();
+    }
+
+    // Where idle, running and sprinting actually sit on the animation's own range - the numbers
+    // kSprintOpenFrom is guessing at. Every couple of seconds, and only under MotionHandsDebug,
+    // so one session says whether the knee is in the right place instead of it being taste.
+    if (g_motionHandsDebug) {
+        static long lastReport = 0;
+        if (g_frames - lastReport >= 150) {
+            lastReport = g_frames;
+            float o01[2] = { 0.0f, 0.0f };
+            for (int h = 0; h < 2; ++h) {
+                const float lo = g_opennessMin[h], hi = g_opennessMax[h];
+                if (lo < 1.0e29f && hi > lo + 4.0f) o01[h] = (gameOpenness[h] - lo) / (hi - lo);
+            }
+            Log("[hands-f4] %-12s animation openness L %.1f (%.2f of %.1f-%.1f) R %.1f (%.2f)"
+                " -> resting curl L %.2f R %.2f", MoveName(moveState),
+                gameOpenness[0], o01[0], g_opennessMin[0], g_opennessMax[0],
+                gameOpenness[1], o01[1],
+                RestingCurlFor(0, gameOpenness[0]), RestingCurlFor(1, gameOpenness[1]));
+        }
+    }
+
+    // Rest, then squeeze from there. A grip of zero leaves the hand at its resting curl rather
+    // than at the captured sprint pose, and a full squeeze reaches the fist from wherever it
+    // started, so the control still spans the whole range.
+    float blend[2];
+    bool anyWrite = false;
+    for (int h = 0; h < 2; ++h) {
+        const float rest = haveOpen ? RestingCurlFor(h, gameOpenness[h]) : 0.0f;
+        blend[h] = rest + (1.0f - rest) * g_curlNow[h];
+        if (blend[h] > 0.0f) anyWrite = true;
+    }
+    if (!anyWrite) return;
+
+    // Lengths before, so the write can be checked against the one property this math is supposed
+    // to guarantee. A rigid rotation cannot change a bone length; if one moves, the chain walk is
+    // wrong, and that is a number rather than something to squint at in a headset.
+    float lengthBefore[kFingerBoneCount];
+    for (int i = 0; i < kFingerBoneCount; ++i) {
+        const MEVR_Vec3 a = SpanOrigin(span, kFingerBones[i].index);
+        const MEVR_Vec3 p = SpanOrigin(span, kFingerBones[i].parent);
+        lengthBefore[i] = VecLength({ a.x - p.x, a.y - p.y, a.z - p.z });
+    }
+
+    // How far each middle fingertip sits from its own wrist, before and after. Closing must
+    // shorten it - the cheapest possible check that the pose went the right way.
+    float reachBefore[2], reachAfter[2];
+    for (int h = 0; h < 2; ++h) {
+        const MEVR_Vec3 tip = SpanOrigin(span, kHandBones[h].middle3);
+        const MEVR_Vec3 wrist = SpanOrigin(span, kHandBones[h].hand);
+        reachBefore[h] = VecLength({ tip.x - wrist.x, tip.y - wrist.y, tip.z - wrist.z });
+    }
+
+    // The captured fist is the pose; the hand-authored curl is only what happens if the baked one
+    // is somehow unusable. They are not equivalent and are not meant to be - the curl folds every
+    // finger about one shared knuckle line, which is right enough for four fingers and wrong for
+    // a thumb, and it is the reason run 5's thumbs sat still.
+    static const char* lastRefusal = nullptr;
+    for (int h = 0; h < 2; ++h) {
+        if (blend[h] <= 0.0f) continue;
+        const char* why = nullptr;
+        if (ApplyCapturedFist(span, h, blend[h], &why)) continue;
+        if (CurlOneHand(span, h, blend[h], &why)) continue;
+        if (why && why != lastRefusal) {
+            lastRefusal = why;
+            Log("[hands-f4] %s hand not curled: %s", h == 0 ? "LEFT" : "RIGHT", why);
+        }
+    }
+
+    for (int h = 0; h < 2; ++h) {
+        const MEVR_Vec3 tip = SpanOrigin(span, kHandBones[h].middle3);
+        const MEVR_Vec3 wrist = SpanOrigin(span, kHandBones[h].hand);
+        reachAfter[h] = VecLength({ tip.x - wrist.x, tip.y - wrist.y, tip.z - wrist.z });
+    }
+
+    float worstDrift = 0.0f;
+    int worstBone = -1;
+    for (int i = 0; i < kFingerBoneCount; ++i) {
+        const MEVR_Vec3 a = SpanOrigin(span, kFingerBones[i].index);
+        const MEVR_Vec3 p = SpanOrigin(span, kFingerBones[i].parent);
+        const float drift = fabsf(VecLength({ a.x - p.x, a.y - p.y, a.z - p.z }) - lengthBefore[i]);
+        if (!std::isfinite(drift)) { worstDrift = 1.0e9f; worstBone = i; break; }
+        if (drift > worstDrift) { worstDrift = drift; worstBone = i; }
+    }
+    // Refuse to write a pose that has already failed its own invariant. A stretched finger would
+    // render, and rendering a visibly broken hand teaches nothing that this line does not.
+    if (worstDrift > 0.01f) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            Log("*** [hands-f4] WRITE REFUSED: %s stretched %.4f UU at t=%.2f/%.2f. A rigid"
+                " rotation cannot change a bone length, so the chain walk is wrong.",
+                worstBone >= 0 ? kFingerBones[worstBone].name : "?", worstDrift,
+                g_curlNow[0], g_curlNow[1]);
+        }
+        return;
+    }
+
+    // Only the two finger blocks, never the whole span: bones 19-20 and 40-49 are the hand and
+    // the weapon attach points, which this reads for reference and has no business moving.
+    static const struct { int first, last; } kWriteBlocks[2] = { { 21, 39 }, { 50, 68 } };
+    for (int b = 0; b < 2; ++b) {
+        if (blend[b] <= 0.0f) continue;
+        const int count = kWriteBlocks[b].last - kWriteBlocks[b].first + 1;
+        if (WriteRigBytes(bases.data + (uint32_t)kWriteBlocks[b].first * sizeof(UE3Matrix44),
+                          &span[kWriteBlocks[b].first - kFingerSpanFirst],
+                          (size_t)count * sizeof(UE3Matrix44)))
+            ++g_bonePokeWrites;
+    }
+
+    static bool announced = false;
+    if (!announced && (g_curlNow[0] > 0.5f || g_curlNow[1] > 0.5f)) {
+        announced = true;
+        Log("*** [hands-f4] curling L %.2f R %.2f from %s; worst bone-length drift %.5f UU across"
+            " %d bones, so the chain walk is rigid.", g_curlNow[0], g_curlNow[1],
+            g_gripToGrip ? "the GRIPS" : "NUMPAD /", worstDrift, kFingerBoneCount);
+        for (int h = 0; h < 2; ++h)
+            Log("*** [hands-f4]   %s middle fingertip to wrist %.2f -> %.2f UU: %s",
+                h == 0 ? "LEFT " : "RIGHT", reachBefore[h], reachAfter[h],
+                reachAfter[h] < reachBefore[h] - 0.5f ? "CLOSING"
+                    : reachAfter[h] > reachBefore[h] + 0.5f ? "OPENING - the pose is inverted"
+                                                            : "barely moved");
+    }
 }
 
 static int FindControlListSlot(const UE3Array32& lists, const char* bone,
@@ -12036,6 +13943,14 @@ static HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWO
                 if (!g_rtCurrent && g_rtSeenCount < 16) {
                     g_rtSeen[g_rtSeenCount] = { surf, d.Width, d.Height, d.Format, 0 };
                     g_rtCurrent = &g_rtSeen[g_rtSeenCount++];
+                    // The order the engine FIRST binds its targets is the startup fingerprint
+                    // of the half-res fault: a healthy run binds a full-res fmt-21 working
+                    // target right before the full-res HDR scene buffer, a degraded run never
+                    // binds one at all and that phase lands on the 1280x720 fp16 buffer
+                    // instead. Logged unconditionally so a monitor-only run with no headset
+                    // still records which path the engine chose.
+                    Log("[rt-first] #%d at frame %ld: %ux%u fmt %d  surf=%p",
+                        g_rtSeenCount, g_frames, d.Width, d.Height, (int)d.Format, (void*)surf);
                 }
             }
         }
@@ -12068,12 +13983,19 @@ static void AdoptSceneTarget()
     int  best = -1;
     long bestScene = 0;
     long bestBackbufferScene = 0;
+    long halfFp16Scene = 0;   // the partial-failure signal; see the streak guard below
     for (int i = 0; i < g_rtSeenCount; ++i) {
         const long sd = g_rtSeen[i].sceneDraws;
         if (g_rtSeen[i].w == g_capW && g_rtSeen[i].h == g_capH) {
             if (sd > bestBackbufferScene) bestBackbufferScene = sd;
         }
         else if (sd > bestScene) { bestScene = sd; best = i; }
+        // Exactly half the capture size AND fp16: the one buffer the measured failure uses.
+        // Keyed that tightly because run 27 records full-res shadow maps passing looser
+        // tests, and shadow maps are never fmt 113 in any census on record.
+        if (g_rtSeen[i].w * 2 == g_capW && g_rtSeen[i].h * 2 == g_capH &&
+            g_rtSeen[i].fmt == 113)
+            halfFp16Scene += sd;
     }
     for (int i = 0; i < g_rtSeenCount; ++i) g_rtSeen[i].sceneDraws = 0;
 
@@ -12105,6 +14027,41 @@ static void AdoptSceneTarget()
             Log("*** [rt] the world renders into the backbuffer again - stereo duplication"
                 " resumed");
         }
+
+        // ---- the streak guard: the PARTIAL failure the parity rule reads as healthy ----
+        //
+        // Measured 2026-08-28 (runs 14:04 / 14:05 / 14:19): ~9k scene draws per window on
+        // the half-size fp16 buffer while the backbuffer keeps the majority (786 vs 323 per
+        // frame). This branch means "backbuffer is live", so duplication kept running - over
+        // a frame the game no longer fully repaints - and the player saw the run-16 trails:
+        // hands and building edges ghosting along their motion history. Same answer as the
+        // full split: present mono, resume when it clears.
+        //
+        // Entry is ONE window because the measured signal is 4x this threshold and every
+        // healthy run on record measures ZERO scene draws here in every window; exit takes
+        // two clean windows so a boundary case cannot flap duplication on and off.
+        const long kPartialSceneDraws = 2000;
+        static int partialCleanStreak = 0;
+        if (halfFp16Scene >= kPartialSceneDraws) {
+            partialCleanStreak = 0;
+            if (!g_scenePartialMono) {
+                g_scenePartialMono = true;
+                Log("");
+                Log("*** [rt] PARTIAL half-res: %ld scene draws this window went to the"
+                    " half-size fp16 buffer while the backbuffer stays live. Duplicating"
+                    " would streak hands and edges over the unrepainted remainder -"
+                    " presenting MONO until it clears.", halfFp16Scene);
+            }
+        } else if (g_scenePartialMono) {
+            if (++partialCleanStreak >= 2) {
+                g_scenePartialMono = false;
+                partialCleanStreak = 0;
+                Log("*** [rt] the half-size fp16 buffer is quiet again - stereo duplication"
+                    " resumed");
+            }
+        } else {
+            partialCleanStreak = 0;
+        }
         return;
     }
 
@@ -12125,6 +14082,7 @@ static void AdoptSceneTarget()
     if (w != g_capW || h != g_capH) {
         if (!g_sceneSplitMono) {
             g_sceneSplitMono = true;
+            g_scenePartialMono = false;   // the full split owns the mono decision from here
             Log("");
             Log("*** [rt] the world renders into a %ux%u buffer while the backbuffer is %ux%u."
                 " Side-by-side stereo cannot follow a half-size mono scene; presenting MONO"
@@ -12158,13 +14116,30 @@ static void ReportRenderTargets()
     const UINT sw = g_sceneW ? g_sceneW : g_capW;
     const UINT sh = g_sceneH ? g_sceneH : g_capH;
     Log("[rt] distinct render targets seen this window:");
+    long halfResDraws = 0;
     for (int i = 0; i < g_rtSeenCount; ++i) {
         Log("[rt]   %p  %4ux%-4u fmt %-3d  %8ld draws (%ld scene)  %s",
             (void*)g_rtSeen[i].surf, g_rtSeen[i].w, g_rtSeen[i].h, (int)g_rtSeen[i].fmt,
             g_rtSeen[i].draws, g_rtSeen[i].sceneDraws,   // sceneDraws is a live window, not a total
             (g_rtSeen[i].w == sw && g_rtSeen[i].h == sh) ? "<- scene-sized, DUPLICATED" : "");
+        // Keyed to half the reference size, not a hardcoded 1280x720, so a different game
+        // resolution keeps the verdict honest. The capture size when XR is up; the first
+        // target ever bound - the backbuffer - on a monitor-only run, where g_capW stays 0
+        // and keying on it made every verdict a false "healthy". fmt 113 is the fp16 buffer
+        // the degraded path renders into.
+        const UINT refW = g_capW ? g_capW : (g_rtSeenCount ? g_rtSeen[0].w : 0);
+        const UINT refH = g_capH ? g_capH : (g_rtSeenCount ? g_rtSeen[0].h : 0);
+        if (refW && g_rtSeen[i].w * 2 == refW && g_rtSeen[i].h * 2 == refH &&
+            g_rtSeen[i].fmt == 113)
+            halfResDraws += g_rtSeen[i].draws;
         g_rtSeen[i].draws = 0;
     }
+    // One greppable verdict per window. Healthy runs put ~53 startup draws there and then
+    // nothing; degraded runs put tens of thousands per window from the menu onwards.
+    Log("[mode] half-res fp16 draws this window: %ld  %s%s", halfResDraws,
+        halfResDraws > 1000 ? "<- DEGRADED half-res scene path" : "(healthy)",
+        g_sceneSplitMono ? "  [mono: full split]"
+                         : (g_scenePartialMono ? "  [mono: streak guard]" : ""));
 }
 
 // ---- Clear census, for the run-16 trails ----
@@ -12213,6 +14188,77 @@ static void ReportClears()
             g_clearBuckets[i].count);
         g_clearBuckets[i].count = 0;
     }
+}
+
+// ---- StretchRect census, for the half-res startup fault ----
+//
+// A degraded run has to upscale its 1280x720 scene into the full-res chain somewhere, and
+// that composite is a StretchRect. Bucketing the distinct size pairs makes the mechanism
+// visible per window, and the first occurrence is logged with its frame number so it can be
+// placed against the [rt-first] bind order. Menus count too - the fault is decided before
+// the first menu frame, so this is also the earliest per-run detector that needs no scene
+// classification and no headset.
+PFN_StretchRect g_origStretchRect = nullptr;   // typedef and extern beside the frame grab
+struct BlitBucket { UINT sw, sh, dw, dh; long count; };
+static BlitBucket g_blitBuckets[16];
+static int g_blitBucketCount = 0;
+
+static HRESULT STDMETHODCALLTYPE Hook_StretchRect(IDirect3DDevice9* dev, IDirect3DSurface9* src,
+                                                  const RECT* srcRect, IDirect3DSurface9* dst,
+                                                  const RECT* dstRect, D3DTEXTUREFILTERTYPE filt)
+{
+    UINT sw = 0, sh = 0, dw = 0, dh = 0;
+    D3DSURFACE_DESC d{};
+    if (srcRect) { sw = (UINT)(srcRect->right - srcRect->left);
+                   sh = (UINT)(srcRect->bottom - srcRect->top); }
+    else if (src && SUCCEEDED(src->GetDesc(&d))) { sw = d.Width; sh = d.Height; }
+    if (dstRect) { dw = (UINT)(dstRect->right - dstRect->left);
+                   dh = (UINT)(dstRect->bottom - dstRect->top); }
+    else if (dst && SUCCEEDED(dst->GetDesc(&d))) { dw = d.Width; dh = d.Height; }
+    int slot = -1;
+    for (int i = 0; i < g_blitBucketCount; ++i)
+        if (g_blitBuckets[i].sw == sw && g_blitBuckets[i].sh == sh &&
+            g_blitBuckets[i].dw == dw && g_blitBuckets[i].dh == dh) { slot = i; break; }
+    if (slot < 0 && g_blitBucketCount < 16) {
+        slot = g_blitBucketCount++;
+        g_blitBuckets[slot] = { sw, sh, dw, dh, 0 };
+        Log("[blit] first %ux%u -> %ux%u at frame %ld", sw, sh, dw, dh, g_frames);
+    }
+    if (slot >= 0) ++g_blitBuckets[slot].count;
+    return g_origStretchRect(dev, src, srcRect, dst, dstRect, filt);
+}
+
+static void ReportBlits()
+{
+    if (!g_blitBucketCount) return;
+    Log("[blit] StretchRect this window by size:");
+    for (int i = 0; i < g_blitBucketCount; ++i) {
+        if (g_blitBuckets[i].count)
+            Log("[blit]   %ux%u -> %ux%u  x%ld", g_blitBuckets[i].sw, g_blitBuckets[i].sh,
+                g_blitBuckets[i].dw, g_blitBuckets[i].dh, g_blitBuckets[i].count);
+        g_blitBuckets[i].count = 0;
+    }
+}
+
+// ---- does the ENGINE consult GetAvailableTextureMem? ----
+//
+// The mod's own periodic [vram] line reads a value clamped near 4095 MB, so if the engine
+// sizes its render-target pool from this call the answer it gets cannot be what varies
+// between runs - but whether it ASKS, and when, and what it is told, has never been
+// measured. The mod's own reads go through g_origGetAvailTexMem so they do not show up
+// here as the game asking.
+typedef UINT (STDMETHODCALLTYPE *PFN_GetAvailTexMem)(IDirect3DDevice9*);
+static PFN_GetAvailTexMem g_origGetAvailTexMem = nullptr;
+
+static UINT STDMETHODCALLTYPE Hook_GetAvailTexMem(IDirect3DDevice9* dev)
+{
+    const UINT mem = g_origGetAvailTexMem(dev);
+    static LONG calls = 0;
+    const LONG n = InterlockedIncrement(&calls);
+    if (n <= 8)
+        Log("[vram] the GAME asked GetAvailableTextureMem -> %u MB  (call #%ld, frame %ld)",
+            mem / (1024u * 1024u), (long)n, g_frames);
+    return mem;
 }
 
 // ---- hypothesis 2: OCCLUSION QUERIES, and why it is at least as likely as shadows ----
@@ -13128,8 +15174,8 @@ static bool ShouldDuplicate()
         ? (g_rtCurrent->w == (g_sceneW ? g_sceneW : g_capW) &&
            g_rtCurrent->h == (g_sceneH ? g_sceneH : g_capH))
         : g_rtIsScene;
-    if (!(g_simulStereo && !g_sceneSplitMono && !g_inDupDraw && g_sceneMatValid &&
-          g_c0IsScene && currentTargetMatchesScene &&
+    if (!(g_simulStereo && !g_sceneSplitMono && !g_scenePartialMono && !g_inDupDraw &&
+          g_sceneMatValid && g_c0IsScene && currentTargetMatchesScene &&
           g_vmReg >= 0 && g_halfIpdUU > 0.0f && g_capW > 0)) return false;
 
     // ---- INSERT bisects WHICH scene-sized target gets duplicated ----
@@ -13845,14 +15891,14 @@ static void DrawOverlay(IDirect3DDevice9* dev)
                       ((g_swingLastBlockAt != 0 &&
                         (double)(g_swingClock - g_swingLastBlockAt) * 1e-9 < 3.0)
                          ? g_swingLastBlock : "IDLE"))));
-        static const char* kTuneNames[9] = { "DEADBAND", "SPRINT ON", "SPRINT OFF", "STOP MS",
-                                            "UNISON", "JUMP RISE", "CROUCH DROP",
-                                            "HOLD MS", "CROUCH MS" };
-        const float tuneVals[9] = { g_swingDeadbandMS, g_swingSprintOnMS, g_swingSprintOffMS,
-                                    g_swingStopMs, g_swingUnisonMax,
-                                    g_swingJumpRise, g_swingCrouchDrop,
-                                    g_swingHoldMs, g_swingHeadVertMax };
-        const int ti = (g_swingTuneSel >= 0 && g_swingTuneSel < 9) ? g_swingTuneSel : 0;
+        static const char* kTuneNames[10] = { "DEADBAND", "SPRINT ON", "SPRINT OFF", "STOP MS",
+                                             "BOTH ARMS", "UNISON", "JUMP RISE", "CROUCH DROP",
+                                             "HOLD MS", "CROUCH MS" };
+        const float tuneVals[10] = { g_swingDeadbandMS, g_swingSprintOnMS, g_swingSprintOffMS,
+                                     g_swingStopMs, g_swingBothArmsMs, g_swingUnisonMax,
+                                     g_swingJumpRise, g_swingCrouchDrop,
+                                     g_swingHoldMs, g_swingHeadVertMax };
+        const int ti = (g_swingTuneSel >= 0 && g_swingTuneSel < 10) ? g_swingTuneSel : 0;
         // UNISON is the first tunable here that can go negative, and the obvious
         // whole-plus-hundredths split renders -0.30 as "0.-30". Sign is carried separately.
         const float tv = tuneVals[ti];
@@ -13891,9 +15937,11 @@ static void DrawOverlay(IDirect3DDevice9* dev)
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "STEREO %s %s  STRENGTH %d PCT",
                 g_stereoMode ? "ON" : "OFF", g_simulStereo ? "SIMUL" : "ALT",
                 (int)(g_stereoStrength * 100.0f));
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "DUP %ld ONLY %d  OCC %s",
+    _snprintf_s(lines[nl++], 64, _TRUNCATE, "DUP %ld ONLY %d  OCC %s%s",
                 InterlockedCompareExchange(&g_dupDraws, 0, 0), g_dupOnlyTarget,
-                g_occlusionMode == 2 ? "REAL" : (g_occlusionMode == 1 ? "ALWAYS" : "AUTO"));
+                g_occlusionMode == 2 ? "REAL" : (g_occlusionMode == 1 ? "ALWAYS" : "AUTO"),
+                g_sceneSplitMono ? "  SPLIT-MONO"
+                                 : (g_scenePartialMono ? "  PARTIAL-MONO" : ""));
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "6DOF %s  R%+d U%+d F%+d UU",
                 g_sixDof ? "ON" : "OFF", (int)g_dofOffset[0], (int)g_dofOffset[1],
                 (int)-g_dofOffset[2]);
@@ -14058,6 +16106,46 @@ static void DescribeBackbuffer(IDirect3DDevice9* dev)
     }
 }
 
+// ---- 32-bit address space, the resource GetAvailableTextureMem cannot see ----
+//
+// The texture-memory query is clamped and reads ~4095 MB forever, so it cannot be what
+// varies between the runs that come up half-res and the runs that do not. The address space
+// of this 32-bit process is the other finite resource: the game, D3D9Ex, the OpenXR runtime
+// and its D3D11 device all carve it up during the same startup window, and how much
+// contiguous room is left at the moment the engine sizes its buffers is exactly the kind of
+// thing that can differ run to run with identical config. Total free plus the largest
+// single hole, logged at the moments that matter, so good and bad runs can be compared.
+static void LogAddressSpace(const char* when)
+{
+    static bool laaLogged = false;
+    if (!laaLogged) {
+        laaLogged = true;
+        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)GetModuleHandleW(nullptr);
+        if (dos) {
+            const IMAGE_NT_HEADERS* nt =
+                (const IMAGE_NT_HEADERS*)((const BYTE*)dos + dos->e_lfanew);
+            Log("[addr] host exe LARGEADDRESSAWARE: %s  (decides whether the ceiling is 2 or 4 GB)",
+                (nt->FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) ? "yes" : "no");
+        }
+    }
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    ULONGLONG freeTotal = 0, freeLargest = 0;
+    const BYTE* p   = (const BYTE*)si.lpMinimumApplicationAddress;
+    const BYTE* end = (const BYTE*)si.lpMaximumApplicationAddress;
+    MEMORY_BASIC_INFORMATION mbi{};
+    while (p < end && VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        if (mbi.RegionSize == 0) break;   // cannot advance; a truncated walk beats a hang
+        if (mbi.State == MEM_FREE) {
+            freeTotal += mbi.RegionSize;
+            if (mbi.RegionSize > freeLargest) freeLargest = mbi.RegionSize;
+        }
+        p = (const BYTE*)mbi.BaseAddress + mbi.RegionSize;
+    }
+    Log("[addr] %s: free %llu MB total, largest hole %llu MB",
+        when, (unsigned long long)(freeTotal >> 20), (unsigned long long)(freeLargest >> 20));
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT* src,
                                               const RECT* dst, HWND wnd, const RGNDATA* dirty)
 {
@@ -14094,6 +16182,16 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     if (f == 1) {
         Log("*** first Present - the game is rendering. This is the frame hook everything later hangs off.");
         DescribeBackbuffer(dev);
+        LogAddressSpace("at first Present");
+    }
+
+    // TestStall: ten deliberately terrible frames, the artificial version of the load-finish
+    // hitch that every logged half-res flip sits next to. If the engine's detail scaler is
+    // what swaps the scene into the half-size buffer set, this reproduces the swap on the
+    // monitor with no headset attached.
+    if (g_testStallFrame > 0 && f >= g_testStallFrame && f < g_testStallFrame + 10) {
+        Log("[perf] TestStall frame %ld: sleeping 400 ms", f);
+        Sleep(400);
     }
 
     // ⚠️ OUTSIDE the XR block, and before the capture.
@@ -14188,12 +16286,19 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
         ReportCameraAnimation();
         ReportPadState();
         ReportInputGates();
-        if (g_simulStereo) ReportRenderTargets();
-        if (g_simulStereo) ReportClears();
+        // Not gated on g_simulStereo any more: the half-res fault is decided before the menu
+        // even appears, so a monitor-only run with no headset must still produce the census -
+        // that IS the repro loop for it.
+        ReportRenderTargets();
+        ReportClears();
+        ReportBlits();
         // Alongside the target census: if the engine ever falls back to half-size LDR buffers
-        // again (run 14), the headroom trend here says whether VRAM pressure did it.
+        // again (run 14), the headroom trend here says whether VRAM pressure did it. Through
+        // the ORIGINAL so the mod's own read does not appear as the game asking.
         Log("[vram] approx available texture memory: %u MB",
-            dev->GetAvailableTextureMem() / (1024u * 1024u));
+            (g_origGetAvailTexMem ? g_origGetAvailTexMem(dev)
+                                  : dev->GetAvailableTextureMem()) / (1024u * 1024u));
+        if ((f % 3600) == 0) LogAddressSpace("periodic");
     }
 
     // Six times a second is fast enough to place a transition against the acceptance windows it
@@ -14246,11 +16351,17 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     // because 15% of an angle near the asymptote is not 15% of a frustum.
     //
     // Written every frame because the camera update pulls it back toward the default each tick.
-    if (g_fovForce && g_offFOVAngle >= 0 && g_targetHalfFovX > 0.0f && SceneH() > 0) {
+    //
+    // TestWideFov: a monitor-only run has no capture chain, so SceneH() is 0 and this write
+    // could never fire there; the backbuffer's size from the census carries the aspect
+    // instead. With XR up the values are identical to what they always were.
+    const UINT fovRefW = SceneW() > 0 ? SceneW() : (g_rtSeenCount ? g_rtSeen[0].w : 0);
+    const UINT fovRefH = SceneH() > 0 ? SceneH() : (g_rtSeenCount ? g_rtSeen[0].h : 0);
+    if (g_fovForce && g_offFOVAngle >= 0 && g_targetHalfFovX > 0.0f && fovRefH > 0) {
         const uintptr_t ctl = FindPlayerController();
         if (ctl) {
             // The engine culls against the frame IT renders, so the aspect has to be the scene's.
-            const float aspectFull = (float)SceneW() / (float)SceneH();
+            const float aspectFull = (float)fovRefW / (float)fovRefH;
             const float needVert = tanf(g_targetHalfFovY) * aspectFull;  // to cover our vertical
             const float needHorz = tanf(g_targetHalfFovX);               // to cover our horizontal
             const float t = ((needVert > needHorz) ? needVert : needHorz) * 1.15f;
@@ -14308,6 +16419,45 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
             static long n = 0;
             if (++n == 1 || (n % 60) == 0)
                 Log("*** [fps] cap %.0f -> %.0f (write %ld)", cur, g_fpsCap, n);
+        }
+    }
+
+    // ---- watch the engine's own "too slow" verdict, and optionally disarm it ----
+    //
+    // The flags DWORD is read raw and logged on change rather than decoded: bDropDetail and
+    // bAggressiveLOD are bitfields whose masks this mod has not measured, and a change line
+    // placed next to a [mode] DEGRADED line identifies both the mechanism and the masks in
+    // one run.
+    if ((f % 10) == 0 && g_worldInfoObj) {
+        const int off = g_offDropDetail >= 0 ? g_offDropDetail : g_offAggressiveLOD;
+        if (off >= 0) {
+            uint32_t flags = 0;
+            if (!SafeU32(g_worldInfoObj + (uint32_t)off, &flags)) {
+                g_worldInfoObj = 0;   // level load replaced it; re-found below
+            } else if (flags != g_worldFlagsSeen) {
+                Log("*** [perf] WorldInfo detail flags +0x%X: 0x%08lX -> 0x%08lX at frame %ld"
+                    "  (bDropDetail / bAggressiveLOD live in this DWORD)",
+                    off, (unsigned long)g_worldFlagsSeen, (unsigned long)flags, f);
+                g_worldFlagsSeen = flags;
+            }
+        }
+    }
+    if ((f % 300) == 0 && !g_worldInfoObj && g_gobjAddr && g_offName >= 0) FindWorldInfo();
+    // Held at zero every frame for the same reason the fps cap is: a once-only write is
+    // invisible when the engine recomputes the field behind it.
+    if (g_pinMinDesiredFps && g_clientObj && g_offMinDesiredFps >= 0) {
+        float cur = 0.0f;
+        if (SafeRead(g_clientObj + (uint32_t)g_offMinDesiredFps, &cur, sizeof(float)) &&
+            cur != 0.0f) {
+            const float zero = 0.0f;
+            SIZE_T wrote = 0;
+            WriteProcessMemory(GetCurrentProcess(),
+                               (LPVOID)(uintptr_t)(g_clientObj + (uint32_t)g_offMinDesiredFps),
+                               &zero, sizeof(float), &wrote);
+            static long n = 0;
+            if (++n == 1 || (n % 60) == 0)
+                Log("*** [perf] MinDesiredFrameRate %.1f -> 0 (write %ld) - the detail scaler"
+                    " can no longer fire", cur, n);
         }
     }
 
@@ -14429,7 +16579,8 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateTexture(IDirect3DDevice9* dev, UINT 
             Log("*** [vram] CreateTexture FAILED hr=0x%08lX  %ux%u levels=%u usage=0x%08lX"
                 " fmt=%d pool=%d  |  approx available texture mem %u MB",
                 (unsigned long)hr, w, h, levels, (unsigned long)usage, (int)fmt, (int)pool,
-                dev->GetAvailableTextureMem() / (1024u * 1024u));
+                (g_origGetAvailTexMem ? g_origGetAvailTexMem(dev)
+                                      : dev->GetAvailableTextureMem()) / (1024u * 1024u));
     }
     return hr;
 }
@@ -14520,6 +16671,53 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateIB(IDirect3DDevice9* dev, UINT len, 
     return g_origCreateIB(dev, len, usage, fmt, pool, out, shared);
 }
 
+// ---- the surface creates CreateTexture never sees ----
+//
+// The run-14 fallback theory ("a UE3 engine that cannot allocate its full-size HDR targets
+// quietly builds smaller ones instead") was instrumented only at CreateTexture, and four
+// days of logs show no failure there - but render-target and depth-stencil SURFACES have
+// their own entry points, and a refusal on those was invisible. Both are logged the same
+// way: the first large creations to see the startup allocation order, every failure to see
+// a refusal. DEFAULT pool only on both, so there is nothing to translate for Ex.
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateRT)(IDirect3DDevice9*, UINT, UINT, D3DFORMAT,
+                                                  D3DMULTISAMPLE_TYPE, DWORD, BOOL,
+                                                  IDirect3DSurface9**, HANDLE*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateDS)(IDirect3DDevice9*, UINT, UINT, D3DFORMAT,
+                                                  D3DMULTISAMPLE_TYPE, DWORD, BOOL,
+                                                  IDirect3DSurface9**, HANDLE*);
+static PFN_CreateRT g_origCreateRT = nullptr;
+static PFN_CreateDS g_origCreateDS = nullptr;
+
+static HRESULT STDMETHODCALLTYPE Hook_CreateRT(IDirect3DDevice9* dev, UINT w, UINT h,
+                                               D3DFORMAT fmt, D3DMULTISAMPLE_TYPE ms,
+                                               DWORD msq, BOOL lockable,
+                                               IDirect3DSurface9** out, HANDLE* shared)
+{
+    const HRESULT hr = g_origCreateRT(dev, w, h, fmt, ms, msq, lockable, out, shared);
+    static LONG logged = 0, failLogged = 0;
+    if (FAILED(hr) ? InterlockedIncrement(&failLogged) <= 30
+                   : ((w >= 256 || h >= 256) && InterlockedIncrement(&logged) <= 24))
+        Log("[surf] CreateRenderTarget %ux%u fmt %d ms=%d -> hr=0x%08lX  (frame %ld)%s",
+            w, h, (int)fmt, (int)ms, (unsigned long)hr, g_frames,
+            FAILED(hr) ? "  *** REFUSED" : "");
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_CreateDS(IDirect3DDevice9* dev, UINT w, UINT h,
+                                               D3DFORMAT fmt, D3DMULTISAMPLE_TYPE ms,
+                                               DWORD msq, BOOL discard,
+                                               IDirect3DSurface9** out, HANDLE* shared)
+{
+    const HRESULT hr = g_origCreateDS(dev, w, h, fmt, ms, msq, discard, out, shared);
+    static LONG logged = 0, failLogged = 0;
+    if (FAILED(hr) ? InterlockedIncrement(&failLogged) <= 30
+                   : ((w >= 256 || h >= 256) && InterlockedIncrement(&logged) <= 24))
+        Log("[surf] CreateDepthStencilSurface %ux%u fmt %d ms=%d -> hr=0x%08lX  (frame %ld)%s",
+            w, h, (int)fmt, (int)ms, (unsigned long)hr, g_frames,
+            FAILED(hr) ? "  *** REFUSED" : "");
+    return hr;
+}
+
 
 static void PatchDeviceOnce(IDirect3DDevice9* dev)
 {
@@ -14549,6 +16747,16 @@ static void PatchDeviceOnce(IDirect3DDevice9* dev)
     // Slot 94, extracted from d3d9.h and cross-checked against the reference's working hooks.
     g_origSetVSConstF = (PFN_SetVSConstF) PatchVTable(dev, DEV_SetVertexShaderConstantF,
                                                       (void*)&Hook_SetVSConstF);
+    // The half-res startup investigation. Patched here, inside CreateDevice, so the engine's
+    // very first allocations and queries are already covered when the call returns.
+    g_origCreateRT       = (PFN_CreateRT)       PatchVTable(dev, DEV_CreateRenderTarget,
+                                                            (void*)&Hook_CreateRT);
+    g_origCreateDS       = (PFN_CreateDS)       PatchVTable(dev, DEV_CreateDepthStencilSurface,
+                                                            (void*)&Hook_CreateDS);
+    g_origStretchRect    = (PFN_StretchRect)    PatchVTable(dev, DEV_StretchRect,
+                                                            (void*)&Hook_StretchRect);
+    g_origGetAvailTexMem = (PFN_GetAvailTexMem) PatchVTable(dev, DEV_GetAvailableTextureMem,
+                                                            (void*)&Hook_GetAvailTexMem);
 
     Log("[patch] device vtable patched: Present=%d Reset=%d CreateTexture=%d CreateVB=%d CreateIB=%d",
         DEV_Present, DEV_Reset, DEV_CreateTexture, DEV_CreateVertexBuffer, DEV_CreateIndexBuffer);
@@ -14576,6 +16784,10 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT adapte
     Log("*** CreateDevice on IDirect3D9* %p   adapter=%u DeviceType=%d BehaviorFlags=0x%08lX focus=%p",
         (void*)self, adapter, (int)type, (unsigned long)behavior, (void*)focus);
     LogPresentParams("requested", pp);
+    // The earliest moment worth measuring: everything the engine is about to allocate has to
+    // fit in what is free RIGHT HERE, and this number is the first candidate for what
+    // actually differs between a run that comes up half-res and one that does not.
+    LogAddressSpace("at CreateDevice");
 
     // ---- force WINDOWED ----
     //
@@ -14740,9 +16952,55 @@ static void CheckExOptOut()
     }
 }
 
+// ---- what is the ENGINE told about memory? ----
+//
+// The half-res startup fault: the exe imports GlobalMemoryStatus, and system-wide memory
+// load is one of the few inputs that genuinely differs between two launches minutes apart
+// with identical config. If the engine gates its render-target choices on this call, the
+// numbers it was given are the whole explanation - so record every early call verbatim.
+// Hooked via MinHook like XInput, installed from Direct3DCreate9 so it is live well before
+// the engine sizes its buffers (frame ~440).
+typedef void (WINAPI *PFN_GlobalMemoryStatus)(LPMEMORYSTATUS);
+static PFN_GlobalMemoryStatus g_origGlobalMemoryStatus = nullptr;
+
+static void WINAPI Hook_GlobalMemoryStatus(LPMEMORYSTATUS ms)
+{
+    g_origGlobalMemoryStatus(ms);
+    if (!ms) return;
+    static LONG calls = 0;
+    const LONG n = InterlockedIncrement(&calls);
+    if (n <= 12)
+        Log("[mem] the GAME asked GlobalMemoryStatus (call #%ld, frame %ld): load %lu%%,"
+            " phys %lu/%lu MB avail/total, virt %lu/%lu MB",
+            (long)n, g_frames, (unsigned long)ms->dwMemoryLoad,
+            (unsigned long)(ms->dwAvailPhys >> 20), (unsigned long)(ms->dwTotalPhys >> 20),
+            (unsigned long)(ms->dwAvailVirtual >> 20),
+            (unsigned long)(ms->dwTotalVirtual >> 20));
+}
+
+static void HookGlobalMemoryStatusOnce()
+{
+    static bool tried = false;
+    if (tried) return;
+    tried = true;
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    void* p = k32 ? (void*)GetProcAddress(k32, "GlobalMemoryStatus") : nullptr;
+    if (!p) { Log("[mem] GlobalMemoryStatus not found - not watched"); return; }
+    const MH_STATUS init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
+        Log("[mem] MH_Initialize status %d - GlobalMemoryStatus not watched", (int)init);
+        return;
+    }
+    if (MH_CreateHook(p, (void*)&Hook_GlobalMemoryStatus,
+                      (void**)&g_origGlobalMemoryStatus) == MH_OK &&
+        MH_EnableHook(p) == MH_OK)
+        Log("[mem] GlobalMemoryStatus watched - logging what the engine is told");
+}
+
 extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion)
 {
     CheckExOptOut();
+    HookGlobalMemoryStatusOnce();
 
     // ---- hand back an Ex factory in place of the plain one ----
     //
@@ -14983,6 +17241,41 @@ static void LoadSettings()
             const float f = (float)atof(val);
             if (f >= 20.0f && f <= 1000.0f) { g_fpsCap = f; Log("[cfg]   FrameCap = %.0f", f); applied++; }
             else { Log("[cfg]   FrameCap '%s' out of range 20..1000 - ignored", val); rejected++; }
+        } else if (_stricmp(key, "TestStall") == 0) {
+            const long fr = atol(val);
+            if (fr >= 0 && fr <= 1000000) {
+                g_testStallFrame = fr;
+                Log("[cfg]   TestStall = %ld  (debug: ten 400 ms frames injected there)", fr);
+                applied++;
+            } else { Log("[cfg]   TestStall '%s' out of range 0..1000000 - ignored", val); rejected++; }
+        } else if (_stricmp(key, "PinMinDesiredFps") == 0) {
+            if (SettingBool(val, &b)) {
+                g_pinMinDesiredFps = b;
+                Log("[cfg]   PinMinDesiredFps = %s%s", b ? "on" : "off",
+                    b ? "  (the engine's own detail scaler is held off)" : "");
+                applied++;
+            } else { Log("[cfg]   PinMinDesiredFps '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "TestWideFov") == 0) {
+            if (SettingBool(val, &b)) {
+                if (b && g_targetHalfFovX <= 0.0f) {
+                    // The numbers a real headset run uses (93.3 x 100.0 degrees), planted so
+                    // the culling-FOV write fires on a monitor-only run. The half-res hunt
+                    // needs the engine to see the same wide frustum it sees in VR, without
+                    // the headset.
+                    g_targetHalfFovX = 0.8142f;
+                    g_targetHalfFovY = 0.8727f;
+                }
+                Log("[cfg]   TestWideFov = %s%s", b ? "on" : "off",
+                    b ? "  (debug: engine FOV widened to the VR frustum)" : "");
+                applied++;
+            } else { Log("[cfg]   TestWideFov '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "OcclusionMode") == 0) {
+            const int m = atoi(val);
+            if (m >= 0 && m <= 2 && (val[0] == '0' || val[0] == '1' || val[0] == '2')) {
+                g_occlusionMode = m;
+                Log("[cfg]   OcclusionMode = %d  (0 auto, 1 always visible, 2 never override)", m);
+                applied++;
+            } else { Log("[cfg]   OcclusionMode '%s' must be 0..2 - ignored", val); rejected++; }
         } else if (_stricmp(key, "LockAnimPitch") == 0) {
             if (SettingBool(val, &b)) { g_animFollow = !b; Log("[cfg]   LockAnimPitch = %s", b?"on":"off"); applied++; }
             else { Log("[cfg]   LockAnimPitch '%s' is not a boolean - ignored", val); rejected++; }
@@ -15009,6 +17302,20 @@ static void LoadSettings()
                 Log("[cfg]   MotionHandsDebug = %s", b ? "on" : "off");
                 applied++;
             } else { Log("[cfg]   MotionHandsDebug '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "StickJumpTurn") == 0) {
+            if (SettingBool(val, &b)) {
+                g_stickJumpTurn = b;
+                Log("[cfg]   StickJumpTurn = %s%s", b ? "on" : "off",
+                    b ? "  (right stick up = jump, down = quick turn; pad pitch is spent)" : "");
+                applied++;
+            } else { Log("[cfg]   StickJumpTurn '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "GripToGrip") == 0) {
+            if (SettingBool(val, &b)) {
+                g_gripToGrip = b;
+                Log("[cfg]   GripToGrip = %s%s", b ? "on" : "off",
+                    b ? "  (the grips stop reaching the game and are held for the hand pose)" : "");
+                applied++;
+            } else { Log("[cfg]   GripToGrip '%s' is not a boolean - ignored", val); rejected++; }
         } else if (_stricmp(key, "ArmSwing") == 0) {
             if (SettingBool(val, &b)) {
                 g_armSwing = b;
@@ -15065,6 +17372,22 @@ static void LoadSettings()
             Log("[cfg]   unknown key '%s' - ignored", key);
             rejected++;
         }
+    }
+    // ---- the one dependency between two settings, resolved after the whole file is read ----
+    //
+    // Here rather than in the GripToGrip row because keys may appear in any order: a file that
+    // sets GripToGrip before StickJumpTurn would otherwise have the forced value overwritten by
+    // the row that follows it.
+    //
+    // Forced rather than refused. GripToGrip takes LSHOULDER and RSHOULDER away from the only
+    // physical controls that reach them, so without the stick remap the run has no jump button
+    // at all - and a run with no jump is not a configuration anyone means to ask for. The log
+    // says what happened, so a player who did mean to keep pad pitch can see the cost and turn
+    // GripToGrip back off.
+    if (g_gripToGrip && !g_stickJumpTurn) {
+        g_stickJumpTurn = true;
+        Log("[cfg]   ^ StickJumpTurn forced ON: GripToGrip leaves jump and quick turn with"
+            " nowhere else to go");
     }
     Log("[cfg] %d applied, %d ignored. Hotkeys still override anything set here.",
         applied, rejected);

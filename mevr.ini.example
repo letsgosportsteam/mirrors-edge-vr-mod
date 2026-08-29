@@ -58,6 +58,35 @@ MotionHands = off
 MotionHandsDebug = off
 
 
+; ---------------------------------------------------------------- freeing the two grips
+;
+; On a Touch pair every button is already spoken for, and the two grips are the only controls
+; that reach jump and quick turn. Anything that wants the grips for itself has to move those two
+; actions first. These are the two settings that do it, kept separate because they answer
+; different questions.
+;
+; StickJumpTurn puts jump on the right stick pushed UP and quick turn on the right stick pushed
+; DOWN. It costs the pad's pitch axis, which is the one stick action a headset already does
+; better - your head carries the pitch, and the game's own pitch is fought all frame by the view
+; path anyway. Nothing else moves: turn stays on the right stick's X, and the grips keep working
+; too, so with this on alone there are simply two ways to do each action.
+;
+; GripToGrip hands the grips to the hand instead: squeeze to close Faith's fingers, let go to
+; open them. While it is on the grips no longer reach the game at all - a hand closing around
+; nothing must not also jump - so it needs StickJumpTurn, and turns it on for you if you forgot.
+; Turning StickJumpTurn on by itself is fine and changes nothing else.
+;
+; The hand closes proportionally, not on a threshold: half a squeeze is a half-closed hand. The
+; fist itself was captured from Faith's own first-person run cycle, so it is the pose her
+; animators authored for this mesh, thumb included, rather than something approximated here.
+;
+; Each hand is independent, and both stand down wherever the game poses the hands itself - a
+; ledge, a pipe, a zipline, a melee - so a squeeze never fights an authored grab.
+
+StickJumpTurn = off
+GripToGrip = off
+
+
 ; ---------------------------------------------------------------- arm swing locomotion (measuring)
 ;
 ; Swing your arms to run, raise both hands to jump, crouch to crouch. None of that is built yet.
@@ -149,3 +178,32 @@ D3D9Ex = on
 ;
 ; Hotkey: NUMPAD8, so you can compare both in one session.
 FastCapture = on
+
+
+; ---------------------------------------------------------------- the half-res hunt (diagnostics)
+;
+; Some runs come up soft: the engine quietly renders part or all of the scene into its
+; 1280x720 buffer set instead of the full-resolution one, and the picture looks like 720p
+; upscaled. Every log now carries a [mode] line per 12-second window - "healthy" or
+; "DEGRADED" - plus [rt-first]/[surf]/[blit] lines that show which buffers the engine chose.
+; The four keys below are levers for reproducing it on the monitor, with no headset. All of
+; them default off and none belongs in normal play.
+;
+; TestStall injects ten 400 ms frames at the given frame number (0 = off) - an artificial
+; load hitch. TestWideFov performs the same culling-FOV widening a headset run performs.
+; OcclusionMode is the DELETE hotkey's setting made persistent: 0 auto, 1 every occlusion
+; query reports visible, 2 never override. PinMinDesiredFps holds the engine's
+; Client.MinDesiredFrameRate at zero. Measured 2026-08-28: slow frames, stalls, occlusion
+; and the wide FOV each stay healthy alone on the monitor - the remaining suspects engage
+; only in a real headset run, which these lines exist to diagnose when it next happens.
+;
+; The visible symptom - hands and building edges streaking along their motion history - is
+; duplication running while the engine is in the half-res state, and it is guarded
+; automatically: the mod drops to a clean mono view within a few seconds of detecting it
+; and resumes stereo on its own if the engine recovers. No setting: the guard has no off
+; switch because a run with it off has nothing to recommend it.
+
+TestStall = 0
+TestWideFov = off
+OcclusionMode = 0
+PinMinDesiredFps = off
