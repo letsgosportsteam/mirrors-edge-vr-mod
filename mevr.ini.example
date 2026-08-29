@@ -207,3 +207,18 @@ TestStall = 0
 TestWideFov = off
 OcclusionMode = 0
 PinMinDesiredFps = off
+
+
+; ---------------------------------------------------------------- beam balance
+;
+; On a narrow beam the game tips you and expects a counter on the strafe stick. This lets you
+; lean your head instead, which is quicker to start than moving a thumb - and the game gives you
+; only 0.8 s to answer before you fall.
+;
+; Head roll is the one axis of head tracking the game never sees, so this collides with nothing.
+; The stick keeps working either way.
+;
+; If leaning tips you the WRONG way, flip BEAM SIGN in the F3 overlay (NUMPAD . to select,
+; NUMPAD + or - to change). The handedness is measured rather than assumed.
+
+BalanceHeadRoll = on

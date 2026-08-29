@@ -697,6 +697,8 @@ extern int g_offActorLocation;
 extern int g_offVelocity;
 extern uintptr_t g_playerCtl;
 extern bool g_moveInputBlocked;
+extern float g_headRoll;
+extern int   g_animState;
 extern int g_offSprintRadiusLimit;
 extern int g_offSprintHeightLimit;
 extern int g_offWalkRadiusLimit;
@@ -1989,6 +1991,50 @@ static float ArmSwingHold(XrTime when, int kind, const char* why, float maxMs)
     return g_swingDeflection;
 }
 
+// ================================================================ beam balance, by head roll
+//
+// On a narrow beam the game tips the player off and expects a counter on the strafe axis:
+// [TdGame.TdMove_Balance] gives GravityInfluence 0.3 against ControlInfluence 1.5, with
+// TimeToCounter 0.8 - eight hundred milliseconds to answer before falling. Leaning your head is
+// faster to initiate than moving a thumb, so this should read as better than the stick rather
+// than merely different.
+//
+// ---- roll is free, and that is what makes this clean ----
+//
+// Head roll is the one axis of the head pose that never reaches the game: UpdateRotation zeroes
+// ViewRotation.Roll before writing it back, which is why the mod carries roll as an image
+// rotation instead. So mapping it to strafe collides with nothing - and it also means the
+// CameraInfluence 0.3 term in the balance move cannot be responding to head roll today, because
+// the game's camera roll is always exactly zero.
+//
+// The PS3 build did this: SixAxis_BalanceWalk sits in the name table beside SixAxisRollY/Z and
+// DefaultGame.ini maps it to a PS3 control prompt. Tilt-to-balance is the shipped design intent
+// for a motion input, not an invention.
+//
+// ⚠️ 29 is Balance, the narrow beam. NOT 30, LedgeWalk - shuffling along a ledge with your back
+// to a wall does not tip you, and there is nothing there to counter.
+static bool  g_balanceRoll = true;           // BalanceHeadRoll in mevr.ini
+static float g_balanceRollSign = 1.0f;       // ⚠️ measured, not reasoned - see below
+static float g_balanceRollDeadDeg = 4.0f;    // a resting tilt must not drift the player
+static float g_balanceRollFullDeg = 20.0f;   // full strafe at a comfortable lean
+
+// Returns a strafe contribution in -1..1, or 0 when not on a beam.
+static float BalanceHeadRollStrafe()
+{
+    if (!g_balanceRoll || !g_padEnabled || g_animState != 29) return 0.0f;
+    // ⚠️ The sign is a hotkey, not a constant, because the OpenXR-to-UE3 handedness has already
+    // come out inverted for yaw AND for pitch in this file, and g_rollSign exists for exactly
+    // this reason. Guessing a third time is worse than one keypress.
+    const float deg = g_headRoll * 57.29578f * g_balanceRollSign;
+    const float mag = fabsf(deg);
+    if (mag <= g_balanceRollDeadDeg) return 0.0f;
+    const float span = g_balanceRollFullDeg - g_balanceRollDeadDeg;
+    if (span < 1.0f) return 0.0f;
+    float t = (mag - g_balanceRollDeadDeg) / span;
+    if (t > 1.0f) t = 1.0f;
+    return (deg < 0.0f) ? -t : t;
+}
+
 // Returns true while the synthesised crouch should be held. The game decides crouch or slide.
 static bool ArmSwingCrouchTick(XrTime when)
 {
@@ -2395,8 +2441,12 @@ static bool XrSyncInput(XrTime when)
         // Clamped to the DISC rather than per-axis: the game's gate is on the stick's radius,
         // so letting the sum reach 1.41 diagonally would cross a threshold the player never
         // asked for, and clamping each axis separately would do exactly that.
-        if (swing > 0.0f) {
-            float fx = mx, fy = my + swing;
+        // The beam assist adds on the strafe axis, and goes through the SAME clamp - a balance
+        // correction that pushed the stick radius past 1 would cross the sprint gate while the
+        // player was trying not to fall off a beam.
+        const float balance = BalanceHeadRollStrafe();
+        if (swing > 0.0f || balance != 0.0f) {
+            float fx = mx + balance, fy = my + swing;
             const float len = sqrtf(fx * fx + fy * fy);
             if (len > 1.0f) { fx /= len; fy /= len; }
             s.Gamepad.sThumbLX = axis(fx);
@@ -7994,6 +8044,9 @@ static void CheckHeadHotkeys()
         { "SPRINT OFF", &g_swingSprintOffMS, 0.05f, 0.20f, 3.00f },
         { "STOP MS",    &g_swingStopMs,     25.0f, 50.0f, 600.0f },
         { "BOTH ARMS",  &g_swingBothArmsMs, 50.0f, 200.0f, 2000.0f },
+        // Step 2 over a range of 2, so +/- flips the sign rather than nudging it.
+        { "BEAM SIGN",  &g_balanceRollSign,  2.0f, -1.0f, 1.00f },
+        { "BEAM DEG",   &g_balanceRollFullDeg, 2.0f, 6.0f, 45.0f },
         { "UNISON",     &g_swingUnisonMax,   0.05f, -0.50f, 1.00f },
         { "JUMP RISE",  &g_swingJumpRise,    0.05f, 0.05f, 1.00f },
         { "CROUCH DROP",&g_swingCrouchDrop,  0.05f, 0.05f, 1.00f },
@@ -8803,7 +8856,7 @@ enum P13BlockReason {
 static const char* P13ReasonName(P13BlockReason reason)
 {
     switch (reason) {
-        case P13_READY:         return "eligible: unarmed Walking/Jump/Falling/Crouch/180Turn/Balance/LedgeWalk + tracked grip";
+        case P13_READY:         return "eligible: unarmed Walking/Jump/Falling/Crouch/Slide/180Turn/Balance/LedgeWalk + tracked grip";
         case P13_LAYOUT:        return "rig/controller layout is not ready";
         case P13_RIG:           return "no validated live position rig";
         case P13_VIEW:          return "ViewTarget is not the player pawn";
@@ -8974,9 +9027,19 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13HandPoseSnapshot& 
     // keeps the arms rather than snapping to animation and back. 29 Balance (narrow beams) and
     // 30 LedgeWalk are slow deliberate locomotion where the player asked to keep the hands -
     // both confirmed as the blocking states in run 18.
+    // 16 Slide, added on request rather than on evidence - unlike the states above it, which
+    // each came out of a measured run. The case for it is that a slide is now something the
+    // player DOES rather than something that happens to them: AS.3 enters it from a physical
+    // crouch, so the hands are already the player's at the moment it starts, and snapping them
+    // to animation for the length of the slide is the jarring part.
+    //
+    // ⚠️ Untested, and the thing to watch is whether the game's own slide wants the arms. Faith
+    // goes down on a hip and a hand can reach for the floor; if that read is game-authored IK
+    // it will fight the VR write for the duration. If it does, take 16 back out - the whitelist
+    // is deliberately conservative and this is the first entry admitted without proof.
     if (g_offMoveState < 0 || !SafeRead(pawn + g_offMoveState, &movement, 1) ||
         !(movement == 1 || movement == 2 || movement == 11 || movement == 15 ||
-          movement == 24 || movement == 29 || movement == 30)) {
+          movement == 16 || movement == 24 || movement == 29 || movement == 30)) {
         if (outMovement) *outMovement = movement;
         return P13_MOVEMENT;
     }
@@ -15516,7 +15579,7 @@ int  g_offSprintHeightLimit = -1;    // TdPawn::InputMaxSprintHeightLimit
 int  g_offWalkRadiusLimit = -1;      // TdPawn::InputMaxWalkRadiusLimit
 static float g_animPeak[3] = { 0, 0, 0 };       // degrees, |pitch| |yaw| |roll| since last report
 float        g_animNow[3]  = { 0, 0, 0 };       // live, for the overlay and the pitch anchor
-static int   g_animState   = -1;
+int          g_animState   = -1;   // non-static: the beam balance assist reads it
 // From TdPawn.EMovement in the decompiled script. Named rather than numbered because the whole
 // point is to say WHICH moves throw the camera around, and "state 4 = 11.2 degrees" needs a
 // lookup table on the reader's side that a log line can just carry.
@@ -15875,6 +15938,15 @@ static void DrawOverlay(IDirect3DDevice9* dev)
     _snprintf_s(lines[nl++], 64, _TRUNCATE,
                 "FOREARM R R%s L R%s", rr, lr);
     _snprintf_s(lines[nl++], 64, _TRUNCATE, "ARROWS L/R SELECT  U/D CHANGE 5 DEG");
+    // Its own row, outside the arm-swing block: the beam assist is an independent feature and
+    // works with ArmSwing off. Shown only on a beam, which is the only place it does anything.
+    if (g_balanceRoll && g_animState == 29) {
+        const float bs = BalanceHeadRollStrafe();
+        _snprintf_s(lines[nl++], 64, _TRUNCATE, "BEAM ROLL %s%d DEG  STRAFE %s%d.%02d",
+                    g_headRoll < 0.0f ? "-" : "", (int)fabsf(g_headRoll * 57.29578f),
+                    bs < 0.0f ? "-" : "", (int)fabsf(bs),
+                    (int)(fabsf(bs - (float)(int)bs) * 100.0f + 0.5f));
+    }
     if (g_armSwing) {
         // Two rows, and the block reason is on the first: "why am I not moving" is the question
         // this feature will be asked most, and it must be answerable without leaving the game.
@@ -15891,14 +15963,16 @@ static void DrawOverlay(IDirect3DDevice9* dev)
                       ((g_swingLastBlockAt != 0 &&
                         (double)(g_swingClock - g_swingLastBlockAt) * 1e-9 < 3.0)
                          ? g_swingLastBlock : "IDLE"))));
-        static const char* kTuneNames[10] = { "DEADBAND", "SPRINT ON", "SPRINT OFF", "STOP MS",
-                                             "BOTH ARMS", "UNISON", "JUMP RISE", "CROUCH DROP",
+        static const char* kTuneNames[12] = { "DEADBAND", "SPRINT ON", "SPRINT OFF", "STOP MS",
+                                             "BOTH ARMS", "BEAM SIGN", "BEAM DEG", "UNISON",
+                                             "JUMP RISE", "CROUCH DROP",
                                              "HOLD MS", "CROUCH MS" };
-        const float tuneVals[10] = { g_swingDeadbandMS, g_swingSprintOnMS, g_swingSprintOffMS,
-                                     g_swingStopMs, g_swingBothArmsMs, g_swingUnisonMax,
+        const float tuneVals[12] = { g_swingDeadbandMS, g_swingSprintOnMS, g_swingSprintOffMS,
+                                     g_swingStopMs, g_swingBothArmsMs,
+                                     g_balanceRollSign, g_balanceRollFullDeg, g_swingUnisonMax,
                                      g_swingJumpRise, g_swingCrouchDrop,
                                      g_swingHoldMs, g_swingHeadVertMax };
-        const int ti = (g_swingTuneSel >= 0 && g_swingTuneSel < 10) ? g_swingTuneSel : 0;
+        const int ti = (g_swingTuneSel >= 0 && g_swingTuneSel < 12) ? g_swingTuneSel : 0;
         // UNISON is the first tunable here that can go negative, and the obvious
         // whole-plus-hundredths split renders -0.30 as "0.-30". Sign is carried separately.
         const float tv = tuneVals[ti];
@@ -17342,6 +17416,13 @@ static void LoadSettings()
                     b ? "" : "  (the swing is still suppressed while crouching)");
                 applied++;
             } else { Log("[cfg]   ArmSwingCrouch '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "BalanceHeadRoll") == 0) {
+            if (SettingBool(val, &b)) {
+                g_balanceRoll = b;
+                Log("[cfg]   BalanceHeadRoll = %s%s", b ? "on" : "off",
+                    b ? "  (tilt your head to counter on a narrow beam)" : "");
+                applied++;
+            } else { Log("[cfg]   BalanceHeadRoll '%s' is not a boolean - ignored", val); rejected++; }
         } else if (_stricmp(key, "D3D9Ex") == 0) {
             // ⚠️ Not a hotkey, and cannot be. A device's TYPE is fixed when it is created, so
             // switching it later would mean destroying every resource in the game. This is the
