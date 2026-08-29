@@ -130,6 +130,90 @@ Two resolution changes, both `hr=0`, backbuffer re-measured correctly each time
 resources were recreated. Reset is a path the VR frame plumbing must survive, and it is now
 known to be exercised by an ordinary video-options change rather than only by alt-tab.
 
+### ✅ The resolution limit is a mode-list check, not the menu — measured 2026-08-29
+
+The complaint was "only sizes in the game's video menu work". The menu is a symptom. Four
+headless boots (`MirrorsEdge.exe Edge_p`), reading the `[requested]` line the `CreateDevice`
+hook prints:
+
+| what was set | what the engine asked D3D for | ini afterwards |
+|---|---|---|
+| `TdEngine.ini` `ResX=1920 ResY=1080` | **1920×1080** | kept |
+| `TdEngine.ini` `ResX=4224 ResY=2376`, `Fullscreen=False` | 2560×1440 | **rewritten** to 2560×1440, `Fullscreen=True` |
+| command line `-ResX=4224 -ResY=2376 -windowed` | 2560×1440 | — |
+
+So `[SystemSettings] ResX/ResY` **is** the authority — row 1 proves the engine reads and keeps
+it — and row 2 proves the value is validated against a list of supported sizes and snapped to
+the nearest when it misses. Row 3 says the UE3 command-line overrides are not wired up in this
+build at all; **ignore the `-ResX=` suggestion the `[xr]` log line still prints.**
+
+**The list comes from D3D9, and only from D3D9.** `MirrorsEdge.exe` imports no
+`EnumDisplaySettings` / `EnumDisplaySettingsEx` / `ChangeDisplaySettings` — the strings are
+absent from the image — and `AllowD3D10=False`, so `IDirect3D9::GetAdapterModeCount` /
+`EnumAdapterModes` is the only surviving source. Both are in the wrapper's reach.
+
+The exe does carry a hardcoded table — `2560x1600 1920x1200 1920x1080 1600x1200 1280x1024
+1280x720 800x600` — but it is followed by a `%dx%d` formatter, and 2560×1440 is not in it and
+works, so the menu formats enumerated modes rather than offering that list.
+
+**Confirmed by construction.** Appending one synthetic mode to the enumeration (`Resolution`
+in `mevr.ini`) and matching `ResX/ResY` to it:
+
+```
+[res] the engine is enumerating display modes - adapter 0 format X8R8G8B8 -> 150
+[res] adapter 0 format X8R8G8B8: 150 real modes, 4224x2376 APPENDED
+[requested] 4224x2376   [granted] 4224x2376  Windowed=1
+[surf] CreateRenderTarget 4224x2376 fmt 113 ms=4 -> hr=0x00000000  (frame 440)
+[mode] half-res this window: fp16 raw 0, scene-classified 0  (healthy)
+```
+
+The whole scene target set allocated at the new size, 37k draws went to it, and the ini kept
+`4224×2376` afterwards because the value now passes the check. Inventing a mode is safe only
+because `CreateDevice` already forces `Windowed=TRUE`: no display mode is ever *set*, the
+oversized backbuffer is just a surface, and the headset is fed from it before Present shrinks
+it into the window.
+
+⚠️ **Ask for 16:9.** The engine renders 16:9 regardless and letterboxes the remainder into a
+separate smaller target — the 1600×1200 case `g_sceneW/g_sceneH` exist for — and
+`AdoptSceneTarget` answers a scene target that is not backbuffer-sized by presenting mono. So
+the width is the runtime's recommended per-eye width **doubled** and the height is `width*9/16`,
+*not* the recommended height: 2112×2304 an eye → **4224×2376**.
+
+⚠️ **The perf figure is mono.** That run held 72 fps at 4224×2376 with `[addr]` reporting
+3.2 GB free at first Present (the exe is `LARGEADDRESSAWARE`), but duplication never armed —
+0 scene-classified draws. Stereo issues every scene draw twice, and the half-res fallback is
+triggered by work spikes, so this is the one setting that can reintroduce the streaking state.
+`MaxMultisamples=4` is the first thing to give up.
+
+⚠️ The half-res buffer set stays **1280×720 absolute**, not half the configured size, so the
+fallback is a proportionally worse downgrade the higher this is set.
+
+### ⚠️ `Resolution = auto` cannot be same-launch, and the reason is structural
+
+Following the headset automatically runs into an ordering wall that no amount of care removes:
+
+| needs to happen | earliest we can |
+|---|---|
+| ResX/ResY correct **before the engine's config pass** | `DllMain`, which the loader runs before the exe's entry point |
+| ask the runtime what it wants | **not** `DllMain` — `xrCreateInstance` loads the runtime's DLL, and `LoadLibrary` under the loader lock is the deadlock `EnsureReal` already documents |
+
+So the two halves are split across launches instead of raced inside one: `InitXR` records the
+recommended per-eye size to `%LOCALAPPDATA%\MirrorsEdgeVR\headset.txt`, and the next `DllMain`
+reads it, derives `width*2 × (width*2)*9/16`, and rewrites `ResX`/`ResY`. A changed headset —
+or just a moved Virtual Desktop render-scale slider — costs exactly one launch and says so.
+
+The tempting alternative, probing on a worker thread spawned from `DllMain`, is a race against
+the engine's config pass whose failure mode is a resolution that looks corrupted. One late
+launch is the better trade.
+
+⚠️ **`%USERPROFILE%\Documents` is the wrong path** for `TdEngine.ini` and fails in a way that
+looks like the write silently not working: Documents is redirected into OneDrive here, and the
+naive path resolves to a real directory that simply does not hold the game's config. The
+authority is `HKCU\...\Explorer\User Shell Folders\Personal` (`REG_EXPAND_SZ`, expand it).
+`SHGetFolderPathW` would also work but is avoided on purpose — this runs from `DllMain`, and a
+registry read cannot decide to load anything. All three candidates are confirmed by the file
+being there rather than by trusting whichever source produced the directory.
+
 ---
 
 ## OpenXR

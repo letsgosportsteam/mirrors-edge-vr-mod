@@ -122,7 +122,9 @@ try {
     $cmd = "`"$vcvars`" x86 && cl /nologo /LD /EHsc /W3 /w34505 /Zi /MD /std:c++17 " +
            "$incArgs " +
            "/Fe:d3d9.dll d3d9.cpp $mhSrc " +
-           "/link /DEF:d3d9.def $xrLib user32.lib shell32.lib psapi.lib"
+           # advapi32: Resolution = auto resolves the real Documents folder from the registry
+           # rather than assuming %USERPROFILE%\Documents, which OneDrive redirection breaks.
+           "/link /DEF:d3d9.def $xrLib user32.lib shell32.lib psapi.lib advapi32.lib"
     cmd /c $cmd
     if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
     Write-Host ""

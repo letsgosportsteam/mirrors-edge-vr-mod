@@ -179,6 +179,62 @@ D3D9Ex = on
 ; Hotkey: NUMPAD8, so you can compare both in one session.
 FastCapture = on
 
+; Render at a size the game's own video menu does not offer.
+;
+; Without this the frame is 2560x1440, an eye gets half of it - 1280x1440 - and the runtime
+; upscales that to the 2112x2304 it asked for. More than half the pixels the headset shows are
+; invented. The menu is not the real limit though: the engine reads ResX/ResY from
+; TdEngine.ini and keeps them, but VALIDATES them against the display modes the graphics
+; driver reports and silently snaps to the nearest when yours is not one. This adds yours to
+; that list, so the check passes. Nothing ever changes your monitor's mode - the mod already
+; forces the game windowed, so the oversized frame is just a surface that Present shrinks into
+; the window. The headset is fed from that surface BEFORE the shrink, at full size.
+;
+; Resolution = auto follows whatever headset is attached and needs nothing else set. It also
+; keeps ResX / ResY in TdEngine.ini in step for you, which is the half people miss.
+;
+; ⚠️ auto always lands ONE LAUNCH LATE, by construction. The engine fixes its render size
+; from its config long before it loads d3d9.dll, so the only code of ours that runs early
+; enough is DllMain - and the headset cannot be asked there, because opening the OpenXR
+; runtime loads a DLL and doing that under the loader lock is a deadlock. So the size is
+; recorded when the headset IS reachable (first frame) and applied at the next launch. Change
+; headsets, or move Virtual Desktop's render-scale slider, and the log says:
+;
+;     *** [res] auto: the runtime now wants 2064x2208 an eye, this run was built for
+;         2112x2304. RESTART to pick it up
+;
+; Restart once and it is right. The remembered size lives in
+; %LOCALAPPDATA%\MirrorsEdgeVR\headset.txt - delete it to force a fresh look.
+;
+; TO PIN A SIZE INSTEAD, both of these, and one alone does nothing:
+;
+;   1. Resolution = <W>x<H> here.
+;   2. The SAME numbers as ResX / ResY in the [SystemSettings] section of
+;      Documents\EA Games\Mirror's Edge\TdGame\Config\TdEngine.ini
+;
+; What to put there. Read "[xr] headset wants WxH per eye" out of the log, DOUBLE the width,
+; and then take 9/16 of that width for the height - not the height the log prints. Mirror's
+; Edge renders 16:9 whatever you hand it and letterboxes the rest into a separate, smaller
+; buffer, which the mod can only answer by dropping to mono. So 2112x2304 per eye means
+; 4224x2376 here: full width per eye, 3% more vertical than the runtime asked for, and an
+; aspect the engine does not fight. auto does exactly this arithmetic.
+;
+; ⚠️ This is the single most expensive setting in this file. 4224x2376 is 2.7x the pixels of
+; 1440p, and MaxMultisamples=4 in TdEngine.ini multiplies that again - turn MSAA down to 1
+; first, the mod downsamples into the eye buffers anyway. Measured 2026-08-29: the engine
+; allocates the whole scene target set at 4224x2376 with room to spare (the exe is large
+; address aware, 3.2 GB free at first Present) and held 72 fps - but that was a MONO
+; measurement, with duplication not yet armed. Stereo issues every scene draw twice. If the
+; frame rate falls far enough the engine starts moving work into its 1280x720 buffers, which
+; is the streaking failure the half-res section below is about - so come down a step
+; (3840x2160, 3200x1800) rather than living with it.
+;
+; Off = the game's own menu list is the limit, and the engine snaps anything else. Turning it
+; off also repairs TdEngine.ini on its own: the engine finds the size is not a real display
+; mode any more, snaps to the nearest and writes that back. MaxMultisamples is NOT restored -
+; that one is yours.
+Resolution = off
+
 
 ; ---------------------------------------------------------------- the half-res hunt (diagnostics)
 ;

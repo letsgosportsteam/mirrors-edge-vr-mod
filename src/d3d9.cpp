@@ -78,6 +78,7 @@
 #include <cstdarg>
 #include <cmath>
 #include <vector>
+#include <new>
 #include <psapi.h>
 // Rung 10. The build script reads this include to decide whether to compile MinHook's sources,
 // so it is the switch as well as the declaration - see the note in build.ps1.
@@ -93,6 +94,11 @@
 
 enum {
     D3D9_CreateDevice          = 16,   // IDirect3D9
+    // The resolution list the engine validates ResX/ResY against. Measured 2026-08-29: the
+    // exe imports no EnumDisplaySettings at all, so this pair is the ONLY place a supported
+    // size can come from, which is what makes an injected mode reach the engine's own check.
+    D3D9_GetAdapterModeCount   = 6,
+    D3D9_EnumAdapterModes      = 7,
 
     DEV_Reset                  = 16,   // IDirect3DDevice9
     DEV_Present                = 17,
@@ -333,6 +339,236 @@ static void Log(_Printf_format_string_ const char* fmt, ...)
     LeaveCriticalSection(&g_lock);
 }
 
+// ================================================================ Resolution = auto
+//
+// Following the headset's own recommended size instead of a number typed into mevr.ini. The
+// hard part is not reading the size, it is WHEN the size is needed.
+//
+// ---- the ordering that dictates this whole design ----
+//
+// The engine sizes its scene targets from its configured ResX/ResY, so that value has to be
+// right before the engine reads its config - and the engine reads it during startup, long
+// before it ever touches d3d9.dll. The only code of ours that runs earlier is DllMain, which
+// the loader calls before the exe's own entry point. So the write has to happen there.
+//
+// ⚠️ And the headset CANNOT be asked there. xrCreateInstance loads the runtime's DLL, and
+// LoadLibrary under the loader lock is the documented deadlock this file already avoids in
+// EnsureReal. That is not a risk worth taking to save one launch.
+//
+// So the two halves are split across time instead of racing inside one launch:
+//
+//   InitXR, first Present   - the runtime says what it wants; remember it in a file.
+//   DllMain, next launch    - read that file, compute the size, write ResX/ResY.
+//
+// The cost is that the FIRST run after the headset changes still uses the old size, and says
+// so in the log. Every run after it is correct with no user action. A different headset, or
+// just a moved render-scale slider in Virtual Desktop, is picked up the same way.
+//
+// The alternative - probing on a worker thread started from DllMain and hoping it finishes
+// before the engine's config pass - is a race with a corrupted-looking resolution as its
+// failure mode. One late launch is the better trade.
+static wchar_t g_headsetCachePath[MAX_PATH] = L"";
+static bool    g_resAuto  = false;                 // ini Resolution = auto
+// The CACHED per-eye size this run was actually built from, so InitXR can say whether the
+// runtime still agrees with it. Zero means auto had nothing to go on yet.
+static UINT    g_autoEyeW = 0, g_autoEyeH = 0;
+
+static void BuildHeadsetCachePath()
+{
+    wchar_t base[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    // Beside mevr.log, in the directory BuildLogPath has already created.
+    _snwprintf_s(g_headsetCachePath, _TRUNCATE, L"%s\\MirrorsEdgeVR\\headset.txt", base);
+}
+
+// The runtime's recommended PER-EYE size, as last reported. Not the frame size: the frame is
+// derived from it, and storing the derivation instead of the measurement would bake today's
+// 16:9 rule into a file that outlives it.
+static bool ReadHeadsetCache(UINT* eyeW, UINT* eyeH)
+{
+    if (!g_headsetCachePath[0]) return false;
+    HANDLE h = CreateFileW(g_headsetCachePath, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    char buf[64]{};
+    DWORD got = 0;
+    const bool ok = ReadFile(h, buf, sizeof(buf) - 1, &got, nullptr) && got > 0;
+    CloseHandle(h);
+    if (!ok) return false;
+    unsigned w = 0, e = 0;
+    if (sscanf_s(buf, "%ux%u", &w, &e) != 2) return false;
+    if (w < 320 || w > 8192 || e < 240 || e > 8192) return false;
+    *eyeW = w; *eyeH = e;
+    return true;
+}
+
+static void WriteHeadsetCache(UINT eyeW, UINT eyeH)
+{
+    if (!g_headsetCachePath[0]) return;
+    char buf[64];
+    const int n = _snprintf_s(buf, _TRUNCATE, "%ux%u\r\n", eyeW, eyeH);
+    if (n <= 0) return;
+    HANDLE h = CreateFileW(g_headsetCachePath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(h, buf, (DWORD)n, &written, nullptr);
+    CloseHandle(h);
+}
+
+// ---- where TdEngine.ini actually is ----
+//
+// NOT %USERPROFILE%\Documents. This machine has Documents redirected into OneDrive, and the
+// naive path resolves to a real directory that simply does not contain the game's config -
+// which would fail silently and look exactly like the write not working. The registry value
+// is the one that follows redirection, and each candidate is confirmed by the file BEING
+// THERE rather than by trusting whichever source produced it.
+//
+// shell32 is linked, but SHGetFolderPathW is avoided deliberately: this runs from DllMain,
+// and a registry read cannot decide to load anything.
+static bool FindTdEngineIni(wchar_t* out, size_t count)
+{
+    const wchar_t* kTail = L"\\EA Games\\Mirror's Edge\\TdGame\\Config\\TdEngine.ini";
+    wchar_t docs[MAX_PATH];
+
+    for (int source = 0; source < 3; ++source) {
+        docs[0] = 0;
+        if (source == 0) {
+            HKEY key;
+            if (RegOpenKeyExW(HKEY_CURRENT_USER,
+                              L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer"
+                              L"\\User Shell Folders", 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+                continue;
+            wchar_t raw[MAX_PATH]; DWORD cb = sizeof(raw), type = 0;
+            const LONG r = RegQueryValueExW(key, L"Personal", nullptr, &type, (LPBYTE)raw, &cb);
+            RegCloseKey(key);
+            if (r != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) continue;
+            raw[min(cb / sizeof(wchar_t), (DWORD)(MAX_PATH - 1))] = 0;
+            // REG_EXPAND_SZ legitimately carries %USERPROFILE%, and expanding a plain REG_SZ
+            // that has no variables in it is a copy.
+            if (!ExpandEnvironmentStringsW(raw, docs, MAX_PATH)) continue;
+        } else {
+            wchar_t home[MAX_PATH];
+            if (!GetEnvironmentVariableW(L"USERPROFILE", home, MAX_PATH)) continue;
+            _snwprintf_s(docs, _TRUNCATE, (source == 1) ? L"%s\\Documents"
+                                                        : L"%s\\OneDrive\\Documents", home);
+        }
+        if (!docs[0]) continue;
+
+        wchar_t path[MAX_PATH];
+        _snwprintf_s(path, _TRUNCATE, L"%s%s", docs, kTail);
+        if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) continue;
+        wcsncpy_s(out, count, path, _TRUNCATE);
+        return true;
+    }
+    return false;
+}
+
+// Rewrite ResX / ResY in place. Returns true if the file now names this size.
+//
+// Line-anchored, and both keys occur exactly once in the file - the [SystemSettings] copies
+// are the only ones written without a section prefix - so no section parsing is needed to
+// hit the right pair. Everything else is copied byte for byte, CRLF included: this is the
+// game's own file and the mod is a guest in it.
+static bool SyncEngineResolution(UINT w, UINT h, char* whatHappened, size_t whatCount)
+{
+    wchar_t path[MAX_PATH];
+    if (!FindTdEngineIni(path, MAX_PATH)) {
+        strncpy_s(whatHappened, whatCount, "TdEngine.ini not found - looked beside Documents"
+                  " from the registry, %USERPROFILE%\\Documents and \\OneDrive\\Documents",
+                  _TRUNCATE);
+        return false;
+    }
+
+    HANDLE h1 = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h1 == INVALID_HANDLE_VALUE) {
+        strncpy_s(whatHappened, whatCount, "TdEngine.ini could not be opened for reading",
+                  _TRUNCATE);
+        return false;
+    }
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(h1, &size) || size.QuadPart <= 0 || size.QuadPart > 4 * 1024 * 1024) {
+        CloseHandle(h1);
+        strncpy_s(whatHappened, whatCount, "TdEngine.ini is an implausible size - left alone",
+                  _TRUNCATE);
+        return false;
+    }
+    const DWORD len = (DWORD)size.QuadPart;
+    char* buf = new (std::nothrow) char[len + 1];
+    if (!buf) { CloseHandle(h1); strncpy_s(whatHappened, whatCount, "out of memory", _TRUNCATE);
+                return false; }
+    DWORD got = 0;
+    const bool read = ReadFile(h1, buf, len, &got, nullptr) && got == len;
+    CloseHandle(h1);
+    if (!read) { delete[] buf; strncpy_s(whatHappened, whatCount, "TdEngine.ini read failed",
+                                         _TRUNCATE); return false; }
+    buf[len] = 0;
+
+    // Build the replacement by walking lines, so a value of any width is handled and the
+    // file's own line endings survive untouched.
+    std::vector<char> out;
+    out.reserve(len + 32);
+    UINT oldW = 0, oldH = 0;
+    bool wroteW = false, wroteH = false;
+    DWORD i = 0;
+    while (i < len) {
+        DWORD e = i;
+        while (e < len && buf[e] != '\n') ++e;              // e is the '\n' or the end
+        DWORD contentEnd = e;                                // strip a trailing '\r' for matching
+        if (contentEnd > i && buf[contentEnd - 1] == '\r') --contentEnd;
+        const DWORD lineLen = contentEnd - i;
+
+        const bool isX = (lineLen > 5) && strncmp(buf + i, "ResX=", 5) == 0;
+        const bool isY = (lineLen > 5) && strncmp(buf + i, "ResY=", 5) == 0;
+        if (isX || isY) {
+            char digits[16]{};
+            memcpy(digits, buf + i + 5, min(lineLen - 5, (DWORD)15));
+            (isX ? oldW : oldH) = (UINT)atoi(digits);
+            char repl[32];
+            const int n = _snprintf_s(repl, _TRUNCATE, "%s=%u", isX ? "ResX" : "ResY",
+                                      isX ? w : h);
+            if (n > 0) out.insert(out.end(), repl, repl + n);
+            (isX ? wroteW : wroteH) = true;
+            // The line's own terminator, copied from what was there.
+            out.insert(out.end(), buf + contentEnd, buf + e);
+        } else {
+            out.insert(out.end(), buf + i, buf + e);
+        }
+        if (e < len) out.push_back('\n');
+        i = e + 1;
+    }
+    delete[] buf;
+
+    if (!wroteW || !wroteH) {
+        _snprintf_s(whatHappened, whatCount, _TRUNCATE,
+                    "TdEngine.ini has no %s line - nothing written",
+                    !wroteW ? "ResX" : "ResY");
+        return false;
+    }
+    if (oldW == w && oldH == h) {
+        _snprintf_s(whatHappened, whatCount, _TRUNCATE, "TdEngine.ini already says %ux%u", w, h);
+        return true;
+    }
+
+    HANDLE h2 = CreateFileW(path, GENERIC_WRITE, 0, nullptr, TRUNCATE_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h2 == INVALID_HANDLE_VALUE) {
+        strncpy_s(whatHappened, whatCount, "TdEngine.ini is not writable - left alone",
+                  _TRUNCATE);
+        return false;
+    }
+    DWORD written = 0;
+    const bool ok = WriteFile(h2, out.data(), (DWORD)out.size(), &written, nullptr) &&
+                    written == out.size();
+    CloseHandle(h2);
+    _snprintf_s(whatHappened, whatCount, _TRUNCATE, ok ? "TdEngine.ini %ux%u -> %ux%u"
+                                                       : "TdEngine.ini write FAILED at %ux%u->%ux%u",
+                oldW, oldH, w, h);
+    return ok;
+}
+
 // ---------------------------------------------------------------- naming helpers
 
 static const char* FormatName(D3DFORMAT f)
@@ -448,8 +684,40 @@ static bool InitXR()
                 g_recEyeH = vcv[0].recommendedImageRectHeight;
                 Log("[xr] headset wants %ux%u per eye (max %ux%u)", g_recEyeW, g_recEyeH,
                     vcv[0].maxImageRectWidth, vcv[0].maxImageRectHeight);
-                Log("[xr] => side-by-side stereo would want -ResX=%u -ResY=%u",
-                    g_recEyeW * 2, g_recEyeH);
+                // The height is the WIDTH's 16:9 partner, not the runtime's recommended
+                // height: the engine renders 16:9 whatever it is handed and letterboxes the
+                // rest into a smaller target, which AdoptSceneTarget can only answer with
+                // mono. Trading 3% surplus vertical for a matching aspect is the cheap side
+                // of that. Measured 2026-08-29: the command-line form this line used to print
+                // does NOT work - this build ignores -ResX/-ResY - so it names the two
+                // settings that do.
+                Log("[xr] => for full per-eye resolution: mevr.ini Resolution = %ux%u,"
+                    " and the same numbers as ResX/ResY in TdEngine.ini",
+                    g_recEyeW * 2, (g_recEyeW * 2 * 9) / 16);
+
+                // ---- the half of Resolution = auto that runs here ----
+                //
+                // Recorded whatever the setting is, so turning auto on later already has an
+                // answer to work from rather than costing a launch to discover one.
+                WriteHeadsetCache(g_recEyeW, g_recEyeH);
+                if (g_resAuto) {
+                    if (g_autoEyeW == g_recEyeW && g_autoEyeH == g_recEyeH) {
+                        Log("[res] auto: this run is sized for exactly what the runtime asked"
+                            " for");
+                    } else if (g_autoEyeW) {
+                        Log("");
+                        Log("*** [res] auto: the runtime now wants %ux%u an eye, this run was"
+                            " built for %ux%u. RESTART to pick it up - the size has to be"
+                            " known before the engine reads its config, so it always lands"
+                            " one launch later.",
+                            g_recEyeW, g_recEyeH, g_autoEyeW, g_autoEyeH);
+                    } else {
+                        Log("");
+                        Log("*** [res] auto: first run with a headset seen - %ux%u an eye"
+                            " recorded. RESTART and the frame will be sized for it.",
+                            g_recEyeW, g_recEyeH);
+                    }
+                }
             }
         }
     }
@@ -16867,6 +17135,138 @@ static void PatchDeviceOnce(IDirect3DDevice9* dev)
         Log("[patch] *** ONE OR MORE ORIGINALS ARE NULL - a patch failed, expect a crash ***");
 }
 
+// ================================================================ a resolution off the menu
+//
+// The complaint this answers: only sizes the game's own video menu offers can be used, so the
+// headset renders from a 2560x1440 frame - 1280x1440 an eye - and upscales it to the 2112x2304
+// the runtime asks for. Better than half the pixels the headset can show are invented.
+//
+// ---- what was actually measured, 2026-08-29, before any of this was written ----
+//
+// Four headless boots (`MirrorsEdge.exe Edge_p`), reading the [requested] line the CreateDevice
+// hook already prints:
+//
+//   ini ResX=1920 ResY=1080                        -> requested 1920x1080.   HONOURED, and the
+//                                                     ini still said 1920x1080 afterwards.
+//   ini ResX=4224 ResY=2376, Fullscreen=False      -> requested 2560x1440, and the engine
+//                                                     REWROTE the ini back to 2560x1440 /
+//                                                     Fullscreen=True during startup.
+//   command line -ResX=4224 -ResY=2376 -windowed   -> requested 2560x1440. Ignored outright.
+//
+// So `[SystemSettings] ResX/ResY` IS the authority - the first run proves the engine reads and
+// keeps it - and the second proves the value is VALIDATED against a list of supported sizes and
+// snapped to the nearest when it misses. The menu is a symptom, not the cause: it offers what
+// passes the same check.
+//
+// Where that list comes from is not a guess either. MirrorsEdge.exe imports no
+// EnumDisplaySettings / EnumDisplaySettingsEx / ChangeDisplaySettings - the strings are absent
+// from the image - and D3D10 is off, so IDirect3D9's own mode enumeration is the only surviving
+// source. Hence these two hooks and no others.
+//
+// ---- why inventing a display mode is safe here ----
+//
+// A mode this monitor cannot scan out would normally be a black screen. It cannot be, because
+// Hook_CreateDevice below already forces Windowed=TRUE on every device this game creates - it
+// has since the alt-tab freeze - so no display mode is ever SET. The engine only ever uses the
+// list to size its own render targets, and a windowed backbuffer is just a surface: it is
+// allowed to be larger than the desktop, and Present stretches it down into the window.
+//
+// The headset never sees that downscale. The frame is grabbed from the backbuffer BEFORE
+// Present, so the eyes get the full-size image and only the desktop mirror is shrunk.
+//
+// ⚠️ Pick a 16:9 size. Mirror's Edge renders the scene 16:9 whatever it is handed and
+// letterboxes the remainder into a separate, smaller target - the 1600x1200 case that
+// g_sceneW/g_sceneH exist for - and AdoptSceneTarget answers a scene target that is not
+// backbuffer-sized by presenting MONO. So the width to ask for is the runtime's recommended
+// per-eye width doubled, and the height is that width * 9/16, NOT the recommended height:
+// at 2112x2304 an eye that is 4224x2376, which keeps full horizontal parity and renders 3%
+// more vertical than the runtime asks for rather than fighting the engine's aspect.
+static UINT g_forceResW = 0, g_forceResH = 0;      // ini Resolution = WxH; 0 = leave alone
+
+typedef UINT    (STDMETHODCALLTYPE *PFN_GetAdapterModeCount)(IDirect3D9*, UINT, D3DFORMAT);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_EnumAdapterModes)(IDirect3D9*, UINT, D3DFORMAT, UINT,
+                                                          D3DDISPLAYMODE*);
+static PFN_GetAdapterModeCount g_origGetAdapterModeCount = nullptr;
+static PFN_EnumAdapterModes    g_origEnumAdapterModes    = nullptr;
+
+// Whether the extra mode is appended for one (adapter, format) pair, decided once and cached.
+// The decision costs a full re-enumeration - the size must not be added twice if the adapter
+// already offers it - and EnumAdapterModes is called once per index, so deciding per call would
+// make the engine's single pass quadratic.
+struct ModeInject { UINT adapter; D3DFORMAT fmt; UINT realCount; bool append; };
+static ModeInject g_modeInject[8]{};
+static int        g_modeInjectCount = 0;
+static bool       g_modeInjectLogged = false;
+
+// realCount is passed in rather than re-queried: the caller already has it, and asking the
+// runtime again inside the decision would recurse through nothing useful.
+static bool AppendForcedMode(IDirect3D9* self, UINT adapter, D3DFORMAT fmt, UINT realCount)
+{
+    if (!g_forceResW || !g_forceResH || !g_origEnumAdapterModes) return false;
+    // A format with no modes is one the adapter cannot scan out. Adding the only mode it has
+    // would claim otherwise, and the engine is entitled to believe that.
+    if (realCount == 0) return false;
+
+    for (int i = 0; i < g_modeInjectCount; ++i)
+        if (g_modeInject[i].adapter == adapter && g_modeInject[i].fmt == fmt &&
+            g_modeInject[i].realCount == realCount)
+            return g_modeInject[i].append;
+
+    bool already = false;
+    for (UINT i = 0; i < realCount && !already; ++i) {
+        D3DDISPLAYMODE m{};
+        if (SUCCEEDED(g_origEnumAdapterModes(self, adapter, fmt, i, &m)) &&
+            m.Width == g_forceResW && m.Height == g_forceResH)
+            already = true;
+    }
+    const bool append = !already;
+    if (g_modeInjectCount < 8)
+        g_modeInject[g_modeInjectCount++] = { adapter, fmt, realCount, append };
+    Log("[res] adapter %u format %s: %u real modes, %ux%u %s", adapter, FormatName(fmt),
+        realCount, g_forceResW, g_forceResH,
+        append ? "APPENDED" : "already offered - nothing to do");
+    return append;
+}
+
+static UINT STDMETHODCALLTYPE Hook_GetAdapterModeCount(IDirect3D9* self, UINT adapter,
+                                                       D3DFORMAT fmt)
+{
+    if (!g_origGetAdapterModeCount) return 0;
+    const UINT real = g_origGetAdapterModeCount(self, adapter, fmt);
+    if (!g_modeInjectLogged) {
+        g_modeInjectLogged = true;
+        // The one line that proves the engine walks this path at all. If a run that snapped the
+        // resolution never prints it, the list is coming from somewhere else and this whole
+        // block is answering the wrong question.
+        Log("[res] the engine is enumerating display modes - adapter %u format %s -> %u",
+            adapter, FormatName(fmt), real);
+    }
+    return real + (AppendForcedMode(self, adapter, fmt, real) ? 1 : 0);
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_EnumAdapterModes(IDirect3D9* self, UINT adapter,
+                                                       D3DFORMAT fmt, UINT index,
+                                                       D3DDISPLAYMODE* mode)
+{
+    if (!g_origEnumAdapterModes || !g_origGetAdapterModeCount) return D3DERR_INVALIDCALL;
+    const UINT real = g_origGetAdapterModeCount(self, adapter, fmt);
+    if (mode && index == real && AppendForcedMode(self, adapter, fmt, real)) {
+        // Appended LAST so every real index keeps the meaning it already had. A caller that
+        // walked the list once and remembered index N still gets the mode it saw.
+        mode->Width  = g_forceResW;
+        mode->Height = g_forceResH;
+        mode->Format = fmt;
+        // The refresh rate the desktop is running at, so a mode-to-rate match still succeeds.
+        // Zero would be legal to the runtime and read as "unknown" by an engine comparing them.
+        D3DDISPLAYMODE cur{};
+        mode->RefreshRate = (g_origEnumAdapterModes && real > 0 &&
+                             SUCCEEDED(g_origEnumAdapterModes(self, adapter, fmt, real - 1, &cur)))
+                            ? cur.RefreshRate : 60;
+        return D3D_OK;
+    }
+    return g_origEnumAdapterModes(self, adapter, fmt, index, mode);
+}
+
 // ---------------------------------------------------------------- IDirect3D9::CreateDevice
 
 typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateDevice)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD,
@@ -17143,6 +17543,23 @@ extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion)
             D3D9_CreateDevice, (void*)g_origCreateDevice);
         if (!g_origCreateDevice)
             Log("[patch] *** ORIGINAL IS NULL - the patch failed, expect a crash ***");
+
+        // Patched unconditionally, not only when Resolution is set: the pair reports whether
+        // the engine consults this list at all, which is worth knowing on every run and costs
+        // one log line. With no forced size they are exact pass-throughs.
+        g_origGetAdapterModeCount =
+            (PFN_GetAdapterModeCount)PatchVTable(d3d, D3D9_GetAdapterModeCount,
+                                                 (void*)&Hook_GetAdapterModeCount);
+        g_origEnumAdapterModes =
+            (PFN_EnumAdapterModes)PatchVTable(d3d, D3D9_EnumAdapterModes,
+                                              (void*)&Hook_EnumAdapterModes);
+        if (!g_origGetAdapterModeCount || !g_origEnumAdapterModes) {
+            Log("[patch] *** mode-enumeration patch failed - reverting to pass-through ***");
+            g_forceResW = g_forceResH = 0;
+        } else if (g_forceResW) {
+            Log("[res] Resolution = %ux%u will be offered to the engine as a display mode",
+                g_forceResW, g_forceResH);
+        }
     }
     return d3d;
 }
@@ -17471,6 +17888,66 @@ static void LoadSettings()
                     b ? "  (shared surface, stays on the GPU)" : "  (CPU round trip, ~4 ms/frame)");
                 applied++;
             } else { Log("[cfg]   FastCapture '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "Resolution") == 0) {
+            // auto, WxH, or off. Parsed strictly - a typo here is a size the engine will snap
+            // away from silently, and the run would look like the setting did nothing.
+            unsigned resW = 0, resH = 0;
+            if (SettingBool(val, &b) && !b) {
+                g_forceResW = g_forceResH = 0;
+                Log("[cfg]   Resolution = off  (the game's own menu list is the limit)");
+                applied++;
+            } else if (_stricmp(val, "auto") == 0) {
+                g_resAuto = true;
+                applied++;
+                // Read from the file the last run with a headset left behind. Everything this
+                // does has to be finished before the engine's config pass, and that pass has
+                // not happened yet only because this is DllMain - see the note at the cache.
+                if (ReadHeadsetCache(&g_autoEyeW, &g_autoEyeH)) {
+                    // Full per-eye width, and the height that width's 16:9 partner rather than
+                    // the runtime's own - the engine renders 16:9 regardless and letterboxes
+                    // the remainder into a smaller target, which costs stereo, not pixels.
+                    g_forceResW = g_autoEyeW * 2;
+                    g_forceResH = (g_forceResW * 9) / 16;
+                    Log("[cfg]   Resolution = auto -> %ux%u  (headset last wanted %ux%u an eye)",
+                        g_forceResW, g_forceResH, g_autoEyeW, g_autoEyeH);
+                    char what[256] = "";
+                    const bool ok = SyncEngineResolution(g_forceResW, g_forceResH,
+                                                         what, sizeof(what));
+                    Log("[cfg]   Resolution: %s", what);
+                    if (!ok) {
+                        // The mode would be offered and never asked for. Saying nothing here
+                        // is how this ends up looking like the injection failed.
+                        Log("[cfg]   Resolution: *** the engine will keep asking for its own"
+                            " size. Set ResX/ResY by hand, or use Resolution = %ux%u.",
+                            g_forceResW, g_forceResH);
+                    }
+                } else {
+                    Log("[cfg]   Resolution = auto  (no headset size recorded yet - this run"
+                        " uses the game's own size, and the next one will be correct)");
+                }
+            } else if (sscanf_s(val, "%ux%u", &resW, &resH) == 2 &&
+                       resW >= 640 && resW <= 16384 && resH >= 480 && resH <= 16384) {
+                g_forceResW = resW; g_forceResH = resH;
+                // Both halves of the trap, stated where it can still be acted on. The engine
+                // renders 16:9 regardless and puts the remainder in a smaller target, which
+                // AdoptSceneTarget answers by presenting mono - so a non-16:9 size here costs
+                // stereo, not just some pixels.
+                const bool wide = (resW * 9 == resH * 16);
+                Log("[cfg]   Resolution = %ux%u%s", resW, resH,
+                    wide ? "  (16:9 - the aspect the engine renders)"
+                         : "  *** NOT 16:9 - the engine will letterbox into a smaller scene"
+                           " target and stereo will drop to mono. Use width*9/16 for height.");
+                if (!wide)
+                    Log("[cfg]   Resolution: %ux%u is the 16:9 height for that width",
+                        resW, (resW * 9) / 16);
+                Log("[cfg]   Resolution: set [SystemSettings] ResX/ResY in TdEngine.ini to"
+                    " match, or the engine will keep asking for its own size");
+                applied++;
+            } else {
+                Log("[cfg]   Resolution '%s' is not WxH within 640x480..16384x16384 - ignored",
+                    val);
+                rejected++;
+            }
         } else if (_stricmp(key, "LockAnimYaw") == 0) {
             if (SettingBool(val, &b)) { g_animYawFollow = !b; Log("[cfg]   LockAnimYaw = %s", b?"on":"off"); applied++; }
             else { Log("[cfg]   LockAnimYaw '%s' is not a boolean - ignored", val); rejected++; }
@@ -17514,6 +17991,8 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID)
         BuildLogPath();
         ArchivePreviousLog();
         LogHeader();
+        // Before LoadSettings, because Resolution = auto reads the cache while parsing.
+        BuildHeadsetCachePath();
         // Straight after the header, so what a run was configured with is the first thing in the
         // log rather than something to be inferred from behaviour further down.
         LoadSettings();
