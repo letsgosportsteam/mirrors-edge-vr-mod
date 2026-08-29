@@ -15900,6 +15900,33 @@ static void FormatHandTuneValue(char* out, size_t cap, int value, bool selected)
     else          _snprintf_s(out, cap, _TRUNCATE, "%+d", value);
 }
 
+// ---- ⚠️ overlay rows are appended by every rung, so the cap is enforced at the WRITE ----
+//
+// This file already carried the warning: "the rows are edited per test by design, and this array
+// had silently grown to nine entries in an eight-row buffer - the next row added would have been
+// a stack overwrite in a Present hook." It then happened. AS.1 took the count to seventeen rows
+// in a sixteen-row buffer, AS.2/AS.3 kept it there, and the beam row made it eighteen - which
+// crashed the game the moment the player stepped onto a beam, because that row is the only one
+// gated on being there.
+//
+// The old `if (nl > 16) nl = 16;` could never have caught it: it clamps how many rows are DRAWN,
+// long after the writes have already run off the end of the array. A bound that is checked after
+// the overflow is not a bound.
+//
+// So the write itself refuses. Rows may now be added and removed freely, which is what the
+// original comment wanted and could not deliver.
+static const int kOverlayRows = 32;
+
+static void OverlayRow(char lines[][64], int* nl, _Printf_format_string_ const char* fmt, ...)
+{
+    if (!nl || *nl < 0 || *nl >= kOverlayRows) return;
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf_s(lines[*nl], 64, _TRUNCATE, fmt, ap);
+    va_end(ap);
+    (*nl)++;
+}
+
 static void DrawOverlay(IDirect3DDevice9* dev)
 {
     if (!g_debug || !g_overlay || !dev) return;   // Debug=off takes the text off the screen
@@ -15907,11 +15934,11 @@ static void DrawOverlay(IDirect3DDevice9* dev)
     // Sized with headroom and bounds-checked below. The rows are edited per test by design,
     // and this array had silently grown to nine entries in an eight-row buffer - /analyze
     // caught it, but the next row added would have been a stack overwrite in a Present hook.
-    char lines[16][64];
+    char lines[kOverlayRows][64];
     int nl = 0;
 
     // ---- rows for the CURRENT test. Delete freely; see the note at the top. ----
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "MEVR FPS %d GRAB %d MS",
+    OverlayRow(lines, &nl, "MEVR FPS %d GRAB %d MS",
                 (int)(g_capSamples ? (1000.0 / (g_capMsTotal / g_capSamples + 0.001)) : 0),
                 (int)(g_capSamples ? (g_capMsTotal / g_capSamples) : 0.0));
     // Put the active test at the top. TextRects intentionally caps work; late diagnostic rows
@@ -15929,20 +15956,19 @@ static void DrawOverlay(IDirect3DDevice9* dev)
                         g_handTuneSelected == 4);
     FormatHandTuneValue(lr, sizeof(lr), g_wristCalibrationDeg[0][2],
                         g_handTuneSelected == 5);
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "WRIST R P%s Y%s R%s", rp, ry, rr);
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "WRIST L P%s Y%s R%s", lp, ly, lr);
+    OverlayRow(lines, &nl, "WRIST R P%s Y%s R%s", rp, ry, rr);
+    OverlayRow(lines, &nl, "WRIST L P%s Y%s R%s", lp, ly, lr);
     FormatHandTuneValue(rr, sizeof(rr), g_forearmRollCalibrationDeg[1],
                         g_handTuneSelected == 6);
     FormatHandTuneValue(lr, sizeof(lr), g_forearmRollCalibrationDeg[0],
                         g_handTuneSelected == 7);
-    _snprintf_s(lines[nl++], 64, _TRUNCATE,
-                "FOREARM R R%s L R%s", rr, lr);
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "ARROWS L/R SELECT  U/D CHANGE 5 DEG");
+    OverlayRow(lines, &nl, "FOREARM R R%s L R%s", rr, lr);
+    OverlayRow(lines, &nl, "ARROWS L/R SELECT  U/D CHANGE 5 DEG");
     // Its own row, outside the arm-swing block: the beam assist is an independent feature and
     // works with ArmSwing off. Shown only on a beam, which is the only place it does anything.
     if (g_balanceRoll && g_animState == 29) {
         const float bs = BalanceHeadRollStrafe();
-        _snprintf_s(lines[nl++], 64, _TRUNCATE, "BEAM ROLL %s%d DEG  STRAFE %s%d.%02d",
+        OverlayRow(lines, &nl, "BEAM ROLL %s%d DEG  STRAFE %s%d.%02d",
                     g_headRoll < 0.0f ? "-" : "", (int)fabsf(g_headRoll * 57.29578f),
                     bs < 0.0f ? "-" : "", (int)fabsf(bs),
                     (int)(fabsf(bs - (float)(int)bs) * 100.0f + 0.5f));
@@ -15950,7 +15976,7 @@ static void DrawOverlay(IDirect3DDevice9* dev)
     if (g_armSwing) {
         // Two rows, and the block reason is on the first: "why am I not moving" is the question
         // this feature will be asked most, and it must be answerable without leaving the game.
-        _snprintf_s(lines[nl++], 64, _TRUNCATE, "SWING %d.%02d DEF %d.%02d %s",
+        OverlayRow(lines, &nl, "SWING %d.%02d DEF %d.%02d %s",
                     (int)g_swingSmoothed, (int)((g_swingSmoothed - (int)g_swingSmoothed) * 100.0f),
                     (int)g_swingDeflection,
                     (int)((g_swingDeflection - (int)g_swingDeflection) * 100.0f),
@@ -15982,46 +16008,46 @@ static void DrawOverlay(IDirect3DDevice9* dev)
         // blind means guessing how far "overhead" and "crouched" actually are for this body.
         const float hi = (g_swingL.rel.y > g_swingR.rel.y) ? g_swingL.rel.y : g_swingR.rel.y;
         const float dropNow = g_haveCrouchBaseline ? (g_crouchBaselineY - g_swingHeadPosY) : 0.0f;
-        _snprintf_s(lines[nl++], 64, _TRUNCATE, "HANDS %s%d.%02d J%ld  DROP %s%d.%02d C%ld %s",
+        OverlayRow(lines, &nl, "HANDS %s%d.%02d J%ld  DROP %s%d.%02d C%ld %s",
                     hi < 0.0f && (int)hi == 0 ? "-" : "", (int)hi,
                     (int)(fabsf(hi - (float)(int)hi) * 100.0f + 0.5f), g_swingJumps,
                     dropNow < 0.0f && (int)dropNow == 0 ? "-" : "", (int)dropNow,
                     (int)(fabsf(dropNow - (float)(int)dropNow) * 100.0f + 0.5f), g_swingCrouches,
                     g_swingCrouching ? "CROUCH" : "");
-        _snprintf_s(lines[nl++], 64, _TRUNCATE, "TUNE %s (%s%d.%02d) NUM . + -",
+        OverlayRow(lines, &nl, "TUNE %s (%s%d.%02d) NUM . + -",
                     kTuneNames[ti], (tv < 0.0f && whole == 0) ? "-" : "", whole, frac);
     }
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "OBJ %s  PROP %s",
+    OverlayRow(lines, &nl, "OBJ %s  PROP %s",
                 g_offName >= 0 ? "OK" : "NO", g_offPropOff >= 0 ? "OK" : "NO");
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "HEAD %s Y%+d P%+d  ROLL %s %+d DEG",
+    OverlayRow(lines, &nl, "HEAD %s Y%+d P%+d  ROLL %s %+d DEG",
                 g_headTracking ? "ON" : "OFF", g_yawSign, g_pitchSign,
                 g_rollEnabled ? "ON" : "OFF", (int)(g_headRoll * g_rollSign * 57.2958f));
     if (g_vmReg >= 0)
-        _snprintf_s(lines[nl++], 64, _TRUNCATE, "VM C%d %s MODE %d",
+        OverlayRow(lines, &nl, "VM C%d %s MODE %d",
                     g_vmReg, g_vmRow ? "ROW" : "COL", g_vmMode);
     else
-        _snprintf_s(lines[nl++], 64, _TRUNCATE, "VM NOT SCANNED  F6");
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "OFFSET %d %d %d",
+        OverlayRow(lines, &nl, "VM NOT SCANNED  F6");
+    OverlayRow(lines, &nl, "OFFSET %d %d %d",
                 (int)g_vmOffset[0], (int)g_vmOffset[1], (int)g_vmOffset[2]);
     // ⚠️ This block showed SCALE 100 UU/M and no strength at all, because two edits to it were
     // made with a string replace that silently did nothing when it failed to match. World
     // scale is now a fixed measured constant, so that row could never change - reported as
     // "stuck at 100 no matter how many times I press F11", which was the readout being wrong
     // rather than the key. STRENGTH is what F11 moves and is what has to be on screen.
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "STEREO %s %s  STRENGTH %d PCT",
+    OverlayRow(lines, &nl, "STEREO %s %s  STRENGTH %d PCT",
                 g_stereoMode ? "ON" : "OFF", g_simulStereo ? "SIMUL" : "ALT",
                 (int)(g_stereoStrength * 100.0f));
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "DUP %ld ONLY %d  OCC %s%s",
+    OverlayRow(lines, &nl, "DUP %ld ONLY %d  OCC %s%s",
                 InterlockedCompareExchange(&g_dupDraws, 0, 0), g_dupOnlyTarget,
                 g_occlusionMode == 2 ? "REAL" : (g_occlusionMode == 1 ? "ALWAYS" : "AUTO"),
                 g_sceneSplitMono ? "  SPLIT-MONO"
                                  : (g_scenePartialMono ? "  PARTIAL-MONO" : ""));
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "6DOF %s  R%+d U%+d F%+d UU",
+    OverlayRow(lines, &nl, "6DOF %s  R%+d U%+d F%+d UU",
                 g_sixDof ? "ON" : "OFF", (int)g_dofOffset[0], (int)g_dofOffset[1],
                 (int)-g_dofOffset[2]);
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "ANIM P%+d Y%+d R%+d ST%d",
+    OverlayRow(lines, &nl, "ANIM P%+d Y%+d R%+d ST%d",
                 (int)g_animNow[0], (int)g_animNow[1], (int)g_animNow[2], g_animState);
-    _snprintf_s(lines[nl++], 64, _TRUNCATE, "FOV %d X %d  IPD %d/100",
+    OverlayRow(lines, &nl, "FOV %d X %d  IPD %d/100",
                 (int)(g_gameHalfFovX * 114.59f), (int)(g_gameHalfFovY * 114.59f),
                 (int)(g_halfIpdUU * g_stereoStrength * 100.0f));
 
@@ -16029,7 +16055,6 @@ static void DrawOverlay(IDirect3DDevice9* dev)
     // render thread, which /analyze flagged as C6262. Safe because DrawOverlay is only ever
     // called from Hook_Present, on one thread. TextRects stops at the cap rather than
     // overflowing, so a long line truncates instead of corrupting anything.
-    if (nl > 16) nl = 16;   // belt and braces: the rows are edited freely and this is a hook
     static D3DRECT rects[2048];
     int n = 0;
     const int px = 3;                                   // pixel scale
