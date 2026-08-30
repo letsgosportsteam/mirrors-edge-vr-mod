@@ -2455,7 +2455,7 @@ static bool ArmSwingJumpTick(XrTime when)
 enum PkHand { PK_HAND_NONE = -1, PK_HAND_L = 0, PK_HAND_R = 1 };
 
 static bool  g_parkourDebug = false;
-static int   g_pkAnchor = PK_HAND_NONE;     // which hand is holding the world still
+int   g_pkAnchor = PK_HAND_NONE;            // which hand is holding the world still
 static float g_pkAnchorLat = 0.0f;          // its lateral position when it grabbed, metres
 static float g_pkProgress = 0.0f;           // how far the body has travelled since, metres
 static float g_pkDesired = 0.0f;            // how far the player has asked for, metres
@@ -2482,6 +2482,150 @@ long g_pkStallFrames = 0;
 // so the view answering at once matches their proprioception. The uncomfortable version is the
 // one we have now, where you pull and nothing happens until a 60 UU/s actuator catches up.
 static float g_pkCamLead = 0.0f;            // metres along the head's right axis, signed
+static float g_pkCamLeadFwd = 0.0f;         // ...and forward, and up: no body follows these
+static float g_pkCamLeadUp = 0.0f;
+// ---- ⚠️ THE ANCHOR CHANGING IS NOT THE PLAYER MOVING ----
+//
+// These two are an ABSOLUTE function of how far the anchor hand has travelled from where it
+// latched, and the reference re-latches the instant the anchor hand changes. So at every hand
+// swap they go to zero in one frame, from whatever the outgoing hand had accumulated - and on a
+// hand-over-hand shimmy that is the whole stroke, 15-25 cm of it, twice per cycle: once when the
+// reaching hand releases and the anchor falls back to the other one, and again when it grips.
+//
+// Unlike the sideways axis there is no servo here and no smoothing anywhere: the value is
+// assigned and added straight into g_dofOffset. That single-frame step is a view teleport, and
+// it is keyed to the grab exactly as reported.
+//
+// The value is right; the DISCONTINUITY is the bug. So the step is measured at the swap and
+// carried as a bias that makes the lead continuous across it, then decayed away so the lead
+// converges on the new hand's own honest displacement. Continuity first, correctness a few
+// hundred ms later - which is the right way round, because only one of the two is felt.
+// ---- ⚠️ THESE TWO INTEGRATE MOTION. THEY DO NOT MEASURE A POSITION. ----
+//
+// Both were an ABSOLUTE function of how far the anchor hand had travelled from where it latched,
+// and the reference re-latched the instant the anchor hand changed. Two builds tried to fix the
+// resulting jump at the grab and neither could, because the jump is not a bug in the smoothing -
+// it is what an absolute measure DOES when you change what it is measured from:
+//
+//   - reference the latch instant, and the swap steps by the whole stroke
+//   - reference the ledge, or a fixed resting posture, and the swap still steps, by however far
+//     apart the two hands are - which in the reported case is exactly the 30 cm the right hand
+//     was pushed down while the left sat at rest
+//   - carry a bias so the swap itself is continuous, and the bias has to decay to somewhere,
+//     which is the "smooth transition" that was still a transition
+//
+// There is no absolute reference that does not step, because the quantity genuinely changes when
+// the hand being read changes. So this stops being absolute. The lead now accumulates the anchor
+// hand's motion FRAME BY FRAME while it is gripped, and the frame an anchor changes contributes
+// nothing at all - not a smoothed nothing, an exact zero, because there is no previous sample of
+// the new hand to difference against.
+//
+// That is the player's spec, verbatim: move the controller while gripped and the camera moves;
+// the transition from ungrabbed to grabbed moves it by nothing.
+//
+// ---- ⚠️ AND WHY ONLY THE VERTICAL AXIS GETS IT ----
+//
+// The predicted cost of an integrator was a ratchet: it has no restoring force, and the RELEASE
+// half of a hand-over-hand cycle is not integrated, so anything accumulated while gripped is
+// kept when the hand lets go and resets. Push down 20 cm, release, raise, grip - the 20 cm
+// stays. Repeat and it walks.
+//
+// It showed up immediately, and on the axis that has somewhere fatal to walk TO. A shimmy pull
+// brings the anchor hand back toward the body every stroke, which the fore/aft lead integrates
+// as "the wall pushed me forward", and it never gives it back. The player's report is getting
+// stuck INSIDE the ledge, which is that ratchet arriving at the only hard boundary within arm's
+// reach of a hanging player.
+//
+// So the two axes are not the same problem and no longer share an answer:
+//
+//   FORE/AFT is bounded by geometry a few centimetres away, so it needs a reference that brings
+//   it home - and the grab is the natural place, because that is when the player has just told
+//   us where their hand really is. It goes back to being measured from the anchor latch, with
+//   the carried bias that made the swap a glide instead of a step. The player asked for exactly
+//   this: "pushed back to the proper position each time I gripped".
+//
+//   VERTICAL has no boundary at arm's reach in either direction, so nothing forces a reference
+//   on it, and a reference is precisely what was moving the view at every grab. It stays an
+//   integrator.
+//
+// The ratchet is still real on the vertical - a long enough hang can walk the view off the body,
+// bounded by g_pkCamLeadMax and reset whenever the ledge is left. If the view creeps upward over
+// a long shimmy, this is why, and it is a known trade rather than a new bug.
+static XrVector3f g_pkLeadPrevRel{};        // the anchor hand's rel on the previous frame
+static bool  g_pkLeadPrevOk = false;        // false = nothing to difference; contribute zero
+static XrVector3f g_pkAnchorRel{};          // the anchor hand's rel at latch - FORE/AFT only
+static bool  g_pkAnchorRelOk = false;
+static float g_pkCamLeadBiasFwd = 0.0f;     // what the fore/aft lead was when the anchor changed
+static bool g_pkCamLeadUpOn  = true;        // ParkourCamLeadUp
+static bool g_pkCamLeadFwdOn = true;        // ParkourCamLeadFwd
+// ⚠️ Every path that leaves the ledge has to call one of these. The lead block sits near the
+// BOTTOM of ParkourTick, below four early returns - not on a wall, no head axes, no hand
+// gripping, wrong mode - and none of them touched the two new axes. So letting go of a ledge
+// left the view holding whatever offset the last frame of the hang had built, indefinitely.
+//
+// Two of them, because letting go is not the same event as leaving the wall:
+//
+//   ZERO is for the parkour system being out of the picture entirely - the mode is no longer a
+//   ledge, or direct drive stood down. The view has to rejoin the body, and at that moment the
+//   player is falling or being handed back to the game anyway.
+//
+//   DECAY is for still being on the ledge with nothing gripped. Snapping there would be a step
+//   in the direction the player did NOT ask to be free of, and the offset has to come home
+//   because the body it is measured against is not going anywhere.
+static void PkZeroLead()
+{
+    g_pkCamLead = g_pkCamLeadFwd = g_pkCamLeadUp = 0.0f;
+    g_pkCamLeadBiasFwd = 0.0f;
+    g_pkLeadPrevOk = false;
+    g_pkAnchorRelOk = false;
+}
+static void PkDecayLead()
+{
+    g_pkCamLead = 0.0f;
+    g_pkCamLeadFwd *= 0.90f;
+    g_pkCamLeadUp  *= 0.90f;
+    if (fabsf(g_pkCamLeadFwd) < 0.002f) g_pkCamLeadFwd = 0.0f;
+    if (fabsf(g_pkCamLeadUp)  < 0.002f) g_pkCamLeadUp  = 0.0f;
+    // ⚠️ The fore/aft bias is set to where the axis actually IS, not decayed alongside it. The
+    // next grab captures its bias from this value, and the two have to agree or the grab steps
+    // by the difference - which is the bug this whole block exists to have stopped doing.
+    g_pkCamLeadBiasFwd = g_pkCamLeadFwd;
+    g_pkLeadPrevOk = false;     // whatever grips next starts from no previous sample
+    g_pkAnchorRelOk = false;
+}
+// ---- ⚠️ THE VIEW DOES NOT MOVE AT A GRAB, whatever the body does ----
+//
+// The first attempt smoothed the step in the camera lead, on the theory that re-latching the
+// anchor zeroed it. It changed nothing, for a simple reason: in direct-drive mode the lead is set
+// to zero and the function returns before that smoothing ever runs. It was dead code.
+//
+// Rather than keep hunting which system nudges the body when a hand grabs - the anchor re-latch,
+// the shoulder detaching to reach a new target, the grab move's own repositioning, any of them -
+// this cancels the result. At the moment of a grab the pawn's position is recorded, and for the
+// next half second the view is offset by exactly however far the pawn has since moved, in the
+// opposite direction. The body may do whatever it likes; the head stays where it was.
+//
+// The compensation then decays to nothing, so the view rejoins the body rather than being
+// permanently displaced. Being a cancellation rather than a fix, it is robust to not knowing the
+// cause - and it is correct on its own terms anyway: a hand closing on a ledge is not a reason
+// for the player's head to move.
+static float g_pkFreezePos[3] = { 0, 0, 0 };   // the pawn's position BEFORE the jump being cancelled
+static bool  g_pkFreezeOn = false;
+static float g_pkFreezeMix = 0.0f;          // 1 at the jump, decaying to 0
+static float g_pkGrabPos[3] = { 0, 0, 0 };  // ...and at the last grab, for the diagnostic only
+static long  g_pkGrabWindow = 0;
+float g_pkFreezeOff[3] = { 0, 0, 0 };
+float g_pkFreezeCm = 0.0f, g_pkFreezeCmPeak = 0.0f;   // body movement being cancelled, cm
+// ---- what is moving: the body, or the camera itself? ----
+//
+// The freeze cancels PAWN movement. If the camera still snaps while FRZ stays near zero, then
+// nothing is moving the body and something is driving PlayerCameraLocation directly - a
+// completely different lead to follow. Measuring both separately is the only way to tell them
+// apart, and neither is visible from inside a headset otherwise.
+static float g_pkCamAtGrab[3] = { 0, 0, 0 };
+static bool  g_pkCamAtGrabOk = false;
+float g_pkCamMovedCm = 0.0f;
+float g_pkStepPeak = 0.0f;      // biggest single-frame pawn move since the grab
 // ---- why raising this makes the camera track the pull outright ----
 //
 // It is worth writing down what the servo already does, because it is not obvious and the first
@@ -2576,6 +2720,10 @@ int g_offFoundLedge = -1;
 uint32_t g_maskFoundLedge = 0;
 
 static bool PkLedgeAxis(float* axis);       // defined with the direct-drive code below
+static void PkAskTheGameTick();             // PK.7, defined beside the direct-drive code
+void DumpLedgeishClasses();                 // the authored-geometry census, far below
+void GeomCensusTick();                      // ...and its off-by-default, quiet-moment trigger
+static void PkCornerTick();                 // ...and the corner state machine beside it
 
 // ---- the ledge's observed extent, which needs no property at all ----
 //
@@ -2645,6 +2793,427 @@ static void PkNoteExtent()
     if (t > g_pkExtentMax) g_pkExtentMax = t;
 }
 
+// ---- the corner, and the end of the ledge ----
+//
+// Direct drive writes the position itself, so the game is never asked and can never refuse. Both
+// of these are consequences of that, and both are answered by handing control back rather than by
+// trying to author what the game already knows how to do.
+int g_offPendingCorner = -1;                         // TdMove_Grab::PendingShimmyCornerAnimation
+int g_offDisableShimmy = -1;                         // TdMove_Grab::DisableShimmyTime, seconds
+// ================================================================ PK.8: drive the game's own input
+//
+// Direct drive writes Location, and the cost has been measured three times over: the game's own
+// state cannot keep up, so MoveLedgeLocation lags the pawn by up to 124.9 UU, and anything the
+// game authors against that state - the corner animation above all - plays from the wrong place.
+// Cornering by stick is always aligned because the stick makes the GAME move the player, so its
+// state travels with them. Four gates have now been written to work around that and every one of
+// them was a guess about when to hand control back.
+//
+// The idea was to write GrabDesiredLedgeOffset instead of Location, so the game's own logic did
+// the moving and its state could not lag behind the pawn.
+//
+// ---- ⚠️ MEASURED, AND THE IDEA IS WRONG ----
+//
+// Rung 1 only watched, because writing a 12-byte struct in a basis nobody had checked is the
+// pattern that stalled falls, froze a landing and killed the landing roll. Over 3000 samples:
+//
+//     GrabDesiredLedgeOffset = (30.0, 0.0, 92.8), and it CHANGED ON 0 OF 3000 FRAMES.
+//
+// It is not a position. It is the authored hang POSTURE - hold the pawn 30 UU out from the
+// ledge, 0 along it, and 92.8 below it - and writing it would not drive anything.
+//
+// ---- but it answered a different question exactly ----
+//
+// The pawn-to-ledge delta in the pawn's own frame reads (-30.0, small, -92.8) all run: the out
+// and down components sit precisely on the authored 30 and 92.8, and the ONLY component that
+// varies is the one the posture says should be zero - along the ledge. So that component is not
+// noise, it is the exact, game-defined disagreement between where we have written the pawn and
+// where the game believes it is. The 124.9 UU worst case measured earlier is that number.
+//
+// Which retires the guesswork rather than the goal: the corner alignment clamp no longer has to
+// infer the lag from a latched axis, it can read it.
+int g_offGrabDesiredOffset = -1;
+int g_offCurShimmy = -1;                             // TdMove_Grab::CurrentShimmyMove, a byte
+static long g_gdoSamples = 0, g_gdoWorldHits = 0, g_gdoLocalHits = 0, g_gdoLocalBHits = 0;
+static long g_gdoChanged = 0;
+static float g_gdoPrev[3] = { 0, 0, 0 };
+static bool  g_gdoHavePrev = false;
+static float g_gdoWorstWorld = 0.0f, g_gdoWorstLocal = 0.0f;
+int g_offActiveVaultType = -1;                       // TdMove_VaultOver::ActiveVaultType
+int g_offVaultState = -1;
+int g_offVaultHandLoc = -1;
+int g_offPreciseInterp = -1;
+int g_offVaultOnto = -1;
+uint32_t g_maskVaultOnto = 0;
+// ---- ⚠️ PROVISIONAL, on three samples ----
+//
+// The player marked two vaults: one where the hands pull her up over the ledge (they want the
+// animation to keep the hands, which is already what happens - state 9 is not in the eligibility
+// list) and one where a single hand goes down for balance (they want to keep control).
+//
+// Both were TdMove_VaultOver. Two fields separated them across three entries:
+//
+//     +0x4C bit 20  bResetCameraLook            pull-up 1, handplant 0
+//     +0x73         PreciseLocationInterpMode   pull-up 0, handplant 2
+//
+// The third, unmarked vault matched the pull-up on both, and its speed (128 UU/s) rules out a
+// simple speed threshold separating them - 464 and 128 both gave the pull-up pattern against 557.
+//
+// Neither field is ABOUT which animation is playing, though, and the class has one that is:
+// ActiveVaultType, indexing its own VaultTypes array. That is what this should key on, and the
+// value for each case is one run away. Until then PreciseLocationInterpMode stands in, so the
+// behaviour is probably already right, and every entry logs both so the swap is a one-line
+// change rather than another guess.
+// ---- ⚠️ AN ALLOW-LIST, AND ON ActiveVaultType ----
+//
+// The stand-in keyed on PreciseLocationInterpMode == 2, which is a MODE, not an identity: any
+// other vault configured the same way would silently be handed to the player too. The player's
+// report is exactly that shape - scrambling up onto a higher ledge started failing to grab.
+//
+// The run named the real field. ActiveVaultType indexes the move's own VaultTypes array:
+//
+//     type 5, PreciseInterp 0  - the pull-up over the ledge. The animation keeps the hands.
+//     type 2, PreciseInterp 2  - the handplant for balance. The player keeps them.
+//
+// So it is an allow-list of types, and anything not on it defaults to the ANIMATION's hands -
+// which is what every move in the game did before this feature existed. A vault type nobody has
+// characterised cannot be broken by it; it just behaves as it always has, and the log names it.
+static const int kVaultTypesOurs[] = { 2 };
+bool        g_vaultHandsAreOurs = false;             // decided once, at the vault's first frame
+static float g_pkLastGood[3] = { 0, 0, 0 };          // last position where the game saw a ledge
+static bool  g_pkLastGoodOk = false;
+static int   g_pkCornerSide = 0;                     // -1 left, +1 right, 0 none pending
+// ⚠️ MEASURED, not chosen. The drift guard compared the pawn-to-ledge distance against a flat
+// 150 UU, on the assumption that a hanging pawn sits close to the ledge point it is holding. It
+// does not: the log reads "pawn is 150 UU from the reported ledge" over and over, at rest, on a
+// ledge the player is plainly still on. 150 was not a far distance, it was roughly the normal
+// one, so the guard fired on the first frame of every engagement - 47 times in one run.
+//
+// So the baseline is taken at entry, alongside the hand offset, and drift is judged against what
+// this pawn on this ledge actually reads. Absolute distances in world units are exactly the kind
+// of number this project has learned not to invent.
+static float g_pkGapBaseline = 0.0f;
+static bool  g_pkGapBaselineOk = false;
+float g_pkGapNow = 0.0f;                 // live pawn-to-ledge distance, for the overlay
+bool  g_pkFoundLedgePub = false;         // the game's own bFoundLedge, as read this frame
+int   g_pkCornerSidePub = 0;
+float g_pkGapBaselinePub = 0.0f;
+bool  g_pkGapBaselineOkPub = false;
+
+extern int g_offMoveState;
+extern int g_offMoves;
+extern int g_offCamLoc;
+static bool ReadMoveClassName(uintptr_t pawn, int st, char* out, size_t cap, uintptr_t* outObj);
+static bool NameOf(uint32_t index, char* out, size_t cap);
+
+// Which way the game is offering a corner, if any. The name it holds is
+// HangCornerOutSideLeft or ...Right, so the side comes out of the name itself rather than from a
+// separate field - and a name of None means no corner is available from here.
+// ---- which vault is this? ----
+//
+// The move class is dumped at startup so the field that separates the two vault animations can be
+// named; until it is, every VaultOver entry logs the first few dwords of the move object beside
+// the pawn's speed. One run with a marker on each animation pairs the numbers with the two.
+static void PkLogVaultEntry()
+{
+    static bool wasVault = false;
+    const bool isVault = (g_animState == 9);
+    if (isVault && !wasVault) {
+        uintptr_t obj = 0;
+        char cls[48];
+        float vel[3] = { 0, 0, 0 };
+        if (g_offVelocity >= 0 && g_playerPawn)
+            SafeRead(g_playerPawn + g_offVelocity, vel, sizeof(vel));
+        const float speed = sqrtf(vel[0] * vel[0] + vel[1] * vel[1]);
+        g_vaultHandsAreOurs = false;
+        if (ReadMoveClassName(g_playerPawn, 9, cls, sizeof(cls), &obj) && obj) {
+            int32_t type = -1, vstate = -1;
+            uint8_t interp = 0xFF;
+            uint32_t bits = 0;
+            float hand[3] = { 0, 0, 0 };
+            if (g_offActiveVaultType >= 0) SafeRead(obj + g_offActiveVaultType, &type, 4);
+            if (g_offVaultState >= 0)      SafeRead(obj + g_offVaultState, &vstate, 4);
+            if (g_offPreciseInterp >= 0)   SafeRead(obj + g_offPreciseInterp, &interp, 1);
+            if (g_offVaultOnto >= 0)       SafeRead(obj + g_offVaultOnto, &bits, 4);
+            if (g_offVaultHandLoc >= 0)    SafeRead(obj + g_offVaultHandLoc, hand, sizeof(hand));
+            const int onto = g_maskVaultOnto ? ((bits & g_maskVaultOnto) ? 1 : 0) : -1;
+
+            // ⚠️ Decided ONCE, on the move's first frame, and held. The eligibility check runs
+            // several times a frame from the pose path; re-reading a field the move mutates
+            // mid-animation would hand the hands back and forth part-way through one.
+            if (g_offActiveVaultType >= 0) {
+                for (int i = 0; i < (int)(sizeof(kVaultTypesOurs) / sizeof(kVaultTypesOurs[0])); ++i)
+                    if (type == kVaultTypesOurs[i]) { g_vaultHandsAreOurs = true; break; }
+            }
+
+            Log("*** [vault] %s at %.0f UU/s vz %+.0f | ActiveVaultType=%d VaultState=%d"
+                " bVaultOnto=%d PreciseInterp=%d | hands are %s",
+                cls, speed, vel[2], type, vstate, onto, (int)interp,
+                g_vaultHandsAreOurs ? "OURS (the player keeps them)"
+                                    : "the ANIMATION's (default for any type not on the list)");
+            Log("[vault]   HandLocation (%.0f %.0f %.0f)", hand[0], hand[1], hand[2]);
+        } else {
+            Log("[vault] entered state 9 at %.0f UU/s, vz %+.0f - no move object readable",
+                speed, vel[2]);
+        }
+    }
+    if (!isVault) g_vaultHandsAreOurs = false;
+    wasVault = isVault;
+}
+
+extern int g_offActorRotation;   // declared with the other pawn offsets, far below
+
+// PK.8 rung 1. Watches, and says nothing else. See the note on g_offGrabDesiredOffset.
+static void PkWatchLedgeOffset()
+{
+    if (g_offGrabDesiredOffset < 0 || g_pkMode != PK_LEDGE || !g_pkLedgeOk) return;
+    if (g_offMoveState < 0 || g_offMoves < 0 || !g_playerPawn) return;
+    uint8_t st = 0xFF;
+    if (!SafeRead(g_playerPawn + g_offMoveState, &st, 1) || st != 3) return;
+    char cls[48];
+    uintptr_t obj = 0;
+    if (!ReadMoveClassName(g_playerPawn, (int)st, cls, sizeof(cls), &obj) || !obj) return;
+
+    float off[3], loc[3];
+    int32_t rot[3];
+    if (!SafeRead(obj + g_offGrabDesiredOffset, off, sizeof(off))) return;
+    if (g_offActorLocation < 0 || !SafeRead(g_playerPawn + g_offActorLocation, loc, sizeof(loc)))
+        return;
+    if (g_offActorRotation < 0 || !SafeRead(g_playerPawn + g_offActorRotation, rot, sizeof(rot)))
+        return;
+
+    const float yaw = (float)rot[1] * (6.2831853f / 65536.0f);
+    const float c = cosf(yaw), sn = sinf(yaw);
+    const float wd[3] = { loc[0] - g_pkLedgeLoc[0], loc[1] - g_pkLedgeLoc[1],
+                          loc[2] - g_pkLedgeLoc[2] };
+    // The pawn's own basis: forward (cos, sin), and the two candidate rights. The sign of the
+    // right vector has been wrong once already in this file, so both are scored rather than
+    // picked.
+    const float fwdC  = wd[0] * c  + wd[1] * sn;
+    const float rgtA  = wd[0] * -sn + wd[1] * c;
+    const float rgtB  = -rgtA;
+
+    auto err3 = [](float a, float b, float cc) {
+        return sqrtf(a * a + b * b + cc * cc);
+    };
+    const float eWorld  = err3(wd[0] - off[0], wd[1] - off[1], wd[2] - off[2]);
+    const float eLocalA = err3(fwdC - off[0], rgtA - off[1], wd[2] - off[2]);
+    const float eLocalB = err3(fwdC - off[0], rgtB - off[1], wd[2] - off[2]);
+
+    ++g_gdoSamples;
+    if (eWorld  < 5.0f) ++g_gdoWorldHits;
+    if (eLocalA < 5.0f) ++g_gdoLocalHits;
+    if (eLocalB < 5.0f) ++g_gdoLocalBHits;
+    if (eWorld  > g_gdoWorstWorld) g_gdoWorstWorld = eWorld;
+    if (eLocalA > g_gdoWorstLocal) g_gdoWorstLocal = eLocalA;
+    if (g_gdoHavePrev &&
+        (fabsf(off[0] - g_gdoPrev[0]) + fabsf(off[1] - g_gdoPrev[1]) +
+         fabsf(off[2] - g_gdoPrev[2])) > 0.05f)
+        ++g_gdoChanged;
+    memcpy(g_gdoPrev, off, sizeof(off));
+    g_gdoHavePrev = true;
+
+    if (g_parkourDebug && (g_gdoSamples % 300) == 0) {
+        Log("[grabofs] %ld samples | offset (%.1f %.1f %.1f) changed on %ld | pawn-ledge world"
+            " (%.1f %.1f %.1f) local (%.1f %.1f %.1f)",
+            g_gdoSamples, off[0], off[1], off[2], g_gdoChanged,
+            wd[0], wd[1], wd[2], fwdC, rgtA, wd[2]);
+        Log("[grabofs]   model fit: WORLD %ld/%ld (worst %.1f UU)  LOCAL+ %ld/%ld  LOCAL- %ld/%ld"
+            " (worst %.1f UU)  <- a model that fits is the one to write in",
+            g_gdoWorldHits, g_gdoSamples, g_gdoWorstWorld,
+            g_gdoLocalHits, g_gdoSamples, g_gdoLocalBHits, g_gdoSamples, g_gdoWorstLocal);
+        if (g_gdoChanged * 20 < g_gdoSamples)
+            Log("[grabofs]   ⚠️ it has changed on %ld of %ld samples - if it is static it is"
+                " CONFIGURATION, not a live position, and PK.8 is the wrong idea",
+                g_gdoChanged, g_gdoSamples);
+    }
+}
+
+static void PkReadCorner()
+{
+    g_pkCornerSide = 0;
+    g_pkCornerSidePub = 0;
+    if (g_offPendingCorner < 0 || !g_playerPawn || g_offMoveState < 0 || g_offMoves < 0) return;
+    uint8_t st = 0xFF;
+    if (!SafeRead(g_playerPawn + g_offMoveState, &st, 1) || st != 3) return;
+    char cls[48];
+    uintptr_t obj = 0;
+    if (!ReadMoveClassName(g_playerPawn, (int)st, cls, sizeof(cls), &obj) || !obj) return;
+    uint32_t idx = 0;
+    if (!SafeRead(obj + g_offPendingCorner, &idx, sizeof(idx)) || idx == 0) return;
+    char nm[64];
+    if (!NameOf(idx, nm, sizeof(nm))) return;
+    if (strstr(nm, "Left"))  g_pkCornerSide = -1;
+    else if (strstr(nm, "Right")) g_pkCornerSide = +1;
+    g_pkCornerSidePub = g_pkCornerSide;
+}
+
+// ---- ⚠️ THE GRAB NO LONGER ARMS THE CANCELLATION. A JUMP DOES. ----
+//
+// This was written to cancel a 40-61 UU body movement that appeared after every grab, on the
+// theory that something was shoving the pawn. The instrumentation it shipped with has since
+// answered the question it could not answer at the time, and the answer is that nothing is:
+//
+//   - `pawn JUMPED` fired ZERO times in the run - no single frame ever carried a step
+//   - every one of the 26 [pkdirect] reports read "the game moved the pawn 0.00 UU/frame on
+//     average, worst 0.00" - TdMove_Grab is not contesting the direct writes at all
+//   - the 40-61 UU is spread over the whole window and matches the servo's own want= (0.45 m,
+//     0.57 m) on the same frames
+//
+// So the movement being cancelled was the player's pull. And it was being cancelled hard: the
+// mix decays 0.94/frame, which is ~0.9 s at the 72 fps this runs at, not the ~0.4 s the comment
+// assumed - about the entire time between two hand-over-hand grabs. Against 0.61 m of travel the
+// 0.30 m clamp saturated for most of every stroke, which is the same "saturation breaks the
+// identity" failure already written up for the camera lead below: while it is clamped the view
+// stops tracking the pull and starts showing the difference instead. Pull, view lags; grab
+// again, view snaps back. That is the reported shift, manufactured here.
+//
+// The mechanism is still worth having, because a real teleport does want cancelling. It is now
+// armed by the thing it was always meant to catch - a single frame carrying a step no arm can
+// produce - and referenced to the position BEFORE that step rather than to the grab. On the
+// evidence above it should now essentially never fire, and if it does, the log says so.
+// ⚠️ 40, NOT 8, AND ONLY ON A LEDGE. THIS COST A RUN.
+//
+// 8 UU/frame was inherited from a detector that only ever ran INSIDE a post-grab window on a
+// HANGING pawn, where it is genuinely impossible. Arming the cancellation from it meant running
+// it on every frame of the game instead - and 8 UU at 72 fps is 5.8 m/s, which is not a
+// teleport, it is Faith sprinting. Or falling. Or being pulled up onto the ledge she just left.
+//
+// It fired 869 times in one run and re-armed on consecutive frames, each time referencing the
+// position one frame back at full strength, so the view carried a permanent backward offset of
+// about one frame of travel that changed size with her speed. Reported as juddering after
+// leaving a ledge, with the head sitting too far back. Both are exactly that.
+//
+// So the number is measured against what a hanging pawn actually does, which the same run
+// reports: "[vm] camera position steps: mean 0.21 max 1.62 UU". 40 is twenty-five times the
+// worst legitimate step and still far below any real teleport. And the gate matters more than
+// the number - off a ledge this has no business looking at the pawn at all.
+static const float kPkJumpUU = 40.0f;
+
+// Called the instant a hand grabs. Takes the reference the DIAGNOSTIC is measured against - how
+// far the pawn and the camera have moved since - which is all this does now.
+static void PkFreezeViewNow()
+{
+    if (!g_playerPawn || g_offActorLocation < 0) return;
+    if (!SafeRead(g_playerPawn + g_offActorLocation, g_pkGrabPos, sizeof(g_pkGrabPos))) return;
+    g_pkGrabWindow = 120;                   // frames the two numbers stay live for the overlay
+    g_pkFreezeCm = 0.0f;
+    g_pkFreezeCmPeak = 0.0f;
+    g_pkCamAtGrabOk = (g_offCamLoc >= 0 && g_playerPawn &&
+                       SafeRead(g_playerPawn + g_offCamLoc, g_pkCamAtGrab,
+                                sizeof(g_pkCamAtGrab)));
+    g_pkCamMovedCm = 0.0f;
+    g_pkStepPeak = 0.0f;
+}
+
+// Per frame: how far has the pawn moved since the grab, and how much of that is still being
+// cancelled. Expressed in the head's own levelled axes because that is the frame g_dofOffset is
+// applied in.
+static void PkFreezeViewTick()
+{
+    float loc[3];
+    const bool haveLoc = g_playerPawn && g_offActorLocation >= 0 &&
+                         SafeRead(g_playerPawn + g_offActorLocation, loc, sizeof(loc));
+
+    // ---- is it ONE JUMP or a pull? ----
+    //
+    // A single frame carrying most of the distance is a teleport; the same distance spread over
+    // thirty frames is someone moving their arm. This used to only report the difference; it now
+    // acts on it, because acting on the total instead was cancelling the arm.
+    //
+    // ⚠️ Runs whether or not the cancellation is already up, and OUTSIDE any freeze gate - it is
+    // what arms the thing, so gating it on the thing would mean it could never arm. It is NOT
+    // outside the ledge gate: see kPkJumpUU.
+    const bool onLedge = g_parkour && g_pkMode == PK_LEDGE;
+    if (!onLedge && g_pkFreezeOn) {
+        // Nothing armed on a ledge may outlive it. Leaving is a fall or a pull-up, and both move
+        // the pawn hard enough to look like the thing this cancels.
+        g_pkFreezeOn = false;
+        g_pkFreezeMix = 0.0f;
+    }
+    {
+        static float prev[3] = { 0, 0, 0 };
+        static bool  have = false;
+        if (haveLoc && have && onLedge) {
+            const float sx = loc[0] - prev[0], sy = loc[1] - prev[1], sz = loc[2] - prev[2];
+            const float step = sqrtf(sx * sx + sy * sy + sz * sz);
+            if (step > g_pkStepPeak) g_pkStepPeak = step;
+            if (step > kPkJumpUU) {
+                // The reference is where the pawn was BEFORE the step, not where it was at the
+                // grab: only the jump is being cancelled, and anything travelled before it was
+                // the player's own and has already been shown to them.
+                memcpy(g_pkFreezePos, prev, sizeof(g_pkFreezePos));
+                g_pkFreezeOn = true;
+                g_pkFreezeMix = 1.0f;
+                Log("[pkcam] pawn JUMPED %.0f UU in one frame - cancelling that from the view"
+                    " (%.0f UU total since the grab, which is NOT cancelled)",
+                    step, g_pkFreezeCm);
+            }
+        }
+        if (haveLoc) { memcpy(prev, loc, sizeof(prev)); have = true; } else have = false;
+    }
+
+    // The two numbers the overlay reads: how far the pawn and the camera have moved since the
+    // grab. Diagnostic only - neither one displaces the view any more.
+    if (g_pkGrabWindow > 0 && haveLoc) {
+        --g_pkGrabWindow;
+        const float gx = (loc[0] - g_pkGrabPos[0]) / g_pkUUPerMetre;
+        const float gy = (loc[1] - g_pkGrabPos[1]) / g_pkUUPerMetre;
+        const float gz = (loc[2] - g_pkGrabPos[2]) / g_pkUUPerMetre;
+        g_pkFreezeCm = sqrtf(gx * gx + gy * gy + gz * gz) * 100.0f;
+        if (g_pkFreezeCm > g_pkFreezeCmPeak) g_pkFreezeCmPeak = g_pkFreezeCm;
+
+        if (g_pkCamAtGrabOk && g_offCamLoc >= 0) {
+            float c[3];
+            if (SafeRead(g_playerPawn + g_offCamLoc, c, sizeof(c))) {
+                const float ax = c[0] - g_pkCamAtGrab[0], ay = c[1] - g_pkCamAtGrab[1];
+                const float az = c[2] - g_pkCamAtGrab[2];
+                g_pkCamMovedCm = sqrtf(ax * ax + ay * ay + az * az);
+                static long said = 0;
+                if (g_pkCamMovedCm > 5.0f && g_frames - said > 30) {
+                    said = g_frames;
+                    Log("[pkcam] camera has moved %.0f UU since the grab while the pawn moved %.0f"
+                        " - %s", g_pkCamMovedCm, g_pkFreezeCm,
+                        g_pkCamMovedCm > g_pkFreezeCm * 1.5f + 5.0f
+                            ? "the CAMERA is being driven, not the body"
+                            : "the camera is following the body");
+                }
+            }
+        }
+    }
+
+    if (!g_pkFreezeOn) { g_pkFreezeOff[0] = g_pkFreezeOff[1] = g_pkFreezeOff[2] = 0.0f; return; }
+    if (!haveLoc) {
+        g_pkFreezeOn = false;
+        g_pkFreezeOff[0] = g_pkFreezeOff[1] = g_pkFreezeOff[2] = 0.0f;
+        return;
+    }
+    // ~0.4 s at 120 fps, ~0.7 s at the 72 this usually runs at. It is cancelling a step now, not
+    // a stroke, so the length only has to outlast the flinch.
+    g_pkFreezeMix *= 0.94f;
+    if (g_pkFreezeMix < 0.02f) { g_pkFreezeOn = false; g_pkFreezeMix = 0.0f; }
+
+    const float dx = (loc[0] - g_pkFreezePos[0]) / g_pkUUPerMetre;
+    const float dy = (loc[1] - g_pkFreezePos[1]) / g_pkUUPerMetre;
+    const float dz = (loc[2] - g_pkFreezePos[2]) / g_pkUUPerMetre;
+    // The game is Z-up; the head frame is Y-up with right/forward in the horizontal plane.
+    g_pkFreezeOff[0] = -(dx * g_headRight.x   + dy * g_headRight.z)   * g_pkFreezeMix;
+    g_pkFreezeOff[1] = -(dz)                                          * g_pkFreezeMix;
+    g_pkFreezeOff[2] = -(dx * g_headForward.x + dy * g_headForward.z) * g_pkFreezeMix;
+
+    // ⚠️ Clamped, because this deliberately separates the view from the body and a large
+    // separation on a ledge means looking from inside the building. It cannot DRIFT - the offset
+    // is recomputed from the pre-jump position each frame rather than accumulated, and the mix
+    // decays to zero. Now that only a jump arms it the clamp should never engage: a step big
+    // enough to reach 0.30 m in one frame is 30x the threshold that armed this.
+    const float lim = 0.30f;
+    for (int i = 0; i < 3; ++i) {
+        if (g_pkFreezeOff[i] >  lim) g_pkFreezeOff[i] =  lim;
+        if (g_pkFreezeOff[i] < -lim) g_pkFreezeOff[i] = -lim;
+    }
+
+}
+
 static void PkReadLedge()
 {
     g_pkLedgeOk = false;
@@ -2661,6 +3230,28 @@ static void PkReadLedge()
     }
     memcpy(prev, loc, sizeof(loc));
     have = true;
+    // ⚠️ The world origin is not a ledge.
+    //
+    // MoveLedgeLocation reads (0,0,0) whenever the game has not filled it in - it was visible in
+    // the very first telemetry that printed it and got treated as a position anyway. Against a
+    // pawn nineteen thousand units from the origin that is a gap of nineteen thousand units, so
+    // the direct drive's "have I drifted off the ledge" guard fired on the first frame, every
+    // time: 41 stand-downs after 0 writes in one run, which is what stopped lateral movement and
+    // sent the player back to the stick.
+    //
+    // An unfilled field is a MISSING reading, not a reading of zero. Treated as missing, every
+    // consumer stands down cleanly instead of acting on a coordinate nobody wrote.
+    const float mag = sqrtf(loc[0] * loc[0] + loc[1] * loc[1] + loc[2] * loc[2]);
+    if (!(mag > 1.0f) || !std::isfinite(mag)) {
+        static long lastSaid = 0;
+        if (g_frames - lastSaid > 600) {
+            lastSaid = g_frames;
+            Log("[pk] MoveLedgeLocation is unset (%.1f %.1f %.1f) - treating the ledge as unknown",
+                loc[0], loc[1], loc[2]);
+        }
+        return;                                  // g_pkLedgeOk stays false
+    }
+
     memcpy(g_pkLedgeLoc, loc, sizeof(loc));
     memcpy(g_pkLedgeNrm, nrm, sizeof(nrm));
     g_pkLedgeOk = true;
@@ -2692,13 +3283,113 @@ static void PkReadLedge()
 // It also stops silently: nothing forces the arm to reach a point it cannot. The existing IK
 // clamps the effector radially, so an anchor left behind simply pulls the arm to full extension
 // and stays there - a visible, correct cue to move that hand rather than a broken pose.
-static float g_pkSnapRadius = 0.60f;        // metres - generous until a run says what it should be
+// Measured: a hand held where it naturally would be on a ledge reads 10-12 UU from the ledge
+// line. So the room-to-world mapping is good to about a centimetre, and 60 UU was six times
+// looser than it needed to be - loose enough that a grip well out in open air would still have
+// counted as holding the ledge. 30 UU keeps a wide margin over the measurement while leaving
+// "gripping at nothing" clearly outside.
+static float g_pkSnapRadius = 0.22f;        // metres
 static bool  g_pkSnapOn = true;
 static bool  g_pkHandHeld[2] = { false, false };
-static bool  g_pkHandAnchored[2] = { false, false };
+bool  g_pkHandAnchored[2] = { false, false };   // latched on the grip press: is this hand ON the ledge
+// ---- ⚠️ anchor to where the GAME puts the hand, not to a line we computed ----
+//
+// The anchor was the closest point on a ledge line built from MoveLedgeLocation. That is close -
+// the hand measures 10-12 UU from it - but it is not where a hand GOES. A hand wrapped over an
+// edge sits over and slightly down from it, at an offset no line we derive knows about. Hence
+// "planted incorrectly", while the game's own pose - back when it briefly owned the whole hand -
+// was exactly right.
+//
+// So the game is asked. On the grip press the hand is handed to it for a few frames, its composed
+// hand bone is read in world space, and THAT becomes the anchor: correct by construction, because
+// it is literally the position the game chose. Then it is held still in world space while the
+// body travels, which is the part the game's body-relative pose could not do.
+// ⚠️ The capture must PROVE the game re-posed the hand before believing what it reads.
+//
+// Three frames of standing down, then read the hand bone - that assumed handing the hand back
+// makes the game's pose reappear promptly. It does not necessarily: the control is DETACHED, and
+// a detached control can simply hold the last value we wrote. So the capture read our own hand
+// position, and the anchor latched at the controller - which is exactly what the ledge screenshot
+// shows, a hand pinned in mid-air where the player was pointing.
+//
+// So the window is long enough for a real blend, and the capture waits for EVIDENCE: the composed
+// hand bone has to move away from the effector we last wrote. Until it does, whatever is being
+// read is still ours. If the window expires without it ever moving, nothing is anchored and that
+// is said out loud - an honest failure beats a confident wrong answer, which is what the last
+// three builds produced.
+// ---- capture at GRAB ENTRY: freeze the flat game's hands and keep that offset ----
+//
+// When the player first latches onto a ledge the game places both hands on it, correctly, before
+// anything of ours has touched them. That is the one moment its hand position is unambiguously
+// the game's, and it needs no handing back, no waiting for a re-pose, and no reading our own
+// output - all of which the previous attempts did, and all of which anchored the hand to wherever
+// the controller happened to be.
+//
+// So both hands are left entirely to the game for a short window at entry, their composed
+// positions are measured against the ledge line, and the PERPENDICULAR part of that - the
+// over-and-slightly-below offset that makes a hand look wrapped over an edge - is kept for the
+// rest of the hang. It is body-independent by construction, because it is measured from the
+// ledge rather than from the pawn.
+//
+// After that, a grip anchors at: the player's reach projected onto the ledge line, plus that
+// offset. Where along the ledge is theirs; how a hand sits on it is the game's.
+static long g_pkEntryHold = 0;                       // frames the game keeps both hands at entry
+static long g_pkEntryPrev = 0;                       // ...last frame, so the handback is an edge
+// ---- ⚠️ the corner is a STATE, not a timer ----
+//
+// It was a 150-frame hold, which is not what "until the animation has played out" means: too
+// short and the anchors are taken mid-turn, too long and the player hangs there unanchored after
+// it is over. The animation's own completion is observable - the pawn yaws through the corner and
+// then stops - so that is what is waited for, with the frame count kept only as a backstop for a
+// turn that never comes.
+int          g_pkCornerState = 0;                    // 0 idle, 1 turning
+static float g_pkCornerYaw0 = 0.0f;                  // pawn yaw when the corner was requested
+static long  g_pkCornerFrames = 0;
+static long  g_pkCornerStill = 0;                    // consecutive frames the yaw has been still
+static long  g_pkCornerSettle = 0;                   // frames left of the post-turn entry window
+static bool  g_pkCornerSeenNone = true;              // has the corner field read None since?
+static bool  g_pkCornerTurned = false;               // has it yawed far enough to BE a corner?
+bool         g_pkCornerUrge = false;                 // ask continuously: a corner is offered ahead
+bool         g_pkAtEnd = false;                      // the leash is engaging: no more ledge ahead
+                                                     // (reported only - see the note above)
+static bool  PkPawnYaw(float* deg);
+// ⚠️ SHARED between the hands, not one each.
+//
+// Both hands wrap over the same edge, so the perpendicular offset is the same for either of them
+// - and taking it per hand means it is only ever as good as where that particular hand happened
+// to be during the snapshot. The right hand was not on the ledge at entry, so its offset was
+// junk and gripping with it threw the hand out of sight.
+//
+// One offset, taken from whichever hand gives a plausible reading, serves both. It is also
+// sanity-checked: a hand rests on an edge within a few tens of UU, and anything larger is a
+// measurement of something other than a hand on a ledge.
+static MEVR_Vec3 g_pkEntryOffset = {};
+static bool g_pkEntryOffsetValid = false;
+
+// ---- the corner, and the end of the ledge ----
+//
+// Direct drive writes the position itself, so the game is never asked and can never refuse. Both
+// of these are consequences of that, and both are solved by handing control back rather than by
+// trying to author what the game already knows how to do.
+int        g_pkHandPending[2] = { 0, 0 };            // frames left to wait for the game's pose
+MEVR_Vec3  g_pkLastWritten[2] = {};                  // the effector we last wrote, per hand
+bool       g_pkLastWrittenOk[2] = { false, false };
+MEVR_Vec3  g_pkGameHandWorld[2] = {};                // where the game last posed each hand
+MEVR_Vec3  g_pkReachWorld[2] = {};                   // where the PLAYER reached, at the grip press
+bool       g_pkReachValid[2] = { false, false };
+bool       g_pkGameHandValid[2] = { false, false };
+
+// Rotation and fingers follow the game for a PENDING hand too, or the capture would read a hand
+// we were still steering.
+static bool PkHandIsTheGames(int h)
+{
+    return g_pkHandAnchored[h] || g_pkHandPending[h] > 0;
+}
 static float g_pkHandAnchor[2][3] = { { 0, 0, 0 }, { 0, 0, 0 } };
 static long  g_pkSnapLog = 0;
 float g_pkHandLedgeDist[2] = { -1.0f, -1.0f };   // UU from each hand target to the ledge line
+bool  g_pkGameOwnsHand[2] = { false, false };   // is this hand the game's pose this frame?
+bool  g_pkFingersAreTheGames[2] = { false, false };  // ...and specifically its FINGERS
 
 // ⚠️ Instrumented rather than reasoned about. Two builds have now shipped a fix for "the hand
 // does not snap" based on reading the code, and both were wrong in a way no log could show:
@@ -2715,14 +3406,35 @@ const char* g_pkSnapWhy2[2] = { "never called", "never called" };
 
 static bool PkLedgeAxis(float* axis);        // defined below, beside the direct-drive code
 
+// ⚠️ THE STATE HALF RUNS ONCE PER FRAME. THE APPLY HALF RUNS ON EVERY CALL.
+//
+// This function carries edge-triggered state - did the grip just close, where did the player
+// reach, how far is the hand from the ledge - and it is called THREE times per frame from three
+// different places, each with a different target value: the real effector writer, and two
+// leftovers in the shoulder solver that should have been removed when the call moved.
+//
+// The consequences were all of the symptoms at once. The rising edge fired on whichever call ran
+// first, so the reach was captured from whatever target that one happened to hold; the distance
+// was whatever the LAST call overwrote it with, which is why both hands read an identical 84 UU;
+// and a single grip produced six anchor captures. The anchor then landed 140 UU along the ledge -
+// a metre and a half of "slide to where the player reached", computed from a reach that was never
+// the player's hand.
+//
+// Guarding on the frame rather than deleting the extra calls, because the shoulder solver does
+// legitimately need the anchored target to reach toward - it just must not re-run the edge logic
+// to get it.
 static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
 {
     ++g_pkSnapCalls;
     if (hand < 0 || hand > 1 || !target) return;
     g_pkSnapWhy2[hand] = "ok";
+    static long stateFrame[2] = { -1, -1 };
+    const bool firstThisFrame = stateFrame[hand] != g_frames;
+    if (firstThisFrame) stateFrame[hand] = g_frames;
+
     const bool grip = g_gripValue[hand] > 0.5f;
     const bool wasHeld = g_pkHandHeld[hand];
-    g_pkHandHeld[hand] = grip;
+    if (firstThisFrame) g_pkHandHeld[hand] = grip;
 
     // The distance is computed EVERY frame, whether or not the hand is gripping, because it is
     // the number the player needs on screen while deciding where to reach. Only computing it on
@@ -2749,15 +3461,30 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
         g_pkHandLedgeDist[hand] = -1.0f;
     }
 
-    if (!g_pkSnapOn || g_pkMode != PK_LEDGE || !grip) {
+    if (!g_pkSnapOn || g_pkMode != PK_LEDGE || !grip ||
+        g_pkEntryHold > 0 || g_pkCornerState != 0) {
         if (g_pkSnapWhy2[hand][0] == 'o')   // keep a more specific reason set above
-            g_pkSnapWhy2[hand] = !g_pkSnapOn ? "off" : (grip ? "nomode" : "nogrip");
+            g_pkSnapWhy2[hand] = !g_pkSnapOn ? "off"
+                               : g_pkCornerState != 0 ? "corner"
+                               : g_pkEntryHold > 0 ? "entry"
+                               : (grip ? "nomode" : "nogrip");
+        // ⚠️ g_pkEntryHold is in here, not just at the call site that decides who owns the hand.
+        // Through a corner the player never lets go, so there is no grip edge to re-latch on -
+        // and without this the OLD anchor stayed pinned, holding the hand at a world point on
+        // the wall being turned away from for the whole animation.
         g_pkHandAnchored[hand] = false;
+        g_pkHandPending[hand] = 0;
         return;
     }
 
-    // ---- latch, once, on the closing edge of the grip ----
-    if (!wasHeld && g_pkLedgeOk && haveAxis) {
+    // ---- latch, once, on the closing edge of the grip - or when the game hands back ----
+    //
+    // ⚠️ The second case exists because a corner does not involve letting go. The window closes
+    // with the grip already held, so there is no rising edge coming and the hand would stay free
+    // until the player happened to release and re-grip. Treating the handback as an edge is the
+    // same event from the other side: this is the first frame the hand is ours again.
+    const bool handedBack = g_pkEntryPrev > 0 && g_pkEntryHold == 0;
+    if (firstThisFrame && (!wasHeld || handedBack) && g_pkLedgeOk && haveAxis) {
         {
             const float ax = axis[0], ay = axis[1];
             const float vx = target->x - g_pkLedgeLoc[0];
@@ -2777,26 +3504,44 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
                 dist <= g_pkSnapRadius * g_pkUUPerMetre ? "ANCHORED" : "too far, hand stays free");
 
             if (dist <= g_pkSnapRadius * g_pkUUPerMetre) {
-                g_pkHandAnchor[hand][0] = cx;
-                g_pkHandAnchor[hand][1] = cy;
-                g_pkHandAnchor[hand][2] = cz;
-                g_pkHandAnchored[hand] = true;
+                // ---- anchor immediately, from the offset measured at entry ----
+                //
+                // Where ALONG the ledge is the player's - the point on the line nearest the hand
+                // they reached with. How the hand SITS on it is the game's, measured once when it
+                // owned both hands and nothing of ours had touched them.
+                //
+                // No pending window, no capture of a bone we might have written ourselves. That
+                // whole mechanism existed to recover a number this already has.
+                if (g_pkEntryOffsetValid) {
+                    g_pkHandAnchor[hand][0] = cx + g_pkEntryOffset.x;
+                    g_pkHandAnchor[hand][1] = cy + g_pkEntryOffset.y;
+                    g_pkHandAnchor[hand][2] = g_pkLedgeLoc[2] + g_pkEntryOffset.z;
+                    g_pkHandAnchored[hand] = true;
+                    g_pkHandPending[hand] = 0;
+                    PkFreezeViewNow();
+                    Log("[pk] %s hand anchored at (%.0f %.0f %.0f) = ledge line at the player's"
+                        " reach, plus the entry offset", hand ? "RIGHT" : "LEFT",
+                        g_pkHandAnchor[hand][0], g_pkHandAnchor[hand][1], g_pkHandAnchor[hand][2]);
+                } else {
+                    // Nothing measured yet - say so rather than anchoring to a guess.
+                    Log("[pk] %s hand: no entry offset measured, leaving the hand free",
+                        hand ? "RIGHT" : "LEFT");
+                }
             }
         }
     }
 
-    // ⚠️ The override is GONE, deliberately - PK.7 hands a gripping hand back to the game
-    // instead, and a gripping hand no longer reaches this code at all. The anchor bookkeeping
-    // stays because the overlay reports it and because the distance is still the number that
-    // says whether a grab was near enough to count.
-    //
-    // Writing a target here as well would be two systems steering one hand, which is the shape
-    // of every fight this file has a comment about.
+    // The anchor is a WORLD point, so holding the target at it is what makes the hand stay put
+    // while the body slides past. The arm reaches back toward it and extends; the existing IK
+    // clamps the effector radially, so a hand left too far behind simply pulls the arm straight
+    // and stops - a visible cue to move it, not a broken pose.
     if (!g_pkHandAnchored[hand]) return;
+    target->x = g_pkHandAnchor[hand][0];
+    target->y = g_pkHandAnchor[hand][1];
+    target->z = g_pkHandAnchor[hand][2];
     if ((++g_pkSnapLog % 300) == 1)
-        Log("[pk] %s hand is the game's while gripping (ledge point %.0f %.0f %.0f)",
-            hand ? "RIGHT" : "LEFT",
-            g_pkHandAnchor[hand][0], g_pkHandAnchor[hand][1], g_pkHandAnchor[hand][2]);
+        Log("[pk] %s hand held at world (%.0f %.0f %.0f)", hand ? "RIGHT" : "LEFT",
+            target->x, target->y, target->z);
 }
 
 // ================================================================ PK.6: drive the body directly
@@ -2821,7 +3566,118 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
 //   - it stops the moment the state changes, rather than following the player into a fall
 //   - it refuses any single step beyond a sane distance, so a bad axis cannot fling the pawn
 //   - it never writes Z, so the worst failure moves you along a wall rather than off it
-static bool  g_pkDirectBody = false;        // ParkourDirectBody in mevr.ini; SCROLL LOCK toggles
+// ================================================================ PK.7: asking the game
+//
+// ---- three guards, all inert, all for one reason ----
+//
+// Direct drive never asks the game to move, so the game never answers - and every end-of-ledge
+// and corner guard in this file is a way of reading an answer. Measured over one run:
+//
+//   bFoundLedge      never went false. The pawn reached 903 UU from the ledge point the game
+//                    still reported, over open air, and the flag stayed set for all of it -
+//                    thirteen "[pkdirect] note: pawn is N UU from the ledge" lines say so.
+//   PendingShimmyCornerAnimation
+//                    read None on all 194 samples. It is set while the game SHIMMIES, and the
+//                    stick is held at zero precisely so that never happens.
+//   the stall detector
+//                    keys off g_padSentLX, which direct drive pins at zero. Code-provable: it
+//                    cannot fire in this mode, ever.
+//
+// So the player climbs off the end into thin air, and the corner the ledge really has is never
+// offered. Nothing is broken in the three guards; they are being asked to answer a question that
+// was never put to the game.
+//
+// ---- so put it ----
+//
+// The stick is held at zero to stop the shimmy ANIMATION moving the player on top of the writes.
+// But the same run shows the writes already win outright - "the game moved the pawn 0.00 UU/frame
+// on average, worst 0.00", every report, 26 of them. The animation moving the player is a fear
+// this project has now measured and found to be worth 0.00 UU.
+//
+// So while the player is actually travelling, the stick is handed the direction they are pulling.
+// The game then does what only it can: evaluates the ledge under the pawn, advances
+// MoveLedgeLocation if there is more of it, and populates PendingShimmyCornerAnimation if a
+// corner is there. We keep writing Location, so where the player IS remains ours. Only the
+// verdict is the game's.
+//
+// ⚠️ Off by one key, because this is the one change in the file that deliberately lets the grab
+// move run its own logic while we write the value it computes.
+// 0 = off, 1 = pulsed (the default), 2 = continuous. CAPS LOCK cycles all three, so the run
+// that decides between them is one keypress rather than three builds.
+int  g_pkAskMode = 1;
+bool g_pkAsk = true;                        // ParkourAskTheGame; == (g_pkAskMode != 0)
+// 2 frames of stick in every 30 - under 7% duty, a 28 ms nudge about twice a second at 72 fps.
+// Down from 3-in-24 because the first pulsed run could still see the fingers open and shut as
+// the game swapped the hang pose for the shimmy one and back.
+static long g_pkAskPulse  = 2;
+static long g_pkAskPeriod = 30;
+static float g_pkTravelVel = 0.0f;          // EMA of the pawn's travel along the ledge, UU/frame
+int   g_pkTravelDir = 0;                    // its sign, with a deadband: -1 / 0 / +1
+int   g_pkProbeDir = 0;              // what the stick is being handed, -1 / 0 / +1
+
+// ---- reading the answer ----
+//
+// The refusal is not a flag, it is an absence: we ask to travel, and MoveLedgeLocation does not
+// advance. That is only meaningful once it has been seen to advance at all, so the blocker arms
+// itself on positive evidence and stays disarmed without it.
+//
+// ⚠️ That self-validation is the safety property. If the probe turns out not to populate the
+// field, g_pkLedgeMoved stays false, the blocker never arms, and behaviour is exactly what it is
+// today - a player who can climb into open air, not a player frozen against a wall that is not
+// there. A guard that fails closed on a signal it cannot read would be worse than the bug.
+static float g_pkLedgeT = 0.0f;             // MoveLedgeLocation projected on the ledge axis, UU
+static bool  g_pkLedgeTOk = false;
+bool  g_pkLedgeMoved = false;        // has it advanced at all during this hang?
+static long  g_pkNoAdvance = 0;             // consecutive probe cycles asking, with no advance
+static bool  g_pkCycleAnswered = false;     // did THIS cycle get an advance?
+static float g_pkLastGoodT = 0.0f;          // pawn position at the last advance the game gave
+static bool  g_pkLastGoodTOk = false;
+// How far past the last point the ledge was really underneath the pawn it may still be written.
+// Not zero: MoveLedgeLocation is sampled a frame behind a pawn travelling up to 25 UU a frame,
+// so a tight leash would fight ordinary fast movement. 40 is under half the 90 UU the detector
+// needs before it fires, and small enough that the player stops at the edge rather than over it.
+static const float kPkLeashUU = 40.0f;
+// How far along the ledge the pawn may sit from the point the game reports, while a corner is
+// offered ahead. Small, because the whole purpose is that the game's state and the pawn agree
+// when the turn begins; the measured lag without it reached 124.9 UU.
+static const float kPkCornerAlignUU = 25.0f;
+// The loose cap, everywhere else. Insurance against the 124.9 UU excursions rather than a limit
+// on ordinary movement - the measured mean lag is 7.2 UU.
+static const float kPkAlignCapUU = 60.0f;
+float g_pkAlongLag = 0.0f;                  // the game-defined disagreement, live, for the overlay
+static long  g_pkGapOut = 0;                // consecutive frames the gap has been abnormal
+// ---- ⚠️ A WORLD POINT, BECAUSE t IS NOT A COORDINATE ----
+//
+// This was a scalar: the pawn projected onto the ledge axis. But that axis is derived from the
+// pawn's YAW, so it rotates 90 degrees at every corner and flips outright when Faith turns to
+// face the other way along a ledge (bIsTurnedRight). A t recorded before such a change and
+// compared after it is two different frames of reference subtracted from each other.
+//
+// The last run shows what that costs: "Holding at -691.1 UU, where the ledge was still
+// underneath it (now -111.7)" - a 579 UU disagreement about where the player is, on a leash
+// meant to be 40 UU long. Clamping to that pins them five metres from where they are, which is
+// the "got stuck".
+//
+// A world point cannot disagree with itself. Distance from it is the same number whatever the
+// pawn is facing.
+static float g_pkGapGoodPos[3] = { 0, 0, 0 };
+static bool  g_pkGapGoodOk = false;
+int   g_pkEndDir = 0;                // the direction found to be blocked, -1 / +1
+// ---- ⚠️ A WORLD POSITION, NOT A g_pkDesired ----
+//
+// The first version held the block at the g_pkDesired where it latched. That value is measured
+// from the anchor hand's latch and resets to zero at every hand swap - so the player reached the
+// end, got clamped, swapped hands, and the clamp reference was instantly meaningless. Hand over
+// hand is exactly what someone does at the end of a ledge, so the block released precisely when
+// it was needed. Along the ledge axis in world units, nothing about swapping hands moves it.
+// The end is the same fact as the leash and is now held the same way: the last world position
+// the ledge was genuinely under the pawn. g_pkEndDir survives only to say WHICH way is shut, for
+// the log and the overlay.
+// Census, so one run answers whether any of this reads at all without needing a marker.
+static long  g_pkCensusFrames = 0, g_pkCensusAdvance = 0, g_pkCensusNoLedge = 0,
+             g_pkCensusCorner = 0, g_pkCensusAsking = 0;
+
+static bool  g_pkDirectBody = true;         // ParkourDirectBody in mevr.ini; SCROLL LOCK toggles
 static bool  g_pkDirectLive = false;        // actually writing, right now
 static bool  g_pkDirectHave = false;
 static float g_pkDirectBase[3] = { 0, 0, 0 };   // pawn Location when the pull was latched
@@ -2829,6 +3685,7 @@ static float g_pkDirectAxis[3] = { 1, 0, 0 };   // the ledge direction, world, u
 static float g_pkDirectLast = 0.0f;             // last displacement written, metres
 static long  g_pkDirectWrites = 0;
 const char*  g_pkDirectWhy = "off";
+static long  g_pkCooldown = 0;      // frames during which nothing parkour drives anything
 
 // The ledge runs perpendicular to its own normal, in the horizontal plane. UE3 is Z-up, verified
 // by this project's own F2 injection test, so the axis is normal x worldUp.
@@ -2909,15 +3766,607 @@ static void ParkourPollDirectToggle()
             g_pkDirectBody ? "ON (the stick stops driving the shimmy)" : "OFF", g_pkMode);
     }
     prevKey = key;
+
+    static bool prevAsk = false;
+    const bool ask = (GetAsyncKeyState(VK_CAPITAL) & 0x8000) != 0;
+    if (ask && !prevAsk) {
+        g_pkAskMode = (g_pkAskMode + 1) % 3;
+        g_pkAsk = g_pkAskMode != 0;
+        Log("*** [pkend] CAPS LOCK -> asking the game %s  (mode %d)",
+            g_pkAskMode == 0 ? "OFF - no end-of-ledge or corner verdict is available"
+          : g_pkAskMode == 1 ? "PULSED - a short nudge, so the move rules on the ledge without"
+                               " the animation becoming a walk"
+                             : "CONTINUOUS - the stick is held, and the game will shimmy for real",
+            g_pkMode);
+    }
+    prevAsk = ask;
+}
+
+// ⚠️ Standing down is not just clearing a flag.
+//
+// While direct drive owns the body the servo is idle, so g_pkDesired keeps growing with the
+// player's pull while g_pkProgress stays at zero. Handing control back leaves the servo holding
+// an error of half a metre or more, which it answers with full stick and a camera lead at its
+// clamp - reported from the headset as the view shaking at the corner, with no way back onto the
+// ledge except to drop.
+//
+// So the servo is re-latched to where things actually are, the lead is zeroed, and nothing drives
+// for a moment. The player gets a still camera and their own stick back, which is the only
+// sensible thing to hand someone at the point where an automatic system just gave up.
+static void PkDirectStandDown(const char* why)
+{
+    Log("[pkdirect] standing down after %ld writes: %s", g_pkDirectWrites, why);
+    g_pkDirectLive = false;
+    g_pkDirectHave = false;
+    g_pkDirectWhy = why;
+    g_pkAnchor = PK_HAND_NONE;      // forces a clean re-latch instead of inheriting the error
+    g_pkDesired = 0.0f;
+    g_pkProgress = 0.0f;
+    PkZeroLead();
+    g_pkShimmy = 0.0f;
+    g_pkCooldown = 45;              // about half a second of hands off
+}
+
+// Called from ParkourTick once the mode, the anchor and g_pkDesired are all settled for this
+// frame - it needs all three, and reading a stale one is how the corner logic got it wrong once
+// already.
+static void PkAskTheGameTick()
+{
+    if (g_pkMode != PK_LEDGE) {
+        // A new hang is a new ledge. Everything learnt about where this one ends goes with it.
+        if (g_pkLedgeMoved || g_pkEndDir || g_pkLedgeTOk) {
+            g_pkLedgeMoved = false;
+            g_pkLedgeTOk = false;
+            g_pkEndDir = 0;
+            g_pkNoAdvance = 0;
+            g_pkCycleAnswered = false;
+            g_pkLastGoodTOk = false;
+            g_pkGapOut = 0;
+            g_pkGapGoodOk = false;
+        }
+        g_pkProbeDir = 0;
+        g_pkTravelVel = 0.0f;
+        g_pkTravelDir = 0;
+        g_pkAtEnd = false;
+        return;
+    }
+
+    float axis[3];
+    const bool haveAxis = PkLedgeAxis(axis);
+
+    // ---- which way is the player actually travelling? ----
+    //
+    // ⚠️ NOT from g_pkDesired, which is what the first version differentiated and is why the end
+    // detector produced seven false latches in one run and missed the real end. g_pkDesired is
+    // measured from the anchor hand's latch, so it RESETS TO ZERO at every hand swap - it is not
+    // a position signal at all, it is a per-grab displacement. Differentiating it puts a step of
+    // arbitrary sign into the estimate at exactly the moment hand-over-hand happens, which both
+    // flips the probe direction and clears a latched end through the "moving back off" rule.
+    //
+    // The pawn's own position along the ledge axis is continuous through a hand swap, because
+    // nothing about swapping hands moves the body. That is the signal.
+    static float prevT = 0.0f;
+    static bool  havePrevT = false;
+    int dir = 0;
+    if (g_playerPawn && g_offActorLocation >= 0 && haveAxis) {
+        float loc[3];
+        if (SafeRead(g_playerPawn + g_offActorLocation, loc, sizeof(loc))) {
+            const float pt = loc[0] * axis[0] + loc[1] * axis[1];
+            if (havePrevT) {
+                const float step = pt - prevT;
+                if (fabsf(step) < 25.0f)        // a teleport is not travel
+                    g_pkTravelVel += (step - g_pkTravelVel) * 0.25f;
+            }
+            prevT = pt;
+            havePrevT = true;
+        }
+    }
+    // 0.1 UU/frame, about 7 cm/s. Below that the player is holding still, not travelling.
+    dir = (g_pkTravelVel >  0.1f) ?  1 : (g_pkTravelVel < -0.1f) ? -1 : 0;
+    g_pkTravelDir = dir;
+
+    // ---- where the game says the ledge is, along its own axis ----
+    float t = 0.0f;
+    bool  haveT = false;
+    if (g_pkLedgeOk && haveAxis) {
+        t = g_pkLedgeLoc[0] * axis[0] + g_pkLedgeLoc[1] * axis[1];
+        haveT = true;
+    }
+
+    // ---- ⚠️ the game's own shimmy cooldown is not a refusal ----
+    //
+    // DisableShimmyTime reads 0.600 in every moveprop sample. While it is running the grab move
+    // will not shimmy no matter what the stick says, so MoveLedgeLocation does not advance - and
+    // 0.6 s is 43 frames at 72 fps, which sailed straight past the 31-frame "the ledge ends here"
+    // threshold. Five of the seven false latches sit inside one burst; this is why.
+    //
+    // A frame the game was never going to answer is not evidence of an end. It is not counted.
+    bool cooling = false;
+    if (g_offDisableShimmy >= 0 && g_offMoveState >= 0 && g_offMoves >= 0 && g_playerPawn) {
+        uint8_t st = 0xFF;
+        uintptr_t obj = 0;
+        char cls[48];
+        if (SafeRead(g_playerPawn + g_offMoveState, &st, 1) && st == 3 &&
+            ReadMoveClassName(g_playerPawn, (int)st, cls, sizeof(cls), &obj) && obj) {
+            float dt = 0.0f;
+            if (SafeRead(obj + g_offDisableShimmy, &dt, sizeof(dt)) && dt > 0.0f)
+                cooling = true;
+        }
+    }
+
+    ++g_pkCensusFrames;
+    if (!g_pkFoundLedgePub) ++g_pkCensusNoLedge;
+    if (g_pkCornerSide != 0) ++g_pkCensusCorner;
+
+    // ---- ⚠️ THE END OF THE LEDGE IS THE GAP, NOT THE LEDGE POINT ----
+    //
+    // Three builds waited for MoveLedgeLocation to stop advancing. It does not: the census reads
+    // "asked on 35, MoveLedgeLocation advanced on 443" out of 600 frames, because it names the
+    // ledge point NEAREST THE PAWN and direct drive is moving the pawn. It tracks us. It cannot
+    // refuse, so it cannot be a refusal.
+    //
+    // But it is still the honest signal, read the other way round. On a real ledge the nearest
+    // point is right under the player: "gap now 30 UU", six times over, against a measured
+    // resting 30, with 72 the worst excursion. Written PAST the end there is no more ledge to be
+    // nearest to, so the point stays at the endpoint while the pawn keeps going - and the same
+    // instrumentation caught that at 903 UU. Thirty versus nine hundred is not a threshold that
+    // needs tuning.
+    //
+    // ⚠️ Not during a corner, where the pawn legitimately swings away from the old ledge point
+    // before the new one is reported.
+    // ⚠️ Measured here rather than read from g_pkGapNow. That one is only refreshed inside
+    // ParkourDirectBodyTick, which returns early whenever direct drive is not armed - so it goes
+    // stale in exactly the states this most needs it, and a stale gap reads as a healthy ledge.
+    if (g_playerPawn && g_offActorLocation >= 0 && g_pkLedgeOk) {
+        float loc[3];
+        if (SafeRead(g_playerPawn + g_offActorLocation, loc, sizeof(loc))) {
+            const float gx = loc[0] - g_pkLedgeLoc[0], gy = loc[1] - g_pkLedgeLoc[1];
+            g_pkGapNow = sqrtf(gx * gx + gy * gy);
+        }
+    }
+    if (g_pkGapBaselineOk && g_pkCornerState == 0 && g_pkLedgeOk && haveAxis) {
+        if (g_pkGapNow < g_pkGapBaseline + 60.0f) {
+            g_pkGapOut = 0;
+            // The last place the ledge was really underneath us, in world units.
+            if (g_playerPawn && g_offActorLocation >= 0)
+                SafeRead(g_playerPawn + g_offActorLocation, g_pkGapGoodPos,
+                         sizeof(g_pkGapGoodPos));
+            g_pkGapGoodOk = true;
+        } else if (g_pkEndDir == 0 && dir != 0 && g_pkGapGoodOk && ++g_pkGapOut > 5) {
+            g_pkEndDir = dir;
+            Log("*** [pkend] the pawn is %.0f UU from the ledge against a resting %.0f - it has"
+                " been written off the %s end. Held at (%.0f %.0f), the last place the ledge was"
+                " under it", g_pkGapNow, g_pkGapBaseline, dir > 0 ? "RIGHT" : "LEFT",
+                g_pkGapGoodPos[0], g_pkGapGoodPos[1]);
+        }
+    }
+
+    // ---- the probe ----
+    //
+    // Only while travelling, and never into a direction already found to be blocked: asking the
+    // game to shimmy into the end of the ledge, every frame, forever, is how DisableShimmyTime
+    // and the rest of the move's own cooldowns get exercised for no benefit.
+    // ---- ⚠️ PULSED, because a held stick is a played animation ----
+    //
+    // The first version asked on every travelling frame - 4722 of them in one run - and the game
+    // did exactly what it was asked: it shimmied. Feet walking along the wall, the hang pose
+    // taking the fingers back off the ledge, the camera carrying the move's own motion. All of
+    // it correct, none of it wanted: the whole point of direct drive is that the animation does
+    // not run.
+    //
+    // But the answer does not need a held stick. The census shows the corner field, once set,
+    // stays set for hundreds of frames (589, then 1189, then 1789), and MoveLedgeLocation
+    // advances on the frames it is asked. A brief nudge is a question; only a held one is a
+    // movement input.
+    //
+    // So the stick goes out in short pulses. Long enough that the move ticks and rules on the
+    // ledge, short enough that the animation has no time to become a walk.
+    static long phase = 0;
+    ++phase;
+    const bool inPulse = (phase % g_pkAskPeriod) < g_pkAskPulse;
+    g_pkProbeDir = 0;
+    // ⚠️ g_pkCornerUrge is the ONE thing still allowed to predict a corner, and all it buys is a
+    // louder question. The game has said a corner is available that way and the player is going
+    // that way, so a 7% duty nudge is not enough to get it played - but asking harder cannot put
+    // the hands or the body anywhere, which is what every previous predictive path got wrong.
+    if (g_pkAsk && g_pkDirectLive && dir != 0 && dir != g_pkEndDir &&
+        (g_pkAskMode == 2 || g_pkCornerUrge || inPulse)) {
+        g_pkProbeDir = dir;
+        ++g_pkCensusAsking;
+    }
+    // The verdict half must know we ASKED even on the silent frames of a pulse cycle, or a
+    // 10%-duty probe reads as 90% refusal and every ledge ends immediately.
+    const bool asking = g_pkAsk && g_pkDirectLive && dir != 0 && dir != g_pkEndDir;
+
+    // ---- the verdict ----
+    //
+    // Advance in the direction being asked for is the game saying yes. No advance while asking is
+    // the game saying no - but only once it has said yes at least once, so a field that never
+    // populates disarms this rather than blocking everything.
+    //
+    // ⚠️ COUNTED IN PROBE CYCLES, NOT FRAMES. With a 12% duty the silent 21 frames of every 24
+    // produce no advance by construction, so a frame counter is measuring the duty cycle rather
+    // than the ledge - and its threshold would have to be tuned against g_pkAskPeriod, silently,
+    // every time either changed. A cycle either got an answer or it did not.
+    if (haveT && g_pkLedgeTOk && asking) {
+        const float dt = t - g_pkLedgeT;
+        // 200 UU is the same discontinuity bound PkReadLedge uses: past that it is a new ledge
+        // being reported, not this one extending.
+        if (fabsf(dt) > 0.05f && fabsf(dt) < 200.0f && (dt > 0.0f ? 1 : -1) == dir) {
+            if (!g_pkLedgeMoved) {
+                g_pkLedgeMoved = true;
+                Log("[pkend] the game advanced MoveLedgeLocation %+.1f UU while asked to shimmy"
+                    " %s - the end-of-ledge verdict is readable, blocker ARMED",
+                    dt, dir > 0 ? "RIGHT" : "LEFT");
+            }
+            ++g_pkCensusAdvance;
+            g_pkCycleAnswered = true;
+            // The last place the game itself endorsed. The block is held HERE rather than
+            // wherever the pawn drifted to while the refusal was being confirmed - otherwise the
+            // player is parked however far they travelled during the confirmation, which is
+            // exactly the open air this exists to keep them out of.
+            g_pkLastGoodT = prevT;
+            g_pkLastGoodTOk = true;
+        }
+    }
+    if (!asking) { g_pkNoAdvance = 0; g_pkCycleAnswered = false; }
+
+    // End of a probe cycle: rule on it.
+    if (asking && g_pkLedgeMoved && (phase % g_pkAskPeriod) == 0) {
+        if (g_pkCycleAnswered || cooling) {
+            g_pkNoAdvance = 0;              // a cooldown is not a refusal - see above
+        } else if (++g_pkNoAdvance >= 3 && g_pkLastGoodTOk) {
+            // Three cycles is about a second of asking with nothing back.
+            g_pkEndDir = dir;
+            Log("[pkend] asked the game to shimmy %s for %ld probe cycles with no advance -"
+                " the ledge ends here", dir > 0 ? "RIGHT" : "LEFT", g_pkNoAdvance);
+            g_pkProbeDir = 0;
+        }
+        g_pkCycleAnswered = false;
+    }
+
+    // Travelling back off the end clears it: the block is a fact about one direction, and the
+    // player who reverses is asking a question that was never refused.
+    if (g_pkEndDir != 0 && dir != 0 && dir != g_pkEndDir) {
+        Log("[pkend] moving back off the end - %s is open again",
+            g_pkEndDir > 0 ? "RIGHT" : "LEFT");
+        g_pkEndDir = 0;
+        g_pkNoAdvance = 0;
+    }
+
+    if (haveT) { g_pkLedgeT = t; g_pkLedgeTOk = true; }
+
+    if ((g_pkCensusFrames % 600) == 0)
+        Log("[pkend] over 600 frames on a ledge: asked on %ld, MoveLedgeLocation advanced on %ld,"
+            " bFoundLedge false on %ld, a corner was offered on %ld  (gap now %.0f UU)",
+            g_pkCensusAsking, g_pkCensusAdvance, g_pkCensusNoLedge, g_pkCensusCorner, g_pkGapNow);
+
+    if (g_parkourDebug && (g_frames % 6) == 0)
+        Log("[pkend] f%ld ledgeT %.1f pawnGap %.0f found=%d corner=%+d probe=%+d vel %+.4f"
+            " moved=%d endDir=%+d want %+.3f", g_frames, t, g_pkGapNow, (int)g_pkFoundLedgePub,
+            g_pkCornerSide, g_pkProbeDir, g_pkTravelVel, (int)g_pkLedgeMoved, g_pkEndDir,
+            g_pkDesired);
+}
+
+static bool PkPawnYaw(float* deg)
+{
+    int32_t rot[3];
+    if (!deg || g_offActorRotation < 0 || !g_playerPawn ||
+        !SafeRead(g_playerPawn + g_offActorRotation, rot, sizeof(rot))) return false;
+    *deg = (float)rot[1] * (360.0f / 65536.0f);
+    return true;
+}
+
+// Signed shortest way round, so a corner that crosses the 0/360 wrap is still a 90 degree turn
+// and not a 270 degree one.
+static float PkYawDelta(float a, float b)
+{
+    float d = a - b;
+    while (d >  180.0f) d -= 360.0f;
+    while (d < -180.0f) d += 360.0f;
+    return d;
+}
+
+// Waits out the corner animation, then makes wherever it left the hands the new anchors.
+static void PkCornerTick()
+{
+    if (g_pkMode != PK_LEDGE) { g_pkCornerState = 0; g_pkCornerUrge = false; return; }
+
+    float yaw = 0.0f;
+    const bool haveYaw = PkPawnYaw(&yaw);
+
+    // ---- has a corner STARTED? ----
+    //
+    // A hanging pawn faces its wall, so on a straight ledge its yaw does not move at all - the
+    // whole travel is sideways along a fixed facing. Any sustained rotation is the corner
+    // animation running, whatever set it off. Four frames of it, so a single bad read cannot
+    // hand the game the player's hands.
+    if (g_pkCornerState == 0) {
+        // ---- ⚠️ FOUR FRAMES OF YAW WAS FOUR FRAMES TOO LATE ----
+        //
+        // Watching for the turn was right; waiting for four frames of it was not. A 90 degree
+        // corner takes about 105 frames, so 0.85 degrees a frame - four frames of evidence is
+        // five frames of animation during which direct drive is still WRITING the pawn's
+        // position, along an axis latched before the turn, into the opening of the move. And the
+        // corner trace shows MoveLedgeLocation jumps 48.1 UU on the corner's first frame, so for
+        // those same frames the along-lag and the leash are both measured against the far wall.
+        //
+        // The game says it outright, on frame one: CurrentShimmyMove goes from 3 to 2. The trace
+        // also gives a second one-frame tell - the 48 UU ledge jump - and the yaw test is kept
+        // behind both as a fallback for a corner that announces itself some other way.
+        const char* why = nullptr;
+        uint8_t cur = 3;
+        if (g_offCurShimmy >= 0 && g_offMoveState >= 0 && g_offMoves >= 0 && g_playerPawn) {
+            uint8_t st = 0xFF;
+            uintptr_t obj = 0;
+            char cls[48];
+            if (SafeRead(g_playerPawn + g_offMoveState, &st, 1) && st == 3 &&
+                ReadMoveClassName(g_playerPawn, (int)st, cls, sizeof(cls), &obj) && obj)
+                SafeRead(obj + g_offCurShimmy, &cur, 1);
+        }
+        if (cur == 2) why = "CurrentShimmyMove went to 2";
+
+        static float lastLedge[3] = { 0, 0, 0 };
+        static bool  haveLedge = false;
+        if (!why && haveLedge && g_pkLedgeOk) {
+            const float jx = g_pkLedgeLoc[0] - lastLedge[0], jy = g_pkLedgeLoc[1] - lastLedge[1];
+            if (sqrtf(jx * jx + jy * jy) > 25.0f) why = "the ledge point jumped to another wall";
+        }
+        if (g_pkLedgeOk) { memcpy(lastLedge, g_pkLedgeLoc, sizeof(lastLedge)); haveLedge = true; }
+
+        static float lastYaw = 0.0f;
+        static bool  haveLast = false;
+        static long  turning = 0;
+        if (haveYaw && haveLast) {
+            if (fabsf(PkYawDelta(yaw, lastYaw)) > 0.35f) ++turning; else turning = 0;
+        }
+        if (haveYaw) { lastYaw = yaw; haveLast = true; }
+        if (!why && turning >= 4) why = "the pawn has been yawing for four frames";
+        if (!why) return;
+        turning = 0;
+
+        // ---- the animation takes the hands and the body, both ----
+        //
+        // Everything measured about the ledge behind us is wrong from this frame on: the anchors
+        // are world points on a wall being turned away from, the entry offset was taken against
+        // its normal, and g_pkDirectAxis points along it - which after the turn aims into the
+        // building. Writing Location down that axis through a corner IS the "pushed too far in".
+        //
+        // A held grip does not keep the anchors. There is nothing to hold on to yet.
+        g_pkCornerState = 1;
+        g_pkCornerFrames = 0;
+        g_pkCornerStill = 0;
+        g_pkCornerSettle = 0;
+        // ⚠️ NOT assumed. CurrentShimmyMove and the ledge jump both fire BEFORE the yaw moves -
+        // that is the whole point of them - so "it is already turning" is exactly what they do
+        // not prove. Assuming it cost 16 false corners in one run: the state opened,
+        // g_pkCornerTurned was true, ten still frames passed immediately because nothing was
+        // turning, and the whole 39-frame settle-and-re-anchor sequence ran for nothing. Half a
+        // second of the player's hands each time.
+        g_pkCornerTurned = false;
+        g_pkCornerYaw0 = yaw;
+        g_pkHandAnchored[0] = g_pkHandAnchored[1] = false;
+        g_pkHandPending[0] = g_pkHandPending[1] = 0;
+        g_pkDirectLive = false;
+        g_pkDirectHave = false;             // forces a fresh base AND a fresh axis afterwards
+        g_pkDirectWhy = "cornering";
+        g_pkAnchor = PK_HAND_NONE;
+        g_pkDesired = g_pkProgress = 0.0f;
+        g_pkShimmy = 0.0f;
+        g_pkCornerUrge = false;
+        g_pkCornerSeenNone = false;         // not again until the game withdraws this offer
+        g_pkLedgeTOk = false;
+        g_pkLedgeMoved = false;
+        // ⚠️ The turn moves the pawn a long way and rotates everything measured about the old
+        // ledge. A last-good point from before it is a place on the other wall.
+        g_pkGapGoodOk = false;
+        g_pkGapOut = 0;
+        g_pkEndDir = 0;
+        g_pkAtEnd = false;
+        // ---- ⚠️ THE LEAD GOES TO ZERO OUTRIGHT, NOT BY DECAY ----
+        //
+        // The player's own diagnosis, and the code agrees with it. Push the controller forward
+        // and the fore/aft lead displaces the VIEW back from the body - correctly, while they are
+        // the one pulling. Through a corner they are a passenger, so the corner branch decayed it
+        // instead at 0.90 a frame: about 40 frames to become negligible, against a corner
+        // animation that measures 98 to 113. So most of the turn was played with the view still
+        // pushed out by however far their arm happened to be extended when it started.
+        //
+        // And it does not merely persist, it FOLLOWS. g_dofOffset[2] is applied along the
+        // camera's own forward axis, and that axis yaws through the whole 90 degrees with the
+        // corner - so a displacement earned on the old wall is carried round and re-applied
+        // against the new one. "It is keeping me in line with that as I go around the corner" is
+        // literally what the offset does.
+        //
+        // A step here is the right trade: it lands on the first frame of a large authored camera
+        // move, where it is masked, and the alternative is a view drifting on its own for half a
+        // second in the middle of one.
+        PkZeroLead();
+        Log("*** [pk] a corner animation is running (%s). Hands and body both go to it; anchors"
+            " dropped, direct drive off, axis will be re-derived after", why);
+        return;
+    }
+
+    ++g_pkCornerFrames;
+
+    // ---- ⚠️ THE ONE WINDOW NOTHING WAS MEASURING ----
+    //
+    // Four causes have been proposed for the corner misalignment and eliminated one at a time -
+    // perpendicular drift (29.6 to 30.0 UU, steady), the along lag, the fore/aft view lead, the
+    // grab-offset rewrite - and not one of them could be CONFIRMED, because the corner is
+    // precisely the window where this code stops writing and stops looking. [moveprop] carries
+    // the ledge point and the servo, never the pawn's own position, so "is the body wrong or is
+    // the view wrong" has never been answerable from a log.
+    //
+    // It is now. Every frame of every corner, both halves side by side: where the pawn actually
+    // is against the posture the game itself authors (30 out, 0 along, 92.8 down, measured over
+    // 3000 samples), and every offset this mod is adding to the view. If the pawn column is
+    // clean and the view column is not, it is ours; if the pawn column drifts while we are
+    // writing nothing, it is the animation starting from the wrong place.
+    // ⚠️ Behind the debug flag now. It was 1473 lines of a 7387-line log - a fifth of the whole
+    // run - and it has already answered what it was built for: the body reaches the authored
+    // posture, the view offsets are zero throughout, and the corner opens on frame one.
+    if (g_parkourDebug) {
+        extern float g_dofOffset[3];   // the composed view offset, declared far below
+        float loc[3], cam[3] = { 0, 0, 0 };
+        int32_t rot[3];
+        if (g_playerPawn && g_offActorLocation >= 0 && g_offActorRotation >= 0 &&
+            SafeRead(g_playerPawn + g_offActorLocation, loc, sizeof(loc)) &&
+            SafeRead(g_playerPawn + g_offActorRotation, rot, sizeof(rot))) {
+            const float y = (float)rot[1] * (6.2831853f / 65536.0f);
+            const float c = cosf(y), sn = sinf(y);
+            const float wx = loc[0] - g_pkLedgeLoc[0], wy = loc[1] - g_pkLedgeLoc[1];
+            const float wz = loc[2] - g_pkLedgeLoc[2];
+            const float out   = -(wx * c + wy * sn);          // authored 30
+            const float along =  (wx * -sn + wy * c);         // authored 0
+            if (g_offCamLoc >= 0) SafeRead(g_playerPawn + g_offCamLoc, cam, sizeof(cam));
+            // ⚠️ ledgeLoc is in the line because the 63 -> 30 sweep has two completely
+            // different readings and only this tells them apart. If MoveLedgeLocation JUMPS to
+            // the far wall as the corner is offered, then 63 is simply "how far I am from the
+            // ledge I am about to be on", the sweep is the animation doing its job, and the body
+            // was never displaced. If it stays on the near wall, 63 is a real 33 UU of
+            // displacement carried through the whole turn.
+            static float prevLedge[3] = { 0, 0, 0 };
+            const float lj = sqrtf((g_pkLedgeLoc[0] - prevLedge[0]) * (g_pkLedgeLoc[0] - prevLedge[0]) +
+                                   (g_pkLedgeLoc[1] - prevLedge[1]) * (g_pkLedgeLoc[1] - prevLedge[1]));
+            memcpy(prevLedge, g_pkLedgeLoc, sizeof(prevLedge));
+            Log("[corner] f%ld yaw %+.0f | pawn out %.1f along %+.1f down %.1f  (authored"
+                " 30.0 / 0.0 / 92.8) | ledge (%.0f %.0f %.0f) moved %.1f | dof R%+.2f U%+.2f"
+                " F%+.2f | lead %+.2f/%+.2f/%+.2f frz %+.2f/%+.2f/%+.2f | pawn (%.0f %.0f %.0f)",
+                g_pkCornerFrames, y * 57.2957795f, out, along, -wz,
+                g_pkLedgeLoc[0], g_pkLedgeLoc[1], g_pkLedgeLoc[2], lj,
+                g_dofOffset[0], g_dofOffset[1], g_dofOffset[2],
+                g_pkCamLead, g_pkCamLeadUp, g_pkCamLeadFwd,
+                g_pkFreezeOff[0], g_pkFreezeOff[1], g_pkFreezeOff[2],
+                loc[0], loc[1], loc[2]);
+            (void)cam;
+        }
+    }
+
+    // ---- has the animation finished? ----
+    //
+    // Two conditions, because either alone is wrong. Yawed far enough says a corner is happening
+    // rather than a wobble; gone still says it has stopped happening. Waiting only for stillness
+    // would fire on the first frame, before the turn began.
+    static float prevYaw = 0.0f;
+    static bool  havePrevYaw = false;
+    bool done = false;
+    if (haveYaw) {
+        const float swept = fabsf(PkYawDelta(yaw, g_pkCornerYaw0));
+        if (swept > 30.0f) g_pkCornerTurned = true;
+        // ---- ⚠️ and an early way out, because the trigger can be wrong ----
+        //
+        // A real corner sweeps 90 degrees over about 105 frames, so it cannot be asked for 30 of
+        // them in 20 - but it will certainly have STARTED. Two degrees inside twenty frames is a
+        // turn beginning; nothing at all is a trigger that fired on something else, and the
+        // player gets their hands and their body straight back rather than after the 240-frame
+        // backstop.
+        if (!g_pkCornerTurned && g_pkCornerFrames > 20 && swept < 2.0f) {
+            g_pkCornerState = 0;
+            g_pkCornerSettle = 0;
+            Log("[pk] no turn came in %ld frames (yaw moved %.1f deg) - that was not a corner,"
+                " handing everything straight back", g_pkCornerFrames, swept);
+            return;
+        }
+        if (havePrevYaw && fabsf(PkYawDelta(yaw, prevYaw)) < 0.5f) ++g_pkCornerStill;
+        else g_pkCornerStill = 0;
+        prevYaw = yaw;
+        havePrevYaw = true;
+        // ---- ⚠️ THE YAW SETTLING IS NOT THE POSE SETTLING ----
+        //
+        // Anchoring the moment the turn stopped put the hands "a little bit too far back from
+        // the ledge" - the same trap the entry measurement already documents, where capturing
+        // early read the hand 54.6 UU BELOW the ledge because it was still arriving. The body
+        // finishes turning before the arms finish reaching.
+        //
+        // So the turn ending only STARTS the ordinary entry window. Thirty frames with the game
+        // holding both hands, the existing entry code measuring the hand-to-ledge offset off its
+        // own settled hang pose, and the anchors taken when that window closes. Which is the
+        // player's actual request: after a corner, behave exactly as on first entering a ledge.
+        if (g_pkCornerTurned && g_pkCornerStill >= 10 && g_pkCornerSettle == 0) {
+            g_pkCornerSettle = 30;
+            g_pkEntryHold = 30;
+            g_pkEntryOffsetValid = false;
+            g_pkGapBaselineOk = false;
+            g_pkGapBaselineOkPub = false;
+            Log("[pk] the turn has stopped after %ld frames - now the ordinary %ld-frame entry"
+                " window, so the anchors come off a hang pose that has finished arriving",
+                g_pkCornerFrames, g_pkCornerSettle);
+        }
+        if (g_pkCornerSettle > 0 && --g_pkCornerSettle == 0) done = true;
+    }
+
+    // The backstop. A turn that never comes is the game declining the corner, which is the same
+    // fact the end-of-ledge block is built on - so it IS the block, latched here rather than
+    // waiting three more probe cycles to rediscover it.
+    if (!done && g_pkCornerFrames > 240) {
+        g_pkCornerState = 0;
+        // No end is claimed here. The turn was observed, so something happened; it simply never
+        // settled inside the window. Falling back to the ordinary entry measurement is the honest
+        // move - it is the same thing done on first arriving at any ledge.
+        Log("[pk] corner: yawed %.0f deg but never settled in %ld frames - giving the hands back"
+            " and re-measuring the ordinary way",
+            haveYaw ? PkYawDelta(yaw, g_pkCornerYaw0) : 0.0f, g_pkCornerFrames);
+        g_pkEntryHold = 30;
+        return;
+    }
+    if (!done) return;
+
+    // ---- ⚠️ the anchors come from the GAME'S HANDS, not from the player's reach ----
+    //
+    // Everywhere else in this file an anchor is "where the player reached, projected onto the
+    // ledge, plus the offset the game's hang pose has off it" - because everywhere else the
+    // player CHOSE where to put their hand. Through a corner they chose nothing; the animation
+    // placed them. So the two hands the animation has just set down on the new ledge are the
+    // anchors, directly, with nothing of ours mixed in.
+    float axis[3];
+    const bool haveAxis = PkLedgeAxis(axis);
+    (void)axis;
+    int taken = 0;
+    for (int h = 0; h < 2; ++h) {
+        if (!g_pkGameHandValid[h]) continue;
+        g_pkHandAnchor[h][0] = g_pkGameHandWorld[h].x;
+        g_pkHandAnchor[h][1] = g_pkGameHandWorld[h].y;
+        g_pkHandAnchor[h][2] = g_pkGameHandWorld[h].z;
+        g_pkHandAnchored[h] = true;
+        ++taken;
+    }
+
+    // The hand-to-ledge offset was measured by the entry window that has just closed - the same
+    // code, off the same settled pose, as on first arriving at any ledge. Nothing to redo here.
+    if (haveAxis && g_pkLedgeOk) {
+        float loc[3];
+        if (g_playerPawn && g_offActorLocation >= 0 &&
+            SafeRead(g_playerPawn + g_offActorLocation, loc, sizeof(loc))) {
+            const float gx = loc[0] - g_pkLedgeLoc[0], gy = loc[1] - g_pkLedgeLoc[1];
+            g_pkGapBaseline = sqrtf(gx * gx + gy * gy);
+            g_pkGapBaselinePub = g_pkGapBaseline;
+            g_pkGapBaselineOk = true;
+            g_pkGapBaselineOkPub = true;
+        }
+    }
+
+    // A real turn means the end that was blocked belonged to the ledge behind us.
+    g_pkEndDir = 0;
+    g_pkExtentHave = false;
+    g_pkLedgeTOk = false;
+    g_pkLedgeMoved = false;
+    g_pkLastGoodTOk = false;
+    g_pkCornerState = 0;
+    g_pkEntryHold = 0;          // the measurement this window existed for has just been done
+    Log("*** [pk] corner complete after %ld frames, yawed %.0f deg - %d hand(s) anchored where"
+        " the animation left them, and direct drive has the body back",
+        g_pkCornerFrames, haveYaw ? PkYawDelta(yaw, g_pkCornerYaw0) : 0.0f, taken);
 }
 
 static void ParkourDirectBodyTick()
 {
     const bool want = g_pkDirectBody && g_pkMode == PK_LEDGE && g_pkAnchor != PK_HAND_NONE &&
-                      g_playerPawn && g_offActorLocation >= 0;
+                      g_pkCornerState == 0 && g_playerPawn && g_offActorLocation >= 0;
     if (!want) {
         // DIRECT-IDLE with no reason has now cost two runs. Say which condition is missing.
         g_pkDirectWhy = !g_pkDirectBody      ? "off"
+                      : g_pkCornerState != 0 ? "cornering"
                       : g_pkMode != PK_LEDGE ? "not on a ledge"
                       : g_pkAnchor == PK_HAND_NONE ? "no anchor"
                       : !g_playerPawn        ? "no pawn" : "no Location offset";
@@ -2939,6 +4388,18 @@ static void ParkourDirectBodyTick()
     static int prevAnchor = PK_HAND_NONE;
     if (!g_pkDirectHave || prevAnchor != g_pkAnchor) {
         if (!PkLedgeAxis(g_pkDirectAxis)) { g_pkDirectWhy = "no ledge axis"; return; }
+        // ⚠️ Logged, because "dislodged a little outwards over several corners, correct again
+        // after each one" is a PERPENDICULAR error and nothing here measures one. The base is
+        // whatever the pawn's position was at the latch, and every write after it is that base
+        // plus a distance ALONG the ledge - so any perpendicular offset in the base is carried
+        // for the whole life of the latch and cannot correct itself.
+        if (g_pkLedgeOk) {
+            const float vx = loc[0] - g_pkLedgeLoc[0], vy = loc[1] - g_pkLedgeLoc[1];
+            const float t = vx * g_pkDirectAxis[0] + vy * g_pkDirectAxis[1];
+            const float px = vx - g_pkDirectAxis[0] * t, py = vy - g_pkDirectAxis[1] * t;
+            Log("[pkdirect] latch: %.1f UU perpendicular to the ledge line, %.1f along"
+                " (resting gap %.0f)", sqrtf(px * px + py * py), t, g_pkGapBaseline);
+        }
         memcpy(g_pkDirectBase, loc, sizeof(loc));
         g_pkDirectHave = true;
         g_pkDirectLast = 0.0f;
@@ -2962,16 +4423,76 @@ static void ParkourDirectBodyTick()
     // The guard is the game's own verdict, read back rather than predicted: if it stops
     // reporting a ledge under the player, the write went somewhere there is no ledge, and the
     // only safe move is to stop writing and let the game have its position back.
-    if (!g_pkLedgeOk) {
-        Log("[pkdirect] the game stopped reporting a ledge - standing down after %ld writes",
-            g_pkDirectWrites);
-        g_pkDirectLive = false;
-        g_pkDirectHave = false;
-        g_pkDirectWhy = "ledge lost";
+    // ⚠️ bFoundLedge, which was resolved and logged and then never actually consulted - the
+    // guard was left on g_pkLedgeOk, which only says our own READ succeeded, not that the game
+    // still finds a ledge under the player. That is the difference between noticing we lost the
+    // pointer and noticing the player is over open air, and the field report was climbing past
+    // the end of a ledge floating in nothing.
+    bool foundLedge = g_pkLedgeOk;
+    if (g_offFoundLedge >= 0 && g_maskFoundLedge && g_playerPawn) {
+        uint32_t w = 0;
+        if (SafeRead(g_playerPawn + g_offFoundLedge, &w, sizeof(w)))
+            foundLedge = (w & g_maskFoundLedge) != 0;
+        g_pkFoundLedgePub = foundLedge;
+    }
+    if (!foundLedge) {
+        // ⚠️ Put the pawn BACK before letting go of it.
+        //
+        // Standing down on its own leaves the player wherever the last write landed, which is
+        // already past the end of the ledge - detected a frame late, which is a frame spent in
+        // open air. The last position the game itself accepted is known, so restore it and stop
+        // there instead.
+        if (g_pkLastGoodOk) {
+            SIZE_T back = 0;
+            WriteProcessMemory(GetCurrentProcess(),
+                               (LPVOID)(g_playerPawn + g_offActorLocation),
+                               g_pkLastGood, sizeof(g_pkLastGood), &back);
+            Log("[pkdirect] ledge ended - pawn restored to (%.0f %.0f %.0f), the last place the"
+                " game still saw one", g_pkLastGood[0], g_pkLastGood[1], g_pkLastGood[2]);
+        }
+        PkDirectStandDown("no ledge under us");
         return;
     }
+    memcpy(g_pkLastGood, loc, sizeof(g_pkLastGood));
+    g_pkLastGoodOk = true;
 
-    const float d = g_pkDesired * g_pkUUPerMetre;
+    // ⚠️ bFoundLedge alone did not stop the player climbing along open air, so the geometry is
+    // checked too: if the pawn has been written far from the ledge point the game still reports,
+    // we have carried it somewhere the game is not following, whatever its flag says.
+    {
+        const float gx = loc[0] - g_pkLedgeLoc[0], gy = loc[1] - g_pkLedgeLoc[1];
+        const float gap = sqrtf(gx * gx + gy * gy);
+        g_pkGapNow = gap;
+        // ---- ⚠️ this no longer stands anything down, deliberately ----
+        //
+        // It was added because the player could be written past the end of a ledge into open air
+        // while bFoundLedge failed to stop it. But bFoundLedge was not failing - its BitMask was
+        // zero, because the owner pass that recorded it ran before the mask was derived. It was
+        // never being read at all. This was a heuristic covering for a flag that was broken, and
+        // the flag has since been fixed.
+        //
+        // It also measures the wrong quantity. Pawn-to-ledge distance cannot tell "I have come off
+        // the ledge" from "I have travelled along it": if MoveLedgeLocation lags even slightly,
+        // the gap grows with distance covered and the guard fires on a perfectly good long ledge.
+        //
+        // Where a ledge stops and where it turns are things the GAME knows - bFoundLedge above,
+        // and PendingShimmyCornerAnimation for the corner. A distance in world units invented
+        // here knows neither. Kept as a logged observation only, because the number is still
+        // worth seeing when something does go wrong.
+        if (g_pkLedgeOk && g_pkGapBaselineOk && gap > g_pkGapBaseline + 250.0f) {
+            static long lastSaid = 0;
+            if (g_frames - lastSaid > 300) {
+                lastSaid = g_frames;
+                Log("[pkdirect] note: pawn is %.0f UU from the ledge against a resting %.0f"
+                    " - not acting on it, bFoundLedge is the guard", gap, g_pkGapBaseline);
+            }
+        }
+    }
+
+    // ⚠️ Not `want` - that name is already the armed/idle bool at the top of this function, and
+    // shadowing it compiles into a completely different meaning further down.
+    float travel = g_pkDesired;
+    const float d = travel * g_pkUUPerMetre;
     // A single frame cannot legitimately ask for more than a big arm's reach. Past that the axis
     // or the latch is wrong, and flinging the pawn is a worse outcome than doing nothing.
     if (!(fabsf(d) < 200.0f) || !std::isfinite(d)) { g_pkBlock = "direct step rejected"; return; }
@@ -2979,6 +4500,76 @@ static void ParkourDirectBodyTick()
     float want3[3] = { g_pkDirectBase[0] + g_pkDirectAxis[0] * d,
                        g_pkDirectBase[1] + g_pkDirectAxis[1] * d,
                        loc[2] };            // Z is never written - see the note above
+
+    // ---- ⚠️ ALIGNMENT: NEAR A CORNER, DO NOT OUTRUN THE GAME'S OWN STATE ----
+    //
+    // Measured cause of "cornering by hand dislodges me, cornering by stick never does": under
+    // direct drive the pawn runs up to 124.9 UU ALONG the ledge from the point the game reports.
+    // The stick makes the game shimmy, so its state travels with the player; direct drive writes
+    // Location and only nudges the game two frames in thirty, so the game's state cannot keep up
+    // and falls behind by however fast the player pulls. The corner animation is authored against
+    // that state, so it starts the turn displaced by exactly the lag.
+    //
+    // The lag cannot be removed everywhere: the game only advances its state while it is
+    // shimmying, at 60 UU/s, and a hand can pull faster than that. Holding the stick down to keep
+    // it fed is the animation the player does not want.
+    //
+    // But it only MATTERS at a corner. So the pawn is held within a short distance along the
+    // ledge of the point the game is reporting, and only while a corner is offered in the
+    // direction of travel - which is a local speed limit where alignment is worth more than
+    // 1:1 tracking, and no constraint at all anywhere else. The probe is already continuous in
+    // that state (g_pkCornerUrge), so the game advances at its full rate while it applies.
+    // ⚠️ The LIVE axis, not g_pkDirectAxis. That one is latched with the base and goes stale
+    // through exactly the yaw change this is trying to survive.
+    float liveAxis[3];
+    if (g_pkLedgeOk && PkLedgeAxis(liveAxis)) {
+        const float vx = want3[0] - g_pkLedgeLoc[0], vy = want3[1] - g_pkLedgeLoc[1];
+        const float along = vx * liveAxis[0] + vy * liveAxis[1];
+        g_pkAlongLag = along;
+        // Tight while a corner is offered ahead, where agreement is worth more than 1:1
+        // tracking; generous otherwise, where it is only insurance. The measured lag averaged
+        // 7.2 UU, so the loose cap should almost never engage.
+        const float cap = (g_pkCornerSide != 0 && g_pkTravelDir == g_pkCornerSide)
+                        ? kPkCornerAlignUU : kPkAlignCapUU;
+        if (fabsf(along) > cap) {
+            const float trim = (along > 0.0f ? along - cap : along + cap);
+            want3[0] -= liveAxis[0] * trim;
+            want3[1] -= liveAxis[1] * trim;
+            g_pkBlock = "waiting for the game to catch up";
+        }
+    }
+
+    // ---- ⚠️ THE LEASH: ONE RULE, IN WORLD UNITS, AT THE WRITE ----
+    //
+    // The end of the ledge and the leash used to be two clamps in axis space, applied to `travel`
+    // before the position was formed - so both inherited every frame-of-reference problem the
+    // axis has, and disagreed with each other by hundreds of UU after a corner or a turn-around.
+    //
+    // They are one thing: the pawn may not be written further than a leash from the last place
+    // the ledge was genuinely underneath it. That point is refreshed every frame the gap is
+    // normal, so along a real ledge this clamp never engages at all; where the ledge stops, the
+    // point stops, and so does the player. No direction, no latch, no axis.
+    //
+    // ⚠️ The baseline has to be believable before anything is clamped against it. It is measured
+    // while the pawn is still settling onto the ledge, and a bad one arms a leash around the
+    // wrong place - a player who cannot move at all, with nothing on screen saying why.
+    const bool baselineSane = g_pkGapBaselineOk && g_pkGapBaseline > 5.0f &&
+                              g_pkGapBaseline < 200.0f;
+    if (g_pkGapGoodOk && baselineSane) {
+        const float ox = want3[0] - g_pkGapGoodPos[0];
+        const float oy = want3[1] - g_pkGapGoodPos[1];
+        const float out = sqrtf(ox * ox + oy * oy);
+        if (out > kPkLeashUU) {
+            const float k = kPkLeashUU / out;
+            want3[0] = g_pkGapGoodPos[0] + ox * k;
+            want3[1] = g_pkGapGoodPos[1] + oy * k;
+            g_pkBlock = g_pkEndDir > 0 ? "LEDGE ENDS RIGHT"
+                      : g_pkEndDir < 0 ? "LEDGE ENDS LEFT" : "off the ledge";
+            g_pkAtEnd = true;       // the ledge has stopped coming - see the corner handover
+        } else {
+            g_pkAtEnd = false;
+        }
+    }
     SIZE_T wrote = 0;
     if (!WriteProcessMemory(GetCurrentProcess(), (LPVOID)(g_playerPawn + g_offActorLocation),
                             want3, sizeof(want3), &wrote) || wrote != sizeof(want3)) {
@@ -2988,7 +4579,7 @@ static void ParkourDirectBodyTick()
         return;
     }
     ++g_pkDirectWrites;
-    g_pkDirectLast = g_pkDesired;
+    g_pkDirectLast = travel;
 
     // How far the game moved the pawn away from what was written since last frame IS the fight,
     // measured rather than argued about. Zero means the move is not contesting position; a
@@ -3015,6 +4606,8 @@ static void ParkourTick(XrTime when)
 {
     (void)when;
     ParkourPollDirectToggle();      // unconditional - see the note on why it moved here
+    PkLogVaultEntry();
+    GeomCensusTick();
     // ⚠️ Both of these moved ABOVE the early returns, for the reason the toggle did.
     //
     // PkReadLedge sat after the grip check, so the ledge was only re-read while a hand was
@@ -3026,10 +4619,15 @@ static void ParkourTick(XrTime when)
     // Neither depends on a grip. Both have their own gates and are safe to call whenever there
     // is a pawn.
     PkReadLedge();
-    ParkourDirectBodyTick();
+    PkReadCorner();
+    PkWatchLedgeOffset();
+    // ⚠️ ABOVE PkFreezeViewTick, which gates on it. It used to be assigned after, so the freeze
+    // read LAST frame's mode - and the one frame that buys is the frame the player leaves the
+    // ledge, which is precisely the frame the pawn moves hardest.
+    g_pkMode = g_parkour ? ParkourModeNow() : PK_NONE;
+    PkFreezeViewTick();
     const float prevShimmy = g_pkShimmy;
     g_pkShimmy = 0.0f;
-    g_pkMode = g_parkour ? ParkourModeNow() : PK_NONE;
 
     ParkourAnimLock(g_pkMode != PK_NONE);
 
@@ -3037,6 +4635,26 @@ static void ParkourTick(XrTime when)
     if (g_pkMode != prevMode) {
         if (g_pkMode == PK_NONE || prevMode == PK_NONE)
             Log("[pk] mode %d -> %d at t=%.2fs", prevMode, g_pkMode, LogSecs());
+        if (g_pkMode == PK_LEDGE) {
+            g_pkEntryHold = 30;
+            g_pkEntryOffsetValid = false;
+            g_pkGapBaselineOk = false;
+            g_pkGapBaselineOkPub = false;
+            Log("[pk] ledge entered - the game keeps both hands for %ld frames while the"
+                " hand-to-ledge offset is measured", g_pkEntryHold);
+        }
+        // ⚠️ Direct drive is never TOLD it is over. ParkourDirectBodyTick is called below the
+        // "not on a wall" early return, so the frame the mode leaves the ledge is the last frame
+        // it ever runs - g_pkDirectLive and g_pkDirectHave stayed set for the rest of the run.
+        // Nothing downstream writes on them, but the log went silent at exactly the moment worth
+        // reading, and the run where the exit was the bug had no line saying it happened.
+        if (prevMode == PK_LEDGE && g_pkDirectLive) {
+            Log("[pkdirect] the ledge ended the move after %ld writes - stood down (mode %d)",
+                g_pkDirectWrites, g_pkMode);
+            g_pkDirectLive = false;
+            g_pkDirectHave = false;
+            g_pkDirectWhy = "left the ledge";
+        }
         prevMode = g_pkMode;
         g_pkAnchor = PK_HAND_NONE;
         g_pkProgress = g_pkDesired = 0.0f;
@@ -3044,12 +4662,62 @@ static void ParkourTick(XrTime when)
         g_pkExtentHave = false;      // a new ledge is a new span, not a longer one
     }
     if (g_pkMode == PK_NONE) {
-        g_pkBlock = "not on a wall"; g_pkAnchor = PK_HAND_NONE; g_pkCamLead = 0.0f; return;
+        g_pkBlock = "not on a wall"; g_pkAnchor = PK_HAND_NONE; PkZeroLead();
+        g_pkCornerState = 0; g_pkCornerUrge = false;
+        return;
     }
+
+    // ⚠️ HERE, above the grip test and the anchor selection, not down beside the servo. The turn
+    // is a fact about the game, not about whether the player happens to be squeezing a grip -
+    // and every early return below this point would skip it. Standing on a ledge with both hands
+    // open while the game corners you is exactly when the anchors most need to be gone.
+    PkCornerTick();
 
     // Body travel is accumulated every frame, signed by what we were LAST asking for - the move
     // that actually produced it. Signing by this frame's request would credit the previous
     // frame's travel to a direction that had already been reversed.
+    // ⚠️ Sampled before the decrement, so the frame the window closes is visible as an EDGE to
+    // PkSnapHandToLedge - which runs from the pose path, not from here, and would otherwise only
+    // ever see "the window is shut" with no way to tell the first such frame from the thousandth.
+    // ---- ⚠️ A FAILED ENTRY MEASUREMENT USED TO BE FOREVER ----
+    //
+    // The window is 30 frames from the moment the ledge move starts, and the measurement inside
+    // it can legitimately fail: the log has "RIGHT hand reads 70.8 UU off the ledge at entry -
+    // not a hand on a ledge, ignored", and if neither hand gives a plausible reading the offset
+    // never becomes valid. Every grip after that logs "no entry offset measured, leaving the hand
+    // free" - for the whole time on that ledge. First grab of a run is the likeliest to miss it,
+    // because the pawn is still arriving from IntoGrab when the window opens.
+    //
+    // So it retries. The window costs nothing when it succeeds and is the only way back when it
+    // does not.
+    if (g_pkMode == PK_LEDGE && g_pkEntryHold == 0 && !g_pkEntryOffsetValid &&
+        g_pkCornerState == 0) {
+        static long retryAt = 0;
+        if (g_frames > retryAt) {
+            retryAt = g_frames + 120;
+            g_pkEntryHold = 30;
+            Log("[pk] no hand-to-ledge offset yet - re-opening the entry window to measure it"
+                " again");
+        }
+    }
+    g_pkEntryPrev = g_pkEntryHold;
+    if (g_pkEntryHold > 0) {
+        --g_pkEntryHold;
+        // The resting pawn-to-ledge distance, measured while the game still owns everything.
+        float loc[3];
+        if (g_pkLedgeOk && g_playerPawn && g_offActorLocation >= 0 &&
+            SafeRead(g_playerPawn + g_offActorLocation, loc, sizeof(loc))) {
+            const float gx = loc[0] - g_pkLedgeLoc[0], gy = loc[1] - g_pkLedgeLoc[1];
+            g_pkGapBaseline = sqrtf(gx * gx + gy * gy);
+            g_pkGapBaselinePub = g_pkGapBaseline;
+            if (g_pkEntryHold <= 1 && !g_pkGapBaselineOk) {
+                g_pkGapBaselineOk = true;
+                g_pkGapBaselineOkPub = true;
+                Log("[pk] resting pawn-to-ledge distance is %.0f UU - drift is judged from there",
+                    g_pkGapBaseline);
+            }
+        }
+    }
     const float step = PkBodyStep();
     if (prevShimmy != 0.0f) g_pkProgress += (prevShimmy > 0.0f ? step : -step);
 
@@ -3077,7 +4745,19 @@ static void ParkourTick(XrTime when)
         g_pkStallFrames = 0;
     }
 
-    if (!g_headAxesOk) { g_pkBlock = "no head axes"; return; }
+    // ⚠️ The cooldown suppresses DRIVING, not latching.
+    //
+    // It used to return here, above the grip test and the anchor selection - so for the 45 frames
+    // after any stand-down the servo anchor could not be re-established at all, and DIRECT went on
+    // reporting "no anchor" long after the reason for standing down had passed. A recovery period
+    // that also prevents recovering is just a longer outage.
+    const bool cooling = g_pkCooldown > 0;
+    if (cooling) {
+        --g_pkCooldown;
+        g_pkBlock = "recovering";
+        g_pkCamLead = 0.0f;
+    }
+    if (!g_headAxesOk) { g_pkBlock = "no head axes"; PkDecayLead(); return; }
 
     // A hand holds the world when its grip is squeezed AND the runtime can see it. Untracked is
     // deliberately NOT treated as holding on here: this decides where the body goes, and a lost
@@ -3093,7 +4773,7 @@ static void ParkourTick(XrTime when)
         // player has abandoned is a camera nobody is steering.
         g_pkBlock = "no hand gripping";
         g_pkAnchor = PK_HAND_NONE;
-        g_pkCamLead = 0.0f;
+        PkDecayLead();
         return;
     }
 
@@ -3111,8 +4791,18 @@ static void ParkourTick(XrTime when)
     prevHeld[0] = held[0]; prevHeld[1] = held[1];
 
     if (want != g_pkAnchor) {
+        // ⚠️ BEFORE g_pkAnchorRel moves, or the bias captures a fore/aft lead that has already
+        // been reset and the swap steps by the whole of it.
+        g_pkCamLeadBiasFwd = g_pkCamLeadFwd;
         g_pkAnchor = want;
         g_pkAnchorLat = PkLateralOf(want == PK_HAND_L ? g_swingL : g_swingR);
+        g_pkAnchorRel = (want == PK_HAND_L ? g_swingL : g_swingR).rel;   // fore/aft reference
+        g_pkAnchorRelOk = true;
+        // ⚠️ The integrator's previous sample is DROPPED, not re-latched. Differencing the new
+        // hand against the old one's last sample would put the distance BETWEEN the player's
+        // hands into the view in a single frame. The fore/aft axis above can re-reference
+        // because its bias carries the value across; the vertical has no bias and must not.
+        g_pkLeadPrevOk = false;
         g_pkProgress = 0.0f;
         if (g_parkourDebug)
             Log("[pk] anchor -> %s at lateral %+.3f m",
@@ -3120,20 +4810,165 @@ static void ParkourTick(XrTime when)
     }
 
     g_pkBlock = "";
-    if (g_pkMode != PK_LEDGE) { g_pkBlock = "mode has no servo yet"; return; }
+    if (g_pkMode != PK_LEDGE) { g_pkBlock = "mode has no servo yet"; PkZeroLead(); return; }
 
     // Pull the hands LEFT and the body goes RIGHT. Inverse, because the hand is what is anchored
     // - the same relationship the bar measurement confirmed, where hands back meant feet forward.
     const float lat = PkLateralOf(g_pkAnchor == PK_HAND_L ? g_swingL : g_swingR);
     g_pkDesired = -(lat - g_pkAnchorLat);
 
+    // ⚠️ AFTER the anchor is chosen, not before it.
+    //
+    // This ran near the top of the tick, so it read an anchor that had been selected a frame
+    // earlier - and on any frame the selection did not reach (cooldown, no grip), a stale one.
+    // It depends on g_pkAnchor and g_pkDesired, so it belongs after both are settled for this
+    // frame rather than reasoning about last frame's.
+    // ⚠️ ABOVE the corner decision, which reads the travel direction and the end verdict it
+    // produces. It used to run below, so the corner was ruled on with last frame's answers.
+    PkAskTheGameTick();
+
+    // ---- ⚠️ THE CORNER IS NOT PREDICTED ANY MORE. IT IS NOTICED. ----
+    //
+    // Three builds tried to work out in advance that a corner was about to happen, so the hands
+    // could be handed over before it started. Every one of them was gated on a signal that turned
+    // out not to say what it was asked to say, and the last log is what finally settles it:
+    //
+    //   "over 600 frames on a ledge: asked on 35, MoveLedgeLocation advanced on 443,
+    //    a corner was offered on 286"
+    //
+    // MoveLedgeLocation advances on THREE FRAMES IN FOUR, because it names the ledge point
+    // nearest the pawn and direct drive is moving the pawn. It tracks us; it does not endorse us.
+    // So "the ledge has stopped extending" - the gate the corner was waiting on - was essentially
+    // never true, g_pkCornerState never left 0, and every piece of machinery hanging off it was
+    // dead code for the whole run. The player rounded the corner anyway, on the pulses alone,
+    // with direct drive still writing Location along the axis latched BEFORE the turn - which
+    // after 90 degrees points into the building. That is the "pushed too far in".
+    //
+    // A turn is not something to infer. The pawn yaws through 90 degrees; that is visible, it
+    // needs no property, and it is true whatever caused it - our probe, the physical stick, or
+    // the game's own scripting. So PkCornerTick watches for it directly and gets out of the way
+    // when it starts, and nothing here has to be right about the future.
+    //
+    // What IS still worth doing in advance is asking harder. An offered corner in the direction
+    // of travel means the game is willing, so the probe goes continuous until it plays it -
+    // which changes nothing about who owns the hands or the body, and so cannot go wrong the way
+    // standing down early did.
+    // ⚠️ AND IT MUST NOT SURVIVE THE CORNER IT ASKED FOR.
+    //
+    // PendingShimmyCornerAnimation is sticky - the census had it set for 1800 consecutive frames.
+    // So after a corner completes it is typically STILL set, the urge re-arms on the next frame
+    // the player travels that way, the probe goes continuous again, and the game shimmies for
+    // real. That is the legs carrying on walking after the corner was over.
+    //
+    // The field going back to None is the game saying it is done offering that one. Until it
+    // does, no urge - the pulsed probe is still running underneath, so nothing is lost but the
+    // hurry.
+    if (g_pkCornerSide == 0) g_pkCornerSeenNone = true;
+    g_pkCornerUrge = g_pkCornerState == 0 && g_pkCornerSide != 0 && g_pkCornerSeenNone &&
+                     g_pkTravelDir == g_pkCornerSide;
+
+    // ---- ⚠️ WHY THE LAST ATTEMPT NEVER RAN ----
+    //
+    // It handed the body back when the player reached the END of the ledge with a corner offered.
+    // It fired zero times in a run with eight corners, and the reason is a definition error: a
+    // corner is where the ledge TURNS, not where it stops. The ledge continues round it, so
+    // MoveLedgeLocation stays underneath the pawn, the leash never engages, and g_pkAtEnd is
+    // never true. The gate described a dead end, and a corner is the opposite of one.
+    //
+    // And the obvious replacement - hand over whenever a corner is offered ahead - is the thing
+    // that already went wrong twice: the census has PendingShimmyCornerAnimation set on 600 of
+    // 600 frames in two separate windows. It is not a proximity signal.
+    //
+    // So nothing is handed over. The cause is addressed instead: see the alignment clamp in
+    // ParkourDirectBodyTick.
+    if (!cooling) ParkourDirectBodyTick();
+
+    // ⚠️ ABOVE the direct-mode return. Direct drive owns the body and returns early, so the
+    // forward and vertical lead computed after it never ran at all - "pushing the controller
+    // forward did not move the camera back". Those two axes have no body to conflict with, so
+    // they belong outside the branch that exists to stop the sideways axis double-counting one.
+    // ---- the other two axes: the view answers, because the body cannot ----
+    //
+    // A pull is 3D and the response should be too - push the controller forward in any VR game
+    // and you travel back. On a ledge the game only shimmies sideways, so there is no body motion
+    // to ask for on the other two axes and nothing to servo against. The CAMERA can still answer,
+    // and does: the offset is the displacement itself, inverted, held while the pull is held and
+    // gone when it is released.
+    //
+    // Sideways stays a servo because there the body really does move and the view must not
+    // double-count it.
+    // ---- ⚠️ NO LEAD THROUGH A CORNER ----
+    //
+    // The lead is a displacement of the VIEW from the body, earned by the player pulling on an
+    // anchor. Through a corner there is no anchor and no pull - the animation owns everything and
+    // the player is a passenger - but the lead was still being computed from wherever their
+    // controller had drifted to, and still being added to g_dofOffset. So the whole scene sat
+    // offset from the body for the length of the animation: hands correctly on the ledge, view
+    // somewhere else, which reads exactly as "too far out, grabbing thin air". The snap back at
+    // the end was the lead being released, not the body arriving.
+    if (g_pkCornerState != 0) {
+        PkDecayLead();
+    } else if (g_pkCamLeadOn && g_pkAnchor != PK_HAND_NONE) {
+        const ArmSwingHand& ah = (g_pkAnchor == PK_HAND_L) ? g_swingL : g_swingR;
+
+        // ---- VERTICAL: integrated, so the grab contributes an exact zero ----
+        //
+        // ⚠️ The FIRST frame of any anchor contributes nothing, because there is no previous
+        // sample of that hand to difference against. That is the whole mechanism by which the
+        // grab moves the view by nothing, and it is a structural zero rather than a tuned one.
+        if (g_pkLeadPrevOk && g_pkCamLeadUpOn) {
+            const float dx = ah.rel.x - g_pkLeadPrevRel.x;
+            const float dy = ah.rel.y - g_pkLeadPrevRel.y;
+            const float dz = ah.rel.z - g_pkLeadPrevRel.z;
+            // Same guard the swing differentiator uses, for the same reason: OpenXR has been
+            // measured jumping a tracked pose further in one frame than a limb can travel, and
+            // an integrator keeps a glitch forever rather than shrugging it off next frame.
+            if (dx * dx + dy * dy + dz * dz <= kSwingMaxStepM * kSwingMaxStepM)
+                g_pkCamLeadUp += -dy;
+        }
+        g_pkLeadPrevRel = ah.rel;
+        g_pkLeadPrevOk = true;
+        if (!g_pkCamLeadUpOn) g_pkCamLeadUp = 0.0f;
+
+        // ---- FORE/AFT: measured from the anchor latch, so every grab brings it home ----
+        //
+        // ⚠️ The bias is decayed AFTER it is used, not before. Decaying first costs 8% of it on
+        // the very frame it was captured, which is a step - small, but the same kind of step
+        // this axis was rebuilt to stop making.
+        if (g_pkCamLeadFwdOn && g_pkAnchorRelOk) {
+            const float dx = ah.rel.x - g_pkAnchorRel.x;
+            const float dz = ah.rel.z - g_pkAnchorRel.z;
+            g_pkCamLeadFwd = -(dx * g_headForward.x + dz * g_headForward.z) + g_pkCamLeadBiasFwd;
+            // ~0.4 s to a twentieth: slow enough to read as a settle rather than a snap, fast
+            // enough to be finished before the next stroke needs the axis honest again.
+            g_pkCamLeadBiasFwd *= 0.92f;
+            if (fabsf(g_pkCamLeadBiasFwd) < 0.002f) g_pkCamLeadBiasFwd = 0.0f;
+        } else if (!g_pkCamLeadFwdOn) {
+            g_pkCamLeadFwd = 0.0f;
+            g_pkCamLeadBiasFwd = 0.0f;
+        }
+
+        if (g_pkCamLeadFwd >  g_pkCamLeadMax) g_pkCamLeadFwd =  g_pkCamLeadMax;
+        if (g_pkCamLeadFwd < -g_pkCamLeadMax) g_pkCamLeadFwd = -g_pkCamLeadMax;
+        if (g_pkCamLeadUp  >  g_pkCamLeadMax) g_pkCamLeadUp  =  g_pkCamLeadMax;
+        if (g_pkCamLeadUp  < -g_pkCamLeadMax) g_pkCamLeadUp  = -g_pkCamLeadMax;
+    } else {
+        PkDecayLead();
+    }
+
     if (g_pkDirectLive) {
-        // ⚠️ The whole point. A stick input is what makes the game play the shimmy animation, so
-        // while position is being written directly the stick must stay at rest - otherwise the
-        // animation runs anyway and moves the player on top of the writes.
-        g_pkShimmy = 0.0f;
+        // ⚠️ The stick used to be pinned at zero here, so the shimmy animation could never run
+        // on top of the writes. It still cannot - the writes measured 0.00 UU/frame of fight -
+        // and the cost of the silence was that the game was never asked anything, which is why
+        // the ledge had no end and the corner was never offered. See PK.7.
+        g_pkShimmy = (float)g_pkProbeDir * g_pkShimmyCap;
         g_pkCamLead = 0.0f;     // the body IS where the pull asked; there is no debt to lead
-        g_pkBlock = "direct body drive";
+        // ⚠️ This used to be an unconditional "direct body drive", which overwrote the end-of-
+        // ledge message ParkourDirectBodyTick had just set - so the one state the player most
+        // needs to see in the headset was the one the overlay could never show.
+        g_pkBlock = g_pkEndDir > 0 ? "LEDGE ENDS RIGHT"
+                  : g_pkEndDir < 0 ? "LEDGE ENDS LEFT"
+                  : "direct body drive";
         return;
     }
 
@@ -3154,6 +4989,8 @@ static void ParkourTick(XrTime when)
     //
     // prevShimmy is also the CORRECT value on its own terms: it is the command that produced the
     // travel being measured this frame.
+    if (cooling) { g_pkShimmy = 0.0f; return; }
+
     const float error = g_pkDesired - g_pkProgress;
 
     // The lead IS the error: exactly the distance the body still owes the player. It therefore
@@ -5905,6 +7742,7 @@ extern int g_offMoves;
 extern int g_offMoveLedgeLoc;
 extern int g_offMoveLedgeNrm;
 extern int g_offFoundLedge;
+extern uint32_t g_maskFoundLedge;
 extern int g_offWeapon;
 extern int g_offWeaponAnimState;
 extern int g_offCtlPawn;        // PlayerController::Pawn - the pawn without a 115k-object walk
@@ -6016,6 +7854,41 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                 // PK.4: the ledge the grab move is holding you to, in world space.
                 g_offMoveLedgeLoc = LookupProp("TdPawn", "MoveLedgeLocation", true);
                 g_offMoveLedgeNrm = LookupProp("TdPawn", "MoveLedgeNormal", true);
+                g_offPendingCorner =
+                    LookupProp("TdMove_Grab", "PendingShimmyCornerAnimation", true);
+                // PK.7: the game's own shimmy cooldown. Without it, every cooldown reads as
+                // "the game refused, so the ledge has ended" - see PkAskTheGameTick.
+                g_offDisableShimmy = LookupProp("TdMove_Grab", "DisableShimmyTime", true);
+                // PK.8 rung 1: the field TdMove_Grab recomputes position from. StructProperty,
+                // 12 bytes, so an FVector - but in WHICH frame is the question the next run
+                // answers. Nothing writes it until that is measured.
+                g_offGrabDesiredOffset =
+                    LookupProp("TdMove_Grab", "GrabDesiredLedgeOffset", true);
+                // The game says a corner move is running, on its first frame. See PkCornerTick.
+                g_offCurShimmy = LookupProp("TdMove_Grab", "CurrentShimmyMove", true);
+                Log("[pk] CurrentShimmyMove at +0x%04X (3 = hanging/shimmying, 2 = a corner)",
+                    g_offCurShimmy);
+                Log("[grabofs] GrabDesiredLedgeOffset at +0x%04X", g_offGrabDesiredOffset);
+                // ---- the two vault animations, which share one move state ----
+                //
+                // Both of the player's markers landed on state 9, TdMove_VaultOver, and they want
+                // opposite hand ownership for them. The move carries its own answer: ActiveVaultType
+                // names which of its VaultTypes is running, and bVaultOnto separates going OVER an
+                // obstacle from landing ONTO it. The first probe read +0x40..0x9C and missed both,
+                // which is 0x154 short - the useful fields are at the END of the class.
+                g_offActiveVaultType = LookupProp("TdMove_VaultOver", "ActiveVaultType", true);
+                g_offVaultState      = LookupProp("TdMove_VaultOver", "VaultState", true);
+                g_offVaultHandLoc    = LookupProp("TdMove_VaultOver", "HandLocation", true);
+                g_offPreciseInterp   = LookupProp("TdMove_VaultOver", "PreciseLocationInterpMode", true);
+                {
+                    char k[32] = "?";
+                    g_offVaultOnto = OwnerLookup("TdMove_VaultOver", "bVaultOnto", k, sizeof(k),
+                                                 &g_maskVaultOnto);
+                    Log("[vault] ActiveVaultType +0x%04X  VaultState +0x%04X  bVaultOnto +0x%04X"
+                        " bit %d  PreciseLocationInterpMode +0x%04X",
+                        g_offActiveVaultType, g_offVaultState, g_offVaultOnto,
+                        g_maskVaultOnto ? BitIndexOf(g_maskVaultOnto) : -1, g_offPreciseInterp);
+                }
                 {
                     char k[32] = "?";
                     g_offFoundLedge = OwnerLookup("TdPawn", "bFoundLedge", k, sizeof(k),
@@ -10466,10 +12339,68 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13HandPoseSnapshot& 
     //
     // The reason to admit it anyway: the player cannot judge ANY of the parkour work while their
     // in-game hands are somewhere their real hands are not. That was the whole report.
+    // ---- ⚠️ PK.7 belongs HERE, not at one caller ----
+    //
+    // It was applied to the leftEligible/rightEligible locals that feed the shoulder-detachment
+    // solver. But the hand's POSITION is written by ApplyOneMotionHandPosition, which calls this
+    // function again for itself and never saw that override - so the overlay correctly reported
+    // GAME while the hand went on following the controller. Two evaluations of the same question,
+    // and only one of them was answered.
+    //
+    // A hand gripping within reach of the ledge is the game's: its hang pose already puts the
+    // hand there, in line, with the fingers over the edge. Everything downstream - position,
+    // shoulder, fingers - now reads one verdict.
+    //
+    // ⚠️ LATCHED at the grip press, not re-tested every frame.
+    //
+    // Testing the distance continuously meant a hand that grabbed the ledge handed itself back
+    // to the controller the moment the player's real arm drifted past the radius - mid-grip,
+    // without them releasing anything. That is wrong on its own terms: squeezing the grip is a
+    // commitment, and nothing about holding on should depend on where the controller wanders to
+    // afterwards.
+    //
+    // g_pkHandAnchored already carries exactly this: set on the closing edge if the hand was
+    // within reach, cleared when the grip opens. So the question "is this hand on the ledge" is
+    // answered once, at the moment it is actually being asked, and held until let go.
+    //
+    // Which makes the radius decide what the player wanted it to decide: press the grip near the
+    // ledge and the hand grabs it, press it out in open air and the hand closes on nothing and
+    // stays yours.
+    // ⚠️ Handing the whole hand to the game was half right, and the wrong half.
+    //
+    // Its hang pose is correct - on the ledge, in line, fingers over the edge - but it is posed
+    // RELATIVE TO THE BODY. So the moment the body travels, the hand travels with it and slides
+    // along the ledge it is supposed to be holding. A hand that moves when you move is not
+    // holding anything.
+    //
+    // The two halves have to be separated. POSITION stays ours, written to the world point
+    // latched when the grip closed, so the hand stands still while the shoulder moves away from
+    // it and the arm stretches - which is what holding on looks like. The FINGERS stay the
+    // game's, because its ledge grip is exactly the pose wanted and nothing here can author one.
+    //
+    // So this deliberately does NOT stand the arm down for an ANCHORED hand. It does for a
+    // PENDING one: those few frames exist precisely so the game can pose the hand without us
+    // steering it, and capturing a position we wrote ourselves would anchor to our own guess.
+    if (g_parkour && g_pkMode == PK_LEDGE &&
+        (g_pkEntryHold > 0 || g_pkCornerState != 0 ||
+         g_pkHandPending[leftHand ? 0 : 1] > 0)) {
+        if (outMovement) {
+            uint8_t mv = 0xFF;
+            SafeRead(pawn + g_offMoveState, &mv, 1);
+            *outMovement = mv;
+        }
+        return P13_MOVEMENT;
+    }
+
+    // ⚠️ State 9 is conditional, and it is the only one that is. Every other entry here is a
+    // whole movement state; VaultOver is one state running two different animations, and the
+    // player wants the hands on opposite sides of that. g_vaultHandsAreOurs is latched on the
+    // move's first frame - see PkLogVaultEntry - so it cannot flip part-way through one.
     if (g_offMoveState < 0 || !SafeRead(pawn + g_offMoveState, &movement, 1) ||
         !(movement == 1 || movement == 2 || movement == 11 || movement == 15 ||
           movement == 16 || movement == 24 || movement == 29 || movement == 30 ||
-          (g_parkour && movement == 3))) {
+          (g_parkour && movement == 3) ||
+          (movement == 9 && g_vaultHandsAreOurs))) {
         if (outMovement) *outMovement = movement;
         return P13_MOVEMENT;
     }
@@ -10689,6 +12620,13 @@ static void ApplyOneMotionHandPosition(uintptr_t pawn, const P13HandPoseSnapshot
     // nothing), so the one lever is the effector itself: keep it strictly inside the reachable
     // sphere and let the detached shoulder cover the remainder - the job it exists for.
     MEVR_Vec3 effector = pose.worldPosition;
+    // ⚠️ THIS is the target that reaches the game. The snap has now been applied twice to values
+    // that never got here - first to MonitorArmContinuity's diagnostic snapshot, then to the
+    // leftWorld/rightWorld locals that feed the shoulder solver. Both are copies; this is the one
+    // written into EffectorLocation, so an anchored hand has to be pinned here or nowhere.
+    PkSnapHandToLedge(leftHand ? 0 : 1, &effector);
+    g_pkLastWritten[leftHand ? 0 : 1] = effector;
+    g_pkLastWrittenOk[leftHand ? 0 : 1] = true;
     const int rootIndex = leftHand ? 0 : 1;
     if (g_armChainRootValid[rootIndex]) {
         const MEVR_Vec3& root = g_armChainRoot[rootIndex];
@@ -11850,7 +13788,22 @@ static void __fastcall Hook_UpdateSkelPose(void* self, void* edx, float deltaTim
         // still drives both hands together, which is how F2 and F3 were judged.
         const float wanted = g_gripToGrip ? CurlTargetFromGrip(g_gripValue[h])
                                           : (g_bonePokeProbe ? 1.0f : 0.0f);
-        g_curlTarget[h] = gameOwns ? 0.0f : wanted;
+        // ---- PK.8: on a ledge, ownership of the FINGERS is per hand ----
+        //
+        // GameOwnsTheHands lists Grabbing, so the whole hand stood down for the length of a hang
+        // and the fingers stayed in the game's ledge grip whatever the player did - reported as
+        // "bone structure is always locked to what it would be if I was gripping a ledge".
+        //
+        // That is right for a hand that IS holding the ledge and wrong for one that is not. A
+        // released hand belongs to the player: open at rest, closing into a fist as they squeeze,
+        // exactly as it behaves everywhere else. So the state-wide answer is narrowed to a
+        // per-hand one, and only while parkour is on.
+        // The finger half of the split: the game poses a hand that is ON the ledge, we pose one
+        // that is not. Keyed on the same latch the position uses, so the two halves cannot
+        // disagree about whether a hand is holding.
+        g_pkFingersAreTheGames[h] = gameOwns;
+        if (g_parkour && moveState == 3) g_pkFingersAreTheGames[h] = PkHandIsTheGames(h);
+        g_curlTarget[h] = g_pkFingersAreTheGames[h] ? 0.0f : wanted;
     }
 
     // ---- who owns the fingers during ordinary movement ----
@@ -11866,7 +13819,17 @@ static void __fastcall Hook_UpdateSkelPose(void* self, void* edx, float deltaTim
     const bool wantCurl = haveOpen || g_curlTarget[0] > 0.0f || g_curlNow[0] > 0.0f ||
                           g_curlTarget[1] > 0.0f || g_curlNow[1] > 0.0f;
     const bool wantCapture = g_motionHandsDebug && !g_captureReported;
-    if (gameOwns || (!wantCurl && !wantCapture)) return;
+    // ⚠️ Per hand, not state-wide.
+    //
+    // This read `gameOwns`, which lists Grabbing - so during a hang the writer returned before
+    // touching anything and the per-hand target computed above went nowhere. The overlay showed
+    // CURL climbing to 1 while the fingers never moved, which is exactly a target with no writer
+    // behind it.
+    //
+    // Only bail when NEITHER hand is ours. With one hand on the ledge and one free, the free one
+    // still needs its pose written, and the held one is skipped inside the write loop instead.
+    if ((g_pkFingersAreTheGames[0] && g_pkFingersAreTheGames[1]) ||
+        (!wantCurl && !wantCapture)) return;
 
     // Framerate-independent, and gentle: the squeeze axis is already an analogue signal, so this
     // is taking the tremble off a sensor rather than shaping the feel. Anything slower would put
@@ -11936,6 +13899,10 @@ static void __fastcall Hook_UpdateSkelPose(void* self, void* edx, float deltaTim
     float blend[2];
     bool anyWrite = false;
     for (int h = 0; h < 2; ++h) {
+        // A hand the game owns is left exactly as the animation posed it. Writing "open" over a
+        // ledge grip would replace the correct pose with a wrong one, which is worse than not
+        // writing at all.
+        if (g_pkFingersAreTheGames[h]) { blend[h] = -1.0f; continue; }
         const float rest = haveOpen ? RestingCurlFor(h, gameOpenness[h]) : 0.0f;
         blend[h] = rest + (1.0f - rest) * g_curlNow[h];
         if (blend[h] > 0.0f) anyWrite = true;
@@ -12405,6 +14372,7 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
         P13Eligibility(pawn, pose.right, pose.presentFrame, false,
                        &ignored, nullptr, nullptr) == P13_READY;
 
+    extern bool g_pkGameOwnsHand[2];
     // ---- PK.7: a hand holding the ledge belongs to the GAME, not to the controller ----
     //
     // Everything before this tried to compute where a held hand should be: project it onto the
@@ -12432,17 +14400,78 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
     // ledge" is not what was asked for. Squeezing out in open air should still close a fist on
     // nothing - that is the player's own hand doing what they told it. Only a grip within reach
     // of the ledge is a grab, and the distance that decides it is the one now on the overlay.
-    if (g_parkour && g_pkMode == PK_LEDGE) {
-        const float reach = g_pkSnapRadius * g_pkUUPerMetre;
-        for (int h = 0; h < 2; ++h) {
-            // Not called `near`: windef.h still #defines that, and the error it produces names
-            // the line rather than the macro.
-            const bool inReach = g_pkHandLedgeDist[h] >= 0.0f && g_pkHandLedgeDist[h] <= reach;
-            if (g_gripValue[h] > 0.5f && inReach) {
-                if (h == 0) leftEligible = false; else rightEligible = false;
+    // Reporting only. P13Eligibility now owns the decision, so these two locals already carry
+    // it - recomputing the rule here would be a second copy to keep in step, which is exactly
+    // how the first version came apart.
+    for (int h = 0; h < 2; ++h) {
+        if (g_pkHandPending[h] <= 0) continue;
+        --g_pkHandPending[h];
+
+        // Has the hand actually left where we put it? Until it has, the bone still reads our own
+        // write and capturing it would anchor to the controller.
+        bool moved = false;
+        if (g_pkGameHandValid[h] && g_pkLastWrittenOk[h]) {
+            const float dx = g_pkGameHandWorld[h].x - g_pkLastWritten[h].x;
+            const float dy = g_pkGameHandWorld[h].y - g_pkLastWritten[h].y;
+            const float dz = g_pkGameHandWorld[h].z - g_pkLastWritten[h].z;
+            moved = sqrtf(dx * dx + dy * dy + dz * dz) > 5.0f;
+        } else if (g_pkGameHandValid[h]) {
+            moved = true;              // nothing of ours was ever written, so this is the game's
+        }
+        if (!moved && g_pkHandPending[h] > 0) continue;
+        if (!moved) {
+            Log("[pk] %s hand: the game never re-posed it in 30 frames - NOT anchoring."
+                " The detached control is holding our own write.", h ? "RIGHT" : "LEFT");
+            continue;
+        }
+        g_pkHandPending[h] = 0;
+        {
+            if (g_pkGameHandValid[h]) {
+                // ---- ⚠️ the game supplies the OFFSET, the player supplies the POSITION ----
+                //
+                // Anchoring straight to the game's hand snapped the hand back to wherever the
+                // hang pose puts it, which is roughly where it already was - "it snaps in place
+                // rather than to the ledge". Anchoring to the bare ledge line put it at the right
+                // place along the ledge but at the wrong height and depth, because a hand wrapped
+                // over an edge sits over and below the line.
+                //
+                // Both halves are available. The game's hand, measured perpendicular to the ledge
+                // line, IS that over-and-below offset - it is the one thing the game knows that we
+                // cannot derive. The player's reach along the line is the one thing WE know that
+                // the game cannot, since its pose is body-relative.
+                //
+                // So: project both onto the line, keep the player's distance along it, and add
+                // the game's offset off it.
+                float axis[3];
+                MEVR_Vec3 want = g_pkGameHandWorld[h];
+                if (PkLedgeAxis(axis) && g_pkLedgeOk && g_pkReachValid[h]) {
+                    const float tGame = (g_pkGameHandWorld[h].x - g_pkLedgeLoc[0]) * axis[0] +
+                                        (g_pkGameHandWorld[h].y - g_pkLedgeLoc[1]) * axis[1];
+                    const float tHand = (g_pkReachWorld[h].x - g_pkLedgeLoc[0]) * axis[0] +
+                                        (g_pkReachWorld[h].y - g_pkLedgeLoc[1]) * axis[1];
+                    // Clamped to a reach. Beyond that the capture is wrong rather than the
+                    // player being unusually long-armed, and a hand flung a metre down the ledge
+                    // is worse than one that lands where the game would have put it.
+                    float slide = tHand - tGame;
+                    if (slide >  60.0f) slide =  60.0f;
+                    if (slide < -60.0f) slide = -60.0f;
+                    want.x += axis[0] * slide;
+                    want.y += axis[1] * slide;
+                }
+                g_pkHandAnchor[h][0] = want.x;
+                g_pkHandAnchor[h][1] = want.y;
+                g_pkHandAnchor[h][2] = want.z;
+                g_pkHandAnchored[h] = true;
+                Log("[pk] %s hand anchored at (%.0f %.0f %.0f): the game's offset from the ledge,"
+                    " slid to where the player reached", h ? "RIGHT" : "LEFT",
+                    want.x, want.y, want.z);
+            } else {
+                Log("[pk] %s hand: no game pose to anchor to - staying free", h ? "RIGHT" : "LEFT");
             }
         }
     }
+    g_pkGameOwnsHand[0] = g_parkour && g_pkMode == PK_LEDGE && !leftEligible;
+    g_pkGameOwnsHand[1] = g_parkour && g_pkMode == PK_LEDGE && !rightEligible;
 
     MEVR_Vec3 leftSocket{}, rightSocket{};
     const bool haveLeftSocket = ShoulderWorldPosition(
@@ -12456,6 +14485,40 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
         if (haveSocket && BoneWorldPosition(rig, armBone, &arm) &&
             BoneWorldPosition(rig, armBone + 1, &elbow) &&
             BoneWorldPosition(rig, armBone + 2, &meshHand)) {
+            g_pkGameHandWorld[hand] = meshHand;
+            g_pkGameHandValid[hand] = true;
+            // ⚠️ Taken on the LAST frame of the window, not the first.
+            //
+            // Capturing on the first valid frame measured the hand while it was still arriving
+            // from IntoGrab, before the hang pose had settled - it read 54.6 UU BELOW the ledge,
+            // which is where a hand is on its way up, not where it rests. Every grip then anchored
+            // half a metre low.
+            //
+            // The window exists to let the pose settle; reading at its start throws that away.
+            if (g_pkEntryHold > 0 && g_pkLedgeOk) {
+                float ax[3];
+                if (PkLedgeAxis(ax)) {
+                    const float t = (meshHand.x - g_pkLedgeLoc[0]) * ax[0] +
+                                    (meshHand.y - g_pkLedgeLoc[1]) * ax[1];
+                    const MEVR_Vec3 off = {
+                        meshHand.x - (g_pkLedgeLoc[0] + ax[0] * t),
+                        meshHand.y - (g_pkLedgeLoc[1] + ax[1] * t),
+                        meshHand.z -  g_pkLedgeLoc[2] };
+                    const float mag = sqrtf(off.x * off.x + off.y * off.y + off.z * off.z);
+                    if (mag < 60.0f) {
+                        g_pkEntryOffset = off;      // kept fresh; believed when the window closes
+                        if (g_pkEntryHold <= 1 && !g_pkEntryOffsetValid) {
+                            g_pkEntryOffsetValid = true;
+                            Log("[pk] hand-to-ledge offset settled off the %s hand:"
+                                " (%.1f %.1f %.1f), %.1f UU - used for both",
+                                hand ? "RIGHT" : "LEFT", off.x, off.y, off.z, mag);
+                        }
+                    } else if (g_pkEntryHold <= 1) {
+                        Log("[pk] %s hand reads %.1f UU off the ledge at entry - not a hand on a"
+                            " ledge, ignored", hand ? "RIGHT" : "LEFT", mag);
+                    }
+                }
+            }
             diag.valid = true;
             diag.shoulderToTarget = VecLength({ target.x - socket.x,
                                                 target.y - socket.y,
@@ -12898,15 +14961,28 @@ static void ApplyBorrowedWristRotations(uintptr_t pawn, const P13PoseSnapshot& p
         P13Eligibility(pawn, pose.right, pose.presentFrame, false,
                        &ignored, nullptr, nullptr) == P13_READY &&
         (pose.right.flags & orientationNeed) == orientationNeed;
-    if (!leftEligible && !rightEligible) return;
+
+    // ---- a hand holding the ledge keeps the game's WRIST too ----
+    //
+    // Pinning the position alone left the hand in the right place with the wrist still free to
+    // turn with the controller - reported as "the wrist snaps to the ledge but I can still
+    // rotate the hand". A hand wrapped over an edge does not swivel.
+    //
+    // Gated here rather than in P13Eligibility because the split is genuinely three-way for an
+    // anchored hand: POSITION is ours (a world point, so the hand stays put while the body
+    // slides), while ROTATION and FINGERS are the game's. One eligibility answer cannot express
+    // that, which is why the earlier attempt to put it in P13Eligibility had to come back out.
+    const bool leftHeld  = g_parkour && PkHandIsTheGames(0);
+    const bool rightHeld = g_parkour && PkHandIsTheGames(1);
+    if ((leftEligible && !leftHeld) == false && (rightEligible && !rightHeld) == false) return;
 
     WristOverrideState frame{};
     frame.active = true;
     frame.pawn = pawn;
     bool wrote = true;
-    if (leftEligible)
+    if (leftEligible && !leftHeld)
         wrote = ApplyOneWristSide(leftRuntime, pose.left, true, &frame.left);
-    if (rightEligible && wrote)
+    if (rightEligible && !rightHeld && wrote)
         wrote = ApplyOneWristSide(rightRuntime, pose.right, false, &frame.right);
     g_wristOverride = frame;
     if (!wrote) {
@@ -13612,8 +15688,13 @@ static bool ApplyDedicatedHandForearmRotations(uintptr_t pawn, const P13PoseSnap
         (pose.left.flags & orientationNeed) == orientationNeed;
     const bool rightOrientationTracked =
         (pose.right.flags & orientationNeed) == orientationNeed;
-    const bool leftEligible = leftReason == P13_READY && leftOrientationTracked;
-    const bool rightEligible = rightReason == P13_READY && rightOrientationTracked;
+    // ⚠️ The dedicated path is the one that RUNS; the borrowed one is only its fallback, and
+    // gating that alone left the wrist free to turn with the controller on a held hand. A hand
+    // wrapped over an edge does not swivel, so a held hand keeps the game's wrist here too.
+    const bool leftEligible = leftReason == P13_READY && leftOrientationTracked &&
+                              !(g_parkour && PkHandIsTheGames(0));
+    const bool rightEligible = rightReason == P13_READY && rightOrientationTracked &&
+                               !(g_parkour && PkHandIsTheGames(1));
     // The world-space helper write carries almost no per-frame state; only the jump
     // diagnostic's continuity sample and the twist unwrap reference must forget poses from
     // before an ownership gap.
@@ -16111,8 +18192,16 @@ void UpdateSixDof(XrTime when)
     // on the next frame. It goes on the RIGHT axis because that is the axis the shimmy servo
     // measures against, and both are the head's own levelled right - the same basis, so the view
     // moves along exactly the line the player pulled.
-    if (g_pkCamLead != 0.0f) {
-        g_dofOffset[0] += g_pkCamLead * g_worldScale;
+    // ⚠️ Outside the lead's own test. The grab freeze must apply in direct-drive mode, where
+    // every lead component is deliberately zero - which is exactly when the snap was reported.
+    g_dofOffset[0] += g_pkFreezeOff[0] * g_worldScale;
+    g_dofOffset[1] += g_pkFreezeOff[1] * g_worldScale;
+    g_dofOffset[2] += g_pkFreezeOff[2] * g_worldScale;
+
+    if (g_pkCamLead != 0.0f || g_pkCamLeadUp != 0.0f || g_pkCamLeadFwd != 0.0f) {
+        g_dofOffset[0] += g_pkCamLead    * g_worldScale;
+        g_dofOffset[1] += g_pkCamLeadUp  * g_worldScale;
+        g_dofOffset[2] += g_pkCamLeadFwd * g_worldScale;
         // Said once, because the lead is silently inert with 6-DOF off and a player who toggled
         // it away would otherwise be debugging a shimmy that merely looks unresponsive.
         static bool warned = false;
@@ -17560,12 +19649,161 @@ static void DumpMoveClassProps(const char* className)
     }
 }
 
+// ================================================ route B: is the ledge AUTHORED anywhere?
+//
+// Everything the parkour code knows about a ledge is inferred from ONE point: MoveLedgeLocation,
+// the nearest point on it to the pawn. Not a line, not an extent, no endpoints - and
+// MoveLedgeNormal has measured (0,0,0) on every run, so even the direction has to come from the
+// pawn's yaw instead. Every hard problem in this system traces back to that: no ledge length, so
+// the end has to be detected by the pawn drifting away from the point; no corner geometry, so a
+// corner has to be noticed by the pawn yawing through it.
+//
+// But this game already has TdLadderVolume and TdSwingVolume - authored actors describing where
+// a climbable or a swingable IS. If there is a ledge equivalent, it is a static description of
+// every ledge in the level, including its extent and its corners, which is strictly better than
+// anything traced at runtime because it carries the designer's intent.
+//
+// Nobody has looked. This looks: every CLASS whose name reads like parkour geometry, how many
+// live instances of it exist in this level, and what the ones that exist declare.
+//
+// ⚠️ Instance COUNT is the discriminator, not the name. A class with a promising name and zero
+// instances is an abstract base or an unused feature, and dumping its fields teaches nothing.
+// One with hundreds is the level actually describing itself.
+// ⚠️ NOT AT STARTUP. The first run of this fired during the setup pass, counted 87396 objects,
+// and reported one "live instance" of every ledge-ish class - every one of them named
+// Default__Something, which is the class default object, not a placed actor. The level had not
+// been loaded yet, so the only instances in existence were the CDOs the engine makes for every
+// class. It was not a negative result about the level; it was a question asked before there was
+// anything to answer it.
+//
+// The second run fixed that by firing it on the first ledge frame - and broke the first grab of
+// every run instead. Two full passes over 114,749 objects with a read per object, plus the
+// per-class dumps, is a 1.2 SECOND synchronous stall on the game thread: "mode 0 -> 1 at
+// t=35.91s", the census, then the next frame stamp at t=37.11s. It landed squarely inside the
+// 30-frame entry window, so the hand-to-ledge offset was measured across a freeze.
+//
+// ⚠️ A diagnostic that costs a second of frame time cannot fire anywhere near gameplay it is
+// meant to diagnose. It is OFF by default now - it has already answered its question, and the
+// answer is in ENGINE_NOTES - and when enabled it waits for a quiet moment: in a level, off the
+// wall, a minute in.
+bool g_geomCensus = false;                  // ParkourGeomCensus - see the warning above
+
+// Called every frame; does nothing at all unless asked for, and then only once, well away from
+// anything worth not stalling.
+void GeomCensusTick()
+{
+    if (!g_geomCensus) return;
+    static bool done = false;
+    if (done) return;
+    if (!g_playerPawn || g_pkMode != PK_NONE || LogSecs() < 60.0) return;
+    done = true;
+    Log("[geom] running the authored-geometry census - this STALLS the game for about a second,"
+        " which is why it waits for a quiet moment");
+    DumpLedgeishClasses();
+}
+
+void DumpLedgeishClasses()
+{
+    if (!g_gobjAddr || g_offName < 0) { Log("[geom] no GObjects - cannot look"); return; }
+    static const char* kWant[] = { "Ledge", "Grab", "Climb", "Vault", "Zip", "Pipe", "Balance" };
+    uint32_t data = 0, count = 0;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return;
+
+    struct Hit { uint32_t cls; char name[64]; long instances; };
+    Hit hits[32]{};
+    int nhits = 0;
+
+    for (uint32_t i = 0; i < count && nhits < 32; ++i) {
+        uint32_t obj = 0, vt = 0, cls = 0;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+        if (!SafeU32(obj, &vt) || !InModule(vt)) continue;
+        if (!SafeU32(obj + 0x34, &cls) || cls < 0x10000) continue;
+        if (!ObjNameIs((uintptr_t)cls, "Class")) continue;      // it IS a class
+        char nm[64];
+        if (!ReadObjName(obj, nm, sizeof(nm))) continue;
+        bool want = false;
+        for (int w = 0; w < (int)(sizeof(kWant) / sizeof(kWant[0])); ++w)
+            if (strstr(nm, kWant[w])) { want = true; break; }
+        if (!want) continue;
+        bool dup = false;
+        for (int h = 0; h < nhits; ++h) if (hits[h].cls == obj) { dup = true; break; }
+        if (dup) continue;
+        hits[nhits].cls = obj;
+        _snprintf_s(hits[nhits].name, sizeof(hits[nhits].name), _TRUNCATE, "%s", nm);
+        hits[nhits].instances = 0;
+        ++nhits;
+    }
+
+    // One more pass for the counts, because an object's Class pointer is the only honest way to
+    // say "this is an instance of that" - the name of an instance is its own, not its class's.
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t obj = 0, cls = 0;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+        if (!SafeU32(obj + 0x34, &cls) || cls < 0x10000) continue;
+        for (int h = 0; h < nhits; ++h)
+            if (hits[h].cls == cls) { ++hits[h].instances; break; }
+    }
+
+    Log("[geom] ---- classes that read like parkour geometry (%d of %u objects) ----",
+        nhits, count);
+    for (int h = 0; h < nhits; ++h)
+        Log("[geom]   %-40s %ld live instance%s", hits[h].name, hits[h].instances,
+            hits[h].instances == 1 ? "" : "s");
+
+    // And the fields of the ones the level actually uses. Capped, because a dump nobody reads is
+    // just a slower log.
+    int dumped = 0;
+    for (int h = 0; h < nhits && dumped < 6; ++h) {
+        if (hits[h].instances <= 0) continue;
+        ++dumped;
+        DumpMoveClassProps(hits[h].name);
+
+        // Where is the first one? If these carry a Location the level is describing positions,
+        // which is the whole point of looking. Actor::Location is inherited, so the offset the
+        // pawn uses reads on any actor - and if this class is not an actor the number will be
+        // obvious nonsense, which is why it is printed rather than trusted.
+        if (g_offActorLocation < 0) continue;
+        int shown = 0;
+        for (uint32_t i = 0; i < count && shown < 3; ++i) {
+            uint32_t obj = 0, cls = 0;
+            if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+            if (!SafeU32(obj + 0x34, &cls) || cls != hits[h].cls) continue;
+            float loc[3];
+            if (!SafeRead(obj + g_offActorLocation, loc, sizeof(loc))) continue;
+            if (!std::isfinite(loc[0]) || !std::isfinite(loc[1]) || !std::isfinite(loc[2])) continue;
+            if (fabsf(loc[0]) > 1.0e6f || fabsf(loc[1]) > 1.0e6f || fabsf(loc[2]) > 1.0e6f) continue;
+            char nm[64] = "?";
+            ReadObjName(obj, nm, sizeof(nm));
+            float pw[3] = { 0, 0, 0 };
+            float dist = -1.0f;
+            if (g_playerPawn && SafeRead(g_playerPawn + g_offActorLocation, pw, sizeof(pw))) {
+                const float dx = loc[0] - pw[0], dy = loc[1] - pw[1], dz = loc[2] - pw[2];
+                dist = sqrtf(dx * dx + dy * dy + dz * dz);
+            }
+            Log("[geom]     %-34s (%.0f %.0f %.0f)  %.0f UU from the player", nm,
+                loc[0], loc[1], loc[2], dist);
+            (void)0;
+            ++shown;
+        }
+    }
+    Log("[geom] ---- end ----");
+}
+
 static void ResolveMoveProbeProps()
 {
     DeriveBoolMaskFromAnyClass();   // no-op if the startup pass already found it
     DumpMoveClassProps("TdMove_Grab");
     DumpMoveClassProps("TdMove_Swing");
     DumpMoveClassProps("TdMove_Climb");
+    // ---- ⚠️ TWO DIFFERENT VAULTS ARE THE SAME MOVE STATE ----
+    //
+    // Both of the player's markers landed on state 9, TdMove_VaultOver: one where the hands pull
+    // her up over the ledge, one where a single hand goes down for balance. They want opposite
+    // hand ownership, and the move state cannot tell them apart because it is the same move.
+    //
+    // Whatever distinguishes them is a field on this class - a vault type, a height, a flag - so
+    // dump what it declares rather than guessing a name a run at a time.
+    DumpMoveClassProps("TdMove_VaultOver");
     // ---- where the pipe and the bar actually keep their state ----
     //
     // ClimbState, ClimbSpeed and ClimbingPawn are all real names in the package and none of them
@@ -18162,6 +20400,29 @@ static const int kOverlayRows = 32;
 // The overlay renderer takes a narrow character set, so values are decomposed by hand rather
 // than handed to %f - the same way the wrist calibration rows already do it.
 extern float g_pkHandLedgeDist[2];
+extern float g_pkCamLeadFwd, g_pkCamLeadUp;
+extern float g_pkGapNow, g_pkGapBaselinePub;
+extern float g_pkFreezeOff[3];
+extern float g_pkFreezeCm, g_pkFreezeCmPeak;
+extern float g_pkCamMovedCm;
+extern float g_pkStepPeak;
+extern bool  g_pkFoundLedgePub;
+extern int   g_pkCornerSidePub;
+extern bool  g_pkGapBaselineOkPub;
+extern bool  g_pkHandAnchored[2];
+extern int   g_pkHandPending[2];
+extern int   g_pkAnchor;
+extern bool  g_pkAsk;
+extern int   g_pkAskMode;
+extern bool  g_geomCensus;
+extern float g_pkAlongLag;
+extern int   g_pkCornerState;
+extern int   g_pkProbeDir;
+extern bool  g_pkLedgeMoved;
+extern int   g_pkEndDir;
+extern bool  g_pkFingersAreTheGames[2];
+extern bool  g_pkGameOwnsHand[2];
+extern float g_curlTarget[2];
 extern long  g_pkSnapCalls;
 extern float g_pkExtentMin, g_pkExtentMax;
 extern bool  g_pkExtentHave;
@@ -18259,8 +20520,13 @@ static void DrawOverlay(IDirect3DDevice9* dev)
         OverlayRow(lines, &nl, "PK %s M%d %s", mn, g_animState,
                     g_pkBlock[0] ? g_pkBlock : "driving");
         if (g_pkDirectBody)
-            OverlayRow(lines, &nl, "DIRECT %s %s",
-                        g_pkDirectLive ? "LIVE" : "IDLE", g_pkDirectWhy);
+            OverlayRow(lines, &nl, "DIRECT %s %s | ask%s%+d arm%s end%+d",
+                        g_pkDirectLive ? "LIVE" : "IDLE", g_pkDirectWhy,
+                        g_pkCornerState ? "-CORNER" : g_pkAskMode == 0 ? "-OFF"
+                                        : g_pkAskMode == 1 ? "" : "-CONT", g_pkProbeDir,
+                        g_pkLedgeMoved ? "+" : "-", g_pkEndDir);
+        OverlayRow(lines, &nl, "LAG %+.0f UU along (the game's own idea of where we are)",
+                   g_pkAlongLag);
         // Distance per hand with its anchor state - the reach decision, in one row.
         PkFmtInt(a1, sizeof(a1), g_pkHandLedgeDist[0]);
         PkFmtInt(a2, sizeof(a2), g_pkHandLedgeDist[1]);
@@ -18276,8 +20542,26 @@ static void DrawOverlay(IDirect3DDevice9* dev)
         OverlayRow(lines, &nl, "WANT %s GOT %s LEAD %s", a1, a2, a3);
         // n is the whole point: 0 means the arm path never reaches the snap and the fix is a call
         // site, not a guard. Non-zero with a reason means the opposite.
-        OverlayRow(lines, &nl, "SNAP N%d L%s R%s", (int)(g_pkSnapCalls % 100000),
-                    g_pkSnapWhy2[0], g_pkSnapWhy2[1]);
+        // Compact on purpose. Nine long rows exhausted the rectangle budget and truncated
+        // themselves mid-line; the same facts fit in three.
+        //
+        // G/M is who owns each hand, + or - is whether it is latched to the ledge, ANC is the
+        // servo anchor. FRZ/PK is the body movement being cancelled at the view and its worst
+        // since the last grab. FLG is the game's bFoundLedge, CNR its offered corner. CAM is how
+        // far the camera itself moved since the last grab, which is the number that says whether
+        // the snap is the body moving or something moving the camera directly.
+        OverlayRow(lines, &nl, "HAND L%s%s R%s%s ANC %s",
+                    g_pkGameOwnsHand[0] ? "G" : "M", g_pkHandAnchored[0] ? "+" : "-",
+                    g_pkGameOwnsHand[1] ? "G" : "M", g_pkHandAnchored[1] ? "+" : "-",
+                    g_pkAnchor == 0 ? "L" : g_pkAnchor == 1 ? "R" : "-");
+        OverlayRow(lines, &nl, "FRZ %d PK %d FLG %s CNR %s",
+                    (int)g_pkFreezeCm, (int)g_pkFreezeCmPeak,
+                    g_pkFoundLedgePub ? "Y" : "N",
+                    g_pkCornerSidePub > 0 ? "R" : g_pkCornerSidePub < 0 ? "L" : "-");
+        // STEP is the decisive one: a big STEP with a similar PK is a single jump, while a big
+        // PK with a small STEP is the player pulling and must not be cancelled.
+        OverlayRow(lines, &nl, "CAM %d STEP %d GAP %d", (int)g_pkCamMovedCm,
+                    (int)g_pkStepPeak, (int)g_pkGapNow);
         OverlayRow(lines, &nl, "SPAN %d UU SEEN%s",
                     (int)(g_pkExtentHave ? (g_pkExtentMax - g_pkExtentMin) : 0.0f),
                     g_pkBlockedDir > 0 ? "  BLOCKED R"
@@ -19943,6 +22227,40 @@ static void LoadSettings()
                         " EXPERIMENTAL, SCROLL LOCK toggles it live)" : "");
                 applied++;
             } else { Log("[cfg]   ParkourDirectBody '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourCamLeadUp") == 0) {
+            if (SettingBool(val, &b)) {
+                g_pkCamLeadUpOn = b;
+                Log("[cfg]   ParkourCamLeadUp = %s%s", b ? "on" : "off",
+                    b ? "  (moving the gripped hand up or down moves the view, 1:1)"
+                      : "  (the view keeps the ledge's own height)");
+                applied++;
+            } else { Log("[cfg]   ParkourCamLeadUp '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourCamLeadFwd") == 0) {
+            if (SettingBool(val, &b)) {
+                g_pkCamLeadFwdOn = b;
+                Log("[cfg]   ParkourCamLeadFwd = %s%s", b ? "on" : "off",
+                    b ? "  (push the anchor hand at the wall and the view swings back)" : "");
+                applied++;
+            } else { Log("[cfg]   ParkourCamLeadFwd '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourAskTheGame") == 0) {
+            if (SettingBool(val, &b)) {
+                g_pkAsk = b;
+                g_pkAskMode = b ? 1 : 0;
+                Log("[cfg]   ParkourAskTheGame = %s%s", b ? "on" : "off",
+                    b ? "  (PK.7: the stick carries the direction of travel while position is"
+                        " written, so the game can rule on the ledge's end and its corners -"
+                        " CAPS LOCK toggles it live)"
+                      : "  (no end-of-ledge or corner verdict is available)");
+                applied++;
+            } else { Log("[cfg]   ParkourAskTheGame '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourGeomCensus") == 0) {
+            if (SettingBool(val, &b)) {
+                g_geomCensus = b;
+                Log("[cfg]   ParkourGeomCensus = %s%s", b ? "on" : "off",
+                    b ? "  (one-shot dump of authored parkour geometry - STALLS the game for"
+                        " about a second, so it waits for a quiet moment)" : "");
+                applied++;
+            } else { Log("[cfg]   ParkourGeomCensus '%s' is not a boolean - ignored", val); rejected++; }
         } else if (_stricmp(key, "ParkourLockAnim") == 0) {
             if (SettingBool(val, &b)) {
                 g_pkLockAnim = b;

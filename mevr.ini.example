@@ -145,6 +145,53 @@ Parkour = on
 ; on proximity and not on the grip alone.
 ParkourLedgeSnap = on
 
+; Moving a GRIPPED hand up or down moves the view with it, 1:1 - the axes the body cannot travel
+; on while hanging, so the camera answers them alone.
+;
+; The vertical accumulates motion rather than measuring a position, which is what makes a grab
+; move the view by nothing: the frame the anchor hand changes has no previous sample to
+; difference against, so it contributes an exact zero. The cost is that an integrator has no
+; restoring force - push a hand down while gripped, release, raise it, grip again, and the offset
+; is kept - so a long hang can walk the view above the body. Clamped, and reset on leaving.
+ParkourCamLeadUp = on
+
+; The same idea fore/aft - push the wall away and a hanging body swings back - but measured from
+; the last grab rather than accumulated, so each grab settles the view back to a true depth.
+;
+; Not a style choice: integrated, this axis ratchets you INTO the ledge, because a shimmy pull
+; brings the hand back toward the body every stroke and nothing gives it back. Fore/aft has a
+; hard boundary a few centimetres away and the vertical does not, which is the whole reason the
+; two axes are built differently.
+ParkourCamLeadFwd = on
+
+; PK.7. While direct drive is writing the pawn's position, hand the stick the direction the
+; player is travelling instead of pinning it at zero.
+;
+; Not a movement input - the position writes win outright, measured at 0.00 UU/frame of fight
+; over 26 reports. It is a QUESTION. The game answers it by advancing MoveLedgeLocation when
+; there is more ledge, and by populating PendingShimmyCornerAnimation when there is a corner,
+; and it does neither while the stick is silent. With the stick silent, every end-of-ledge and
+; corner guard in the mod is inert: bFoundLedge never went false 903 UU out over open air, the
+; corner field read None on all 194 samples of a run, and the stall detector keys off a stick
+; this mode holds at zero.
+;
+; The blocker that stops you climbing past the end arms itself only after it has SEEN
+; MoveLedgeLocation advance. If asking turns out not to populate it, nothing blocks and you get
+; today's behaviour rather than a player frozen against a wall that is not there.
+;
+; CAPS LOCK toggles it live.
+ParkourAskTheGame = on
+
+; One-shot dump of every authored parkour-geometry class in the level, with instance counts and
+; positions. Off, and it should stay off unless you are asking that question: it walks the whole
+; object table twice and STALLS the game for about a second. Enabled, it waits for a quiet moment
+; - in a level, off the wall, a minute in - because the first version fired on the first ledge
+; grab and broke it.
+;
+; It has already answered its question. This level has one TdLedgeWalkVolume, 19000 UU away, and
+; no authored class for grab-ledges at all.
+ParkourGeomCensus = off
+
 ; The shimmy animation carries 55 degrees of camera pitch and 10 of roll on its own schedule.
 ; This forces LockAnimPitch/Roll/Yaw while on a wall and restores whatever you had set on the
 ; way out, so the view answers your hands rather than the animation.
@@ -158,7 +205,7 @@ ParkourLockAnim = on
 ; oversized step, and when the game stops reporting a ledge under you, and it never writes the
 ; vertical axis - so the worst failure moves you along a wall rather than off it. SCROLL LOCK
 ; toggles it live.
-ParkourDirectBody = off
+ParkourDirectBody = on
 
 
 ; ---------------------------------------------------------------- frame pacing
