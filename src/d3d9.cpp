@@ -1470,6 +1470,11 @@ static const float kSwingWalkMS     = 0.57f;   // walk-cadence swing
 static const float kSwingFullMS     = 1.58f;   // run-cadence swing -> full deflection
 
 // The chosen metric this frame, m/s. AS.1's envelope consumes exactly this and nothing else.
+// The composed left stick as the game received it, written once per pad build. Read by the
+// move-property probe on another thread; a torn float pair is not worth a lock here, because
+// both are logged for correlation rather than acted on.
+static float  g_padSentLX = 0.0f;
+static float  g_padSentLY = 0.0f;
 static float  g_swingNow = 0.0f;
 static float  g_swingDt = 0.0f;             // seconds, the sampler's own validated dt
 static float  g_swingHeadVert = 0.0f;       // |head vertical speed|, m/s - the crouch tell
@@ -1715,6 +1720,19 @@ static void ArmSwingForgetHistory()
 }
 
 // The head, in the same room-fixed space and at the same instant as the grips. Position only.
+// ---- the head's own left/right and forward, in room axes ----
+//
+// ArmSwingHand::rel is grip-minus-head in ROOM axes, and for the swing envelope that was enough:
+// it only ever asked how FAST a hand was moving. A parkour gesture asks WHICH WAY, and room X is
+// not the player's right - turn ninety degrees on the spot and it becomes their forward.
+//
+// The orientation was in the locate result the whole time and simply was not published. Taken
+// horizontally and renormalised, so leaning or looking down does not tilt the axis the gesture
+// is measured against; a shimmy should not weaken because the player looked at their feet.
+static XrVector3f g_headRight   = { 1.0f, 0.0f, 0.0f };
+static XrVector3f g_headForward = { 0.0f, 0.0f, -1.0f };
+static bool       g_headAxesOk  = false;
+
 static bool ArmSwingLocateHead(XrTime when, XrVector3f* out)
 {
     if (g_viewSpace == XR_NULL_HANDLE || g_xrSpace == XR_NULL_HANDLE) return false;
@@ -1723,6 +1741,27 @@ static bool ArmSwingLocateHead(XrTime when, XrVector3f* out)
     if (!(loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) ||
         !(loc.locationFlags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT)) return false;
     *out = loc.pose.position;
+
+    if (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) {
+        const XrQuaternionf& q = loc.pose.orientation;
+        // First and third columns of the rotation matrix: the rotated X and -Z axes.
+        XrVector3f r = { 1.0f - 2.0f * (q.y * q.y + q.z * q.z),
+                         2.0f * (q.x * q.y + q.w * q.z),
+                         2.0f * (q.x * q.z - q.w * q.y) };
+        XrVector3f f = { -(2.0f * (q.x * q.z + q.w * q.y)),
+                         -(2.0f * (q.y * q.z - q.w * q.x)),
+                         -(1.0f - 2.0f * (q.x * q.x + q.y * q.y)) };
+        const float rl = sqrtf(r.x * r.x + r.z * r.z);
+        const float fl = sqrtf(f.x * f.x + f.z * f.z);
+        // Looking straight up or down collapses the horizontal projection. Keep the last good
+        // pair rather than normalising a zero - a gesture axis that flips at the zenith would
+        // reverse the player's controls exactly when they are looking where they are going.
+        if (rl > 0.1f && fl > 0.1f) {
+            g_headRight   = { r.x / rl, 0.0f, r.z / rl };
+            g_headForward = { f.x / fl, 0.0f, f.z / fl };
+            g_headAxesOk  = true;
+        }
+    }
     return true;
 }
 
@@ -2195,6 +2234,14 @@ static void ReportSprintLimitsOnce()
             0.280f + sr * 0.720f);
 }
 
+// Declared up here, ahead of the swing gates rather than beside the parkour code, because every
+// one of those gates reads it - and two of them assert buttons that let go of a ledge.
+enum ParkourMode { PK_NONE = 0, PK_LEDGE, PK_CLIMB, PK_BAR };
+struct MEVR_Vec3;
+static void PkSnapHandToLedge(int hand, MEVR_Vec3* target);   // defined with the ledge reads
+static bool g_parkour = true;               // Parkour in mevr.ini
+static int  g_pkMode  = PK_NONE;
+
 static void ArmSwingCollapse(const char* why)
 {
     if (g_swingEngaged || g_swingSmoothed > 0.0f) {
@@ -2306,6 +2353,10 @@ static float BalanceHeadRollStrafe()
 // Returns true while the synthesised crouch should be held. The game decides crouch or slide.
 static bool ArmSwingCrouchTick(XrTime when)
 {
+    // ⚠️ This one is not a nicety. The crouch gesture asserts bLeftTrigger = 0xFF, which is
+    // GBA_Crouch, which is bRequestDropDown - the LET GO path, measured flipping on a real hang.
+    // Ducking to look down at the drop would otherwise release the ledge, and the fall is fatal.
+    if (g_pkMode != PK_NONE) { g_swingCrouching = false; return false; }
     if (!g_armSwing || !g_armSwingCrouch || !g_padEnabled || !g_haveCrouchBaseline ||
         !g_swingL.tracked || !g_swingR.tracked) {
         if (g_swingCrouching) Log("*** [swing] crouch released - tracking or gate lost");
@@ -2333,6 +2384,10 @@ static bool ArmSwingCrouchTick(XrTime when)
 // Returns true while the synthesised jump button should be held down.
 static bool ArmSwingJumpTick(XrTime when)
 {
+    // ⚠️ Hands 0.25 m above the head IS the resting posture of a player hanging from a ledge, and
+    // this asserts GBA_Jump - which on a ledge is GrabPullUp or a jump off it. It would fire
+    // continuously, unprompted, over a drop.
+    if (g_pkMode != PK_NONE) { g_swingJumpAsserted = false; return false; }
     if (!g_armSwing || !g_armSwingJump || !g_padEnabled ||
         !g_swingL.tracked || !g_swingR.tracked) {
         // Not re-armed here. A controller that blinks out mid-gesture must not hand back a
@@ -2368,6 +2423,763 @@ static bool ArmSwingJumpTick(XrTime when)
 
 // Called from the pad build, AFTER the physical stick has been read, because the stick is the
 // override and an override that arrives a frame late is not one.
+// ================================================================ parkour: hands on the wall
+//
+// PK.1 - hand-over-hand along a ledge, the way VR climbing games do it.
+//
+// ---- the model ----
+//
+// Grab, and that hand is anchored to the world. Move it, and your BODY moves by the inverse.
+// Pull your hands left and you travel right. No gesture recognition, no cadence detection and no
+// thresholds to tune: the coupling is kinematic and 1:1, and it is self-limiting because the
+// displacement asked for is a finite quantity that gets consumed.
+//
+// ---- the one thing this cannot copy from those games ----
+//
+// They SET the body position from hand displacement. We cannot. All we have is a stick, and the
+// game shimmies at a flat 60 UU/s whatever we push - a rate-limited actuator, not a teleport. So
+// the same idea has to be closed as a SERVO:
+//
+//     desired = -(hand now - hand at grab)     how far the player has asked to travel
+//     actual  =  how far the body really went  read back from the pawn, never assumed
+//     error   =  desired - actual              drive the stick until this is nothing
+//
+// The error is what makes it stop, rather than a gesture ending.
+//
+// Reading `actual` back instead of integrating what we commanded is the whole point: the game
+// refuses to move during corner animations and transitions, and a dead-reckoned position would
+// drift further from the truth at every one of them.
+//
+// The honest cost of the rate limit: pull faster than 0.6 m/s and the body lags, then catches up.
+// Nothing here can fix that - the game has exactly one shimmy speed.
+enum PkHand { PK_HAND_NONE = -1, PK_HAND_L = 0, PK_HAND_R = 1 };
+
+static bool  g_parkourDebug = false;
+static int   g_pkAnchor = PK_HAND_NONE;     // which hand is holding the world still
+static float g_pkAnchorLat = 0.0f;          // its lateral position when it grabbed, metres
+static float g_pkProgress = 0.0f;           // how far the body has travelled since, metres
+static float g_pkDesired = 0.0f;            // how far the player has asked for, metres
+static bool  g_pkHavePrevLoc = false;
+static float g_pkPrevLoc[3] = { 0, 0, 0 };
+static float g_pkShimmy = 0.0f;             // what the pad is asked for on X
+static const char* g_pkBlock = "";
+int  g_pkBlockedDir = 0;        // +1 / -1 when the game refuses to travel that way, 0 otherwise
+long g_pkStallFrames = 0;
+
+// ---- PK.2: the camera leads, the body follows ----
+//
+// The pull cannot move the BODY directly. TdMove_Grab recomputes the pawn's position every tick
+// from MoveLedgeLocation and GrabDesiredLedgeOffset, and writing a value whose own logic
+// round-trips through it is this project's worst-characterised failure - the one that stalled
+// falls, froze a landing and killed the landing roll when the swan spring was fought each frame.
+//
+// The CAMERA is a different matter. ApplySixDof already injects a world-space positional offset
+// into the view matrix, so the view can answer the pull IMMEDIATELY while the servo drives the
+// body to catch up underneath, and the offset shrinks to nothing as it arrives.
+//
+// ⚠️ This is the opposite of the usual VR comfort hazard. Moving the view without the body is
+// what makes people ill; here the player's body genuinely DID move - they pulled their own arm -
+// so the view answering at once matches their proprioception. The uncomfortable version is the
+// one we have now, where you pull and nothing happens until a 60 UU/s actuator catches up.
+static float g_pkCamLead = 0.0f;            // metres along the head's right axis, signed
+// ---- why raising this makes the camera track the pull outright ----
+//
+// It is worth writing down what the servo already does, because it is not obvious and the first
+// clamp was set as if the lead were a correction rather than the whole signal:
+//
+//     camera = body + lead
+//            = body + (desired - actual)
+//            = (body_at_latch + actual) + desired - actual
+//            = body_at_latch + desired
+//
+// The actual travel cancels. So the camera sits exactly where the player's pull asked for it,
+// immediately, and the body catching up underneath changes nothing about where the view is - it
+// only changes how much of the offset is real movement versus injected. The clamp was therefore
+// the ONLY thing stopping the view from answering a pull in full.
+//
+// ---- and why the clamp has to be bigger than the pull, not equal to it ----
+//
+// ⚠️ Saturation is not a soft limit here, it BREAKS the identity above. While the lead is clamped
+// the actual travel no longer cancels, so the body's own 60 UU/s motion reappears in the view -
+// which is precisely the "waiting for the animation" the player described. The last run pulled
+// to 0.546 m against a 0.55 clamp: saturated for the whole stroke, so the cancellation never
+// held and the camera showed the shimmy rather than the pull.
+//
+// So the clamp is now well clear of a full arm's reach and exists only as a backstop against a
+// runaway offset putting the view outside the building. A clamp that engages in ordinary use is
+// not a safety limit, it is a bug that happens to be bounded.
+static float g_pkCamLeadMax = 1.20f;
+static bool  g_pkCamLeadOn = true;
+
+static float g_pkTolerance  = 0.02f;        // metres of error worth chasing; ~2 frames at 60 UU/s
+static float g_pkShimmyCap  = 0.85f;        // never full deflection - see below
+static float g_pkUUPerMetre = 100.0f;       // 1 UU ~ 1 cm, from the pendulum period measurement
+
+// The cap is there because on a pipe every deflection from -0.1 to -0.9 descended at a flat
+// 127.7 and only -1.0 broke through to 509 and became a SLIDE. Full stick is a different move,
+// not more of the same one, and MA_ShimmyLeftLong in the name table says the ledge very likely
+// splits the same way. The physical stick keeps sole access to the extreme.
+
+static int  ParkourModeNow();      // defined with the move code, which owns the reads
+void ParkourAnimLock(bool onWall);          // defined beside the anim-follow flags it toggles
+
+static float PkLateralOf(const ArmSwingHand& h)
+{
+    return h.rel.x * g_headRight.x + h.rel.z * g_headRight.z;
+}
+
+// Body displacement since the last call, in metres, unsigned. Read from the pawn's own Location
+// rather than the camera: PlayerCameraLocation carries the animation this project has spent runs
+// characterising, and a landing dip is not travel along a ledge.
+static float PkBodyStep()
+{
+    float loc[3];
+    if (g_offActorLocation < 0 || !g_playerPawn ||
+        !SafeRead(g_playerPawn + g_offActorLocation, loc, sizeof(loc))) {
+        g_pkHavePrevLoc = false;
+        return 0.0f;
+    }
+    if (!g_pkHavePrevLoc) {
+        memcpy(g_pkPrevLoc, loc, sizeof(loc));
+        g_pkHavePrevLoc = true;
+        return 0.0f;
+    }
+    const float dx = loc[0] - g_pkPrevLoc[0];
+    const float dy = loc[1] - g_pkPrevLoc[1];
+    const float dz = loc[2] - g_pkPrevLoc[2];
+    memcpy(g_pkPrevLoc, loc, sizeof(loc));
+    const float d = sqrtf(dx * dx + dy * dy + dz * dz) / g_pkUUPerMetre;
+    // A teleport, a checkpoint load or a pawn swap is not a shimmy. Anything past a frame's worth
+    // of the game's own top speed is discarded rather than accumulated.
+    return (d > 0.25f) ? 0.0f : d;
+}
+
+// ---- PK.4: how far is each hand from the ledge the game thinks you are holding? ----
+//
+// Measured: MoveLedgeLocation DOES track along the ledge as the player shimmies - it accumulated
+// 3625 UU of travel in one run - so it names a live surface rather than the point first grabbed.
+// That is what makes "is my hand actually at the ledge" answerable at all.
+//
+// TdPawn::MoveLedgeLocation and MoveLedgeNormal were located by the owner pass at +0x0648 and
+// +0x0654, and the two live in world UU while the hands live in metres in the player's room.
+static float g_pkLedgeLoc[3] = { 0, 0, 0 };
+static float g_pkLedgeNrm[3] = { 0, 0, 0 };
+static bool  g_pkLedgeOk = false;
+static float g_pkLedgeTravel = 0.0f;        // how far the ledge point itself has moved, UU
+
+int g_offMoveLedgeLoc = -1;
+int g_offMoveLedgeNrm = -1;
+// TdPawn::bFoundLedge, located by the owner pass at +0x041C - the same packed dword as
+// bClimbDownFast. This is the game saying whether there is a ledge under the player at all, and
+// it is the only honest guard the direct drive can have: no persistent ledge LENGTH exists.
+int g_offFoundLedge = -1;
+uint32_t g_maskFoundLedge = 0;
+
+static bool PkLedgeAxis(float* axis);       // defined with the direct-drive code below
+
+// ---- the ledge's observed extent, which needs no property at all ----
+//
+// Whatever the owner pass turns up, this is available now: MoveLedgeLocation slides ALONG the
+// ledge as the player shimmies (3625 UU of travel in one measured run), so projecting it onto the
+// ledge axis and keeping the range gives the span actually explored.
+//
+// ⚠️ It is a floor on the ledge's length, never the length itself - it only knows where the
+// player has been. Useful for clamping a hand to somewhere known to be real; useless for
+// reaching PAST where they have been, which is exactly where a player would want to reach next.
+// If LedgeWidth turns out to exist, prefer it and keep this as the corroboration.
+float g_pkExtentMin = 0.0f, g_pkExtentMax = 0.0f;
+bool  g_pkExtentHave = false;
+
+static void PkNoteExtent()
+{
+    float axis[3];
+    if (!g_pkLedgeOk || !PkLedgeAxis(axis)) return;
+    // ---- ⚠️ two compounding faults, and each one alone produced the 20000 UU span ----
+    //
+    // FIRST: t was an ABSOLUTE projection, loc . axis, with loc in world coordinates around
+    // 19000 UU. The axis comes from the pawn's yaw, which turns whenever the player does, so one
+    // degree of yaw swings t by |loc| . sin(1 deg) - about 330 UU - with the ledge perfectly
+    // still. The span was measuring head rotation scaled by the distance to the world origin.
+    // Measuring from a LATCHED ORIGIN makes the error scale with how far the ledge point has
+    // really moved, which is metres rather than kilometres.
+    //
+    // SECOND: the turn test compared this frame's axis to the PREVIOUS FRAME'S. Rounding a
+    // corner takes a second or more, so ninety degrees arrives as a long series of sub-degree
+    // steps and a per-frame threshold never fires however low it is set. The comparison has to be
+    // against the axis as it was WHEN THE SPAN STARTED, so a gradual turn accumulates.
+    static float org[2] = { 0, 0 };
+    static float baseAxis[2] = { 0, 0 };
+
+    // ⚠️ 60 degrees AND sustained, not 30 and instant.
+    //
+    // At 30 degrees the run restarted the span thirteen times and twelve of those were 30 or 31 -
+    // ordinary looking around, not corners. Only one was a real turn, at 109. Because the axis
+    // comes from the pawn's yaw it moves with the player's whole body, so the threshold has to
+    // clear normal wander by a wide margin; a real corner is ninety degrees and nothing else
+    // comes close. Every restart in that run logged "was 0 UU", which is the span being reset
+    // before it could ever accumulate anything.
+    //
+    // Sustained as well, because a yaw spike during a swing or a stumble is not a new ledge.
+    static long turnFrames = 0;
+    const float align = baseAxis[0] * axis[0] + baseAxis[1] * axis[1];
+    if (g_pkExtentHave && align < 0.50f) ++turnFrames; else turnFrames = 0;
+    const bool turned = turnFrames > 10;
+
+    if (!g_pkExtentHave || turned) {
+        if (turned) {
+            Log("[pk] ledge turned %.0f deg from the span's start - restarting (was %.0f UU)",
+                acosf(align < -1.0f ? -1.0f : (align > 1.0f ? 1.0f : align)) * 57.29578f,
+                g_pkExtentMax - g_pkExtentMin);
+            turnFrames = 0;
+        }
+        org[0] = g_pkLedgeLoc[0]; org[1] = g_pkLedgeLoc[1];
+        baseAxis[0] = axis[0];   baseAxis[1] = axis[1];
+        g_pkExtentMin = g_pkExtentMax = 0.0f;
+        g_pkExtentHave = true;
+        return;
+    }
+
+    const float t = (g_pkLedgeLoc[0] - org[0]) * axis[0] +
+                    (g_pkLedgeLoc[1] - org[1]) * axis[1];
+    if (t < g_pkExtentMin) g_pkExtentMin = t;
+    if (t > g_pkExtentMax) g_pkExtentMax = t;
+}
+
+static void PkReadLedge()
+{
+    g_pkLedgeOk = false;
+    if (!g_playerPawn || g_offMoveLedgeLoc < 0 || g_offMoveLedgeNrm < 0) return;
+    float loc[3], nrm[3];
+    if (!SafeRead(g_playerPawn + g_offMoveLedgeLoc, loc, sizeof(loc))) return;
+    if (!SafeRead(g_playerPawn + g_offMoveLedgeNrm, nrm, sizeof(nrm))) return;
+    static bool have = false;
+    static float prev[3] = { 0, 0, 0 };
+    if (have) {
+        const float dx = loc[0] - prev[0], dy = loc[1] - prev[1], dz = loc[2] - prev[2];
+        const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (d < 200.0f) g_pkLedgeTravel += d;    // a jump that size is a new ledge, not travel
+    }
+    memcpy(prev, loc, sizeof(loc));
+    have = true;
+    memcpy(g_pkLedgeLoc, loc, sizeof(loc));
+    memcpy(g_pkLedgeNrm, nrm, sizeof(nrm));
+    g_pkLedgeOk = true;
+    PkNoteExtent();
+}
+
+// ---- PK.5: pull a gripped hand onto the ledge it is reaching for ----
+//
+// The ledge is a LINE: a point (MoveLedgeLocation) and a direction perpendicular to its normal,
+// horizontal. A hand within reach of that line, with its grip squeezed, is snapped to the closest
+// point on it - so the hand plants where the player reached rather than hovering beside it.
+//
+// ⚠️ Only ever a pull TOWARD the line, and only within the radius. Snapping unconditionally
+// would glue the hands to the ledge through the whole hang and take away the thing this was
+// built for - lifting a hand off and moving it. The radius is what makes the release readable:
+// outside it the hand is the player's own, inside it and gripping, it is on the ledge.
+// ⚠️ LATCHED, not projected every frame - the difference the player asked for.
+//
+// The first version pulled the hand toward the ledge line each frame while it was within reach.
+// That looks like a hand drifting near a ledge, not a hand HOLDING one: the moment the real
+// controller moved, the target moved with it and the hand slid along. "Snap to the actual ledge
+// and stick there" is an anchor.
+//
+// So the ledge point is captured once, on the frame the grip closes, and held until it opens.
+// After that the hand stays at a fixed WORLD point while the body travels past it - which is
+// exactly what holding on means, and what makes the hand the anchor the servo is already
+// treating it as.
+//
+// It also stops silently: nothing forces the arm to reach a point it cannot. The existing IK
+// clamps the effector radially, so an anchor left behind simply pulls the arm to full extension
+// and stays there - a visible, correct cue to move that hand rather than a broken pose.
+static float g_pkSnapRadius = 0.60f;        // metres - generous until a run says what it should be
+static bool  g_pkSnapOn = true;
+static bool  g_pkHandHeld[2] = { false, false };
+static bool  g_pkHandAnchored[2] = { false, false };
+static float g_pkHandAnchor[2][3] = { { 0, 0, 0 }, { 0, 0, 0 } };
+static long  g_pkSnapLog = 0;
+float g_pkHandLedgeDist[2] = { -1.0f, -1.0f };   // UU from each hand target to the ledge line
+
+// ⚠️ Instrumented rather than reasoned about. Two builds have now shipped a fix for "the hand
+// does not snap" based on reading the code, and both were wrong in a way no log could show:
+// the first edited a diagnostic copy, the second was never proven to run at all. A call counter
+// and the failing guard, on screen, distinguishes "not called" from "called and refused" - which
+// need completely different fixes and cannot be told apart from the outside.
+// ⚠️ PER HAND. It was one shared global, and the report that came back is exactly what that
+// produces: the function runs for hand 0 then hand 1 every frame, so whichever ran LAST won.
+// Gripping the left hand set "ok" and the right hand's call immediately overwrote it with "not
+// gripping" - which read as "the left controller has no effect" when the left hand was in fact
+// working perfectly. A per-hand fact needs per-hand storage.
+long        g_pkSnapCalls = 0;
+const char* g_pkSnapWhy2[2] = { "never called", "never called" };
+
+static bool PkLedgeAxis(float* axis);        // defined below, beside the direct-drive code
+
+static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
+{
+    ++g_pkSnapCalls;
+    if (hand < 0 || hand > 1 || !target) return;
+    g_pkSnapWhy2[hand] = "ok";
+    const bool grip = g_gripValue[hand] > 0.5f;
+    const bool wasHeld = g_pkHandHeld[hand];
+    g_pkHandHeld[hand] = grip;
+
+    // The distance is computed EVERY frame, whether or not the hand is gripping, because it is
+    // the number the player needs on screen while deciding where to reach. Only computing it on
+    // the grip edge meant it existed exactly once per grab and only in the log.
+    // Sign is irrelevant here: this projects onto the ledge as a LINE, and a line has no
+    // direction. Only the direct drive, which travels ALONG it, cares which way it points.
+    float axis[3];
+    const bool haveAxis = PkLedgeAxis(axis);
+    if (g_pkLedgeOk && g_pkMode == PK_LEDGE && haveAxis) {
+        const float t = (target->x - g_pkLedgeLoc[0]) * axis[0] +
+                        (target->y - g_pkLedgeLoc[1]) * axis[1];
+        const float dx = target->x - (g_pkLedgeLoc[0] + axis[0] * t);
+        const float dy = target->y - (g_pkLedgeLoc[1] + axis[1] * t);
+        const float dz = target->z - g_pkLedgeLoc[2];
+        g_pkHandLedgeDist[hand] = sqrtf(dx * dx + dy * dy + dz * dz);
+    } else if (g_pkLedgeOk && g_pkMode == PK_LEDGE && !haveAxis) {
+        // ⚠️ This branch is why the readout said "ok" while nothing happened. The old code
+        // skipped the whole computation when the axis was degenerate WITHOUT touching the reason
+        // or the distance, so a silent skip and a success were indistinguishable on screen.
+        g_pkSnapWhy2[hand] = "noaxis";
+        g_pkHandLedgeDist[hand] = -1.0f;
+    } else {
+        g_pkSnapWhy2[hand] = !g_pkLedgeOk ? "noledge" : "nomode";
+        g_pkHandLedgeDist[hand] = -1.0f;
+    }
+
+    if (!g_pkSnapOn || g_pkMode != PK_LEDGE || !grip) {
+        if (g_pkSnapWhy2[hand][0] == 'o')   // keep a more specific reason set above
+            g_pkSnapWhy2[hand] = !g_pkSnapOn ? "off" : (grip ? "nomode" : "nogrip");
+        g_pkHandAnchored[hand] = false;
+        return;
+    }
+
+    // ---- latch, once, on the closing edge of the grip ----
+    if (!wasHeld && g_pkLedgeOk && haveAxis) {
+        {
+            const float ax = axis[0], ay = axis[1];
+            const float vx = target->x - g_pkLedgeLoc[0];
+            const float vy = target->y - g_pkLedgeLoc[1];
+            const float t  = vx * ax + vy * ay;
+            const float cx = g_pkLedgeLoc[0] + ax * t;
+            const float cy = g_pkLedgeLoc[1] + ay * t;
+            const float cz = g_pkLedgeLoc[2];
+            const float dx = target->x - cx, dy = target->y - cy, dz = target->z - cz;
+            const float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+
+            // Logged EVERY time, hit or miss. The radius is a guess until a run says how far the
+            // hand target actually sits from the ledge, and a silent miss teaches nothing - two
+            // runs have now ended with "it did not snap" and no number to size it from.
+            Log("[pk] %s grip closed %.1f UU from the ledge line (radius %.0f) - %s",
+                hand ? "RIGHT" : "LEFT", dist, g_pkSnapRadius * g_pkUUPerMetre,
+                dist <= g_pkSnapRadius * g_pkUUPerMetre ? "ANCHORED" : "too far, hand stays free");
+
+            if (dist <= g_pkSnapRadius * g_pkUUPerMetre) {
+                g_pkHandAnchor[hand][0] = cx;
+                g_pkHandAnchor[hand][1] = cy;
+                g_pkHandAnchor[hand][2] = cz;
+                g_pkHandAnchored[hand] = true;
+            }
+        }
+    }
+
+    // ⚠️ The override is GONE, deliberately - PK.7 hands a gripping hand back to the game
+    // instead, and a gripping hand no longer reaches this code at all. The anchor bookkeeping
+    // stays because the overlay reports it and because the distance is still the number that
+    // says whether a grab was near enough to count.
+    //
+    // Writing a target here as well would be two systems steering one hand, which is the shape
+    // of every fight this file has a comment about.
+    if (!g_pkHandAnchored[hand]) return;
+    if ((++g_pkSnapLog % 300) == 1)
+        Log("[pk] %s hand is the game's while gripping (ledge point %.0f %.0f %.0f)",
+            hand ? "RIGHT" : "LEFT",
+            g_pkHandAnchor[hand][0], g_pkHandAnchor[hand][1], g_pkHandAnchor[hand][2]);
+}
+
+// ================================================================ PK.6: drive the body directly
+//
+// Everything above drives a STICK, and a stick makes the game play its shimmy animation - which
+// is both what moves you and what was steering the view and the arms. The player's request is to
+// remove that entirely: no animation, and body, camera and arms all following their hands.
+//
+// So this mode does not push the stick at all. With no input the game has nothing to shimmy on,
+// the animation never starts, and the pawn's Location is written each frame to wherever the pull
+// says it should be.
+//
+// ---- ⚠️ this is the thing this file has spent runs learning not to do ----
+//
+// Writing a value every frame that the owning logic also reads is how the swan-neck spring
+// stalled falls, froze a landing and killed the landing roll. TdMove_Grab recomputes position
+// from MoveLedgeLocation and GrabDesiredLedgeOffset on its own schedule, so this WILL be a
+// fight; the only question is which side wins and what it costs.
+//
+// It is therefore off by default, toggled live, and it gives up on its own:
+//   - it only writes while the move is actually TdMove_Grab
+//   - it stops the moment the state changes, rather than following the player into a fall
+//   - it refuses any single step beyond a sane distance, so a bad axis cannot fling the pawn
+//   - it never writes Z, so the worst failure moves you along a wall rather than off it
+static bool  g_pkDirectBody = false;        // ParkourDirectBody in mevr.ini; SCROLL LOCK toggles
+static bool  g_pkDirectLive = false;        // actually writing, right now
+static bool  g_pkDirectHave = false;
+static float g_pkDirectBase[3] = { 0, 0, 0 };   // pawn Location when the pull was latched
+static float g_pkDirectAxis[3] = { 1, 0, 0 };   // the ledge direction, world, unit
+static float g_pkDirectLast = 0.0f;             // last displacement written, metres
+static long  g_pkDirectWrites = 0;
+const char*  g_pkDirectWhy = "off";
+
+// The ledge runs perpendicular to its own normal, in the horizontal plane. UE3 is Z-up, verified
+// by this project's own F2 injection test, so the axis is normal x worldUp.
+//
+// The SIGN is the part that cannot be reasoned out safely: nothing says whether that cross
+// product points the same way as the player's right. It is resolved against the pawn's own yaw
+// each time the pull is latched, and both are logged - a mirrored shimmy is then one line of the
+// log to spot rather than a run to re-diagnose.
+extern int g_offActorRotation;   // defined with the other pawn offsets, far below
+
+// ---- ⚠️ the ledge direction comes from the PAWN, because MoveLedgeNormal is EMPTY ----
+//
+// This was derived as normal x worldUp, assuming the normal faces out of the wall. When that
+// produced "no ledge axis" the guess was that the normal points UP instead - reasonable, since
+// the game's GrabMinGrabableZNormal is a threshold on its Z.
+//
+// Both were wrong. Measured: MoveLedgeNormal reads (0.00 0.00 0.00). Not vertical, not
+// horizontal - never populated at all, at least at the moments sampled. A cross product with a
+// zero vector is zero whichever way you take it, which is why every derivation from it failed.
+//
+// The pawn's own facing is the source that works. Hanging, the character faces the wall, so the
+// ledge runs along its RIGHT vector - which is up x forward, not forward x up; that sign was
+// wrong once too and the body travelled with the hands instead of against them.
+//
+// The pawn's own facing is the reliable source. Hanging, the character faces the wall, so the
+// ledge runs along its RIGHT vector. UE3 rotators are 65536 to the turn and forward is
+// (cos, sin, 0) in the XY plane, so right is (sin, -cos, 0). No cross product, no dependence on
+// a normal whose convention was guessed at.
+static bool PkLedgeAxis(float* axis)
+{
+    if (!g_pkLedgeOk) return false;
+    int32_t rot[3];
+    if (g_offActorRotation < 0 || !g_playerPawn ||
+        !SafeRead(g_playerPawn + g_offActorRotation, rot, sizeof(rot))) return false;
+    // ⚠️ right = up x forward, NOT forward x up.
+    //
+    // With forward = (cos, sin, 0) and up = (0,0,1) the two differ only by sign, and the sign is
+    // the entire behaviour: the first build used forward x up and the body travelled WITH the
+    // hands instead of against them. Anchored hands means the world is what stays still, so
+    // pulling the hands right has to carry the body LEFT - the same inversion the bar measurement
+    // confirmed, where hands back meant feet forward.
+    //
+    // Measured rather than reasoned: the handedness was guessed once and was wrong, and the
+    // in-headset direction is what settled it.
+    const float yaw = (float)rot[1] * (6.2831853f / 65536.0f);
+    axis[0] = -sinf(yaw);
+    axis[1] =  cosf(yaw);
+    axis[2] = 0.0f;
+
+    // The normal is logged once rather than used, because the assumption about it cost three
+    // runs and the next reader deserves the measurement instead of the same guess.
+    static bool said = false;
+    if (!said && g_pkMode == PK_LEDGE && (g_gripValue[0] > 0.5f || g_gripValue[1] > 0.5f)) {
+        said = true;
+        Log("[pk] ledge axis from pawn yaw = (%.2f %.2f); MoveLedgeNormal reads (%.2f %.2f %.2f)"
+            "  <- if that normal is mostly Z it is the top face, not the wall",
+            axis[0], axis[1], g_pkLedgeNrm[0], g_pkLedgeNrm[1], g_pkLedgeNrm[2]);
+    }
+    return true;
+}
+
+// ⚠️ Polled from the TOP of ParkourTick, not from inside ParkourDirectBodyTick.
+//
+// It used to live in that function, which is called after four early returns - not on a wall, no
+// hand gripping, no head axes, wrong mode. So the key was only sampled while the player was
+// already hanging AND gripping, and a press at any other moment was simply never seen. Two runs
+// reported "SCROLL LOCK did nothing" and both were right: it was never read.
+//
+// A toggle has to be readable whenever a human might press it, which is not the same set of
+// moments as when the thing it toggles can act.
+static void ParkourPollDirectToggle()
+{
+    static bool prevKey = false;
+    const bool key = (GetAsyncKeyState(VK_SCROLL) & 0x8000) != 0;
+    if (key && !prevKey) {
+        g_pkDirectBody = !g_pkDirectBody;
+        Log("*** [pkdirect] SCROLL LOCK -> direct body drive %s  (mode %d)",
+            g_pkDirectBody ? "ON (the stick stops driving the shimmy)" : "OFF", g_pkMode);
+    }
+    prevKey = key;
+}
+
+static void ParkourDirectBodyTick()
+{
+    const bool want = g_pkDirectBody && g_pkMode == PK_LEDGE && g_pkAnchor != PK_HAND_NONE &&
+                      g_playerPawn && g_offActorLocation >= 0;
+    if (!want) {
+        // DIRECT-IDLE with no reason has now cost two runs. Say which condition is missing.
+        g_pkDirectWhy = !g_pkDirectBody      ? "off"
+                      : g_pkMode != PK_LEDGE ? "not on a ledge"
+                      : g_pkAnchor == PK_HAND_NONE ? "no anchor"
+                      : !g_playerPawn        ? "no pawn" : "no Location offset";
+        if (g_pkDirectLive)
+            Log("[pkdirect] stood down after %ld writes (mode %d, anchor %d)",
+                g_pkDirectWrites, g_pkMode, g_pkAnchor);
+        g_pkDirectLive = false;
+        g_pkDirectHave = false;
+        return;
+    }
+    g_pkDirectWhy = "armed";
+
+    float loc[3];
+    if (!SafeRead(g_playerPawn + g_offActorLocation, loc, sizeof(loc))) return;
+
+    // Latch on entry AND on every anchor change, for the same reason the servo re-latches: the
+    // new hand is somewhere else, and carrying the old base across would teleport the body by
+    // the distance between the player's hands.
+    static int prevAnchor = PK_HAND_NONE;
+    if (!g_pkDirectHave || prevAnchor != g_pkAnchor) {
+        if (!PkLedgeAxis(g_pkDirectAxis)) { g_pkDirectWhy = "no ledge axis"; return; }
+        memcpy(g_pkDirectBase, loc, sizeof(loc));
+        g_pkDirectHave = true;
+        g_pkDirectLast = 0.0f;
+        prevAnchor = g_pkAnchor;
+        if (!g_pkDirectLive) {
+            g_pkDirectLive = true;
+            g_pkDirectWrites = 0;
+            Log("*** [pkdirect] LIVE at (%.1f %.1f %.1f) along (%.2f %.2f)",
+                loc[0], loc[1], loc[2], g_pkDirectAxis[0], g_pkDirectAxis[1]);
+        }
+        return;
+    }
+
+    // ⚠️ Direct drive does not ask the game's permission, so the game cannot refuse.
+    //
+    // In stick mode a ledge that ends simply stops moving the player. Writing Location bypasses
+    // that entirely: nothing prevents pushing the pawn straight off the end of a short ledge, or
+    // into the wall past a corner. The player's warning that ledges do not extend both ways is
+    // exactly this hazard.
+    //
+    // The guard is the game's own verdict, read back rather than predicted: if it stops
+    // reporting a ledge under the player, the write went somewhere there is no ledge, and the
+    // only safe move is to stop writing and let the game have its position back.
+    if (!g_pkLedgeOk) {
+        Log("[pkdirect] the game stopped reporting a ledge - standing down after %ld writes",
+            g_pkDirectWrites);
+        g_pkDirectLive = false;
+        g_pkDirectHave = false;
+        g_pkDirectWhy = "ledge lost";
+        return;
+    }
+
+    const float d = g_pkDesired * g_pkUUPerMetre;
+    // A single frame cannot legitimately ask for more than a big arm's reach. Past that the axis
+    // or the latch is wrong, and flinging the pawn is a worse outcome than doing nothing.
+    if (!(fabsf(d) < 200.0f) || !std::isfinite(d)) { g_pkBlock = "direct step rejected"; return; }
+
+    float want3[3] = { g_pkDirectBase[0] + g_pkDirectAxis[0] * d,
+                       g_pkDirectBase[1] + g_pkDirectAxis[1] * d,
+                       loc[2] };            // Z is never written - see the note above
+    SIZE_T wrote = 0;
+    if (!WriteProcessMemory(GetCurrentProcess(), (LPVOID)(g_playerPawn + g_offActorLocation),
+                            want3, sizeof(want3), &wrote) || wrote != sizeof(want3)) {
+        Log("[pkdirect] write failed - standing down");
+        g_pkDirectBody = false;
+        g_pkDirectLive = false;
+        return;
+    }
+    ++g_pkDirectWrites;
+    g_pkDirectLast = g_pkDesired;
+
+    // How far the game moved the pawn away from what was written since last frame IS the fight,
+    // measured rather than argued about. Zero means the move is not contesting position; a
+    // steady number means it is pulling back every frame and by how much.
+    static float prevWrote[3] = { 0, 0, 0 };
+    static bool  havePrev = false;
+    if (havePrev) {
+        const float bx = loc[0] - prevWrote[0], by = loc[1] - prevWrote[1];
+        const float drift = sqrtf(bx * bx + by * by);
+        static float worst = 0.0f, sum = 0.0f; static long n = 0;
+        if (drift > worst) worst = drift;
+        sum += drift; ++n;
+        if ((g_pkDirectWrites % 72) == 0) {
+            Log("[pkdirect] %ld writes; the game moved the pawn %.2f UU/frame on average,"
+                " worst %.2f  (want %+.3f m)", g_pkDirectWrites, sum / (float)n, worst, g_pkDesired);
+            worst = 0.0f; sum = 0.0f; n = 0;
+        }
+    }
+    memcpy(prevWrote, want3, sizeof(want3));
+    havePrev = true;
+}
+
+static void ParkourTick(XrTime when)
+{
+    (void)when;
+    ParkourPollDirectToggle();      // unconditional - see the note on why it moved here
+    // ⚠️ Both of these moved ABOVE the early returns, for the reason the toggle did.
+    //
+    // PkReadLedge sat after the grip check, so the ledge was only re-read while a hand was
+    // squeezed - and ParkourDirectBodyTick sat after that, so it never ran at all unless the
+    // player was already gripping on a ledge. That is why the DIRECT row reported "off" while
+    // the toggle was on: the function that sets the reason had not executed since startup, so
+    // the row was showing its initial value, not a decision.
+    //
+    // Neither depends on a grip. Both have their own gates and are safe to call whenever there
+    // is a pawn.
+    PkReadLedge();
+    ParkourDirectBodyTick();
+    const float prevShimmy = g_pkShimmy;
+    g_pkShimmy = 0.0f;
+    g_pkMode = g_parkour ? ParkourModeNow() : PK_NONE;
+
+    ParkourAnimLock(g_pkMode != PK_NONE);
+
+    static int prevMode = PK_NONE;
+    if (g_pkMode != prevMode) {
+        if (g_pkMode == PK_NONE || prevMode == PK_NONE)
+            Log("[pk] mode %d -> %d at t=%.2fs", prevMode, g_pkMode, LogSecs());
+        prevMode = g_pkMode;
+        g_pkAnchor = PK_HAND_NONE;
+        g_pkProgress = g_pkDesired = 0.0f;
+        g_pkHavePrevLoc = false;
+        g_pkExtentHave = false;      // a new ledge is a new span, not a longer one
+    }
+    if (g_pkMode == PK_NONE) {
+        g_pkBlock = "not on a wall"; g_pkAnchor = PK_HAND_NONE; g_pkCamLead = 0.0f; return;
+    }
+
+    // Body travel is accumulated every frame, signed by what we were LAST asking for - the move
+    // that actually produced it. Signing by this frame's request would credit the previous
+    // frame's travel to a direction that had already been reversed.
+    const float step = PkBodyStep();
+    if (prevShimmy != 0.0f) g_pkProgress += (prevShimmy > 0.0f ? step : -step);
+
+    // (hoisted above the grip check: the field report was that BLOCKED only appeared while the
+    // controllers were gripped, and a ledge ending is not a fact about whether we are holding on)
+    // ⚠️ The signal is what the GAME was handed, not what our gesture asked for.
+    //
+    // Watching prevShimmy alone meant the detector only ran while the hand servo was driving. The
+    // run that hit two ledge ends logged shim=+0.00 on all 161 samples - the player was moving
+    // with the physical stick, which is the obvious way to go and find an end. A "did the game
+    // refuse" test that only works when we are the one asking is not a test of the game.
+    //
+    // g_padSentLX is the composed left stick as the game received it, whatever produced it.
+    const float asked = g_padSentLX;
+    if (fabsf(asked) > 0.15f) {
+        if (step > 0.001f) { g_pkStallFrames = 0; g_pkBlockedDir = 0; }
+        else if (++g_pkStallFrames > 20) {
+            const int dir = (asked > 0.0f) ? 1 : -1;
+            if (g_pkBlockedDir != dir)
+                Log("[pk] blocked going %s after %ld stalled frames (stick %+.2f)",
+                    dir > 0 ? "RIGHT" : "LEFT", g_pkStallFrames, asked);
+            g_pkBlockedDir = dir;
+        }
+    } else {
+        g_pkStallFrames = 0;
+    }
+
+    if (!g_headAxesOk) { g_pkBlock = "no head axes"; return; }
+
+    // A hand holds the world when its grip is squeezed AND the runtime can see it. Untracked is
+    // deliberately NOT treated as holding on here: this decides where the body goes, and a lost
+    // controller producing a stale anchor would drive the body somewhere nobody asked for. The
+    // rule that an untracked hand keeps HOLDING belongs to the release gesture, which is a
+    // different question with the opposite failure mode.
+    const bool held[2] = {
+        g_swingL.tracked && g_gripValue[0] > 0.5f,
+        g_swingR.tracked && g_gripValue[1] > 0.5f,
+    };
+    if (!held[0] && !held[1]) {
+        // Letting go zeroes the lead outright. A view still displaced from a pull the
+        // player has abandoned is a camera nobody is steering.
+        g_pkBlock = "no hand gripping";
+        g_pkAnchor = PK_HAND_NONE;
+        g_pkCamLead = 0.0f;
+        return;
+    }
+
+    // ---- re-latch on every anchor change, or hand-over-hand lurches ----
+    //
+    // The anchor is the most recently grabbed hand still holding. When it changes, the new hand
+    // is somewhere else entirely, and carrying the old error across would step the body by the
+    // distance BETWEEN the player's hands - once per swap, forever. Re-latching zeroes desired
+    // and actual together, so the switch itself moves nothing.
+    static bool prevHeld[2] = { false, false };
+    int want = g_pkAnchor;
+    for (int h = 0; h < 2; ++h) if (held[h] && !prevHeld[h]) want = h;      // newly grabbed wins
+    if (want == PK_HAND_NONE || !held[want])
+        want = held[PK_HAND_R] ? PK_HAND_R : PK_HAND_L;                     // whichever is still on
+    prevHeld[0] = held[0]; prevHeld[1] = held[1];
+
+    if (want != g_pkAnchor) {
+        g_pkAnchor = want;
+        g_pkAnchorLat = PkLateralOf(want == PK_HAND_L ? g_swingL : g_swingR);
+        g_pkProgress = 0.0f;
+        if (g_parkourDebug)
+            Log("[pk] anchor -> %s at lateral %+.3f m",
+                want == PK_HAND_L ? "L" : "R", g_pkAnchorLat);
+    }
+
+    g_pkBlock = "";
+    if (g_pkMode != PK_LEDGE) { g_pkBlock = "mode has no servo yet"; return; }
+
+    // Pull the hands LEFT and the body goes RIGHT. Inverse, because the hand is what is anchored
+    // - the same relationship the bar measurement confirmed, where hands back meant feet forward.
+    const float lat = PkLateralOf(g_pkAnchor == PK_HAND_L ? g_swingL : g_swingR);
+    g_pkDesired = -(lat - g_pkAnchorLat);
+
+    if (g_pkDirectLive) {
+        // ⚠️ The whole point. A stick input is what makes the game play the shimmy animation, so
+        // while position is being written directly the stick must stay at rest - otherwise the
+        // animation runs anyway and moves the player on top of the writes.
+        g_pkShimmy = 0.0f;
+        g_pkCamLead = 0.0f;     // the body IS where the pull asked; there is no debt to lead
+        g_pkBlock = "direct body drive";
+        return;
+    }
+
+    // ---- the end of a ledge, detected rather than assumed ----
+    //
+    // A ledge does not necessarily continue in both directions from where it was grabbed, and
+    // nothing read so far says where it stops. But the game does say, by refusing: command a
+    // shimmy and the body does not travel.
+    //
+    // That is the reliable signal, and it costs nothing to watch. Cleared the moment travel
+    // resumes, so a momentary stall - a corner animation, a transition - does not latch as a
+    // wall. CanShimmy being a FUNCTION rather than a property is the same fact from the other
+    // side: the game decides this per direction, at the time of asking.
+    // ⚠️ prevShimmy, NOT g_pkShimmy. This runs before the assignment at the end of the function,
+    // so g_pkShimmy is still the zero it was reset to at the top - the test was against a value
+    // that is always zero here, the else branch always ran, and the stall counter could never
+    // reach its threshold. Two ledge ends were hit in a run and neither reported.
+    //
+    // prevShimmy is also the CORRECT value on its own terms: it is the command that produced the
+    // travel being measured this frame.
+    const float error = g_pkDesired - g_pkProgress;
+
+    // The lead IS the error: exactly the distance the body still owes the player. It therefore
+    // converges to zero by construction rather than by a decay constant - when the body arrives
+    // the debt is nothing and so is the offset. Clamped, because a long fast pull can outrun the
+    // actuator by more than a view can be displaced without leaving the room it is in.
+    if (g_pkCamLeadOn) {
+        float lead = -error;    // body owes +x, so the view is currently -x of where it belongs
+        if (fabsf(lead) > g_pkCamLeadMax) {
+            lead = (lead < 0.0f ? -1.0f : 1.0f) * g_pkCamLeadMax;
+            // Logged, not silent. While this fires the camera is no longer tracking the pull, and
+            // that is worth knowing from the log rather than inferring it from a feel report.
+            static long lastWarn = 0;
+            if (g_frames - lastWarn > 120) {
+                lastWarn = g_frames;
+                Log("[pk] camera lead CLAMPED at %.2f m (error %.3f) - the view is not 1:1 while"
+                    " this fires", g_pkCamLeadMax, error);
+            }
+        }
+        g_pkCamLead = lead;
+    }
+
+    if (fabsf(error) <= g_pkTolerance) { g_pkBlock = "arrived"; return; }
+    g_pkShimmy = (error < 0.0f ? -1.0f : 1.0f) * g_pkShimmyCap;
+}
+
 static float ArmSwingDeflection(XrTime when, float physX, float physY)
 {
     // Before the gates, because every one of them can collapse and the collapse stamps its
@@ -2378,6 +3190,10 @@ static float ArmSwingDeflection(XrTime when, float physX, float physY)
     if (!g_padEnabled)                     { ArmSwingCollapse("pad off");    return 0.0f; }
     if (g_sweepActive)                     { ArmSwingCollapse("sweep");      return 0.0f; }
     if (!g_swingL.tracked && !g_swingR.tracked) { ArmSwingCollapse("no tracked hand"); return 0.0f; }
+    // ⚠️ COLLAPSE, not freeze. On a ledge the player is moving their arms deliberately and for a
+    // different purpose; freezing would hold the last forward deflection - this project's oldest
+    // hazard - and resuming from it the moment they let go is worse still.
+    if (g_pkMode != PK_NONE)               { ArmSwingCollapse("parkour");   return 0.0f; }
     // Pulled backwards is the emergency stop, and it outranks every freeze below: a reflex that
     // the game being busy can override is not a reflex. It collapses rather than masking the
     // output, or letting go would resume at the speed it was interrupted at.
@@ -2688,6 +3504,9 @@ static bool XrSyncInput(XrTime when)
     // The physical stick is passed in first, so the override can stand down in the same frame
     // the player reaches for it.
     ReportSprintLimitsOnce();
+    // ⚠️ FIRST. Every swing gate below reads g_pkMode, and two of them assert buttons that let go
+    // of a ledge; a stale mode for one frame is a fall.
+    ParkourTick(when);
     const float sweep = SweepTick(when, mx, my);
     // ⚠️ Called every frame, INCLUDING while the sweep is driving. Its own g_sweepActive guard
     // collapses the envelope; skipping the call instead would freeze the envelope mid-charge for
@@ -2721,6 +3540,14 @@ static bool XrSyncInput(XrTime when)
             s.Gamepad.sThumbLY = axis(fy);
         }
     }
+    // ---- PK.1: the shimmy owns X only while the physical stick is not asking for it ----
+    //
+    // Precedence, not a sum. X is a DIRECTION here and the sum of two directions is a third one
+    // nobody chose; worse, a sum could reach the full deflection the cap exists to avoid. The
+    // stick wins the instant it is touched, which is also how a player takes back control when
+    // the gesture reads them wrong.
+    if (g_pkShimmy != 0.0f && sweep <= 0.0f && fabsf(mx) < 0.15f)
+        s.Gamepad.sThumbLX = axis(g_pkShimmy);
     s.Gamepad.bLeftTrigger  = (BYTE)(flt(g_aLTrig) * 255.0f);
     // AS.3: full, and never below what the physical trigger already asked for. GBA_Crouch is
     // a button as far as the game is concerned; a partial press would only risk sitting under
@@ -2773,6 +3600,15 @@ static bool XrSyncInput(XrTime when)
     if (stickJump) b |= MEVR_PAD_LSHOULDER;
     if (stickTurn) b |= MEVR_PAD_RSHOULDER;
     s.Gamepad.wButtons = b;
+
+    // ---- what the GAME was handed, kept live for the parkour probe ----
+    //
+    // Not the physical stick and not the swing deflection - the composed result, after the
+    // sweep override and the swing sum. The pendulum responds to this and only this, so this is
+    // the number that has to sit beside SwingAngle if the sign between them is ever to be
+    // settled. The [pad] window keeps extremes, which cannot answer a question about direction.
+    g_padSentLX = (float)s.Gamepad.sThumbLX / 32767.0f;
+    g_padSentLY = (float)s.Gamepad.sThumbLY / 32767.0f;
 
     // ---- record the window, before the lock ----
     //
@@ -3643,7 +4479,8 @@ UINT                     g_sceneW = 0, g_sceneH = 0;
 // game's own full-width draws - the only coherent presentation is mono until the mode ends.
 bool                     g_sceneSplitMono = false;
 // The PARTIAL variant of the same failure, measured 2026-08-28: one render phase (~30% of
-// scene draws) moves to the half-size fp16 buffer while the backbuffer keeps the majority,
+// scene draws) moves to a half-size scene buffer - fp16 (fmt 113) in the afternoon runs,
+// LDR (fmt 21) in the 22:16 training-area run - while the backbuffer keeps the majority,
 // so the parity rule reads the run as healthy and duplication keeps going - over a frame the
 // game no longer fully repaints. That is the streak state: hands and building edges ghosting
 // along their motion history. Same answer as the full split - suppress duplication, present
@@ -4897,7 +5734,8 @@ static int LookupProp(const char* className, const char* propName, bool verbose)
 // verdict can never fire. Sustained slowness (FrameCap=20, measured 2026-08-28) does NOT
 // trip it, so the trigger profile is spikes, not load.
 static long      g_testStallFrame   = 0;       // ini TestStall; 0 = off
-static bool      g_pinMinDesiredFps = false;   // ini PinMinDesiredFps
+static bool      g_pinMinDesiredFps = true;    // ini PinMinDesiredFps; ON by default - this
+                                               // is the half-res PREVENTION, see the pin
 static uint32_t  g_clientObj        = 0;
 static int       g_offMinDesiredFps = -1;
 static uint32_t  g_worldInfoObj     = 0;
@@ -5045,6 +5883,11 @@ static void ProbeSwanNeck();
 static bool DerivePropertyOffsets();
 static void DumpClassProperties(const char* className, int maxLines);
 static int  LookupProp(const char* className, const char* propName, bool verbose);
+static void FindPropertyOwners();
+static void DeriveBoolMaskFromAnyClass();
+static int  OwnerLookup(const char* cls, const char* prop, char* kindOut, size_t kindCap,
+                        uint32_t* maskOut);
+static int  BitIndexOf(uint32_t mask);
 static void ResolveMotionRigOffsets();
 static void ResolveInputGates();
 static void InstallUpdate1pArmsHook();
@@ -5057,6 +5900,11 @@ extern int g_offDefaultFOV;
 extern int g_offCamLoc;
 extern int g_offCamRot;
 extern int g_offMoveState;
+extern int g_offCurrentMove;
+extern int g_offMoves;
+extern int g_offMoveLedgeLoc;
+extern int g_offMoveLedgeNrm;
+extern int g_offFoundLedge;
 extern int g_offWeapon;
 extern int g_offWeaponAnimState;
 extern int g_offCtlPawn;        // PlayerController::Pawn - the pawn without a 115k-object walk
@@ -5149,6 +5997,32 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                 g_offCamLoc = LookupProp("TdPlayerPawn", "PlayerCameraLocation", true);
                 LookupProp("TdPlayerPawn", "SwanNeck1p", true);
                 g_offMoveState = LookupProp("TdPlayerPawn", "MovementState", true);
+                // The move object beside the state byte. Looked up from TdPlayerPawn rather
+                // than TdPawn so the walk covers the whole chain whatever declares it - the
+                // log line names the declaring class, which is the answer to where it lives.
+                g_offCurrentMove = LookupProp("TdPlayerPawn", "CurrentMove", true);
+                // Here rather than beside the parkour probe: this is the background thread, and
+                // the walk it does is the one the project already measured at ~1084 ms.
+                // ⚠️ BEFORE the owner pass, not after.
+                //
+                // FindPropertyOwners records a bool's BitMask while it has the property object
+                // in hand - but only if g_offBoolMask is already known. It was derived later in
+                // the sequence, so every bool the owner pass rescued came back with mask 0, and
+                // "bFoundLedge at +0x041C bit -1" is what that looks like from the log. The
+                // offset was right and the bit was missing, which for a packed bool is the same
+                // as having nothing.
+                DeriveBoolMaskFromAnyClass();
+                FindPropertyOwners();
+                // PK.4: the ledge the grab move is holding you to, in world space.
+                g_offMoveLedgeLoc = LookupProp("TdPawn", "MoveLedgeLocation", true);
+                g_offMoveLedgeNrm = LookupProp("TdPawn", "MoveLedgeNormal", true);
+                {
+                    char k[32] = "?";
+                    g_offFoundLedge = OwnerLookup("TdPawn", "bFoundLedge", k, sizeof(k),
+                                                  &g_maskFoundLedge);
+                    Log("[pk] bFoundLedge at +0x%04X bit %d", g_offFoundLedge,
+                        g_maskFoundLedge ? BitIndexOf(g_maskFoundLedge) : -1);
+                }
                 // A position proof must still fail closed when the player is armed. Both are
                 // ordinary byte/pointer fields; P1.3 only admits Weapon=None and Unarmed(0).
                 g_offWeapon = LookupProp("TdPawn", "Weapon", true);
@@ -5607,8 +6481,22 @@ static bool DerivePropertyOffsets()
 // Rotation - it exhausted its budget inside TdPlayerController's own properties - and the
 // Actor dump came back empty, which a targeted query diagnoses instead of hiding: it reports
 // how many fields it walked, so "not found" and "the chain broke" stop looking alike.
+// Set by the LookupProp below on every success: the UProperty object it matched. Read it to
+// learn the property KIND - a UProperty instance's own Class is BoolProperty / FloatProperty /
+// StructProperty / ObjectProperty and so on, while a UFunction's is Function.
+//
+// ⚠️ That distinction is not cosmetic. LookupProp walks Children, which holds FUNCTIONS as well
+// as properties, so a name that happens to be a function matches and returns whatever dword sits
+// at the property-offset position inside a UFunction - a plausible-looking number that points at
+// nothing. Names like CanShimmy and CanPullUp read as either. The kind is what tells them apart.
+//
+// A side channel rather than an out-parameter because LookupProp has ~40 call sites that do not
+// want it; it is valid only immediately after a successful call.
+static uintptr_t g_lastPropObj = 0;
+
 static int LookupProp(const char* className, const char* propName, bool verbose)
 {
+    g_lastPropObj = 0;
     if (g_offChildren < 0 || g_offNext < 0 || g_offPropOff < 0) return -1;
     uintptr_t cls = FindClassByName(className);
     if (!cls) { if (verbose) Log("[prop] class %s NOT FOUND", className); return -1; }
@@ -5627,6 +6515,7 @@ static int LookupProp(const char* className, const char* propName, bool verbose)
                 if (strcmp(nm, propName) == 0) {
                     uint32_t off;
                     if (SafeU32(p + g_offPropOff, &off) && off < 0x8000) {
+                        g_lastPropObj = p;
                         Log("*** [prop] %s::%s at +0x%04X   (declared on %s, %d fields walked)",
                             className, propName, off, cn, walked);
                         return (int)off;
@@ -5651,6 +6540,146 @@ static int LookupProp(const char* className, const char* propName, bool verbose)
         Log("[prop] %s::%s NOT FOUND after walking %d fields up the class chain",
             className, propName, walked);
     return -1;
+}
+
+// ================================================================ who owns a property, really
+//
+// Five runs have now spent themselves guessing which class declares ClimbState, SwingVelocity
+// and the rest. TdMove_Climb does not have them; TdLadderVolume, TdSwingVolume and
+// TdAnimNodeClimb were all located as genuine UClasses and all dumped completely empty. Guessing
+// class names one build at a time is the expensive way to answer an ownership question.
+//
+// GObjects already holds every UProperty in the game, and a UProperty's Outer IS its declaring
+// class. So walk it once, match the names being hunted, and print who owns them. No candidate
+// list, no assumption about where a thing "should" live.
+// One GObjects pass for every name at once. Runs on the object-model thread, never the render
+// thread: the project already measured a full walk at ~1084 ms, which as a per-frame cost was a
+// visible world freeze.
+extern int g_offBoolMask;   // derived beside the property machinery below
+
+// What the owner pass found, kept for the probe to fall back on.
+// ⚠️ The mask is recorded HERE, where the property object is in hand.
+//
+// The owner fallback resolved bClimbDownFast's offset but not its bit, so it printed as the raw
+// packed dword - 0028108A - with bClimbLeftHand printing the identical word beside it. The mask
+// resolution lived only on the LookupProp path, which by definition did not run for anything the
+// fallback had to rescue. A fallback that recovers half a property is worse than one that admits
+// it failed, because the output still looks like an answer.
+struct OwnerRow { char cls[64]; char prop[64]; char kind[32]; int off; uint32_t mask; };
+static const int kOwnerMax = 48;
+static OwnerRow g_ownerRows[kOwnerMax];
+static int g_ownerFound = 0;
+
+// Look up a property the owner pass recorded. Returns -1 if it saw no such thing.
+// Same table, but keyed on the property name alone - for when the class in the question was
+// wrong. Reports which class actually declares it so the caller can say so.
+static int OwnerLookupAnyClass(const char* prop, char* kindOut, size_t kindCap,
+                               char* clsOut, size_t clsCap, uint32_t* maskOut)
+{
+    for (int i = 0; i < g_ownerFound; ++i)
+        if (strcmp(g_ownerRows[i].prop, prop) == 0) {
+            if (kindOut && kindCap) strcpy_s(kindOut, kindCap, g_ownerRows[i].kind);
+            if (clsOut && clsCap)   strcpy_s(clsOut, clsCap, g_ownerRows[i].cls);
+            if (maskOut) *maskOut = g_ownerRows[i].mask;
+            return g_ownerRows[i].off;
+        }
+    return -1;
+}
+
+static int OwnerLookup(const char* cls, const char* prop, char* kindOut, size_t kindCap,
+                      uint32_t* maskOut)
+{
+    for (int i = 0; i < g_ownerFound; ++i)
+        if (strcmp(g_ownerRows[i].cls, cls) == 0 && strcmp(g_ownerRows[i].prop, prop) == 0) {
+            if (kindOut && kindCap) strcpy_s(kindOut, kindCap, g_ownerRows[i].kind);
+            if (maskOut) *maskOut = g_ownerRows[i].mask;
+            return g_ownerRows[i].off;
+        }
+    return -1;
+}
+
+static void FindPropertyOwners()
+{
+    if (g_offOuter < 0 || g_offPropOff < 0 || !g_gobjAddr || g_offName < 0) {
+        Log("[owner] skipped: Outer=%d Offset=%d - the property machinery is not up",
+            g_offOuter, g_offPropOff);
+        return;
+    }
+
+    // The ABSENT list from runs 3-6, plus the ledge geometry the hand placement will need.
+    g_ownerFound = 0;
+    static const char* kWanted[] = {
+        "ClimbState", "ClimbSpeed", "ClimbingPawn", "ClimbAnimIndex",
+        // The pipe slide-down. The game already has it - ClimbDownFastVelocity is config on
+        // TdMove_Climb, and pipeclimbdownfast / ladderclimbdownfast are real animations - so the
+        // question is only which flag says it is happening.
+        "bClimbDownFast", "bClimbLeftHand", "ClimbDownFastVelocity",
+        "SwingVelocity", "Swing1LimitAngle", "Swing2LimitAngle", "SwingLimitStiffness",
+        "bIsShimmying", "CanShimmyAroundCorner", "bHangingFree", "bCheckForGrab",
+        "LedgeLocation", "LedgeNormal", "MoveLedgeLocation", "MoveLedgeNormal",
+        // How LONG is the ledge? The names table carries several candidates and none of them has
+        // been located yet. LedgeWidth is the obvious one; the Find* trio describes the trace
+        // that discovers a ledge, which may bound it; MoveLedgeResult and LedgeHitInfo are the
+        // trace results themselves and could carry the extent directly.
+        "LedgeWidth", "LedgeHeight", "LedgeAngle", "LedgeOffset",
+        "LedgeFindExtent", "LedgeFindDistance", "LedgeFindDepth",
+        "MoveLedgeResult", "LedgeHitInfo", "bFoundLedge",
+    };
+    const int nw = (int)(sizeof(kWanted) / sizeof(kWanted[0]));
+
+    uint32_t data = 0, count = 0;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return;
+    Log("======== property owners: one pass over %u objects ========", count);
+
+    int hits = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t obj = 0, vt = 0;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+        if (!SafeU32(obj, &vt) || !InModule(vt)) continue;
+        char nm[96];
+        if (!ReadObjName((uintptr_t)obj, nm, sizeof(nm))) continue;
+        int w = -1;
+        for (int j = 0; j < nw; ++j) if (strcmp(nm, kWanted[j]) == 0) { w = j; break; }
+        if (w < 0) continue;
+
+        // The name alone is not enough - an enum, a function and a property can share it. The
+        // object's own class says which this is, and only *Property rows carry a usable offset.
+        char kind[48] = "?", owner[96] = "?";
+        uint32_t cls = 0, outer = 0, off = 0xFFFFFFFF;
+        if (SafeU32((uintptr_t)obj + 0x34, &cls) && cls >= 0x10000)
+            ReadObjName((uintptr_t)cls, kind, sizeof(kind));
+        if (SafeU32((uintptr_t)obj + g_offOuter, &outer) && outer >= 0x10000)
+            ReadObjName((uintptr_t)outer, owner, sizeof(owner));
+        SafeU32((uintptr_t)obj + g_offPropOff, &off);
+        const bool isProp = strstr(kind, "Property") != nullptr;
+        Log("[owner] %-24s %-18s on %-32s %s", nm, kind, owner,
+            isProp && off < 0x4000 ? "" : "  (not a property - no usable offset)");
+        if (isProp && off < 0x4000) {
+            Log("[owner]     -> %s::%s at +0x%04X", owner, nm, off);
+            // ⚠️ Kept, because the Children walk cannot be trusted to find these on its own.
+            //
+            // TdMove_Climb::ClimbState and TdMove_Swing::SwingVelocity BOTH came back ABSENT
+            // from LookupProp and were missing from the class dumps - yet here they are, with
+            // Outer naming exactly the class that was searched. In both cases the missing field
+            // sits just BELOW the first offset the Children walk reported, so that walk is
+            // starting part-way into the list rather than at its head.
+            //
+            // Diagnosing that is its own job. Until then this table is the more reliable
+            // resolver of the two, and the probe consults it whenever LookupProp comes up empty.
+            if (g_ownerFound < kOwnerMax) {
+                OwnerRow& r = g_ownerRows[g_ownerFound++];
+                strcpy_s(r.prop, nm);
+                strcpy_s(r.cls, owner);
+                strcpy_s(r.kind, kind);
+                r.off = (int)off;
+                r.mask = 0;
+                if (strcmp(kind, "BoolProperty") == 0 && g_offBoolMask >= 0)
+                    SafeU32((uintptr_t)obj + g_offBoolMask, &r.mask);
+            }
+        }
+        hits++;
+    }
+    Log("======== %d owner rows for %d names ========", hits, nw);
 }
 
 struct DetachedPropRequest {
@@ -6643,7 +7672,7 @@ static void ResolveMotionRigOffsets()
 // single bit. A pointer is neither. The twenty-strong group on TdPlayerController is what makes
 // this decisive rather than suggestive; a lone bool would pass every candidate and prove
 // nothing, which is why a minimum group size is required as well as a minimum count.
-static int g_offBoolMask = -1;
+int g_offBoolMask = -1;
 
 static bool PropIsBool(uintptr_t prop)
 {
@@ -6652,83 +7681,148 @@ static bool PropIsBool(uintptr_t prop)
     return ObjNameIs(cls, "BoolProperty");
 }
 
-static void DeriveBoolMaskOffset(const char* className)
+// ⚠️ maxDepth exists because this failed on its first seed and the failure was structural.
+//
+// Seeded with TdPlayerController and NO depth cap, the walk climbs the whole chain into
+// PlayerController, Controller, Actor and Object - hundreds of bools, most of them engine
+// intrinsics. `ok` is cleared by a SINGLE property whose candidate dword is not a clean single
+// bit, and one such property anywhere in that chain kills every candidate offset. Run 4 logged
+// exactly that: "BitMask NOT FOUND", and bools stayed unreadable for the whole project.
+//
+// The constraint is not wrong, the sample was. Three levels of a game class is a big enough
+// group to be decisive - TdMove_Grab alone packs 8 bools at +0x01B4 and 7 more at +0x0178 -
+// while staying out of the engine base classes that poison it.
+// ---- ⚠️ the criterion changed after run 6, and the reason matters ----
+//
+// The original test required EVERY bool on the class chain to hold a distinct single bit at the
+// candidate offset. That is a global consistency test, and it failed on all five seeds across
+// two builds - even though the evidence dump then showed +0x84 holding, for the twelve bools
+// packed at TdMove_Grab+0x004C, exactly 00000001 00000002 00000004 ... 00000800.
+//
+// So the answer was in range and visible, and a global test still rejected it: ONE malformed or
+// unexpected bool anywhere in three levels of class chain vetoes the correct offset for all the
+// others. A test that can be defeated by its worst sample is the wrong shape.
+//
+// What actually identifies BitMask is the signature within a single PACKING GROUP: n bools that
+// share a dword hold n distinct single bits. That is decisive on its own - for a group of
+// twelve, the odds of an unrelated field reproducing twelve distinct powers of two are nil -
+// and it cannot be spoiled by a stray property elsewhere. The other groups are then reported as
+// corroboration rather than used as a gate, and the first property that disagrees is NAMED, so
+// a genuine layout surprise still surfaces instead of silently becoming a veto.
+static bool DeriveBoolMaskOffset(const char* className, int maxDepth)
 {
-    if (g_offChildren < 0 || g_offNext < 0 || g_offPropOff < 0) return;
+    if (g_offChildren < 0 || g_offNext < 0 || g_offPropOff < 0) return false;
     const uintptr_t cls0 = FindClassByName(className);
-    if (!cls0) { Log("[prop] %s not found - bool flags cannot be read", className); return; }
+    if (!cls0) { Log("[prop] %s not found - bool flags cannot be read", className); return false; }
 
-    int passed[8] = {}, npassed = 0, bestBools = 0, bestGroup = 0;
-    for (int bo = 4; bo <= 0xC0; bo += 4) {
-        if (bo == g_offPropOff) continue;
-
-        uint32_t goff[96] = {}, gbits[96] = {};    // an offset, and the bits already claimed there
-        int gsize[96] = {};
-        int groups = 0, bools = 0, biggest = 0;
-        bool ok = true;
-
-        for (uintptr_t cls = cls0; cls && ok; ) {
-            uint32_t head = 0;
-            if (SafeU32(cls + g_offChildren, &head) && head >= 0x10000) {
-                uintptr_t seen[512]; int nseen = 0;
-                for (uintptr_t p = head; p && nseen < 512 && ok; ) {
-                    uint32_t off = 0, m = 0;
-                    if (PropIsBool(p) && SafeU32(p + g_offPropOff, &off) && SafeU32(p + bo, &m)) {
-                        if (m == 0 || (m & (m - 1)) != 0) {
-                            ok = false;                      // not a single bit - wrong dword
-                        } else {
-                            int g = -1;
-                            for (int k = 0; k < groups; ++k) if (goff[k] == off) { g = k; break; }
-                            if (g < 0 && groups < 96) { g = groups++; goff[g] = off; }
-                            if (g >= 0) {
-                                if (gbits[g] & m) ok = false;   // two bools sharing one bit
-                                else {
-                                    gbits[g] |= m;
-                                    if (++gsize[g] > biggest) biggest = gsize[g];
-                                }
-                            }
-                            bools++;
-                        }
-                    }
-                    bool cycle = false;
-                    for (int k = 0; k < nseen; ++k) if (seen[k] == p) { cycle = true; break; }
-                    if (cycle) break;
-                    seen[nseen++] = p;
-                    uint32_t nxt;
-                    if (!SafeU32(p + g_offNext, &nxt) || nxt < 0x10000) break;
-                    p = nxt;
+    // Collect every bool with its containing offset, in declaration order.
+    // ⚠️ The group key is (DECLARING CLASS, offset), not offset alone.
+    //
+    // That was the actual defect behind six runs of "BitMask NOT FOUND". Grouping by offset only
+    // merges bools from different classes that happen to pack at the same numeric offset - and
+    // low offsets like +0x004C are packed by nearly every class in a chain. Run 7 shows what
+    // that produces: a phantom group of EIGHTY-SEVEN bools sharing +0x004C on TdMove_Grab. No
+    // dword can hold 87 distinct single bits, so the correct offset was rejected every time, on
+    // every seed, by a group that does not exist.
+    //
+    // It was never "one malformed property vetoing the offset" - the corroboration line now
+    // reads 0 of 224 disagree at +0x84. The premise was fine; the grouping was wrong.
+    struct Slot { uintptr_t obj; uintptr_t owner; uint32_t off; char name[40]; };
+    Slot sl[256]; int n = 0;
+    for (uintptr_t cls = cls0; cls && n < 256; ) {
+        uint32_t head = 0;
+        if (SafeU32(cls + g_offChildren, &head) && head >= 0x10000) {
+            uintptr_t seen[512]; int nseen = 0;
+            for (uintptr_t p = head; p && n < 256 && nseen < 512; ) {
+                uint32_t off = 0;
+                if (PropIsBool(p) && SafeU32(p + g_offPropOff, &off) && off < 0x4000) {
+                    sl[n].obj = p; sl[n].off = off; sl[n].owner = cls;
+                    ReadObjName(p, sl[n].name, sizeof(sl[n].name));
+                    n++;
                 }
+                bool cycle = false;
+                for (int k = 0; k < nseen; ++k) if (seen[k] == p) { cycle = true; break; }
+                if (cycle) break;
+                seen[nseen++] = p;
+                uint32_t nxt;
+                if (!SafeU32(p + g_offNext, &nxt) || nxt < 0x10000) break;
+                p = nxt;
             }
-            uint32_t super;
-            if (!SafeU32(cls + 0x3C, &super) || super < 0x10000) break;   // SuperField
-            cls = super;
         }
+        uint32_t super;
+        if (!SafeU32(cls + 0x3C, &super) || super < 0x10000) break;   // SuperField
+        cls = super;
+        if (--maxDepth <= 0) break;
+    }
+    if (n < 6) return false;
 
-        if (ok && bools >= 8 && biggest >= 4) {
-            if (npassed < 8) passed[npassed++] = bo;
-            if (bools > bestBools) { bestBools = bools; bestGroup = biggest; }
+    // The largest packing group is the one that decides it.
+    uint32_t bestOff = 0; uintptr_t bestOwner = 0; int bestN = 0;
+    for (int i = 0; i < n; ++i) {
+        int c = 0;
+        for (int j = 0; j < n; ++j)
+            if (sl[j].off == sl[i].off && sl[j].owner == sl[i].owner) c++;
+        // A real packing group cannot exceed the 32 bits of the dword it shares. Anything
+        // larger is a bookkeeping artefact and must not be allowed to become "the best".
+        if (c > bestN && c <= 32) { bestN = c; bestOff = sl[i].off; bestOwner = sl[i].owner; }
+    }
+    if (bestN < 6) return false;
+
+    int idx[32], gn = 0;
+    for (int i = 0; i < n && gn < 32; ++i)
+        if (sl[i].off == bestOff && sl[i].owner == bestOwner) idx[gn++] = i;
+
+    for (int bo = 4; bo <= 0x180; bo += 4) {
+        if (bo == g_offPropOff) continue;
+        uint32_t used = 0;
+        bool ok = true;
+        for (int g = 0; g < gn && ok; ++g) {
+            uint32_t m = 0;
+            if (!SafeU32(sl[idx[g]].obj + bo, &m)) { ok = false; break; }
+            if (m == 0 || (m & (m - 1)) != 0 || (used & m)) ok = false;   // one bit, unclaimed
+            else used |= m;
         }
-    }
+        if (!ok) continue;
 
-    if (npassed == 0) {
-        Log("[prop] UBoolProperty::BitMask NOT FOUND - bool flags will be skipped");
-        return;
-    }
-    // BitMask is the first member PAST UProperty, so among the survivors the lowest offset above
-    // Offset is the one. More than one survivor is reported rather than hidden: it means the
-    // constraint was not as tight as it looks on this build, and a wrong pick would otherwise
-    // show up much later as a flag that is always zero.
-    g_offBoolMask = -1;
-    for (int i = 0; i < npassed; ++i)
-        if (passed[i] > g_offPropOff && (g_offBoolMask < 0 || passed[i] < g_offBoolMask))
-            g_offBoolMask = passed[i];
-    if (g_offBoolMask < 0) g_offBoolMask = passed[0];
+        g_offBoolMask = bo;
+        Log("*** [prop] UBoolProperty::BitMask at +0x%02X   (the %d bools packed at %s+0x%04X"
+            " hold %d distinct single bits)", bo, gn, className, bestOff, gn);
 
-    Log("*** [prop] UBoolProperty::BitMask at +0x%02X   (%d bools, largest group %d, every mask a"
-        " distinct single bit)", g_offBoolMask, bestBools, bestGroup);
-    if (npassed > 1)
-        Log("[prop]   ⚠️ %d dwords satisfied the test; took the lowest above Offset. A flag that"
-            " reads as always-zero means this picked wrong.", npassed);
+        // Corroboration, not a gate. Every other bool on the chain SHOULD also be a single bit;
+        // if one is not, name it - that is a layout surprise worth seeing, and it is exactly
+        // what silently vetoed this offset when the test was global.
+        int odd = 0;
+        for (int i = 0; i < n; ++i) {
+            if (sl[i].off == bestOff && sl[i].owner == bestOwner) continue;
+            uint32_t m = 0;
+            if (SafeU32(sl[i].obj + bo, &m) && m != 0 && (m & (m - 1)) == 0) continue;
+            if (++odd <= 4)
+                Log("[prop]   ⚠️ %s (+0x%04X) holds %08X here - not a single bit",
+                    sl[i].name, sl[i].off, m);
+        }
+        Log("[prop]   %d of %d bools outside that group disagree", odd, n - gn);
+        return true;
+    }
+    Log("[prop] BitMask: %s yielded no candidate over %d bools (largest group %d at +0x%04X)",
+        className, n, bestN, bestOff);
+    return false;
+}
+
+static void DumpBoolMaskCandidates(const char* className);   // defined with the probe below
+
+// Seeds in order of how clean their bool packing is, not how important they are. The move
+// classes are small, game-authored and densely packed; the controller is the one that already
+// failed. First success wins and the rest are skipped.
+static void DeriveBoolMaskFromAnyClass()
+{
+    if (g_offBoolMask >= 0) return;
+    static const char* kSeeds[] = {
+        "TdMove_Grab", "TdMove_Swing", "TdMove_Walking", "TdPlayerPawn", "TdPlayerController",
+    };
+    for (int i = 0; i < (int)(sizeof(kSeeds) / sizeof(kSeeds[0])); ++i)
+        if (DeriveBoolMaskOffset(kSeeds[i], 3)) return;
+    Log("[prop] UBoolProperty::BitMask NOT FOUND on any seed - dumping the evidence:");
+    DumpBoolMaskCandidates("TdMove_Grab");
 }
 
 // ---- one property, and HOW to read it ----
@@ -6820,7 +7914,7 @@ static int  g_offInputSize = -1;
 
 static void ResolveInputGates()
 {
-    DeriveBoolMaskOffset("TdPlayerController");
+    DeriveBoolMaskFromAnyClass();
 
     char missing[512]; int mn = 0; int nmissing = 0;
     missing[0] = 0;
@@ -7320,6 +8414,42 @@ bool             g_pitchAbsolute = true;
 bool             g_animFollow     = true;   // PITCH; NUMPAD2
 bool             g_animRollFollow = true;   // ROLL;  NUMPAD4
 bool             g_animYawFollow  = true;   // YAW;   NUMPAD5
+
+// ---- PK.3: the shimmy animation stops steering the camera ----
+//
+// Measured: state Grabbing carries 55.1 degrees of camera PITCH animation and 10.8 of roll. That
+// is the game's hand-over-hand shimmy throwing the view around on its own schedule - which is
+// exactly the rhythm the player reported feeling instead of their own pull.
+//
+// The suppression already exists as LockAnimPitch/Roll/Yaw and is proven. All this adds is
+// forcing it on while the player is on a ledge, and restoring the player's own setting on the
+// way out - so someone who deliberately wants the animated camera everywhere else keeps it.
+static bool g_pkLockAnim = true;            // ParkourLockAnim in mevr.ini
+static bool g_pkAnimSaved = false;
+static bool g_pkAnimPrev[3] = { true, true, true };
+
+void ParkourAnimLock(bool onWall)
+{
+    if (!g_pkLockAnim) return;
+    if (onWall && !g_pkAnimSaved) {
+        g_pkAnimPrev[0] = g_animFollow;
+        g_pkAnimPrev[1] = g_animRollFollow;
+        g_pkAnimPrev[2] = g_animYawFollow;
+        g_pkAnimSaved = true;
+        g_animFollow = g_animRollFollow = g_animYawFollow = false;
+        Log("[pk] camera animation locked for the wall (was pitch=%d roll=%d yaw=%d)",
+            (int)g_pkAnimPrev[0], (int)g_pkAnimPrev[1], (int)g_pkAnimPrev[2]);
+    } else if (!onWall && g_pkAnimSaved) {
+        // Restored, not set to true. The player may have turned these off themselves, and
+        // handing them back a different setting than they chose is its own bug.
+        g_animFollow     = g_pkAnimPrev[0];
+        g_animRollFollow = g_pkAnimPrev[1];
+        g_animYawFollow  = g_pkAnimPrev[2];
+        g_pkAnimSaved = false;
+        Log("[pk] camera animation restored to pitch=%d roll=%d yaw=%d",
+            (int)g_pkAnimPrev[0], (int)g_pkAnimPrev[1], (int)g_pkAnimPrev[2]);
+    }
+}
 extern float     g_animNow[3];              // camera animation contribution, degrees, P/Y/R
 static bool      g_headPrimed = false;
 static int32_t   g_lastHeadYaw = 0, g_lastHeadPitch = 0;
@@ -8021,6 +9151,21 @@ static void AutoArm()
     }
 
     if (g_vmReg >= 0) {
+        // ---- settle before arming ----
+        //
+        // Every measured half-res onset sits within a few frames of this arm firing, and
+        // the arm fires the moment a level finishes loading - the most fragile frames a run
+        // has (the 400-900 ms load hitches live exactly there). 120 frames of grace put the
+        // mod's load step past the engine's load-settle window instead of on top of it.
+        // Costs 1.7 s more of the flat view per level; the state it is dodging costs the
+        // whole run.
+        if (g_autoStage < 2) {
+            g_autoStage = 2;
+            g_autoWait = 120;
+            Log("[auto] scene ready - settling 120 frames before stereo arms (the engine is"
+                " most fragile right after a load)");
+            return;
+        }
         g_stereoMode = 1;
         g_simulStereo = true;
         g_eyeFilled[0] = g_eyeFilled[1] = false;
@@ -9305,9 +10450,26 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13HandPoseSnapshot& 
     // goes down on a hip and a hand can reach for the floor; if that read is game-authored IK
     // it will fight the VR write for the duration. If it does, take 16 back out - the whitelist
     // is deliberately conservative and this is the first entry admitted without proof.
+    // ---- 3 Grabbing, admitted only while Parkour is on ----
+    //
+    // This is the entry with the most to lose, and it is deliberately tied to the Parkour flag
+    // rather than added to the list outright: turning Parkour off takes it back out, so a run
+    // that goes wrong needs an ini edit rather than a rebuild.
+    //
+    // ⚠️ What to watch, in the terms the slide entry above set out. A hang is not a state where
+    // the arms merely hang - the game POSES them on the ledge and animates them hand-over-hand
+    // through a shimmy, so unlike Walking there is authored intent for those bones every frame.
+    // The write lands after UpdateSkelPose so it wins the frame it runs, but the arms are being
+    // driven towards somewhere else underneath it. The failure to look for is not the hands
+    // being in the wrong place - it is them fighting, or the shimmy stalling because the pose it
+    // wants never appears.
+    //
+    // The reason to admit it anyway: the player cannot judge ANY of the parkour work while their
+    // in-game hands are somewhere their real hands are not. That was the whole report.
     if (g_offMoveState < 0 || !SafeRead(pawn + g_offMoveState, &movement, 1) ||
         !(movement == 1 || movement == 2 || movement == 11 || movement == 15 ||
-          movement == 16 || movement == 24 || movement == 29 || movement == 30)) {
+          movement == 16 || movement == 24 || movement == 29 || movement == 30 ||
+          (g_parkour && movement == 3))) {
         if (outMovement) *outMovement = movement;
         return P13_MOVEMENT;
     }
@@ -11236,12 +12398,51 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
     }
 
     uintptr_t ignored = 0;
-    const bool leftEligible =
+    bool leftEligible =
         P13Eligibility(pawn, pose.left, pose.presentFrame, true,
                        &ignored, nullptr, nullptr) == P13_READY;
-    const bool rightEligible =
+    bool rightEligible =
         P13Eligibility(pawn, pose.right, pose.presentFrame, false,
                        &ignored, nullptr, nullptr) == P13_READY;
+
+    // ---- PK.7: a hand holding the ledge belongs to the GAME, not to the controller ----
+    //
+    // Everything before this tried to compute where a held hand should be: project it onto the
+    // ledge line, latch an anchor, chase it with IK. All of that was solving a problem the game
+    // has already solved. Its own hang pose puts both hands on the ledge, correctly, in line with
+    // it, with the fingers wrapped over the edge - which is exactly the pose the player described
+    // wanting ("freeze it, that is where I want my hands").
+    //
+    // So a gripping hand is simply handed BACK. Our IK stands down for it, the animation poses
+    // it, and it is on the ledge by construction - no radius to size, no anchor to hold, no
+    // mapping offset to correct. A released hand is the player's again and tracks the controller.
+    //
+    // Three things the player asked for fall out of this rather than needing to be built:
+    //   - a held hand stays put while the arm moves, because it is not following the arm at all
+    //   - re-gripping elsewhere lands perfectly in line with the ledge, because the game placed it
+    //   - the finger pose is the game's ledge grip while held, and reverts to the mod's own
+    //     grip-driven curl the moment it is released
+    //
+    // ⚠️ What this does NOT do is put the hand where the player physically reached. The game
+    // knows one hand position and it is relative to the body. Combined with the direct body
+    // drive that converges - pull, and the body brings the hand to where you reached - but the
+    // hand does not travel independently of the body, and it cannot without owning the pose.
+    //
+    // Gated on PROXIMITY as well as grip, because "grip anywhere and the hand teleports to the
+    // ledge" is not what was asked for. Squeezing out in open air should still close a fist on
+    // nothing - that is the player's own hand doing what they told it. Only a grip within reach
+    // of the ledge is a grab, and the distance that decides it is the one now on the overlay.
+    if (g_parkour && g_pkMode == PK_LEDGE) {
+        const float reach = g_pkSnapRadius * g_pkUUPerMetre;
+        for (int h = 0; h < 2; ++h) {
+            // Not called `near`: windef.h still #defines that, and the error it produces names
+            // the line rather than the macro.
+            const bool inReach = g_pkHandLedgeDist[h] >= 0.0f && g_pkHandLedgeDist[h] <= reach;
+            if (g_gripValue[h] > 0.5f && inReach) {
+                if (h == 0) leftEligible = false; else rightEligible = false;
+            }
+        }
+    }
 
     MEVR_Vec3 leftSocket{}, rightSocket{};
     const bool haveLeftSocket = ShoulderWorldPosition(
@@ -11298,14 +12499,29 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
         }
         g_armGeometryDiag[hand] = diag;
     };
-    updateGeometry(0, 17, leftSocket, pose.left.worldPosition, haveLeftSocket);
-    updateGeometry(1, 46, rightSocket, pose.right.worldPosition, haveRightSocket);
+    // ---- PK.5 applies HERE, on the value that reaches the solve ----
+    //
+    // It was first written into MonitorArmContinuity, which is a diagnostic: the worldTarget it
+    // fills is a snapshot kept for judder analysis and is never read back by the IK. So the snap
+    // ran, edited a copy, and changed nothing on screen - and because that function is not
+    // reached in every state, the distance it published stayed at its -1 sentinel too, which is
+    // why the overlay read L-- R-- on a ledge with a perfectly readable ledge.
+    //
+    // These two locals are what updateGeometry measures and what SolveDetachedOffset solves for,
+    // so a hand moved here is a hand moved in the game.
+    MEVR_Vec3 leftWorld = pose.left.worldPosition;
+    MEVR_Vec3 rightWorld = pose.right.worldPosition;
+    PkSnapHandToLedge(0, &leftWorld);
+    PkSnapHandToLedge(1, &rightWorld);
+
+    updateGeometry(0, 17, leftSocket, leftWorld, haveLeftSocket);
+    updateGeometry(1, 46, rightSocket, rightWorld, haveRightSocket);
     const bool holdShoulderEngagement = MotionTurnInputActive();
     const MEVR_Vec3 leftOffset = SolveDetachedOffset(
-        g_leftDetach, leftSocket, pose.left.worldPosition,
+        g_leftDetach, leftSocket, leftWorld,
         leftEligible && haveLeftSocket, holdShoulderEngagement);
     const MEVR_Vec3 rightOffset = SolveDetachedOffset(
-        g_rightDetach, rightSocket, pose.right.worldPosition,
+        g_rightDetach, rightSocket, rightWorld,
         rightEligible && haveRightSocket, holdShoulderEngagement);
     g_armChainRootValid[0] = leftEligible && haveLeftSocket;
     g_armChainRootValid[1] = rightEligible && haveRightSocket;
@@ -14314,19 +15530,24 @@ static void AdoptSceneTarget()
     int  best = -1;
     long bestScene = 0;
     long bestBackbufferScene = 0;
-    long halfFp16Scene = 0;   // the partial-failure signal; see the streak guard below
+    long halfSizeScene = 0;   // the partial-failure signal; see the streak guard below
     for (int i = 0; i < g_rtSeenCount; ++i) {
         const long sd = g_rtSeen[i].sceneDraws;
         if (g_rtSeen[i].w == g_capW && g_rtSeen[i].h == g_capH) {
             if (sd > bestBackbufferScene) bestBackbufferScene = sd;
         }
         else if (sd > bestScene) { bestScene = sd; best = i; }
-        // Exactly half the capture size AND fp16: the one buffer the measured failure uses.
-        // Keyed that tightly because run 27 records full-res shadow maps passing looser
-        // tests, and shadow maps are never fmt 113 in any census on record.
+        // Exactly half the capture size, in EITHER of the game's scene colour formats: fp16
+        // (fmt 113, the 2026-08-28 afternoon runs) or LDR (fmt 21, run 14 on 08-23 and the
+        // 22:16 training-area run - which streaked for its whole minute while a guard keyed
+        // to 113 alone read "healthy"). Not any-format, deliberately: shadow passes can
+        // carry the scene matrix (run 27), but shadow targets are fmt 36 in every census on
+        // record, and the half-size 21/113 pair are the game's own scene buffers. Scene-
+        // classified draws only - the menu legitimately pushes 180k RAW draws through the
+        // half-size fmt 21 buffer with zero scene draws, so raw counts here would false-fire.
         if (g_rtSeen[i].w * 2 == g_capW && g_rtSeen[i].h * 2 == g_capH &&
-            g_rtSeen[i].fmt == 113)
-            halfFp16Scene += sd;
+            (g_rtSeen[i].fmt == 113 || g_rtSeen[i].fmt == 21))
+            halfSizeScene += sd;
     }
     for (int i = 0; i < g_rtSeenCount; ++i) g_rtSeen[i].sceneDraws = 0;
 
@@ -14362,36 +15583,64 @@ static void AdoptSceneTarget()
         // ---- the streak guard: the PARTIAL failure the parity rule reads as healthy ----
         //
         // Measured 2026-08-28 (runs 14:04 / 14:05 / 14:19): ~9k scene draws per window on
-        // the half-size fp16 buffer while the backbuffer keeps the majority (786 vs 323 per
+        // a half-size scene buffer while the backbuffer keeps the majority (786 vs 323 per
         // frame). This branch means "backbuffer is live", so duplication kept running - over
         // a frame the game no longer fully repaints - and the player saw the run-16 trails:
         // hands and building edges ghosting along their motion history. Same answer as the
         // full split: present mono, resume when it clears.
         //
+        // The 22:16 training-area run is why the signal covers BOTH half-size colour
+        // formats: that run's degraded phase used the fmt 21 buffer (237 scene draws a
+        // frame, a minute of streaking) and the first guard, keyed to fmt 113 alone, sat
+        // silent through all of it.
+        //
         // Entry is ONE window because the measured signal is 4x this threshold and every
-        // healthy run on record measures ZERO scene draws here in every window; exit takes
-        // two clean windows so a boundary case cannot flap duplication on and off.
+        // healthy run on record measures ZERO scene draws here in every window.
+        //
+        // Exit is a RETRY LOOP, not a one-shot: while mono holds, duplication is off, the
+        // occlusion override stands down with it (AUTO keys on dup), and the FOV force
+        // stands down too - so the engine is being measured under the lightest load the mod
+        // can offer, which is its best chance to leave the state. Clean windows resume
+        // stereo. A resume that degrades again within ten windows was a failed retry, and
+        // the clean-window requirement doubles (2 -> 4 -> 8 -> 16 cap) so a stubborn run
+        // settles into flat rather than flapping the player between stereo and mono; a
+        // resume that HOLDS ten windows resets the ladder.
         const long kPartialSceneDraws = 2000;
         static int partialCleanStreak = 0;
-        if (halfFp16Scene >= kPartialSceneDraws) {
+        static int resumeCleanNeeded  = 2;
+        static int windowsSinceResume = -1;   // -1 = no resume being scored
+        if (halfSizeScene >= kPartialSceneDraws) {
             partialCleanStreak = 0;
             if (!g_scenePartialMono) {
+                if (windowsSinceResume >= 0) {
+                    // The previous resume did not hold - climb the ladder.
+                    resumeCleanNeeded = (resumeCleanNeeded < 16) ? resumeCleanNeeded * 2 : 16;
+                    windowsSinceResume = -1;
+                }
                 g_scenePartialMono = true;
                 Log("");
-                Log("*** [rt] PARTIAL half-res: %ld scene draws this window went to the"
-                    " half-size fp16 buffer while the backbuffer stays live. Duplicating"
+                Log("*** [rt] PARTIAL half-res: %ld scene draws this window went to a"
+                    " half-size scene buffer while the backbuffer stays live. Duplicating"
                     " would streak hands and edges over the unrepainted remainder -"
-                    " presenting MONO until it clears.", halfFp16Scene);
+                    " presenting MONO and retrying (%d clean windows to resume).",
+                    halfSizeScene, resumeCleanNeeded);
             }
         } else if (g_scenePartialMono) {
-            if (++partialCleanStreak >= 2) {
+            if (++partialCleanStreak >= resumeCleanNeeded) {
                 g_scenePartialMono = false;
                 partialCleanStreak = 0;
-                Log("*** [rt] the half-size fp16 buffer is quiet again - stereo duplication"
-                    " resumed");
+                windowsSinceResume = 0;
+                Log("*** [rt] the half-size scene buffers are quiet again - stereo duplication"
+                    " resumed (retry ladder at %d)", resumeCleanNeeded);
             }
         } else {
             partialCleanStreak = 0;
+            if (windowsSinceResume >= 0 && ++windowsSinceResume >= 10) {
+                if (resumeCleanNeeded > 2)
+                    Log("[rt] the resume held for 10 clean windows - retry ladder reset");
+                resumeCleanNeeded = 2;
+                windowsSinceResume = -1;
+            }
         }
         return;
     }
@@ -14447,7 +15696,8 @@ static void ReportRenderTargets()
     const UINT sw = g_sceneW ? g_sceneW : g_capW;
     const UINT sh = g_sceneH ? g_sceneH : g_capH;
     Log("[rt] distinct render targets seen this window:");
-    long halfResDraws = 0;
+    long halfResDraws = 0;    // RAW draws on the half-size fp16 buffer - the headless signal
+    long halfSceneDraws = 0;  // scene-classified draws on ANY half-size colour target
     for (int i = 0; i < g_rtSeenCount; ++i) {
         Log("[rt]   %p  %4ux%-4u fmt %-3d  %8ld draws (%ld scene)  %s",
             (void*)g_rtSeen[i].surf, g_rtSeen[i].w, g_rtSeen[i].h, (int)g_rtSeen[i].fmt,
@@ -14456,19 +15706,29 @@ static void ReportRenderTargets()
         // Keyed to half the reference size, not a hardcoded 1280x720, so a different game
         // resolution keeps the verdict honest. The capture size when XR is up; the first
         // target ever bound - the backbuffer - on a monitor-only run, where g_capW stays 0
-        // and keying on it made every verdict a false "healthy". fmt 113 is the fp16 buffer
-        // the degraded path renders into.
+        // and keying on it made every verdict a false "healthy".
+        //
+        // Two signals, because the two failures measure differently. RAW draws are counted
+        // for fmt 113 only: the menu legitimately pushes ~180k raw draws through the
+        // half-size fmt 21 buffer, so raw-21 would cry wolf every launch. Scene-classified
+        // draws are counted for BOTH 21 and 113 - the 22:16 training-area run degraded into
+        // the 21 variant and a verdict keyed to 113 alone printed "healthy" for a minute of
+        // visible streaking.
         const UINT refW = g_capW ? g_capW : (g_rtSeenCount ? g_rtSeen[0].w : 0);
         const UINT refH = g_capH ? g_capH : (g_rtSeenCount ? g_rtSeen[0].h : 0);
-        if (refW && g_rtSeen[i].w * 2 == refW && g_rtSeen[i].h * 2 == refH &&
-            g_rtSeen[i].fmt == 113)
-            halfResDraws += g_rtSeen[i].draws;
+        if (refW && g_rtSeen[i].w * 2 == refW && g_rtSeen[i].h * 2 == refH) {
+            if (g_rtSeen[i].fmt == 113) halfResDraws += g_rtSeen[i].draws;
+            if (g_rtSeen[i].fmt == 113 || g_rtSeen[i].fmt == 21)
+                halfSceneDraws += g_rtSeen[i].sceneDraws;
+        }
         g_rtSeen[i].draws = 0;
     }
-    // One greppable verdict per window. Healthy runs put ~53 startup draws there and then
-    // nothing; degraded runs put tens of thousands per window from the menu onwards.
-    Log("[mode] half-res fp16 draws this window: %ld  %s%s", halfResDraws,
-        halfResDraws > 1000 ? "<- DEGRADED half-res scene path" : "(healthy)",
+    // One greppable verdict per window. Healthy runs put ~53 startup draws on the fp16
+    // buffer and then nothing, and never a scene-classified draw on either half-size buffer.
+    Log("[mode] half-res this window: fp16 raw %ld, scene-classified %ld  %s%s",
+        halfResDraws, halfSceneDraws,
+        (halfResDraws > 1000 || halfSceneDraws > 1000)
+            ? "<- DEGRADED half-res scene path" : "(healthy)",
         g_sceneSplitMono ? "  [mono: full split]"
                          : (g_scenePartialMono ? "  [mono: streak guard]" : ""));
 }
@@ -14844,6 +16104,24 @@ void UpdateSixDof(XrTime when)
     g_dofOffset[0] = (dx * hrx + dz * hrz) * g_worldScale;   // right
     g_dofOffset[1] =  dy                   * g_worldScale;   // up, true vertical
     g_dofOffset[2] = (dx * hfx + dz * hfz) * g_worldScale;   // forward
+
+    // ---- PK.2 composes here, AFTER the headset write, never instead of it ----
+    //
+    // These three are assigned, not accumulated, so a lead folded in earlier would be discarded
+    // on the next frame. It goes on the RIGHT axis because that is the axis the shimmy servo
+    // measures against, and both are the head's own levelled right - the same basis, so the view
+    // moves along exactly the line the player pulled.
+    if (g_pkCamLead != 0.0f) {
+        g_dofOffset[0] += g_pkCamLead * g_worldScale;
+        // Said once, because the lead is silently inert with 6-DOF off and a player who toggled
+        // it away would otherwise be debugging a shimmy that merely looks unresponsive.
+        static bool warned = false;
+        if (!g_sixDof && !warned) {
+            warned = true;
+            Log("[pk] camera lead is active but 6-DOF is OFF (PAGE DOWN) - the view will not"
+                " answer the pull until it is on");
+        }
+    }
 
     // ---- diagnostic: how much does the room-to-world yaw offset wobble? ----
     //
@@ -15839,6 +17117,8 @@ static HRESULT STDMETHODCALLTYPE Hook_DrawIndexed(IDirect3DDevice9* dev, D3DPRIM
 // project months.
 
 int  g_offMoveState = -1;
+int  g_offCurrentMove = -1;          // no such pointer exists - kept so the probe can say so
+int  g_offMoves = -1;                // TdPlayerPawn::Moves - TdMove_* instances by EMovement
 int  g_offWeapon = -1;
 int  g_offWeaponAnimState = -1;
 int  g_offVelocity = -1;             // Actor::Velocity, for the AS.1a curve sweep
@@ -15861,6 +17141,23 @@ static const char* kMoveNames[] = {
     "BotTurnRun","BotTurnStand","ExitCover","Vertigo","MeleeSlide","WallClimbDodgeJump",
     "WallClimb180Jump","WallClimbDodgeL","WallClimbDodgeR","MeleeVault","BotMelee2",
     "StumbleHard","BotRoll","BotFlip",
+    // ---- 58..93, derived from TdPlayerPawn::Moves on 2026-08-28, not transcribed ----
+    //
+    // The first 58 entries were never misaligned, only truncated: the run dumped the whole
+    // 94-entry array and every one of them agreed with the class at its index. What was missing
+    // was the tail, and 60/73 - the swing and its launch - sat in it, which is why the
+    // horizontal bar could not be named at all.
+    //
+    // "-" marks a slot the PLAYER pawn leaves null. Those are the bot and AI moves; the enum
+    // value exists, the player just never instantiates one, so a state byte landing on a dash
+    // would be a real finding rather than a gap in this table.
+    //
+    // 72 = FallingUncontrolled retro-explains the "state 72 at a fall entry" that had been
+    // logged as out-of-enum and unexplained.
+    "-","-","Swing","Coil","MeleeWallrun","MeleeCrouch","-","-","-","-",
+    "-","-","-","Disabled","FallingUncontrolled","SwingJump","AnimationPlayback","-","-","-",
+    "SoftLanding","-","-","AutoStepUp","MeleeAirAbove","-","-","AirBarge","-","-",
+    "-","-","-","SkillRoll","-","Cutscene",
 };
 static const int kMoveCount = (int)(sizeof(kMoveNames) / sizeof(kMoveNames[0]));
 
@@ -15872,6 +17169,609 @@ static const char* MoveName(int st)
     return (st >= 0 && st < kMoveCount) ? kMoveNames[st] : "?";
 }
 
+// ---- the move OBJECT's class name, which is the state's real identity ----
+//
+// kMoveNames above is a PARTIAL transcription. The script package declares 95 EMovement values;
+// that table holds 58, and the ones it is missing are not all past the end - MOVE_Coil,
+// MOVE_Cover, MOVE_Cutscene, MOVE_AutoStepUp, MOVE_SkillRoll, MOVE_SoftLanding and
+// MOVE_JumpIntoGrab have no entry, so every name after the first gap is attached to the wrong
+// byte. MOVE_Swing is absent outright, which means the horizontal-bar state cannot currently be
+// named at all. The parkour work keys entirely off "which state am I in", so the table has to
+// stop being the thing that is trusted.
+//
+// TdPawn::CurrentMove points at the live TdMove_* instance, and the name of its CLASS is the
+// same fact with no table in the middle. Reading that makes the byte the thing being verified
+// rather than the thing being believed - and the census below turns a play session into the
+// corrected enum.
+//
+// ⚠️ The instance's own Name is NOT its class name. A UObject's Name is per-instance; for moves
+// spawned per pawn that is "TdMove_Grab_7" or similar. LooksLikeSwanInstance compares an
+// instance name to "TdSwanNeck" directly and gets away with it only because that object happens
+// to be named for its class. Do not copy that shortcut here - go through Class.
+static const int kUObjectClassOff = 0x34;   // UObject::Class, the offset LooksLikeSwanInstance uses
+
+// ---- the live move object, reached through Moves[MovementState] ----
+//
+// Measured 2026-08-28: there is no current-move pointer. TdPlayerPawn::Moves at +0x05FC is a
+// 94-entry TArray of TdMove_* instances INDEXED BY EMovement, and the state byte is the index.
+// So the state byte and the move object are not two facts to be cross-checked - the byte
+// selects the object, and reading it back is a check on the OFFSET, not on the enum.
+//
+// That is still worth doing every frame. A patch, a level transition or a wrong Moves offset
+// all show up here as a class that disagrees with the state, and the alternative is trusting a
+// hardcoded +0x05FC forever.
+//
+// The object pointer is the payload. Everything downstream - bIsShimmying on TdMove_Grab,
+// SwingAngle on TdMove_Swing, ClimbState on TdMove_Climb - is a property read off THIS pointer,
+// and there is no other way to reach it.
+static bool ReadMoveClassName(uintptr_t pawn, int st, char* out, size_t cap, uintptr_t* outObj)
+{
+    if (out && cap) out[0] = '\0';
+    if (outObj) *outObj = 0;
+    if (!pawn || g_offMoves < 0 || g_offName < 0 || st < 0) return false;
+
+    uint32_t arr[3] = {};       // Data, Count, Max
+    if (!SafeRead(pawn + g_offMoves, arr, sizeof(arr))) return false;
+    if (arr[0] < 0x10000 || st >= (int)arr[1]) return false;
+
+    uint32_t obj = 0;
+    // A null slot is normal, not a fault: the player pawn does not instantiate the bot moves,
+    // and 30 of the 94 entries are empty on it.
+    if (!SafeU32((uintptr_t)arr[0] + (uintptr_t)st * 4, &obj) || obj < 0x10000) return false;
+    if (outObj) *outObj = (uintptr_t)obj;
+    uint32_t cls = 0;
+    if (!SafeU32((uintptr_t)obj + kUObjectClassOff, &cls) || cls < 0x10000) return false;
+    return ReadObjName((uintptr_t)cls, out, cap);
+}
+
+// The corrected enum, accumulated from play rather than transcribed. One row per state byte
+// actually entered, carrying the move class that was live at it and how many frames it held.
+static char g_moveClassSeen[256][48] = {};
+static long g_moveClassFrames[256] = {};
+static bool g_moveCensusDirty = false;
+
+// ---- where the move objects actually live, since CurrentMove is not on the pawn ----
+//
+// Run 1 of this probe: "TdPlayerPawn::CurrentMove NOT FOUND after walking 1576 fields up the
+// class chain". The name is in the package, so it belongs to some other class - and the census
+// it was meant to feed produced nothing but "?" for every state.
+//
+// The names table also carries `Moves` and `MoveClasses`, and an array indexed by EMovement is
+// the more likely design: it explains the absent pointer, and it is strictly better for us.
+// A pointer only ever names the state you are standing in, so the enum could only be recovered
+// by visiting all 95 states in gameplay. An ARRAY hands over the whole mapping in one read,
+// including the states this player will never enter.
+//
+// ⚠️ Both interpretations are printed for every element, deliberately. `Moves` would hold
+// INSTANCES (whose own Name is per-instance, so the class must be reached through Class at
+// +0x34), while `MoveClasses` would hold UClass pointers (whose own Name IS the class name).
+// Guessing which array is which costs a whole run; printing both costs two columns.
+static void ResolveMoveProbeProps();   // defined below, beside the table it fills
+
+static void ProbeMoveObjectArrays()
+{
+    static bool done = false;
+    if (done) return;
+    const uintptr_t pawn = g_playerPawn, ctl = g_playerCtl;
+    if (!pawn || g_offName < 0 || g_offPropOff < 0) return;   // retry next frame
+    done = true;
+
+    Log("");
+    Log("======== move-object probe: where the TdMove_* instances live ========");
+
+    // The pointer, tried everywhere it could plausibly be declared. Verbose, so each line says
+    // either the offset and the declaring class or that the walk did not find it.
+    struct Cand { const char* cls; const char* prop; };
+    static const Cand kPtr[] = {
+        { "TdPlayerPawn", "CurrentMove" }, { "TdPlayerPawn", "Move" },
+        { "TdPlayerPawn", "ActiveMove" },  { "TdPlayerPawn", "MoveSettings" },
+        { "TdPlayerController", "CurrentMove" }, { "TdPlayerController", "Move" },
+    };
+    for (int i = 0; i < (int)(sizeof(kPtr) / sizeof(kPtr[0])); ++i) {
+        const int off = LookupProp(kPtr[i].cls, kPtr[i].prop, false);
+        if (off < 0) continue;
+        Log("[move] candidate %s::%s at +0x%04X", kPtr[i].cls, kPtr[i].prop, off);
+        if (g_offCurrentMove < 0 && strcmp(kPtr[i].prop, "MoveSettings") != 0) {
+            g_offCurrentMove = off;
+            Log("[move]   ^ adopted as the live-move pointer");
+        }
+    }
+    if (g_offCurrentMove < 0)
+        Log("[move] no live-move pointer found on the pawn or the controller");
+
+    // The arrays. UE3 TArray is { void* Data; int Count; int Max; } - the same shape the
+    // GNames/GObjects scans already validate against, so this is a known quantity.
+    static const Cand kArr[] = {
+        { "TdPlayerPawn", "Moves" }, { "TdPlayerPawn", "MoveClasses" },
+        { "TdPlayerController", "Moves" }, { "TdPlayerController", "MoveClasses" },
+    };
+    for (int i = 0; i < (int)(sizeof(kArr) / sizeof(kArr[0])); ++i) {
+        const bool onCtl = (strcmp(kArr[i].cls, "TdPlayerController") == 0);
+        const uintptr_t base = onCtl ? ctl : pawn;
+        if (!base) continue;
+        const int off = LookupProp(kArr[i].cls, kArr[i].prop, false);
+        if (off < 0) continue;
+
+        uint32_t arr[3] = {};       // Data, Count, Max
+        if (!SafeRead(base + off, arr, sizeof(arr))) {
+            Log("[move] %s::%s at +0x%04X - unreadable", kArr[i].cls, kArr[i].prop, off);
+            continue;
+        }
+        // A wrong offset reads as garbage rather than failing, so the shape is checked before
+        // anything is believed: a plausible heap pointer, and a count that could index EMovement.
+        if (arr[0] < 0x10000 || arr[1] <= 0 || arr[1] > 256 || arr[2] < (uint32_t)arr[1]) {
+            Log("[move] %s::%s at +0x%04X does not look like a TArray"
+                " (Data %08X Count %d Max %d) - skipped",
+                kArr[i].cls, kArr[i].prop, off, arr[0], (int)arr[1], (int)arr[2]);
+            continue;
+        }
+        Log("[move] %s::%s at +0x%04X: %d entries  <-- if this is indexed by EMovement,"
+            " the whole enum is below", kArr[i].cls, kArr[i].prop, off, (int)arr[1]);
+        // The INSTANCE array is the one worth keeping: property reads need a live object, and
+        // MoveClasses holds UClass pointers, which carry no per-frame state at all.
+        if (!onCtl && strcmp(kArr[i].prop, "Moves") == 0 && g_offMoves < 0) {
+            g_offMoves = off;
+            Log("[move]   ^ adopted: Moves[MovementState] is the live move object from here on");
+        }
+        for (int e = 0; e < (int)arr[1]; ++e) {
+            uint32_t obj = 0;
+            if (!SafeU32((uintptr_t)arr[0] + (uintptr_t)e * 4, &obj) || obj < 0x10000) {
+                Log("[move]   %3d  (null)", e);
+                continue;
+            }
+            char own[64] = "?", viaClass[64] = "?";
+            ReadObjName((uintptr_t)obj, own, sizeof(own));
+            uint32_t cls = 0;
+            if (SafeU32((uintptr_t)obj + kUObjectClassOff, &cls) && cls >= 0x10000)
+                ReadObjName((uintptr_t)cls, viaClass, sizeof(viaClass));
+            Log("[move]   %3d  own name %-32s  class %-32s  kMoveNames: %s",
+                e, own, viaClass, (e < kMoveCount) ? kMoveNames[e] : "(past the end)");
+        }
+    }
+    // Same one-shot moment, and it needs the same machinery: the parkour properties hang off
+    // the move CLASSES, which are reachable by name whether or not a pawn has instantiated them.
+    ResolveMoveProbeProps();
+    Log("======== end move-object probe ========");
+    Log("");
+}
+
+// ================================================================ move-object property probe
+//
+// The move object is the only place the parkour state actually lives. The state byte says
+// "Grabbing" for twenty seconds straight while the player shimmies along a ledge and turns a
+// corner - two runs measured exactly that, zero transitions inside the window - so every
+// question the ledge and bar designs turn on has to be answered from properties on the object,
+// not from the byte that selects it.
+//
+// ---- the type is not assumed, it is read and then printed three ways ----
+//
+// Nothing here knows whether bIsShimmying is a byte, a dword or a bit. UE3 packs bools into
+// BITFIELDS, so a UBoolProperty's offset names the containing dword and the bit is carried
+// separately - reading it as a byte would return several unrelated bools at once. So the raw
+// dword goes out in hex ALONGSIDE its int and float readings, and one run settles every type at
+// once: a bool announces itself as a single bit flipping inside an otherwise steady word.
+struct MoveProbeProp {
+    // ⚠️ Where a property LIVES and which move it is INTERESTING DURING are different things.
+    //
+    // bClimbDownFast - the pipe slide flag - is on TdPawn at +0x041C, not on TdMove_Climb. Asking
+    // TdMove_Climb for it returned ABSENT while the owner pass had the answer all along, because
+    // the fallback keys on (class, property) and the class in the question was wrong.
+    //
+    // So `cls` is where to look it up and read it from, and `showDuring` is the move class whose
+    // lines it appears on. Null means "same as cls", which is the ordinary case.
+    const char* cls;            // the class that DECLARES it
+    const char* showDuring;     // the move class to print it under; null = cls
+    bool        fromPawn;       // read off the pawn rather than the move object
+    const char* prop;
+    int         off;            // resolved once, -1 = absent
+    uint32_t    mask;           // BoolProperty only: which bit inside the dword at off
+    char        kind[24];       // BoolProperty / FloatProperty / StructProperty / ...
+    uint32_t    prev[3];        // last value seen, for change detection
+    bool        havePrev;
+};
+
+static MoveProbeProp g_moveProbe[] = {
+    // TdMove_Grab - the ledge. bRequestDropDown is the let-go flag the crouch button drives, so
+    // it is also the thing a release gesture would have to assert; the shimmy trio is what the
+    // state byte cannot see through a corner.
+    { "TdMove_Grab", nullptr, false, "bRequestDropDown" },
+    { "TdMove_Grab", nullptr, false, "bIsTurnedRight" },
+    { "TdMove_Grab", nullptr, false, "bSlopedLedge" },
+    { "TdMove_Grab", nullptr, false, "CurrentShimmyMove" },
+    { "TdMove_Grab", nullptr, false, "PendingShimmyCornerAnimation" },
+    { "TdMove_Grab", nullptr, false, "ShimmyVelocity" },
+    { "TdMove_Grab", nullptr, false, "GrabType" },
+    { "TdMove_Grab", nullptr, false, "TargetYaw" },
+    { "TdMove_Grab", nullptr, false, "DisableShimmyTime" },
+    // TdMove_Swing - the bar. SwingAngle is measured; bIsShimmying and ShimmyVelocity are the
+    // SIDEWAYS axis along the bar, which is a second input channel nothing has looked at yet.
+    { "TdMove_Swing", nullptr, false, "SwingAngle" },
+    { "TdMove_Swing", nullptr, false, "SwingVelocity" },
+    { "TdMove_Swing", nullptr, false, "bIsShimmying" },
+    { "TdMove_Swing", nullptr, false, "bIsTurning" },
+    { "TdMove_Swing", nullptr, false, "ShimmyVelocity" },
+    { "TdMove_Swing", nullptr, false, "SwingLocation" },
+    { "TdMove_Swing", nullptr, false, "BarDirection" },
+    { "TdMove_Swing", nullptr, false, "SwingAngleTimingOffset" },
+    // TdMove_Climb carries only animation and sound config - no ClimbState, no ClimbSpeed, no
+    // position. Run 4 dumped the whole class and there is nothing live on it, which is why the
+    // pipe has produced zero value lines across four runs. The state has to be on the climbable
+    // itself; TdLadderVolume is dumped below to find it.
+    // Located by the owner pass at TdMove_Climb+0x018C after five runs of ABSENT. The pipe has
+    // state after all; the Children walk simply never reached it.
+    { "TdMove_Climb", nullptr, false, "ClimbState" },
+    // Located by the owner pass on TdPawn+0x041C, both bits of one dword. Shown on the climb
+    // lines because that is the only time they mean anything.
+    { "TdPawn", "TdMove_Climb", true, "bClimbDownFast" },
+    { "TdPawn", "TdMove_Climb", true, "bClimbLeftHand" },
+    { "TdMove_Climb", nullptr, false, "ClimbDownFastVelocity" },
+    { "TdMove_Climb", nullptr, false, "StartTurningAngle" },
+};
+static const int kMoveProbeCount = (int)(sizeof(g_moveProbe) / sizeof(g_moveProbe[0]));
+
+// ---- when the derivation fails, print the evidence instead of guessing again ----
+//
+// Run 5 rejected every candidate on all five seeds, so the depth cap was not the problem and a
+// sixth guess is not worth a run. The constraint being tested is that the bools packed into ONE
+// dword hold distinct single bits; if no offset satisfies that, the honest move is to show what
+// those properties actually contain and read the answer off the page.
+//
+// The largest packing group is printed as a column per property, one row per candidate offset.
+// The row that reads 00000001 00000002 00000004 00000008 ... is BitMask, and nothing else in a
+// UProperty can look like that.
+static void DumpBoolMaskCandidates(const char* className)
+{
+    if (g_offChildren < 0 || g_offNext < 0 || g_offPropOff < 0) return;
+    uintptr_t cls = FindClassByName(className);
+    if (!cls) return;
+
+    uintptr_t obj[12]; char nm[12][40]; uint32_t want = 0; int n = 0, bestN = 0;
+    // Two passes: find the offset with the most bools, then collect that group in list order.
+    for (int pass = 0; pass < 2; ++pass) {
+        uint32_t counts[64] = {}, offs[64] = {}; int ngroups = 0;
+        n = 0;
+        uintptr_t c = cls;
+        for (int depth = 0; c && depth < 3; ++depth) {
+            uint32_t head = 0;
+            if (SafeU32(c + g_offChildren, &head) && head >= 0x10000) {
+                uintptr_t seen[512]; int nseen = 0;
+                for (uintptr_t q = head; q && nseen < 512; ) {
+                    uint32_t off = 0;
+                    if (PropIsBool(q) && SafeU32(q + g_offPropOff, &off) && off < 0x4000) {
+                        if (pass == 0) {
+                            int g = -1;
+                            for (int k = 0; k < ngroups; ++k) if (offs[k] == off) { g = k; break; }
+                            if (g < 0 && ngroups < 64) { g = ngroups++; offs[g] = off; }
+                            if (g >= 0 && ++counts[g] > (uint32_t)bestN) {
+                                bestN = (int)counts[g]; want = off;
+                            }
+                        } else if (off == want && n < 12) {
+                            obj[n] = q;
+                            ReadObjName(q, nm[n], sizeof(nm[n]));
+                            n++;
+                        }
+                    }
+                    bool cyc = false;
+                    for (int k = 0; k < nseen; ++k) if (seen[k] == q) { cyc = true; break; }
+                    if (cyc) break;
+                    seen[nseen++] = q;
+                    uint32_t nx;
+                    if (!SafeU32(q + g_offNext, &nx) || nx < 0x10000) break;
+                    q = nx;
+                }
+            }
+            uint32_t sup;
+            if (!SafeU32(c + 0x3C, &sup) || sup < 0x10000) break;
+            c = sup;
+        }
+    }
+    if (n < 3) { Log("[bitmask] %s: largest bool group is %d - too small to read", className, n); return; }
+
+    Log("[bitmask] %s: %d bools packed at +0x%04X (Offset dword is +0x%02X)",
+        className, n, want, g_offPropOff);
+    for (int i = 0; i < n; ++i) Log("[bitmask]   col %d = %s", i, nm[i]);
+    for (int oo = 4; oo <= 0x180; oo += 4) {
+        char line[400]; int c2 = 0;
+        c2 += _snprintf_s(line, sizeof(line), _TRUNCATE, "[bitmask]   +0x%03X ", oo);
+        bool allZero = true;
+        for (int i = 0; i < n; ++i) {
+            uint32_t v = 0xDEADBEEF;
+            SafeU32(obj[i] + oo, &v);
+            if (v) allZero = false;
+            c2 += _snprintf_s(line + c2, sizeof(line) - c2, _TRUNCATE, " %08X", v);
+        }
+        if (!allZero) Log("%s", line);
+    }
+}
+
+// Bit index of a mask, for log lines that read better as "bit 4" than "0x00000010".
+static int BitIndexOf(uint32_t mask)
+{
+    for (int i = 0; i < 32; ++i) if (mask == (1u << i)) return i;
+    return -1;
+}
+
+// ---- the inventory, so the next property does not cost a run ----
+//
+// Run 3 asked for sixteen properties by name and ten came back ABSENT - bIsShimmying,
+// LedgeLocation, ClimbState, the swing limits. Those names are all in the package, so they are
+// real; they just live on some other class. Guessing which one, one name per run, is the
+// expensive way to find out.
+//
+// So dump what the move classes ACTUALLY declare, with the type beside each field. Depth is
+// capped at 3 because the chain continues into Object and its hundreds of engine fields, and
+// functions are dropped for the reason ResolveMoveProbeProps drops them: Children holds methods
+// too, and a method's offset dword is not an offset.
+static void DumpMoveClassProps(const char* className)
+{
+    if (g_offChildren < 0 || g_offNext < 0 || g_offPropOff < 0) return;
+    uintptr_t cls = FindClassByName(className);
+    if (!cls) { Log("[moveprop] ---- %s NOT FOUND ----", className); return; }
+
+    Log("[moveprop] ---- %s ----", className);
+    int lines = 0;
+    for (int depth = 0; cls && depth < 3 && lines < 160; ++depth) {
+        char cn[96] = "?";
+        ReadObjName(cls, cn, sizeof(cn));
+        // ⚠️ continue, NOT break. A class that declares no properties of its own has a null
+        // Children, and breaking here abandons the whole chain - which is why TdLadderVolume,
+        // TdSwingVolume and TdAnimNodeClimb all dumped as completely empty in run 5 while
+        // FindClassByName had found every one of them. Their fields are inherited.
+        uint32_t head = 0;
+        if (!SafeU32(cls + g_offChildren, &head) || head < 0x10000) {
+            uint32_t sup;
+            if (!SafeU32(cls + 0x3C, &sup) || sup < 0x10000) break;
+            cls = sup;
+            continue;
+        }
+        uintptr_t seen[512]; int nseen = 0;
+        for (uintptr_t q = head; q && lines < 160 && nseen < 512; ) {
+            char nm[96], kind[32] = "?";
+            uint32_t off = 0, k = 0;
+            if (!ReadObjName(q, nm, sizeof(nm))) break;
+            if (SafeU32(q + kUObjectClassOff, &k) && k >= 0x10000)
+                ReadObjName((uintptr_t)k, kind, sizeof(kind));
+            if (strcmp(kind, "Function") != 0 && strcmp(kind, "State") != 0 &&
+                SafeU32(q + g_offPropOff, &off) && off < 0x4000) {
+                // ⚠️ The depth is printed because the class NAME column is not reliable past
+                // depth 0 - run 4 labelled the shared base block with the queried class on all
+                // three dumps. d1 is that shared base whatever it prints; d0 is the class asked
+                // for. The offsets themselves are confirmed against live reads.
+                char extra[32] = "";
+                uint32_t bm = 0;
+                if (strcmp(kind, "BoolProperty") == 0 && g_offBoolMask >= 0 &&
+                    SafeU32(q + g_offBoolMask, &bm))
+                    _snprintf_s(extra, sizeof(extra), _TRUNCATE, " bit %d", BitIndexOf(bm));
+                Log("[moveprop]   d%d +0x%04X  %-38s %-18s%s (%s)",
+                    depth, off, nm, kind, extra, cn);
+                lines++;
+            }
+            bool cycle = false;
+            for (int j = 0; j < nseen; ++j) if (seen[j] == q) { cycle = true; break; }
+            if (cycle) break;
+            seen[nseen++] = q;
+            uint32_t nxt;
+            if (!SafeU32(q + g_offNext, &nxt) || nxt < 0x10000) break;
+            q = nxt;
+        }
+        uint32_t super;
+        if (!SafeU32(cls + 0x3C, &super) || super < 0x10000) break;   // SuperField
+        cls = super;
+    }
+}
+
+static void ResolveMoveProbeProps()
+{
+    DeriveBoolMaskFromAnyClass();   // no-op if the startup pass already found it
+    DumpMoveClassProps("TdMove_Grab");
+    DumpMoveClassProps("TdMove_Swing");
+    DumpMoveClassProps("TdMove_Climb");
+    // ---- where the pipe and the bar actually keep their state ----
+    //
+    // ClimbState, ClimbSpeed and ClimbingPawn are all real names in the package and none of them
+    // is on TdMove_Climb. SwingVelocity and the two limit angles are likewise absent from
+    // TdMove_Swing while SwingAngle sits right there. Both point the same way: the MOVE runs the
+    // animation, the VOLUME owns the thing being climbed or swung from. These three dumps are
+    // what turn that from a hypothesis into offsets.
+    DumpMoveClassProps("TdLadderVolume");
+    DumpMoveClassProps("TdSwingVolume");
+    DumpMoveClassProps("TdAnimNodeClimb");
+    Log("[moveprop] resolving parkour properties on the move classes:");
+    for (int i = 0; i < kMoveProbeCount; ++i) {
+        MoveProbeProp& p = g_moveProbe[i];
+        p.off = LookupProp(p.cls, p.prop, false);
+        strcpy_s(p.kind, "?");
+        if (p.off < 0) {
+            // Second opinion from the GObjects owner pass, which reaches properties the
+            // Children walk does not. If it has one, take it and say where it came from.
+            char k2[32] = "?";
+            uint32_t m2 = 0;
+            int o2 = OwnerLookup(p.cls, p.prop, k2, sizeof(k2), &m2);
+            if (o2 < 0) {
+                // Last resort: the owner pass knows the property but under a class this table
+                // named wrongly. Take it and SAY whose it really is - a silent re-home would
+                // make the next reader trust a class name that was never verified.
+                char realCls[64] = "";
+                o2 = OwnerLookupAnyClass(p.prop, k2, sizeof(k2), realCls, sizeof(realCls), &m2);
+                if (o2 >= 0)
+                    Log("[moveprop]   %s::%s is actually declared on %s", p.cls, p.prop, realCls);
+            }
+            if (o2 < 0) { Log("[moveprop]   %s::%s  ABSENT", p.cls, p.prop); continue; }
+            p.off = o2;
+            p.mask = m2;
+            strcpy_s(p.kind, k2);
+            if (strcmp(p.kind, "BoolProperty") == 0 && !p.mask) {
+                Log("[moveprop]   %s::%s  (BoolProperty via OWNER pass, NO MASK - dropped)",
+                    p.cls, p.prop);
+                p.off = -1;
+                continue;
+            }
+            Log("[moveprop]   %s::%s at +0x%04X  (%s%s, via the OWNER pass - Children missed it)",
+                p.cls, p.prop, p.off, p.kind,
+                p.mask ? "" : "");
+            if (p.mask) Log("[moveprop]      ^ bit %d", BitIndexOf(p.mask));
+            continue;
+        }
+        // The kind, straight off the matched object. A "Function" here means the name resolved
+        // to a method and the offset is meaningless - reported, never used.
+        if (g_lastPropObj) {
+            uint32_t k = 0;
+            if (SafeU32(g_lastPropObj + kUObjectClassOff, &k) && k >= 0x10000)
+                ReadObjName((uintptr_t)k, p.kind, sizeof(p.kind));
+        }
+        if (strcmp(p.kind, "Function") == 0) {
+            Log("[moveprop]   %s::%s  is a FUNCTION, not a property - dropped", p.cls, p.prop);
+            p.off = -1;
+            continue;
+        }
+        p.mask = 0;
+        if (strcmp(p.kind, "BoolProperty") == 0) {
+            if (g_offBoolMask < 0 || !SafeU32(g_lastPropObj + g_offBoolMask, &p.mask) ||
+                p.mask == 0) {
+                // Dropped rather than read as a byte. Eight bools share this dword; without the
+                // mask, "reading" one means reporting seven others alongside it.
+                Log("[moveprop]   %s::%s at +0x%04X  (BoolProperty, NO MASK - dropped)",
+                    p.cls, p.prop, p.off);
+                p.off = -1;
+                continue;
+            }
+            Log("[moveprop]   %s::%s at +0x%04X  (BoolProperty, bit %d)",
+                p.cls, p.prop, p.off, BitIndexOf(p.mask));
+            continue;
+        }
+        Log("[moveprop]   %s::%s at +0x%04X  (%s)", p.cls, p.prop, p.off, p.kind);
+    }
+}
+
+// Live values, while the matching move is the one running. Rate-limited two ways: a line when
+// something CHANGES, at up to 12 Hz - fast enough to resolve a swing period - and a heartbeat
+// regardless, so "nothing changed" stays distinguishable from "the probe never ran".
+//
+// The player's own hand displacement rides on the same line rather than in a separate stream.
+// The measurement wanted is the PHASE between the arms and the pendulum, and pairing two logs by
+// frame number in a text editor is how that measurement gets abandoned.
+static void ProbeMoveProperties(uintptr_t moveObj, const char* cls, uintptr_t pawn)
+{
+    static long lastLine = -1000;
+    static long lastBeat = -1000;
+    if (!moveObj || !cls || !cls[0]) return;
+
+    bool any = false, changed = false;
+    char body[900]; int n = 0;
+    body[0] = '\0';
+
+    for (int i = 0; i < kMoveProbeCount; ++i) {
+        MoveProbeProp& p = g_moveProbe[i];
+        const char* under = p.showDuring ? p.showDuring : p.cls;
+        if (p.off < 0 || strcmp(under, cls) != 0) continue;
+        const uintptr_t base = p.fromPawn ? pawn : moveObj;
+        if (!base) continue;
+        // Structs are read as three dwords because the ones asked for here are FVectors; a
+        // struct that is not will print three numbers that visibly are not a position.
+        const bool isStruct = (strncmp(p.kind, "Struct", 6) == 0);
+        const int words = isStruct ? 3 : 1;
+        uint32_t v[3] = {};
+        if (!SafeRead(base + p.off, v, sizeof(uint32_t) * words)) continue;
+        if (strcmp(p.kind, "ByteProperty") == 0) v[0] &= 0xFFu;
+        // ⚠️ Reduced to the single bit BEFORE the change comparison. Eight bools share this
+        // dword, so comparing the raw word would report bRequestDropDown as changing every time
+        // any of its seven neighbours moved - the same defect the byte mask fixed.
+        if (p.mask) v[0] = (v[0] & p.mask) ? 1u : 0u;
+        any = true;
+        for (int w = 0; w < words; ++w) if (!p.havePrev || p.prev[w] != v[w]) changed = true;
+        for (int w = 0; w < words; ++w) p.prev[w] = v[w];
+        p.havePrev = true;
+
+        if (isStruct) {
+            float f[3];
+            memcpy(f, v, sizeof(f));
+            n += _snprintf_s(body + n, sizeof(body) - n, _TRUNCATE,
+                             "  %s=(%.1f %.1f %.1f)", p.prop, f[0], f[1], f[2]);
+        } else if (p.mask) {
+            n += _snprintf_s(body + n, sizeof(body) - n, _TRUNCATE,
+                             "  %s=%u", p.prop, v[0]);
+        } else if (strcmp(p.kind, "ByteProperty") == 0) {
+            // ⚠️ A byte read as a dword carries THREE BYTES OF ADJACENT MEMORY. Run 3 printed
+            // CurrentShimmyMove as 206C0003 and 206C0000 - the value is 3 and 0, the 206C00 is
+            // whatever is packed beside it. Masked here rather than at the eye, because the
+            // change detector above compares these words: unmasked, a neighbouring field moving
+            // would read as this one changing.
+            n += _snprintf_s(body + n, sizeof(body) - n, _TRUNCATE,
+                             "  %s=%u", p.prop, v[0] & 0xFFu);
+        } else if (strcmp(p.kind, "NameProperty") == 0) {
+            // An FName is { int Index; int Number; } - the low dword indexes GNames, which is
+            // already resolvable. 000069AE is not a value, it is a name nobody read.
+            char nm[64] = "?";
+            NameOf(v[0], nm, sizeof(nm));
+            n += _snprintf_s(body + n, sizeof(body) - n, _TRUNCATE,
+                             "  %s=%s", p.prop, v[0] ? nm : "None");
+        } else if (strcmp(p.kind, "FloatProperty") == 0) {
+            float f; memcpy(&f, &v[0], sizeof(f));
+            n += _snprintf_s(body + n, sizeof(body) - n, _TRUNCATE, "  %s=%.3f", p.prop, f);
+        } else if (strcmp(p.kind, "IntProperty") == 0) {
+            n += _snprintf_s(body + n, sizeof(body) - n, _TRUNCATE,
+                             "  %s=%d", p.prop, (int)v[0]);
+        } else {
+            // Unknown kind, and BoolProperty lands here deliberately: UE3 bools are BITS inside
+            // a shared dword and the mask lives on the UBoolProperty, which nothing here reads
+            // yet. Hex is the honest rendering - the bit announces itself by flipping.
+            float f; memcpy(&f, &v[0], sizeof(f));
+            n += _snprintf_s(body + n, sizeof(body) - n, _TRUNCATE,
+                             "  %s=%08X/i%d/f%.3f", p.prop, v[0], (int)v[0], f);
+        }
+    }
+    if (!any) return;
+
+    const bool beat = (g_frames - lastBeat) >= 60;
+    if (!beat && (!changed || (g_frames - lastLine) < 6)) return;
+    lastLine = g_frames;
+    if (beat) lastBeat = g_frames;
+
+    // Mean hand position relative to the head, room axes, metres - the same primitive the swing
+    // envelope samples. Carried here so the pendulum and the arms driving it are one line.
+    const float hx = (g_swingL.rel.x + g_swingR.rel.x) * 0.5f;
+    const float hy = (g_swingL.rel.y + g_swingR.rel.y) * 0.5f;
+    const float hz = (g_swingL.rel.z + g_swingR.rel.z) * 0.5f;
+    // ---- descent speed, beside the flag that is supposed to explain it ----
+    //
+    // The open question on the pipe is what promotes a climb-down into a SLIDE: deflection
+    // magnitude, sustained input, or the speed already reached. The first two are visible in the
+    // stick column; the third is not visible anywhere without this. If bClimbDownFast flips only
+    // after vertical speed crosses a value, that is the answer and nothing else in the line
+    // would have shown it.
+    float vel[3] = { 0, 0, 0 };
+    if (g_offVelocity >= 0 && pawn) SafeRead(pawn + g_offVelocity, vel, sizeof(vel));
+    // The gesture's own numbers ride here rather than in a separate stream, for the reason the
+    // hand position does: the question is whether lateral offset produced the shimmy the game
+    // then reports, and pairing two logs by frame number is how that check gets skipped.
+    Log("[moveprop] f%ld t=%.2fs %s%s   hands=(%.2f %.2f %.2f)  stick=(%.2f %.2f)  vz=%.1f"
+        "  pk=%d anc=%d want=%+.3f got=%+.3f shim=%+.2f lead=%+.3f"
+        "  ledge=(%.0f %.0f %.0f) moved=%.0f%s%s",
+        g_frames, LogSecs(), cls, body, hx, hy, hz,
+        g_padSentLX, g_padSentLY, vel[2],
+        g_pkMode, g_pkAnchor, g_pkDesired, g_pkProgress, g_pkShimmy, g_pkCamLead,
+        g_pkLedgeLoc[0], g_pkLedgeLoc[1], g_pkLedgeLoc[2], g_pkLedgeTravel,
+        g_pkBlock[0] ? "  block=" : "", g_pkBlock[0] ? g_pkBlock : "");
+}
+
+// Which parkour surface the player is on, straight off the live move object. Defined here
+// because this is where the Moves array and the state byte are already understood; the pad build
+// calls it once per frame, before anything reads g_pkMode.
+static int ParkourModeNow()
+{
+    const uintptr_t pawn = g_playerPawn;
+    uint8_t st = 0xFF;
+    if (!pawn || g_offMoveState < 0 || !SafeRead(pawn + g_offMoveState, &st, 1)) return PK_NONE;
+    char cls[48];
+    if (!ReadMoveClassName(pawn, (int)st, cls, sizeof(cls), nullptr)) return PK_NONE;
+    // Matched on the CLASS, not the state byte. The byte is an index into a 94-entry array this
+    // project had transcribed wrongly for its whole life; the class name is the fact itself.
+    if (strcmp(cls, "TdMove_Grab") == 0)  return PK_LEDGE;
+    if (strcmp(cls, "TdMove_Climb") == 0) return PK_CLIMB;
+    if (strcmp(cls, "TdMove_Swing") == 0) return PK_BAR;
+    return PK_NONE;
+}
+
 // The authoritative what-state-when timeline. Every other line that mentions a movement
 // state does so as a side effect of its own gate, rate limit, or eligibility check; the
 // transitions BETWEEN those moments were invisible, and the fall/grab freezes live exactly
@@ -15881,27 +17781,101 @@ static void LogMoveTransitions()
 {
     static int lastState = -1;          // -1 = unreadable / nothing seen yet
     static uintptr_t lastPawn = 0;
+    static uintptr_t lastMoveObj = 0;
+    static char lastClass[48] = "";
+    // Self-guarded and one-shot, but it needs a live pawn, so it is driven from the per-frame
+    // caller rather than from startup - the pawn does not exist until gameplay begins.
+    ProbeMoveObjectArrays();
     const uintptr_t pawn = g_playerPawn;
     uint8_t st = 0xFF;
     if (!pawn || g_offMoveState < 0 || !SafeRead(pawn + g_offMoveState, &st, 1)) {
         if (lastState != -1) {
-            Log("[move] frame %ld t=%.2fs: %s(%d) -> UNREADABLE (pawn %p)",
-                g_frames, LogSecs(), MoveName(lastState), lastState, (void*)pawn);
+            Log("[move] frame %ld t=%.2fs: %s(%d)/%s -> UNREADABLE (pawn %p)",
+                g_frames, LogSecs(), MoveName(lastState), lastState,
+                lastClass[0] ? lastClass : "?", (void*)pawn);
             lastState = -1;
             lastPawn = 0;
+            lastMoveObj = 0;
+            lastClass[0] = '\0';
         }
         return;
     }
-    if ((int)st != lastState || pawn != lastPawn) {
-        Log("[move] frame %ld t=%.2fs: %s(%d) -> %s(%d)%s", g_frames, LogSecs(),
-            MoveName(lastState), lastState, MoveName(st), (int)st,
+
+    char cls[48];
+    uintptr_t moveObj = 0;
+    const bool haveClass = ReadMoveClassName(pawn, (int)st, cls, sizeof(cls), &moveObj);
+    if (!haveClass) strcpy_s(cls, "?");
+
+    // A change of EITHER identity is a transition, and they are not redundant: the byte and the
+    // object pointer are written by different code. A run where one moves without the other is
+    // precisely the disagreement this is here to find, so it must produce a line rather than
+    // being averaged away by only watching one of them.
+    //
+    // The object pointer is logged because it also answers, for free, whether moves are pooled
+    // per pawn or spawned per entry - the same address recurring across separate entries into a
+    // state is a pool, and that decides whether a move pointer can be cached at all.
+    if ((int)st != lastState || pawn != lastPawn || moveObj != lastMoveObj) {
+        Log("[move] frame %ld t=%.2fs: %s(%d)/%s -> %s(%d)/%s   [move obj %p]%s",
+            g_frames, LogSecs(),
+            MoveName(lastState), lastState, lastClass[0] ? lastClass : "?",
+            MoveName(st), (int)st, cls, (void*)moveObj,
             (lastPawn != 0 && pawn != lastPawn) ? "  (new pawn)" : "");
         lastState = (int)st;
         lastPawn = pawn;
+        lastMoveObj = moveObj;
+        strcpy_s(lastClass, cls);
+    }
+
+    // Census every frame, not only on transition: a state entered for a single frame still gets
+    // recorded, the dwell counts come out right, and a byte whose class changes UNDER it is
+    // caught wherever that happens rather than only at an edge.
+    if (haveClass) {
+        char* slot = g_moveClassSeen[st];
+        if (!slot[0]) {
+            strcpy_s(slot, sizeof(g_moveClassSeen[0]), cls);
+            g_moveCensusDirty = true;
+            Log("[move] state %d resolves to %s   (kMoveNames says \"%s\")",
+                (int)st, cls, MoveName(st));
+        } else if (strcmp(slot, cls) != 0) {
+            // Not a surprise to be logged once and overwritten. If one byte carries two classes
+            // then either CurrentMove or MovementState is being read wrong, and every conclusion
+            // drawn from either is suspect until that is settled.
+            Log("*** [move] state %d was %s and is NOW %s - the state byte and the move object"
+                " DISAGREE, so one of the two reads is wrong", (int)st, slot, cls);
+            strcpy_s(slot, sizeof(g_moveClassSeen[0]), cls);
+        }
+        g_moveClassFrames[st]++;
+        // Here rather than at the call site: this is the one place that already holds a
+        // verified move object AND the class name that says which properties apply to it.
+        ProbeMoveProperties(moveObj, cls, pawn);
     }
 }
-static float g_statePeakRoll[64] = { 0 };       // worst roll seen in each movement state
-static float g_statePeakPitch[64] = { 0 };
+
+// Dumped on the ordinary report cadence, and only when something new has been seen. The point
+// is a table that can be pasted back over kMoveNames, so it prints in byte order with the
+// current table's claim beside each row - the disagreements read straight off the column.
+static void ReportMoveCensus()
+{
+    if (!g_moveCensusDirty) return;
+    g_moveCensusDirty = false;
+    Log("[move] EMovement census - the move class actually live at each state byte:");
+    int shown = 0, past = 0;
+    for (int i = 0; i < 256; ++i) {
+        if (!g_moveClassSeen[i][0]) continue;
+        shown++;
+        if (i >= kMoveCount) past++;
+        Log("[move]   %3d  %-30s  %8ld frames   kMoveNames: %s%s", i, g_moveClassSeen[i],
+            g_moveClassFrames[i], (i < kMoveCount) ? kMoveNames[i] : "(past the end)",
+            (i >= kMoveCount) ? "  <-- UNNAMEABLE TODAY" : "");
+    }
+    Log("[move]   %d distinct states entered, %d of them past kMoveNames' %d entries."
+        " TdPawn.EMovement declares 95 values.", shown, past, kMoveCount);
+}
+// Sized to the full EMovement range, not 64. The swing is state 60 and its launch is 73, so
+// a 64-entry array silently dropped the launch - and the camera animation during a pendulum is
+// exactly what the comfort question turns on.
+static float g_statePeakRoll[kMoveCount] = { 0 };   // worst roll seen in each movement state
+static float g_statePeakPitch[kMoveCount] = { 0 };
 static long  g_animSamples = 0;
 
 static void ProbeCameraAnimation()
@@ -15930,7 +17904,7 @@ static void ProbeCameraAnimation()
     // by how much, instead of leaving it as a description.
     if (g_offMoveState >= 0) {
         uint8_t st = 0;
-        if (SafeRead(pawn + g_offMoveState, &st, 1) && st < 64) {
+        if (SafeRead(pawn + g_offMoveState, &st, 1) && st < kMoveCount) {
             g_animState = st;
             const float r = fabsf(g_animNow[2]);
             const float p = fabsf(g_animNow[0]);
@@ -16185,6 +18159,29 @@ static void FormatHandTuneValue(char* out, size_t cap, int value, bool selected)
 // original comment wanted and could not deliver.
 static const int kOverlayRows = 32;
 
+// The overlay renderer takes a narrow character set, so values are decomposed by hand rather
+// than handed to %f - the same way the wrist calibration rows already do it.
+extern float g_pkHandLedgeDist[2];
+extern long  g_pkSnapCalls;
+extern float g_pkExtentMin, g_pkExtentMax;
+extern bool  g_pkExtentHave;
+extern int   g_pkBlockedDir;
+extern const char* g_pkSnapWhy2[2];
+
+static void PkFmtInt(char* out, size_t cap, float v)
+{
+    if (v < 0.0f) { _snprintf_s(out, cap, _TRUNCATE, "--"); return; }
+    _snprintf_s(out, cap, _TRUNCATE, "%d", (int)(v + 0.5f));
+}
+
+static void PkFmt2(char* out, size_t cap, float v)
+{
+    const bool neg = v < 0.0f;
+    const float a = neg ? -v : v;
+    _snprintf_s(out, cap, _TRUNCATE, "%s%d.%02d", neg ? "-" : "",
+                (int)a, (int)((a - (float)(int)a) * 100.0f + 0.5f));
+}
+
 static void OverlayRow(char lines[][64], int* nl, _Printf_format_string_ const char* fmt, ...)
 {
     if (!nl || *nl < 0 || *nl >= kOverlayRows) return;
@@ -16241,6 +18238,52 @@ static void DrawOverlay(IDirect3DDevice9* dev)
                     bs < 0.0f ? "-" : "", (int)fabsf(bs),
                     (int)(fabsf(bs - (float)(int)bs) * 100.0f + 0.5f));
     }
+    extern const char* g_pkDirectWhy;
+    // ---- parkour, shown only on a wall because that is the only place it means anything ----
+    //
+    // These are here rather than in the log because the numbers they carry are the ones being
+    // tuned BY FEEL: how far a hand is from the ledge decides where to reach, and reading that
+    // back from a file after the run is how two builds shipped with a radius nobody could size.
+    // ⚠️ Shown ALWAYS, not only on a wall.
+    //
+    // Gated on being on a wall, an undetected mode and a broken feature look identical - both are
+    // simply no row at all, which is what the first field report came back as. A row that says
+    // OFF is a fact; a missing row is a question.
+    {
+        char a1[16], a2[16], a3[16];
+        const char* mn = g_pkMode == PK_LEDGE ? "LEDGE"
+                       : g_pkMode == PK_CLIMB ? "PIPE"
+                       : g_pkMode == PK_BAR   ? "BAR" : "OFF";
+        // The state byte rides along: "OFF" plus a movement number says whether the mode test
+        // failed or the player simply was not on anything, and those are different bugs.
+        OverlayRow(lines, &nl, "PK %s M%d %s", mn, g_animState,
+                    g_pkBlock[0] ? g_pkBlock : "driving");
+        if (g_pkDirectBody)
+            OverlayRow(lines, &nl, "DIRECT %s %s",
+                        g_pkDirectLive ? "LIVE" : "IDLE", g_pkDirectWhy);
+        // Distance per hand with its anchor state - the reach decision, in one row.
+        PkFmtInt(a1, sizeof(a1), g_pkHandLedgeDist[0]);
+        PkFmtInt(a2, sizeof(a2), g_pkHandLedgeDist[1]);
+        // '+' rather than '*': GlyphIndex has no star, so it fell through to the deliberately
+        // visible unknown glyph - a green box that read as a rendering fault rather than a state.
+        OverlayRow(lines, &nl, "LEDGE L%s%s R%s%s R=%d", a1,
+                    g_pkHandAnchored[0] ? "+" : "-", a2,
+                    g_pkHandAnchored[1] ? "+" : "-",
+                    (int)(g_pkSnapRadius * g_pkUUPerMetre));
+        PkFmt2(a1, sizeof(a1), g_pkDesired);
+        PkFmt2(a2, sizeof(a2), g_pkProgress);
+        PkFmt2(a3, sizeof(a3), g_pkCamLead);
+        OverlayRow(lines, &nl, "WANT %s GOT %s LEAD %s", a1, a2, a3);
+        // n is the whole point: 0 means the arm path never reaches the snap and the fix is a call
+        // site, not a guard. Non-zero with a reason means the opposite.
+        OverlayRow(lines, &nl, "SNAP N%d L%s R%s", (int)(g_pkSnapCalls % 100000),
+                    g_pkSnapWhy2[0], g_pkSnapWhy2[1]);
+        OverlayRow(lines, &nl, "SPAN %d UU SEEN%s",
+                    (int)(g_pkExtentHave ? (g_pkExtentMax - g_pkExtentMin) : 0.0f),
+                    g_pkBlockedDir > 0 ? "  BLOCKED R"
+                  : g_pkBlockedDir < 0 ? "  BLOCKED L" : "");
+    }
+
     if (g_armSwing) {
         // Two rows, and the block reason is on the first: "why am I not moving" is the question
         // this feature will be asked most, and it must be answerable without leaving the game.
@@ -16651,6 +18694,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
 
     if ((f % 900) == 0) {
         ReportCameraAnimation();
+        ReportMoveCensus();
         ReportPadState();
         ReportInputGates();
         // Not gated on g_simulStereo any more: the half-res fault is decided before the menu
@@ -16727,12 +18771,52 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     if (g_fovForce && g_offFOVAngle >= 0 && g_targetHalfFovX > 0.0f && fovRefH > 0) {
         const uintptr_t ctl = FindPlayerController();
         if (ctl) {
+            // ---- stand down while the half-res state is active ----
+            //
+            // The wide FOV multiplies what the engine submits, and it kept being written all
+            // through every split-mono run - which never recovered. While the guards hold
+            // duplication off, the engine gets its own FOV back too, so the recovery the
+            // guard keeps testing for is tested under the lightest load the mod can offer.
+            // DefaultFOV was overwritten by the force, so the engine cannot restore itself:
+            // the pre-force value is captured at the first write and put back here, once per
+            // standdown. When the guard re-arms, the else branch resumes forcing by itself.
+            static float fovPreForce = 0.0f;
+            static bool  fovStoodDown = false;
+            const bool degraded = g_sceneSplitMono || g_scenePartialMono;
+            if (degraded) {
+                if (!fovStoodDown && fovPreForce > 1.0f) {
+                    fovStoodDown = true;
+                    SIZE_T wr = 0;
+                    auto putOrig = [&](int off) {
+                        if (off >= 0)
+                            WriteProcessMemory(GetCurrentProcess(), (LPVOID)(ctl + off),
+                                               &fovPreForce, sizeof(float), &wr);
+                    };
+                    putOrig(g_offDesiredFOV);
+                    putOrig(g_offDefaultFOV);
+                    putOrig(g_offFOVAngle);
+                    Log("*** [fov] standing down while half-res is active - engine FOV"
+                        " restored to %.1f", fovPreForce);
+                }
+            } else {
+            fovStoodDown = false;
+
             // The engine culls against the frame IT renders, so the aspect has to be the scene's.
             const float aspectFull = (float)fovRefW / (float)fovRefH;
             const float needVert = tanf(g_targetHalfFovY) * aspectFull;  // to cover our vertical
             const float needHorz = tanf(g_targetHalfFovX);               // to cover our horizontal
             const float t = ((needVert > needHorz) ? needVert : needHorz) * 1.15f;
             const float want = atanf(t) * 2.0f * 57.29578f;
+            // The genuine engine value, captured before the first force so standdown can give
+            // it back. Only a reading far from our own forced constant qualifies - after a
+            // standdown restore the next capture re-reads the same genuine value, and a
+            // reading near `want` is just our own write echoed back.
+            {
+                float pre = 0.0f;
+                if (fovPreForce <= 1.0f && SafeRead(ctl + g_offFOVAngle, &pre, sizeof(float)) &&
+                    pre > 5.0f && pre < 170.0f && fabsf(pre - want) > 5.0f)
+                    fovPreForce = pre;
+            }
             // ⚠️ DesiredFOV first, and it is the one that matters.
             //
             // AdjustFOV runs every tick and ends with `FOVAngle = DesiredFOV` whenever
@@ -16764,6 +18848,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
                         g_targetHalfFovX * 114.5916f, g_targetHalfFovY * 114.5916f,
                         g_offDesiredFOV, g_offDefaultFOV);
             }
+            }   // closes the standdown else - forcing runs only while not degraded
         }
     }
 
@@ -16810,21 +18895,32 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
         }
     }
     if ((f % 300) == 0 && !g_worldInfoObj && g_gobjAddr && g_offName >= 0) FindWorldInfo();
-    // Held at zero every frame for the same reason the fps cap is: a once-only write is
-    // invisible when the engine recomputes the field behind it.
+    // Held every frame for the same reason the fps cap is: a once-only write is invisible
+    // when the engine recomputes the field behind it.
+    //
+    // Held at 1, not 0: every observed use of MinDesiredFrameRate is a "fps below this?"
+    // comparison, but a zero invites a divide somewhere unseen, and "degrade below 1 fps"
+    // disarms the scaler at every playable frame rate just as thoroughly.
+    //
+    // ON BY DEFAULT since the evening of 2026-08-28. The half-res entries always land on
+    // genuine work spikes (stereo engagement at the end of a level load), and the headless
+    // exonerations of "slow frames" both used SLEEPS - which a scaler measuring work time
+    // rather than wall time never sees. That reconciles every measurement, it makes this
+    // field the prime suspect for the trigger, and the pin is the prevention: the streak
+    // guard behind it becomes the backstop instead of the experience.
     if (g_pinMinDesiredFps && g_clientObj && g_offMinDesiredFps >= 0) {
         float cur = 0.0f;
         if (SafeRead(g_clientObj + (uint32_t)g_offMinDesiredFps, &cur, sizeof(float)) &&
-            cur != 0.0f) {
-            const float zero = 0.0f;
+            fabsf(cur - 1.0f) > 0.01f) {
+            const float pinned = 1.0f;
             SIZE_T wrote = 0;
             WriteProcessMemory(GetCurrentProcess(),
                                (LPVOID)(uintptr_t)(g_clientObj + (uint32_t)g_offMinDesiredFps),
-                               &zero, sizeof(float), &wrote);
+                               &pinned, sizeof(float), &wrote);
             static long n = 0;
             if (++n == 1 || (n % 60) == 0)
-                Log("*** [perf] MinDesiredFrameRate %.1f -> 0 (write %ld) - the detail scaler"
-                    " can no longer fire", cur, n);
+                Log("*** [perf] MinDesiredFrameRate %.1f -> 1 (write %ld) - the engine's"
+                    " degrade-when-slow trigger is disarmed", cur, n);
         }
     }
 
@@ -17825,6 +19921,35 @@ static void LoadSettings()
                     b ? "  (right stick up = jump, down = quick turn; pad pitch is spent)" : "");
                 applied++;
             } else { Log("[cfg]   StickJumpTurn '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "Parkour") == 0) {
+            if (SettingBool(val, &b)) {
+                g_parkour = b;
+                Log("[cfg]   Parkour = %s%s", b ? "on" : "off",
+                    b ? "  (PK.1: shimmy along a ledge from lateral hand offset)" : "");
+                applied++;
+            } else { Log("[cfg]   Parkour '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourLedgeSnap") == 0) {
+            if (SettingBool(val, &b)) {
+                g_pkSnapOn = b;
+                Log("[cfg]   ParkourLedgeSnap = %s%s", b ? "on" : "off",
+                    b ? "  (PK.5: a gripped hand within reach of the ledge plants on it)" : "");
+                applied++;
+            } else { Log("[cfg]   ParkourLedgeSnap '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourDirectBody") == 0) {
+            if (SettingBool(val, &b)) {
+                g_pkDirectBody = b;
+                Log("[cfg]   ParkourDirectBody = %s%s", b ? "on" : "off",
+                    b ? "  (PK.6: writes the pawn position and stops driving the stick -"
+                        " EXPERIMENTAL, SCROLL LOCK toggles it live)" : "");
+                applied++;
+            } else { Log("[cfg]   ParkourDirectBody '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourLockAnim") == 0) {
+            if (SettingBool(val, &b)) {
+                g_pkLockAnim = b;
+                Log("[cfg]   ParkourLockAnim = %s%s", b ? "on" : "off",
+                    b ? "  (the shimmy animation stops steering the camera on a wall)" : "");
+                applied++;
+            } else { Log("[cfg]   ParkourLockAnim '%s' is not a boolean - ignored", val); rejected++; }
         } else if (_stricmp(key, "GripToGrip") == 0) {
             if (SettingBool(val, &b)) {
                 g_gripToGrip = b;

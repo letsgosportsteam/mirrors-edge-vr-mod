@@ -119,6 +119,47 @@ ArmSwingDebug = off
 ArmSwingJump = on
 ArmSwingCrouch = on
 
+; ---- Parkour: hands on the wall (PK.1) ----
+;
+; Hand-over-hand along a ledge, the way VR climbing games do it: squeeze a grip and that hand is
+; anchored to the world, so moving it moves your BODY by the inverse. Pull your hands left and
+; you travel right. Release one hand, move it, grab again, and the anchor switches to it.
+;
+; Because the game shimmies at one fixed speed rather than letting us place the body, this runs
+; as a servo - it measures how far the body ACTUALLY moved and drives the stick until that
+; matches how far you pulled. Pull faster than about 0.6 m/s and the body lags, then catches up.
+;
+; Lateral is measured against the player's own left/right, not a fixed room axis, so turning
+; around in your room does not reverse the controls. Deliberately capped below full stick
+; deflection: on a pipe, full deflection is a different move (the slide), and the ledge looks the
+; same way. The physical stick keeps sole access to the extreme and overrides this when touched.
+;
+; Turning this on also stands the arm-swing gestures DOWN whenever the player is on a ledge,
+; pipe or bar. That is not optional tidiness: the crouch gesture asserts the same input as
+; letting go, and hands-overhead is the resting posture of someone hanging from a ledge.
+Parkour = on
+
+; A gripping hand within reach of the ledge is handed back to the GAME's own hang pose, which
+; already places it correctly with the fingers over the edge. Releasing gives the hand back to
+; the controller. Gripping in open air still closes a fist on nothing, which is why this is gated
+; on proximity and not on the grip alone.
+ParkourLedgeSnap = on
+
+; The shimmy animation carries 55 degrees of camera pitch and 10 of roll on its own schedule.
+; This forces LockAnimPitch/Roll/Yaw while on a wall and restores whatever you had set on the
+; way out, so the view answers your hands rather than the animation.
+ParkourLockAnim = on
+
+; EXPERIMENTAL. Writes the pawn's position directly and stops driving the stick at all, so the
+; game never plays a shimmy animation - movement, camera and arms all follow your hands.
+;
+; This writes a value the grab move also computes for itself, which is the pattern that has
+; broken falls and landings elsewhere in this project. It stands down on any state change, on an
+; oversized step, and when the game stops reporting a ledge under you, and it never writes the
+; vertical axis - so the worst failure moves you along a wall rather than off it. SCROLL LOCK
+; toggles it live.
+ParkourDirectBody = off
+
 
 ; ---------------------------------------------------------------- frame pacing
 
@@ -242,27 +283,38 @@ Resolution = off
 ; 1280x720 buffer set instead of the full-resolution one, and the picture looks like 720p
 ; upscaled. Every log now carries a [mode] line per 12-second window - "healthy" or
 ; "DEGRADED" - plus [rt-first]/[surf]/[blit] lines that show which buffers the engine chose.
-; The four keys below are levers for reproducing it on the monitor, with no headset. All of
-; them default off and none belongs in normal play.
+; The three test keys below are levers for reproducing it on the monitor, with no headset -
+; they default off and none belongs in normal play. PinMinDesiredFps is different: it is the
+; PREVENTION, and it defaults ON.
 ;
 ; TestStall injects ten 400 ms frames at the given frame number (0 = off) - an artificial
 ; load hitch. TestWideFov performs the same culling-FOV widening a headset run performs.
 ; OcclusionMode is the DELETE hotkey's setting made persistent: 0 auto, 1 every occlusion
-; query reports visible, 2 never override. PinMinDesiredFps holds the engine's
-; Client.MinDesiredFrameRate at zero. Measured 2026-08-28: slow frames, stalls, occlusion
-; and the wide FOV each stay healthy alone on the monitor - the remaining suspects engage
-; only in a real headset run, which these lines exist to diagnose when it next happens.
+; query reports visible, 2 never override.
+;
+; PinMinDesiredFps holds the engine's Client.MinDesiredFrameRate at 1 - the threshold its
+; degrade-when-slow logic compares frame times against (the ini ships it at 35). Every
+; half-res entry on record lands on a genuine work spike (stereo engagement at the end of a
+; level load), and the monitor-side "slow frame" exonerations both used sleeps, which a
+; scaler measuring work rather than wall time never sees. Pinned to 1, "too slow" cannot
+; happen at any playable frame rate, so the engine should never move scene work into the
+; half-size buffers at all. Turn it off only to hunt the trigger itself.
 ;
 ; The visible symptom - hands and building edges streaking along their motion history - is
 ; duplication running while the engine is in the half-res state, and it is guarded
-; automatically: the mod drops to a clean mono view within a few seconds of detecting it
-; and resumes stereo on its own if the engine recovers. No setting: the guard has no off
-; switch because a run with it off has nothing to recommend it.
+; automatically: the mod drops to a clean mono view within a couple of seconds of detecting
+; it, stands its own load down (duplication, the occlusion override and the widened FOV all
+; pause), and keeps retrying - stereo resumes by itself the moment the engine renders clean
+; again, with a backoff ladder so a stubborn run settles into flat instead of flapping.
+; Stereo also arms 120 frames later than it used to: every measured onset sat right on the
+; end of a level load, so the arm now waits out the engine's most fragile moment. No
+; setting: the guard has no off switch because a run with it off has nothing to recommend
+; it.
 
 TestStall = 0
 TestWideFov = off
 OcclusionMode = 0
-PinMinDesiredFps = off
+PinMinDesiredFps = on
 
 
 ; ---------------------------------------------------------------- beam balance
