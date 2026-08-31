@@ -1475,6 +1475,7 @@ static const float kSwingFullMS     = 1.58f;   // run-cadence swing -> full defl
 // both are logged for correlation rather than acted on.
 static float  g_padSentLX = 0.0f;
 static float  g_padSentLY = 0.0f;
+float         g_padSentRX = 0.0f;   // the LOOK stick, which is what actually turns the player
 static float  g_swingNow = 0.0f;
 static float  g_swingDt = 0.0f;             // seconds, the sampler's own validated dt
 static float  g_swingHeadVert = 0.0f;       // |head vertical speed|, m/s - the crouch tell
@@ -2724,6 +2725,7 @@ int g_offFoundLedge = -1;
 uint32_t g_maskFoundLedge = 0;
 
 static bool PkLedgeAxis(float* axis);       // defined with the direct-drive code below
+static bool PkHoldLine(float* point, float* axis);   // ...and the ledge/pipe line beside it
 static void PkAskTheGameTick();             // PK.7, defined beside the direct-drive code
 void DumpLedgeishClasses();                 // the authored-geometry census, far below
 void GeomCensusTick();                      // ...and its off-by-default, quiet-moment trigger
@@ -3031,6 +3033,68 @@ static void PkWatchLedgeOffset()
             Log("[grabofs]   ⚠️ it has changed on %ld of %ld samples - if it is static it is"
                 " CONFIGURATION, not a live position, and PK.8 is the wrong idea",
                 g_gdoChanged, g_gdoSamples);
+    }
+}
+
+// ---- ⚠️ THE VIEW IS PUSHED WHEN THE HEAD GETS CLOSE TO THE PIPE ----
+//
+// "It still drifts left or right if I move my head too close to the pipe" is a much better clue
+// than the earlier reports, because it names a trigger. Camera collision is what pushes a view
+// away from geometry it is about to enter, and every move class carries bUseCameraCollision at
+// +0x004C bit 22. On foot that is exactly right - the camera should not clip through a wall. On
+// a pipe the player's HEAD is voluntarily inches from a pole, which is the one situation where
+// being shoved away from it is wrong: in VR the head is where the head is.
+//
+// So it is cleared while climbing and restored on the way out - the same borrow-and-return shape
+// ParkourAnimLock already uses for the animation flags, and for the same reason: a flag left
+// clobbered outlives the state that wanted it.
+//
+// ⚠️ MEASURED INERT. On this build the flag reads "was already off" on every pipe, so this
+// changes nothing and the near-pipe drift has another cause. Kept, because it costs a read per
+// frame and would matter on a surface that does have it set - but do NOT read its presence as
+// evidence that camera collision was the problem. It was not.
+static uint32_t g_pkClimbFlagsSaved = 0;
+static bool     g_pkClimbFlagsHeld = false;
+static const uint32_t kUseCameraCollision = 1u << 22;
+
+static void PkClimbCameraCollision(bool onPipe)
+{
+    if (g_offMoveState < 0 || g_offMoves < 0 || !g_playerPawn) return;
+    uint8_t st = 0xFF;
+    uintptr_t obj = 0;
+    char cls[48];
+    if (!SafeRead(g_playerPawn + g_offMoveState, &st, 1)) return;
+    if (!ReadMoveClassName(g_playerPawn, (int)st, cls, sizeof(cls), &obj) || !obj) {
+        g_pkClimbFlagsHeld = false;     // the move is gone; nothing of ours is on it
+        return;
+    }
+    uint32_t w = 0;
+    if (!SafeRead(obj + 0x4C, &w, sizeof(w))) return;
+
+    if (onPipe) {
+        if (!g_pkClimbFlagsHeld) {
+            g_pkClimbFlagsSaved = w;
+            g_pkClimbFlagsHeld = true;
+            Log("[climb] camera collision %s - clearing it while climbing so the view is not"
+                " pushed off the pipe when the head leans in",
+                (w & kUseCameraCollision) ? "was ON" : "was already off");
+        }
+        if (w & kUseCameraCollision) {
+            const uint32_t off = w & ~kUseCameraCollision;
+            SIZE_T wrote = 0;
+            WriteProcessMemory(GetCurrentProcess(), (LPVOID)(obj + 0x4C), &off, sizeof(off),
+                               &wrote);
+        }
+    } else if (g_pkClimbFlagsHeld) {
+        // Only the one bit goes back, not the whole dword - the move owns the other 31 and may
+        // have changed them while we were holding this.
+        const uint32_t restored = (w & ~kUseCameraCollision) |
+                                  (g_pkClimbFlagsSaved & kUseCameraCollision);
+        SIZE_T wrote = 0;
+        WriteProcessMemory(GetCurrentProcess(), (LPVOID)(obj + 0x4C), &restored,
+                           sizeof(restored), &wrote);
+        g_pkClimbFlagsHeld = false;
+        Log("[climb] camera collision restored on leaving the pipe");
     }
 }
 
@@ -3370,6 +3434,22 @@ static bool  PkPawnYaw(float* deg);
 // measurement of something other than a hand on a ledge.
 static MEVR_Vec3 g_pkEntryOffset = {};
 static bool g_pkEntryOffsetValid = false;
+// ---- ⚠️ AND PER HAND, BECAUSE A PIPE IS NOT A LEDGE ----
+//
+// One shared offset was right on a ledge and is wrong on a pipe, for a reason that only shows up
+// once the axis turns vertical. On a ledge the offset is PERPENDICULAR to the line and the two
+// hands differ ALONG it - both wrap over the edge the same way, and where each one sits is the
+// player's own reach. Sharing costs nothing.
+//
+// A pipe's line is vertical, so "along" is height and the shared offset fixes both hands to the
+// same point on the circumference. The hands do not grip a pipe from the same side: they wrap it
+// from opposite ones. Applying one hand's offset to the other lands it across the pipe from where
+// it belongs - reported as the left hand snapping slightly to the right of the right hand's spot.
+//
+// So each hand keeps its own, with the shared one as the fallback for a hand whose entry reading
+// was rejected - which happens: "RIGHT hand reads 70.8 UU off the ledge at entry, ignored".
+static MEVR_Vec3 g_pkEntryOffsetH[2] = {};
+static bool g_pkEntryOffsetHOk[2] = { false, false };
 
 // ---- the corner, and the end of the ledge ----
 //
@@ -3446,16 +3526,20 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
     // the grip edge meant it existed exactly once per grab and only in the log.
     // Sign is irrelevant here: this projects onto the ledge as a LINE, and a line has no
     // direction. Only the direct drive, which travels ALONG it, cares which way it points.
-    float axis[3];
-    const bool haveAxis = PkLedgeAxis(axis);
-    if (g_pkLedgeOk && g_pkMode == PK_LEDGE && haveAxis) {
-        const float t = (target->x - g_pkLedgeLoc[0]) * axis[0] +
-                        (target->y - g_pkLedgeLoc[1]) * axis[1];
-        const float dx = target->x - (g_pkLedgeLoc[0] + axis[0] * t);
-        const float dy = target->y - (g_pkLedgeLoc[1] + axis[1] * t);
-        const float dz = target->z - g_pkLedgeLoc[2];
+    // ⚠️ Three dimensions now, not two. The ledge's axis is horizontal so its Z term was a plain
+    // subtraction; a pipe's axis IS Z, and keeping that special case would have measured every
+    // hand on a pipe as its own height above the pawn.
+    float axis[3], line[3];
+    const bool haveAxis = PkHoldLine(line, axis);
+    if (haveAxis) {
+        const float t = (target->x - line[0]) * axis[0] +
+                        (target->y - line[1]) * axis[1] +
+                        (target->z - line[2]) * axis[2];
+        const float dx = target->x - (line[0] + axis[0] * t);
+        const float dy = target->y - (line[1] + axis[1] * t);
+        const float dz = target->z - (line[2] + axis[2] * t);
         g_pkHandLedgeDist[hand] = sqrtf(dx * dx + dy * dy + dz * dz);
-    } else if (g_pkLedgeOk && g_pkMode == PK_LEDGE && !haveAxis) {
+    } else if (g_pkLedgeOk && g_pkMode == PK_LEDGE) {
         // ⚠️ This branch is why the readout said "ok" while nothing happened. The old code
         // skipped the whole computation when the axis was degenerate WITHOUT touching the reason
         // or the distance, so a silent skip and a success were indistinguishable on screen.
@@ -3466,7 +3550,7 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
         g_pkHandLedgeDist[hand] = -1.0f;
     }
 
-    if (!g_pkSnapOn || g_pkMode != PK_LEDGE || !grip ||
+    if (!g_pkSnapOn || (g_pkMode != PK_LEDGE && g_pkMode != PK_CLIMB) || !grip ||
         g_pkEntryHold > 0 || g_pkCornerState != 0) {
         if (g_pkSnapWhy2[hand][0] == 'o')   // keep a more specific reason set above
             g_pkSnapWhy2[hand] = !g_pkSnapOn ? "off"
@@ -3489,23 +3573,52 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
     // until the player happened to release and re-grip. Treating the handback as an edge is the
     // same event from the other side: this is the first frame the hand is ours again.
     const bool handedBack = g_pkEntryPrev > 0 && g_pkEntryHold == 0;
-    if (firstThisFrame && (!wasHeld || handedBack) && g_pkLedgeOk && haveAxis) {
+    if (firstThisFrame && (!wasHeld || handedBack) && haveAxis) {
         {
-            const float ax = axis[0], ay = axis[1];
-            const float vx = target->x - g_pkLedgeLoc[0];
-            const float vy = target->y - g_pkLedgeLoc[1];
-            const float t  = vx * ax + vy * ay;
-            const float cx = g_pkLedgeLoc[0] + ax * t;
-            const float cy = g_pkLedgeLoc[1] + ay * t;
-            const float cz = g_pkLedgeLoc[2];
+            const float vx = target->x - line[0];
+            const float vy = target->y - line[1];
+            const float vz = target->z - line[2];
+            const float t  = vx * axis[0] + vy * axis[1] + vz * axis[2];
+            const float cx = line[0] + axis[0] * t;
+            const float cy = line[1] + axis[1] * t;
+            const float cz = line[2] + axis[2] * t;
             const float dx = target->x - cx, dy = target->y - cy, dz = target->z - cz;
-            const float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+            const float raw = sqrtf(dx * dx + dy * dy + dz * dz);
+
+            // ---- ⚠️ MEASURE AGAINST WHERE A PLANTED HAND SITS, NOT AGAINST THE LINE ----
+            //
+            // The test was raw distance from the line, which worked on a ledge only because the
+            // ledge's line IS the ledge - MoveLedgeLocation - so a hand on it reads 11 to 15 UU
+            // and a 22 UU radius fits. A pipe has no such point: its line is the PAWN'S vertical
+            // axis, and the pipe surface is about 34 UU in front of the pawn's origin. So every
+            // hand correctly planted on a pipe read 30 to 36 UU and every single grip was
+            // rejected as "too far" - the hands were right and the ruler was wrong.
+            //
+            // The entry offset already says where a planted hand sits on THIS surface, measured
+            // off the game's own pose. So the question is not "how far from the line" but "how
+            // far from where the game puts a hand", and the radius goes back to meaning what it
+            // was tuned to mean. On a ledge the two are within a few UU of each other, so this
+            // does not move that behaviour.
+            const MEVR_Vec3 mine = g_pkEntryOffsetHOk[hand] ? g_pkEntryOffsetH[hand]
+                                                            : g_pkEntryOffset;
+            const bool haveMine = g_pkEntryOffsetHOk[hand] || g_pkEntryOffsetValid;
+            float dist = raw;
+            const char* against = "line";
+            if (haveMine) {
+                const float ex = dx - mine.x;
+                const float ey = dy - mine.y;
+                const float ez = dz - mine.z;
+                dist = sqrtf(ex * ex + ey * ey + ez * ez);
+                against = "planted pose";
+            }
 
             // Logged EVERY time, hit or miss. The radius is a guess until a run says how far the
-            // hand target actually sits from the ledge, and a silent miss teaches nothing - two
-            // runs have now ended with "it did not snap" and no number to size it from.
-            Log("[pk] %s grip closed %.1f UU from the ledge line (radius %.0f) - %s",
-                hand ? "RIGHT" : "LEFT", dist, g_pkSnapRadius * g_pkUUPerMetre,
+            // hand target actually sits, and a silent miss teaches nothing - two runs have now
+            // ended with "it did not snap" and no number to size it from.
+            Log("[pk] %s grip closed %.1f UU from the %s's %s (raw %.1f from the line,"
+                " radius %.0f) - %s",
+                hand ? "RIGHT" : "LEFT", dist, g_pkMode == PK_CLIMB ? "pipe" : "ledge",
+                against, raw, g_pkSnapRadius * g_pkUUPerMetre,
                 dist <= g_pkSnapRadius * g_pkUUPerMetre ? "ANCHORED" : "too far, hand stays free");
 
             if (dist <= g_pkSnapRadius * g_pkUUPerMetre) {
@@ -3517,10 +3630,14 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
                 //
                 // No pending window, no capture of a bone we might have written ourselves. That
                 // whole mechanism existed to recover a number this already has.
-                if (g_pkEntryOffsetValid) {
-                    g_pkHandAnchor[hand][0] = cx + g_pkEntryOffset.x;
-                    g_pkHandAnchor[hand][1] = cy + g_pkEntryOffset.y;
-                    g_pkHandAnchor[hand][2] = g_pkLedgeLoc[2] + g_pkEntryOffset.z;
+                if (haveMine) {
+                    // ⚠️ cz, not the line's own Z. On a ledge those are the same thing and the
+                    // old code could use either; on a pipe the closest point slides UP AND DOWN
+                    // the line, and taking the line's Z would pin every grip to the height the
+                    // pipe was first entered at.
+                    g_pkHandAnchor[hand][0] = cx + mine.x;
+                    g_pkHandAnchor[hand][1] = cy + mine.y;
+                    g_pkHandAnchor[hand][2] = cz + mine.z;
                     g_pkHandAnchored[hand] = true;
                     g_pkHandPending[hand] = 0;
                     PkFreezeViewNow();
@@ -3719,6 +3836,51 @@ extern int g_offActorRotation;   // defined with the other pawn offsets, far bel
 // ledge runs along its RIGHT vector. UE3 rotators are 65536 to the turn and forward is
 // (cos, sin, 0) in the XY plane, so right is (sin, -cos, 0). No cross product, no dependence on
 // a normal whose convention was guessed at.
+// ================================================================ PK.9: the pipe
+//
+// A pipe is the same problem as a ledge with the axis turned ninety degrees, and almost every
+// hard part of the ledge does not exist here:
+//
+//   - the axis needs no derivation. A pipe is vertical: (0, 0, 1). The ledge axis had to come
+//     from the pawn's yaw because MoveLedgeNormal reads (0,0,0), and its sign was wrong twice.
+//   - there is no corner, so none of the corner machinery applies.
+//   - there is no MoveLedgeLocation equivalent - TdMove_Climb carries no position at all, only
+//     ClimbState at +0x018C and bClimbLeftHand on the pawn. But a pipe does not need one: the
+//     pawn hugs it, so the pawn's own X/Y IS the line, and it stays put while you climb.
+//
+// ⚠️ And one thing is strictly harder. Direct drive has never written Z - "so the worst failure
+// moves you along a wall rather than off it" - and on a pipe Z is the ONLY axis to write. That
+// safety property inverts here and is not free: a bad write on a ledge slides you sideways, a bad
+// write on a pipe drops you or fires you through the ceiling. Nothing in this rung writes
+// position; that decision is deferred until the telemetry below says what a climb looks like.
+static bool PkClimbLine(float* point)
+{
+    if (!point || g_pkMode != PK_CLIMB || !g_playerPawn || g_offActorLocation < 0) return false;
+    float loc[3];
+    if (!SafeRead(g_playerPawn + g_offActorLocation, loc, sizeof(loc))) return false;
+    point[0] = loc[0];
+    point[1] = loc[1];
+    point[2] = loc[2];
+    return true;
+}
+
+// The line a gripped hand is measured against, whichever surface the player is on: a point on it
+// and a unit direction along it. The ledge's is horizontal and derived; the pipe's is vertical and
+// read. Everything downstream - the reach projection, the perpendicular offset, the snap radius -
+// is the same arithmetic once it has these two.
+static bool PkHoldLine(float* point, float* axis)
+{
+    if (g_pkMode == PK_CLIMB) {
+        if (!PkClimbLine(point)) return false;
+        axis[0] = 0.0f; axis[1] = 0.0f; axis[2] = 1.0f;
+        return true;
+    }
+    if (g_pkMode != PK_LEDGE || !g_pkLedgeOk) return false;
+    if (!PkLedgeAxis(axis)) return false;
+    point[0] = g_pkLedgeLoc[0]; point[1] = g_pkLedgeLoc[1]; point[2] = g_pkLedgeLoc[2];
+    return true;
+}
+
 static bool PkLedgeAxis(float* axis)
 {
     if (!g_pkLedgeOk) return false;
@@ -4626,6 +4788,7 @@ static void ParkourTick(XrTime when)
     PkReadLedge();
     PkReadCorner();
     PkWatchLedgeOffset();
+    PkClimbCameraCollision(g_pkMode == PK_CLIMB);
     // ⚠️ ABOVE PkFreezeViewTick, which gates on it. It used to be assigned after, so the freeze
     // read LAST frame's mode - and the one frame that buys is the frame the player leaves the
     // ledge, which is precisely the frame the pawn moves hardest.
@@ -4640,13 +4803,15 @@ static void ParkourTick(XrTime when)
     if (g_pkMode != prevMode) {
         if (g_pkMode == PK_NONE || prevMode == PK_NONE)
             Log("[pk] mode %d -> %d at t=%.2fs", prevMode, g_pkMode, LogSecs());
-        if (g_pkMode == PK_LEDGE) {
+        if (g_pkMode == PK_LEDGE || g_pkMode == PK_CLIMB) {
             g_pkEntryHold = 30;
             g_pkEntryOffsetValid = false;
+            g_pkEntryOffsetHOk[0] = g_pkEntryOffsetHOk[1] = false;
             g_pkGapBaselineOk = false;
             g_pkGapBaselineOkPub = false;
-            Log("[pk] ledge entered - the game keeps both hands for %ld frames while the"
-                " hand-to-ledge offset is measured", g_pkEntryHold);
+            Log("[pk] %s entered - the game keeps both hands for %ld frames while the"
+                " hand offset is measured off its own planted pose",
+                g_pkMode == PK_CLIMB ? "pipe" : "ledge", g_pkEntryHold);
         }
         // ⚠️ Direct drive is never TOLD it is over. ParkourDirectBodyTick is called below the
         // "not on a wall" early return, so the frame the mode leaves the ledge is the last frame
@@ -4678,6 +4843,82 @@ static void ParkourTick(XrTime when)
     // open while the game corners you is exactly when the anchors most need to be gone.
     PkCornerTick();
 
+    // ---- what a climb actually looks like, because nothing has ever measured one ----
+    //
+    // The movement half is deliberately NOT built yet. On a ledge, direct drive writes X/Y and
+    // never Z, so the worst failure slides the player along a wall; on a pipe Z is the only axis
+    // there is, and the same class of mistake drops them off it or fires them through the ceiling.
+    // That inversion is worth one run of looking before anything writes.
+    //
+    // What this needs to answer: does the pawn's X/Y really stay fixed while climbing - the whole
+    // PkClimbLine assumption rests on it - how fast the game climbs for a given stick, and whether
+    // the entry measurement lands at all on a surface with no MoveLedgeLocation to measure from.
+    if (g_pkMode == PK_CLIMB && (g_frames % 6) == 0) {
+        // ⚠️ Per ENTRY, not per run. It was a plain static, so "drift from entry" was measured
+        // from the first pipe ever touched - and reported Y+96.0 across two different pipes,
+        // which reads exactly like the pipe-line assumption failing when it is only the baseline
+        // being stale.
+        float loc[3] = { 0, 0, 0 };
+        static float first[3] = { 0, 0, 0 };
+        static bool haveFirst = false;
+        static int prevClimbMode = PK_NONE;
+        if (prevClimbMode != PK_CLIMB) haveFirst = false;
+        prevClimbMode = PK_CLIMB;
+        if (g_playerPawn && g_offActorLocation >= 0 &&
+            SafeRead(g_playerPawn + g_offActorLocation, loc, sizeof(loc))) {
+            if (!haveFirst) { memcpy(first, loc, sizeof(first)); haveFirst = true; }
+            // ---- ⚠️ and the yaw, because the camera pans on its own while holding still ----
+            //
+            // The stick reads 0.00 for every sample of a climb, so nothing the player does is
+            // turning them. The head write accumulates DELTAS "on top of whatever else moves the
+            // camera" - which is fine when nothing else does, and an integrator being fed an
+            // error when something does. A pipe is the one surface where the game can rotate the
+            // pawn on its own: TdMove_Climb carries StartTurningAngle, and TdMove_Grab exposes
+            // GetMin/MaxLookConstrainYaw, so a constraint fighting an accumulator is exactly the
+            // shape of a slow pan.
+            //
+            // Three numbers separate the suspects. If the CONTROLLER yaw creeps while dYaw is
+            // near zero, the game is turning us. If dYaw is persistently non-zero while the
+            // player holds still, the accumulator is. If the PAWN yaw moves and the controller's
+            // does not, it is the climb move rotating the body under a fixed view.
+            // ---- ⚠️ THE TURN AXIS IS RX, AND THE CODE SAID SO ALL ALONG ----
+            //
+            // Both failed fixes gated on g_padSentLX. The pad build maps the LOOK stick to the
+            // game's RIGHT stick - "s.Gamepad.sThumbRX = axis(lx)" - so turning has never touched
+            // LX, and the re-latch that was meant to let stick turning through could not fire.
+            // The stick=(0.00 0.00) in the climb samples is the LEFT stick, exactly as printed,
+            // and I read it as "the player is not turning".
+            //
+            // No run was needed to find that; it is four lines above the pad assignment. Both
+            // axes are logged now, beside the head's own yaw - which also separates the remaining
+            // rotation into "the game is moving the world" versus "the headset's yaw is drifting".
+            extern float g_padSentRX;
+            extern int32_t g_lastHeadYawPub;
+            // ⚠️ The cached pointer, not FindPlayerController() - that one is static and
+            // defined below this, and it walks objects. A telemetry line has no business
+            // repeating a search the head write already did this frame.
+            extern uintptr_t g_lastPlayerController;
+            extern int g_lastYawWrite;
+            int32_t crot[3] = { 0, 0, 0 }, prot[3] = { 0, 0, 0 };
+            const uintptr_t ctl = g_lastPlayerController;
+            if (ctl && g_offActorRotation >= 0)
+                SafeRead(ctl + g_offActorRotation, crot, sizeof(crot));
+            if (g_offActorRotation >= 0)
+                SafeRead(g_playerPawn + g_offActorRotation, prot, sizeof(prot));
+            Log("[climb] pawn (%.0f %.0f %.0f) | drift X%+.1f Y%+.1f dZ%+.1f | stickY %+.2f"
+                " | grips %c%c anchored %c%c | offset %s | yaw ctl %.1f pawn %.1f head %.1f"
+                " dYawWritten %+d | stick LX %+.2f RX %+.2f",
+                loc[0], loc[1], loc[2], loc[0] - first[0], loc[1] - first[1], loc[2] - first[2],
+                g_padSentLY,
+                g_gripValue[0] > 0.5f ? 'G' : '-', g_gripValue[1] > 0.5f ? 'G' : '-',
+                g_pkHandAnchored[0] ? '+' : '-', g_pkHandAnchored[1] ? '+' : '-',
+                g_pkEntryOffsetValid ? "measured" : "NOT YET",
+                (float)crot[1] * (360.0f / 65536.0f), (float)prot[1] * (360.0f / 65536.0f),
+                (float)g_lastHeadYawPub * (360.0f / 65536.0f), g_lastYawWrite,
+                g_padSentLX, g_padSentRX);
+        }
+    }
+
     // Body travel is accumulated every frame, signed by what we were LAST asking for - the move
     // that actually produced it. Signing by this frame's request would credit the previous
     // frame's travel to a direction that had already been reversed.
@@ -4695,8 +4936,8 @@ static void ParkourTick(XrTime when)
     //
     // So it retries. The window costs nothing when it succeeds and is the only way back when it
     // does not.
-    if (g_pkMode == PK_LEDGE && g_pkEntryHold == 0 && !g_pkEntryOffsetValid &&
-        g_pkCornerState == 0) {
+    if ((g_pkMode == PK_LEDGE || g_pkMode == PK_CLIMB) && g_pkEntryHold == 0 &&
+        !g_pkEntryOffsetValid && g_pkCornerState == 0) {
         static long retryAt = 0;
         if (g_frames > retryAt) {
             retryAt = g_frames + 120;
@@ -5327,6 +5568,7 @@ static bool XrSyncInput(XrTime when)
     s.Gamepad.sThumbLX = axis(mx);
     s.Gamepad.sThumbLY = axis(my);
     s.Gamepad.sThumbRX = axis(lx);
+    g_padSentRX = lx;               // the turn axis - see the climb trace
     s.Gamepad.sThumbRY = axis(ly);
 
     // The right stick's Y axis belongs to jump and quick turn now, not to pad pitch. Zeroed
@@ -10301,6 +10543,10 @@ bool             g_pitchAbsolute = true;
 bool             g_animFollow     = true;   // PITCH; NUMPAD2
 bool             g_animRollFollow = true;   // ROLL;  NUMPAD4
 bool             g_animYawFollow  = true;   // YAW;   NUMPAD5
+extern int       g_lastYawWrite;            // defined with the pawn globals
+extern int32_t   g_lastHeadYawPub;          // ...and beside it
+extern float     g_padSentRX;               // the LOOK stick - the axis that actually turns
+extern uintptr_t g_lastPlayerController;    // ...and beside it
 
 // ---- PK.3: the shimmy animation stops steering the camera ----
 //
@@ -10340,6 +10586,8 @@ void ParkourAnimLock(bool onWall)
 extern float     g_animNow[3];              // camera animation contribution, degrees, P/Y/R
 static bool      g_headPrimed = false;
 static int32_t   g_lastHeadYaw = 0, g_lastHeadPitch = 0;
+static int32_t   g_climbYawRef = 0;         // pipe: the game yaw that corresponds to head yaw 0
+static bool      g_climbYawRefOk = false;
 static long      g_headWrites = 0;
 static long      g_headJumpsRejected = 0;
 
@@ -10621,6 +10869,7 @@ static void ApplyHeadTracking(XrTime when)
 
     if (!g_headTracking || g_offActorRotation < 0) return;
     const uintptr_t ctl = FindPlayerController();
+    g_lastPlayerController = ctl;
     if (!ctl) return;
 
     int32_t hy, hp;
@@ -10653,6 +10902,61 @@ static void ApplyHeadTracking(XrTime when)
     }
 
     int32_t dYaw   = YawDelta(hy, g_lastHeadYaw)   * g_yawSign;
+    // ---- ⚠️ ON A PIPE THE GAME ROTATES THE VIEW, AND A DELTA WRITE CANNOT UNDO IT ----
+    //
+    // Measured, with both sticks reading 0.00 on every sample and the player holding still:
+    //
+    //     yaw ctl 178.1 pawn 180.0 head 10.9 dYawWritten +11 | LX +0.00 RX +0.00
+    //     yaw ctl 175.5 pawn 180.0 head  8.5 dYawWritten -10 | LX +0.00 RX +0.00
+    //     yaw ctl 172.7 pawn 180.0 head  9.3 dYawWritten  +0 | LX +0.00 RX +0.00
+    //     yaw ctl 171.9 pawn 180.0 head  8.3 dYawWritten +14 | LX +0.00 RX +0.00
+    //
+    // Three facts fall out. The pawn never moves - 180.0 throughout - so the body is not turning.
+    // The HEAD yaw wanders between 8.1 and 10.9 and comes back, which is a person standing still,
+    // not a headset drifting. And the controller's yaw falls 6.2 degrees while our writes sum to
+    // a NET POSITIVE half degree. The game is rotating the view, against us, unasked.
+    //
+    // A delta write cannot undo that by construction: it adds the head's own motion to whatever
+    // the field already holds, so the game's contribution is never erased and simply accumulates.
+    // That is the same reasoning that made pitch absolute, quoted beside it - "every disturbance
+    // it does not originate is permanent".
+    //
+    // ---- ⚠️ ATTEMPT 3, AND THE TWO BEFORE IT WERE MINE ----
+    //
+    //   1. Standing the write down. The player caught it before testing: with no write the game's
+    //      facing stops tracking the head, so jumping off a pipe goes where the body points.
+    //   2. Absolute, gated on g_padSentLX. Correct in principle, wrong axis - the pad build maps
+    //      the LOOK stick to the game's RIGHT stick ("s.Gamepad.sThumbRX = axis(lx)"), so turning
+    //      never touches LX, the re-latch could never fire, and the player was clamped to however
+    //      far a neck turns. Four lines above the pad assignment, and I built on it twice without
+    //      reading them.
+    //
+    // So: absolute, gated on the axis that actually turns. yaw = reference + head, asserted every
+    // frame, which OVERWRITES the game's pull instead of stacking on it. The reference absorbs
+    // game-moved yaw only while the player is genuinely turning, so stick rotation is unbounded
+    // and a constraint tugging at a still player is simply overwritten.
+    if (g_pkMode == PK_CLIMB) {
+        int32_t cur[3];
+        if (SafeRead(ctl + g_offActorRotation, cur, sizeof(cur))) {
+            const int32_t want = hy * g_yawSign;
+            const bool turning = fabsf(g_padSentRX) > 0.15f || fabsf(g_padSentLX) > 0.15f;
+            if (!g_climbYawRefOk) {
+                g_climbYawRef = cur[1] - want;      // enter facing where you already are
+                g_climbYawRefOk = true;
+                Log("[head] pipe: yaw goes absolute, reference latched at %.1f deg",
+                    (float)g_climbYawRef * (360.0f / 65536.0f));
+            } else if (turning) {
+                g_climbYawRef = cur[1] - want;      // the player asked for this; keep it
+            }
+            // ⚠️ A CORRECTION, not a head motion, though it rides the same write below. The
+            // 11-degree implausible-step guard downstream is sized for the latter; the measured
+            // pull is a quarter degree a frame, and a rejection is harmless anyway because an
+            // absolute scheme recomputes from the field next frame instead of losing it.
+            dYaw = g_climbYawRef + want - cur[1];
+        }
+    } else if (g_climbYawRefOk) {
+        g_climbYawRefOk = false;
+    }
     int32_t dPitch = YawDelta(hp, g_lastHeadPitch) * g_pitchSign;
     g_lastHeadYaw = hy; g_lastHeadPitch = hp;
     // An absolute pitch has to be re-asserted every frame even when the head has not moved -
@@ -10790,6 +11094,8 @@ static void ApplyHeadTracking(XrTime when)
     WriteProcessMemory(GetCurrentProcess(), (LPVOID)(ctl + g_offActorRotation), rot,
                        sizeof(int32_t) * 2, &wrote);
 
+    g_lastYawWrite = dYaw;      // for the climb telemetry - see the drift note there
+    g_lastHeadYawPub = hy;
     if (++g_headWrites == 1 || (g_headWrites % 600) == 0)
         Log("[head] write #%ld  dYaw %+d dPitch %+d -> pitch %d yaw %d",
             g_headWrites, dYaw, dPitch, rot[0], rot[1]);
@@ -11654,6 +11960,9 @@ int g_offCtlCamera = -1;
 int g_offCamViewTarget = -1;
 
 uintptr_t g_playerPawn = 0;
+int       g_lastYawWrite = 0;         // last delta the head write applied - read by the climb trace
+int32_t   g_lastHeadYawPub = 0;       // ...and the head yaw it was derived from
+uintptr_t g_lastPlayerController = 0; // ...and the controller it applied it to
 static long      g_pawnNextTry = 0;
 static bool      g_pawnMissLogged = false;
 // Last pawn accepted and last pawn refused via the controller, so each logs a CHANGE rather
@@ -12395,7 +12704,7 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13HandPoseSnapshot& 
     // So this deliberately does NOT stand the arm down for an ANCHORED hand. It does for a
     // PENDING one: those few frames exist precisely so the game can pose the hand without us
     // steering it, and capturing a position we wrote ourselves would anchor to our own guess.
-    if (g_parkour && g_pkMode == PK_LEDGE &&
+    if (g_parkour && (g_pkMode == PK_LEDGE || g_pkMode == PK_CLIMB) &&
         (g_pkEntryHold > 0 || g_pkCornerState != 0 ||
          g_pkHandPending[leftHand ? 0 : 1] > 0)) {
         if (outMovement) {
@@ -12410,10 +12719,22 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13HandPoseSnapshot& 
     // whole movement state; VaultOver is one state running two different animations, and the
     // player wants the hands on opposite sides of that. g_vaultHandsAreOurs is latched on the
     // move's first frame - see PkLogVaultEntry - so it cannot flip part-way through one.
+    // ---- ⚠️ 21 IS Climb, AND ITS ABSENCE MADE EVERY PIPE FIX INVISIBLE ----
+    //
+    // The player asked the right question: "ungripping my hand hasn't moved my hands off the
+    // pipe, so how can I tell if it's working?" It hasn't, and they couldn't. Climb is state 21
+    // and it was not on this list, so on a pipe the mod NEVER takes the hands - the game poses
+    // them the whole time, gripped or not. Every anchor fix of the last three builds ran on hand
+    // targets that were never written, which is why nothing on screen ever changed.
+    //
+    // With 21 here the pipe behaves like the ledge: a free hand follows the controller, a planted
+    // one is the game's, and PkHandIsTheGames makes that split per hand. Which also makes the
+    // whole thing testable - an ungripped hand that moves with the controller is the difference
+    // you can actually see.
     if (g_offMoveState < 0 || !SafeRead(pawn + g_offMoveState, &movement, 1) ||
         !(movement == 1 || movement == 2 || movement == 11 || movement == 15 ||
           movement == 16 || movement == 24 || movement == 29 || movement == 30 ||
-          (g_parkour && movement == 3) ||
+          (g_parkour && (movement == 3 || movement == 21)) ||
           (movement == 9 && g_vaultHandsAreOurs))) {
         if (outMovement) *outMovement = movement;
         return P13_MOVEMENT;
@@ -13816,7 +14137,9 @@ static void __fastcall Hook_UpdateSkelPose(void* self, void* edx, float deltaTim
         // that is not. Keyed on the same latch the position uses, so the two halves cannot
         // disagree about whether a hand is holding.
         g_pkFingersAreTheGames[h] = gameOwns;
-        if (g_parkour && moveState == 3) g_pkFingersAreTheGames[h] = PkHandIsTheGames(h);
+        // 3 is Grabbing, 4 is Climbing - both are surfaces where a planted hand is the game's.
+        if (g_parkour && (moveState == 3 || g_pkMode == PK_CLIMB))
+            g_pkFingersAreTheGames[h] = PkHandIsTheGames(h);
         g_curlTarget[h] = g_pkFingersAreTheGames[h] ? 0.0f : wanted;
     }
 
@@ -14484,8 +14807,9 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
             }
         }
     }
-    g_pkGameOwnsHand[0] = g_parkour && g_pkMode == PK_LEDGE && !leftEligible;
-    g_pkGameOwnsHand[1] = g_parkour && g_pkMode == PK_LEDGE && !rightEligible;
+    const bool onHold = g_pkMode == PK_LEDGE || g_pkMode == PK_CLIMB;
+    g_pkGameOwnsHand[0] = g_parkour && onHold && !leftEligible;
+    g_pkGameOwnsHand[1] = g_parkour && onHold && !rightEligible;
 
     MEVR_Vec3 leftSocket{}, rightSocket{};
     const bool haveLeftSocket = ShoulderWorldPosition(
@@ -14509,27 +14833,43 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
             // half a metre low.
             //
             // The window exists to let the pose settle; reading at its start throws that away.
-            if (g_pkEntryHold > 0 && g_pkLedgeOk) {
-                float ax[3];
-                if (PkLedgeAxis(ax)) {
-                    const float t = (meshHand.x - g_pkLedgeLoc[0]) * ax[0] +
-                                    (meshHand.y - g_pkLedgeLoc[1]) * ax[1];
+            // ⚠️ THE LINE, not g_pkLedgeLoc. Opening this to the pipe without changing the
+            // arithmetic measured a hand on a pipe against the LAST LEDGE'S location - which is
+            // stale the moment the player leaves it, and is not even on the same wall. It read
+            // 42.3 UU where a real hand offset is 11 to 15, sailed under the 60 UU sanity bound,
+            // and every grip afterwards then landed 33 to 44 UU from the pipe line and was
+            // rejected as "too far". A generalisation that shares a gate but not the maths is
+            // not a generalisation.
+            if (g_pkEntryHold > 0) {
+                float ax[3], ln[3];
+                if (PkHoldLine(ln, ax)) {
+                    const float t = (meshHand.x - ln[0]) * ax[0] +
+                                    (meshHand.y - ln[1]) * ax[1] +
+                                    (meshHand.z - ln[2]) * ax[2];
                     const MEVR_Vec3 off = {
-                        meshHand.x - (g_pkLedgeLoc[0] + ax[0] * t),
-                        meshHand.y - (g_pkLedgeLoc[1] + ax[1] * t),
-                        meshHand.z -  g_pkLedgeLoc[2] };
+                        meshHand.x - (ln[0] + ax[0] * t),
+                        meshHand.y - (ln[1] + ax[1] * t),
+                        meshHand.z - (ln[2] + ax[2] * t) };
                     const float mag = sqrtf(off.x * off.x + off.y * off.y + off.z * off.z);
                     if (mag < 60.0f) {
                         g_pkEntryOffset = off;      // kept fresh; believed when the window closes
+                        g_pkEntryOffsetH[hand] = off;
+                        if (g_pkEntryHold <= 1 && !g_pkEntryOffsetHOk[hand]) {
+                            g_pkEntryOffsetHOk[hand] = true;
+                            Log("[pk] %s hand's own offset: (%.1f %.1f %.1f), %.1f UU",
+                                hand ? "RIGHT" : "LEFT", off.x, off.y, off.z, mag);
+                        }
                         if (g_pkEntryHold <= 1 && !g_pkEntryOffsetValid) {
                             g_pkEntryOffsetValid = true;
-                            Log("[pk] hand-to-ledge offset settled off the %s hand:"
+                            Log("[pk] hand-to-%s offset settled off the %s hand:"
                                 " (%.1f %.1f %.1f), %.1f UU - used for both",
+                                g_pkMode == PK_CLIMB ? "pipe" : "ledge",
                                 hand ? "RIGHT" : "LEFT", off.x, off.y, off.z, mag);
                         }
                     } else if (g_pkEntryHold <= 1) {
-                        Log("[pk] %s hand reads %.1f UU off the ledge at entry - not a hand on a"
-                            " ledge, ignored", hand ? "RIGHT" : "LEFT", mag);
+                        Log("[pk] %s hand reads %.1f UU off the %s at entry - not a hand on it,"
+                            " ignored", hand ? "RIGHT" : "LEFT", mag,
+                            g_pkMode == PK_CLIMB ? "pipe" : "ledge");
                     }
                 }
             }
