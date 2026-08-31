@@ -182,6 +182,11 @@ ParkourCamLeadFwd = on
 ; CAPS LOCK toggles it live.
 ParkourAskTheGame = on
 
+; Dense parkour diagnostics: a per-frame trace of every corner, the ledge-offset watcher, and
+; the CanShimmy-vs-heuristic comparison. A VERY large log - the corner trace alone was a fifth of
+; one run's lines - so on only while you are chasing something.
+ParkourDebug = off
+
 ; One-shot dump of every authored parkour-geometry class in the level, with instance counts and
 ; positions. Off, and it should stay off unless you are asking that question: it walks the whole
 ; object table twice and STALLS the game for about a second. Enabled, it waits for a quiet moment

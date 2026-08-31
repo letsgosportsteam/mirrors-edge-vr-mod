@@ -2454,7 +2454,11 @@ static bool ArmSwingJumpTick(XrTime when)
 // Nothing here can fix that - the game has exactly one shimmy speed.
 enum PkHand { PK_HAND_NONE = -1, PK_HAND_L = 0, PK_HAND_R = 1 };
 
-static bool  g_parkourDebug = false;
+// ⚠️ Had no ini key and no hotkey - nothing in the file ever assigned it, so every diagnostic
+// gated behind it was unreachable code. It accumulated four of them: the dense per-frame corner
+// trace, the grab-offset watcher, the pkend line and the CanShimmy comparison. A debug flag with
+// no way to set it is worse than no flag, because the gating reads as deliberate.
+bool  g_parkourDebug = false;               // ParkourDebug in mevr.ini
 int   g_pkAnchor = PK_HAND_NONE;            // which hand is holding the world still
 static float g_pkAnchorLat = 0.0f;          // its lateral position when it grabbed, metres
 static float g_pkProgress = 0.0f;           // how far the body has travelled since, metres
@@ -19944,10 +19948,23 @@ static uintptr_t PkFindFunction(const char* fnName, const char* outerName)
 // to trust it. A heuristic that has been tuned across a dozen runs is not replaced on the
 // strength of a call that worked once.
 //
-// ShimmyAction's enum values are not known - CurrentShimmyMove has been observed as 0, 2 and 3 -
-// so every value in a small range is asked and the pattern is what identifies them. A direction
-// that answers true only when there is ledge that way will stand out against one that never
-// changes.
+// ---- ⚠️ MEASURED: IT IS NOT THE FUNCTION THIS WAS FOR ----
+//
+// The call works. The mask reads 00000001, the return is a clean UBOOL, and the buffer comes back
+// written rather than poisoned - the machinery is sound and ProcessEvent is confirmed twice over.
+//
+// The ANSWER is the problem. Across 88 samples, all twelve ShimmyAction values agreed every
+// single time: 86 samples of all-true and 2 of all-false, never once a mix. And both all-false
+// samples sit on CurrentShimmyMove=2 - during a corner.
+//
+// So CanShimmy answers "may I shimmy at all right now", not "is there ledge to my left". It is a
+// state query, and the parameter does not change it. That is a real answer and it closes route A
+// for the purpose it was opened for: this cannot replace the end-of-ledge heuristic, because it
+// does not know about ends.
+//
+// What survives is the machinery, and that is not nothing - ProcessEvent is derived and verified,
+// so Actor::Trace and every other function in the game is now callable. The next person who needs
+// real geometry starts from a proven call rather than from here.
 void PkAskCanShimmy()
 {
     if (g_peSlot < 0 || !g_playerPawn || g_offMoveState < 0) return;
@@ -19961,15 +19978,55 @@ void PkAskCanShimmy()
     char cls[48];
     if (!SafeRead(g_playerPawn + g_offMoveState, &st, 1) || st != 3) return;
     if (!ReadMoveClassName(g_playerPawn, (int)st, cls, sizeof(cls), &obj) || !obj) return;
-    const uintptr_t fn = PkFindFunction("CanShimmy", "TdMove_Grab");
+    // ---- ⚠️ CACHED. THIS WAS THE FRAMERATE. ----
+    //
+    // PkFindFunction walks the entire GObjects array - about 115,000 entries, with a read per
+    // entry - and this called it once a second, on the game thread. The same walk takes over a
+    // second when the census does it, which is why the census is fenced off to a quiet moment;
+    // doing it repeatedly during play is the stutter the player reported for the whole run.
+    //
+    // A UFunction does not move. Look it up once.
+    static uintptr_t fn = 0;
+    if (!fn) fn = PkFindFunction("CanShimmy", "TdMove_Grab");
     if (!fn) return;
     uint32_t vt = 0, pe = 0;
     if (!SafeU32(obj, &vt) || !InModule(vt)) return;
     if (!SafeU32(vt + g_peSlot * 4, &pe) || pe < g_textLo || pe >= g_textHi) return;
 
-    char out[96] = "";
+    // ---- ⚠️ AND THE ANSWER SO FAR IS NOT AN ANSWER ----
+    //
+    // Over 130 samples the reply was all-YES 128 times and all-no twice, and never once a MIX.
+    // Six different actions agreeing perfectly, every time, is not six answers - it is one value
+    // that has nothing to do with the parameter. Either ShimmyAction is not reaching the
+    // function, or +0x04 is not where its verdict lands.
+    //
+    // Reading it as a byte is the likelier mistake: a UE3 BoolProperty is a BITFIELD, a dword
+    // masked by the property's own BitMask, so the truth is (dword & mask) and not (low byte).
+    // So the mask is read from the property rather than assumed, the whole dword is logged, and
+    // the range is widened - if no value in 0..11 ever changes the reply, the parameter is not
+    // arriving and the layout is wrong somewhere earlier.
+    uint32_t retMask = 0;
+    {
+        uint32_t cur = 0;
+        if (SafeU32(fn + 0x4C, &cur)) {
+            for (int g2 = 0; g2 < 8 && cur >= 0x10000; ++g2) {
+                char nm[64] = "?";
+                uint32_t off = 0, nxt = 0;
+                ReadObjName(cur, nm, sizeof(nm));
+                SafeU32(cur + g_offPropOff, &off);
+                if (strcmp(nm, "ReturnValue") == 0 && g_offBoolMask >= 0) {
+                    SafeU32(cur + g_offBoolMask, &retMask);
+                    break;
+                }
+                if (!SafeU32(cur + g_offNext, &nxt)) break;
+                cur = nxt;
+            }
+        }
+    }
+
+    char out[192] = "";
     int n = 0;
-    for (int action = 0; action < 6; ++action) {
+    for (int action = 0; action < 12; ++action) {
         // Poisoned again, so "it did not answer" and "it answered false" stay distinguishable.
         unsigned char parms[128];
         memset(parms, 0xCD, sizeof(parms));
@@ -19983,14 +20040,17 @@ void PkAskCanShimmy()
             g_peSlot = -2;
             return;
         }
-        const unsigned char r = parms[4];
-        n += _snprintf_s(out + n, sizeof(out) - n, _TRUNCATE, " %d=%s", action,
-                         r == 0xCD ? "?" : (r ? "YES" : "no"));
+        const uint32_t r = *(const uint32_t*)(parms + 4);
+        const char* verdict = (r == 0xCDCDCDCD) ? "?"
+                            : (retMask ? ((r & retMask) ? "Y" : "n")
+                                       : (r ? "Y" : "n"));
+        n += _snprintf_s(out + n, sizeof(out) - n, _TRUNCATE, " %d:%s/%08X", action, verdict, r);
     }
     // Beside the heuristic that has been answering this question all along, so the next run says
     // outright whether the game's answer is better than the stand-in.
-    Log("[canshimmy]%s | heuristic says end%+d, gap %.0f vs resting %.0f, travelling %+d",
-        out, g_pkEndDir, g_pkGapNow, g_pkGapBaseline, g_pkTravelDir);
+    Log("[canshimmy] mask %08X%s", retMask, out);
+    Log("[canshimmy]   heuristic: end%+d, gap %.0f vs resting %.0f, travelling %+d",
+        g_pkEndDir, g_pkGapNow, g_pkGapBaseline, g_pkTravelDir);
 }
 
 void PkVerifyProcessEvent()
@@ -22726,6 +22786,14 @@ static void LoadSettings()
                       : "  (no end-of-ledge or corner verdict is available)");
                 applied++;
             } else { Log("[cfg]   ParkourAskTheGame '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourDebug") == 0) {
+            if (SettingBool(val, &b)) {
+                g_parkourDebug = b;
+                Log("[cfg]   ParkourDebug = %s%s", b ? "on" : "off",
+                    b ? "  (dense per-frame corner trace, the ledge-offset watcher, and the"
+                        " CanShimmy-vs-heuristic comparison - a VERY large log)" : "");
+                applied++;
+            } else { Log("[cfg]   ParkourDebug '%s' is not a boolean - ignored", val); rejected++; }
         } else if (_stricmp(key, "ParkourGeomCensus") == 0) {
             if (SettingBool(val, &b)) {
                 g_geomCensus = b;
