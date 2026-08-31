@@ -2834,6 +2834,7 @@ int g_offDisableShimmy = -1;                         // TdMove_Grab::DisableShim
 // infer the lag from a latched axis, it can read it.
 int g_offGrabDesiredOffset = -1;
 int g_offCurShimmy = -1;                             // TdMove_Grab::CurrentShimmyMove, a byte
+int g_offGrabType = -1;                              // TdMove_Grab::GrabType - the known answer
 static long g_gdoSamples = 0, g_gdoWorldHits = 0, g_gdoLocalHits = 0, g_gdoLocalBHits = 0;
 static long g_gdoChanged = 0;
 static float g_gdoPrev[3] = { 0, 0, 0 };
@@ -7866,6 +7867,7 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                     LookupProp("TdMove_Grab", "GrabDesiredLedgeOffset", true);
                 // The game says a corner move is running, on its first frame. See PkCornerTick.
                 g_offCurShimmy = LookupProp("TdMove_Grab", "CurrentShimmyMove", true);
+                g_offGrabType  = LookupProp("TdMove_Grab", "GrabType", true);
                 Log("[pk] CurrentShimmyMove at +0x%04X (3 = hanging/shimmying, 2 = a corner)",
                     g_offCurShimmy);
                 Log("[grabofs] GrabDesiredLedgeOffset at +0x%04X", g_offGrabDesiredOffset);
@@ -8791,6 +8793,9 @@ static void LateReanchorP13Pose(uintptr_t pawn, P13PoseSnapshot* pose)
     }
 }
 
+void PkVerifyProcessEvent();   // route A rung 3, defined far below with the vtable work
+void PkAskCanShimmy();         // ...and rung 4, the read-only comparison
+
 static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, void* result)
 {
     if (!g_origUpdate1pArms) return;
@@ -8804,6 +8809,11 @@ static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, voi
     RestoreDetachedArmOverridesBeforeGame(reinterpret_cast<uintptr_t>(self));
     RestoreMotionHandPositionOverridesBeforeGame(reinterpret_cast<uintptr_t>(self));
     g_origUpdate1pArms(self, edx, stack, result);
+
+    // Route A rung 3. Game thread by construction - Update1pArms is a script native, so it
+    // cannot be running anywhere else.
+    PkVerifyProcessEvent();
+    PkAskCanShimmy();
 
     static volatile LONG calls = 0;
     const LONG call = InterlockedIncrement(&calls);
@@ -19690,6 +19700,11 @@ bool g_geomCensus = false;                  // ParkourGeomCensus - see the warni
 
 // Called every frame; does nothing at all unless asked for, and then only once, well away from
 // anything worth not stalling.
+static void DumpNativeFunctions(const char* className, const char* filter);
+static void DumpVtableSlots(uintptr_t objA, const char* whatA,
+                            uintptr_t objB, const char* whatB, int slots);
+void PkVerifyProcessEvent();
+
 void GeomCensusTick()
 {
     if (!g_geomCensus) return;
@@ -19700,6 +19715,439 @@ void GeomCensusTick()
     Log("[geom] running the authored-geometry census - this STALLS the game for about a second,"
         " which is why it waits for a quiet moment");
     DumpLedgeishClasses();
+    // Route A rung 1 rides the same quiet moment, for the same reason: it walks the object table
+    // once per class, and a census that stalls a grab is how the last one broke a first ledge.
+    DumpNativeFunctions("TdMove_Grab", nullptr);
+    DumpNativeFunctions("TdPawn", "Ledge");
+    DumpNativeFunctions("TdPawn", "Grab");
+    DumpNativeFunctions("TdPawn", "Climb");
+    DumpNativeFunctions("Actor", "Trace");
+    DumpNativeFunctions("Actor", "Ledge");
+    // The pawn will do: ProcessEvent is a UObject virtual, so every object shares the slot.
+    // The live TdMove_Grab object is a UObject that is NOT an Actor - exactly the comparison
+    // needed to see which slots AActor replaced.
+    uintptr_t moveObj = 0;
+    if (g_playerPawn && g_offMoveState >= 0) {
+        uint8_t st = 0xFF; char cls[48];
+        if (SafeRead(g_playerPawn + g_offMoveState, &st, 1))
+            ReadMoveClassName(g_playerPawn, (int)st, cls, sizeof(cls), &moveObj);
+    }
+    DumpVtableSlots(g_playerPawn, "TdPlayerPawn", moveObj, "the live move object", 120);
+}
+
+// ================================================ route A, rung 1: what is CALLABLE?
+//
+// Everything the parkour code knows about a ledge is inferred from one point, because that is
+// all the exposed PROPERTIES give. The functions are a different matter and nobody has looked at
+// them: ResolveMoveProbeProps has been dropping names like CanShimmy and CanShimmyAroundCorner
+// for runs, with "is a FUNCTION, not a property - dropped", and a function that answers "can I
+// shimmy that way from here" would replace the gap heuristic, the leash, the probe pulses and
+// the corner urge with one call.
+//
+// ---- ⚠️ THIS RUNG CALLS NOTHING ----
+//
+// A UE3 native exec is __thiscall (FFrame&, RESULT_DECL) and reads its arguments off a bytecode
+// stream, so calling one is not "push the args and go". Getting that wrong does not misbehave,
+// it corrupts the caller's stack - and this project already has the rule, written after the
+// UpdateSkelPose hook: measure the arity from the shipped code, never guess it.
+//
+// So this is a census. Every Function object owned by the parkour classes, whether its Func is a
+// real native exec or the shared script interpreter entry, and for the natives, what the walk
+// says about their shape. One run turns "there might be a predicate" into a list with addresses.
+// ================================================ route A, rung 2: find ProcessEvent
+//
+// Rung 1 came back with two facts that together change the plan for the better.
+//
+//   Actor::Trace, FastTrace, TraceComponent and TraceActors are all real NATIVE execs, located.
+//   CanShimmy and CanShimmyAroundCorner exist - and are SCRIPT functions, not natives.
+//
+// The second is the good news. A native exec is __thiscall (FFrame&, RESULT_DECL) and reads its
+// arguments off a bytecode stream, which is the part that would have to be hand-built and the
+// part that corrupts a stack when it is built wrong. A SCRIPT function is called through
+// UObject::ProcessEvent(UFunction*, void* Parms, void* Result) - a plain parameter struct, no
+// bytecode. And ProcessEvent dispatches natives too, so finding it opens Trace as well.
+//
+// So the whole of route A now rests on one address, and CanShimmy - the game's own answer to
+// "can I shimmy that way from here", carrying its own rules about what counts as a grabbable
+// ledge - is a better prize than any raycast we could interpret ourselves.
+//
+// ---- ⚠️ THIS RUNG STILL CALLS NOTHING ----
+//
+// ProcessEvent is a virtual on UObject, so it is a vtable slot, and the index is build-specific.
+// Guessing it means calling an arbitrary member function with three arguments: on this vtable
+// that could be a destructor. The one property that makes a wrong guess survivable is arity -
+// __thiscall has the callee pop its own arguments, so a slot that ends in `ret 0Ch` leaves the
+// stack balanced whatever else it does - and arity is exactly what the shipped code states out
+// loud and what this file already has a walker for.
+//
+// So: census first. Every slot, its size and its stack cleanup, and which ones are shaped like
+// ProcessEvent. Then one candidate gets called, once, guarded, against a value we can already
+// read another way.
+// Arity alone left ten candidates, so this adds the two discriminators that cost nothing and
+// are far more specific than "ends in ret 0Ch":
+//
+//   ProcessInternal is scriptTarget, an address this file already derives - it is the shared
+//   Func of every script UFunction. It is also virtual, so it should APPEAR in the vtable, and
+//   in UE3 it is declared next to ProcessEvent. Finding that slot names a neighbourhood.
+//
+//   ProcessEvent is overridden by AActor; ProcessInternal is not. So comparing an Actor's vtable
+//   against a plain UObject's separates the slots AActor replaced from the ones it inherited,
+//   and the answer has to be in the first group.
+//
+// ⚠️ Still calls nothing. The point of a second census rather than a first guess is that a wrong
+// vtable slot called with three arguments is a destructor on this table, and the cost of being
+// wrong is the player's session rather than a log line.
+// -2 = the derivation was ambiguous and nothing may be called; -1 = not derived yet.
+int g_peSlot = -1;
+
+static void DumpVtableSlots(uintptr_t objA, const char* whatA,
+                            uintptr_t objB, const char* whatB, int slots)
+{
+    uintptr_t scriptTarget = 0;
+    DeriveUFunctionFuncOffset(&scriptTarget);
+    uint32_t vtA = 0, vtB = 0;
+    if (!objA || !SafeU32(objA, &vtA) || !InModule(vtA)) {
+        Log("[pe] %s has no readable vtable", whatA);
+        return;
+    }
+    const bool haveB = objB && SafeU32(objB, &vtB) && InModule(vtB);
+    Log("[pe] ---- %s vtable %p vs %s vtable %p | ProcessInternal(scriptTarget) = %p ----",
+        whatA, (void*)vtA, haveB ? whatB : "(none)", (void*)vtB, (void*)scriptTarget);
+
+    for (int i = 0; i < slots; ++i) {
+        uint32_t a = 0, b = 0;
+        if (!SafeU32(vtA + i * 4, &a) || a < g_textLo || a >= g_textHi) continue;
+        const bool haveSlotB = haveB && SafeU32(vtB + i * 4, &b) && b >= g_textLo && b < g_textHi;
+        CodeWalk w{};
+        const bool walked = WalkFunction((uintptr_t)a, 512, 400, &w);
+        const int ret = (walked && w.ended) ? w.retBytes : -1;
+
+        // ---- ⚠️ THE TEST THAT ACTUALLY NAMES IT: DOES THE OVERRIDE CALL ITS SUPER? ----
+        //
+        // ProcessInternal never appeared in the vtable, so that anchor is gone - but the survivors
+        // said something better. Every candidate returns inside 512 bytes with one or two calls,
+        // which is not what UObject::ProcessEvent looks like; it IS what an AActor override looks
+        // like, because AActor::ProcessEvent does a couple of checks and then hands off to
+        // UObject::ProcessEvent.
+        //
+        // Which is a test rather than a resemblance. For the right slot, the Actor's function
+        // must contain a direct call to the address the NON-Actor holds in that same slot. Seven
+        // candidates cannot all do that by coincidence.
+        bool callsSuper = false;
+        if (haveSlotB && walked)
+            for (int c = 0; c < w.callCount; ++c)
+                if (w.calls[c].direct == (uintptr_t)b) { callsSuper = true; break; }
+
+        const char* mark = "";
+        if ((uintptr_t)a == scriptTarget) mark = "  <<<< ProcessInternal itself";
+        else if (callsSuper && ret == 12) {
+            mark = "  <<<<<< ret 0Ch, overridden by Actor, AND calls its super - ProcessEvent";
+            // ⚠️ Latched from the derivation, never hardcoded. The index is build-specific and a
+            // stale constant here calls a destructor. If a future build produces two of these,
+            // the second refuses rather than overwriting - an ambiguous answer is not an answer.
+            if (g_peSlot < 0) g_peSlot = i;
+            else if (g_peSlot != i) {
+                Log("[pe] ⚠️ slot %d ALSO qualifies (%d already did) - ambiguous, refusing both",
+                    i, g_peSlot);
+                g_peSlot = -2;
+            }
+        }
+        else if (callsSuper) mark = "  <<<< calls its super";
+        else if (haveSlotB && a != b && ret == 12) mark = "  <<<< ret 0Ch AND overridden by Actor";
+        else if (ret == 12) mark = "  <- ret 0Ch";
+
+        // The call targets of every serious candidate, so a near-miss is readable rather than
+        // just absent - an override that reaches its super through a thunk would show here.
+        if (ret == 12 && haveSlotB && a != b && walked && w.callCount > 0) {
+            char tgts[128] = "";
+            int n = 0;
+            for (int c = 0; c < w.callCount && n < (int)sizeof(tgts) - 16; ++c)
+                n += _snprintf_s(tgts + n, sizeof(tgts) - n, _TRUNCATE, " %p",
+                                 (void*)w.calls[c].direct);
+            Log("[pe]       slot %d calls:%s", i, tgts);
+        }
+
+        // Everything, not just the interesting ones: the neighbourhood around ProcessInternal is
+        // the point, and it cannot be seen if the quiet slots are filtered out.
+        Log("[pe]   %3d A %p %s B %p  ret %d calls %d%s", i, (void*)a,
+            haveSlotB ? (a == b ? "==" : "!=") : "??", (void*)b,
+            ret, walked ? w.callCount : -1, mark);
+    }
+    Log("[pe] ---- end ----");
+    if (g_peSlot >= 0)
+        Log("*** [pe] ProcessEvent is vtable slot %d. Four independent tests agreed: three"
+            " stack arguments popped by the callee, replaced by AActor, small enough to be an"
+            " override rather than the implementation, and calling the very address the"
+            " non-Actor holds in the same slot.", g_peSlot);
+    else
+        Log("[pe] no slot passed all four tests - nothing will be called");
+}
+
+// ================================================ route A, rung 3: the first call
+//
+// ---- ⚠️ EVERY SAFEGUARD HERE IS LOAD-BEARING. NONE IS CEREMONY. ----
+//
+// The slot is DERIVED, never hardcoded: build-specific, and a stale constant calls a destructor.
+// An ambiguous derivation refuses rather than picking.
+//
+// The target is GetGrabType, chosen because it is the only function whose answer we ALREADY KNOW
+// by a completely independent route - GrabType is a ByteProperty at TdMove_Grab+0x01C0 and every
+// [moveprop] line has been printing it for weeks. A call that returns the same value proves the
+// slot, the calling convention and the parameter layout in one step. Anything that cannot be
+// checked against a known answer proves nothing and is not worth the risk of making.
+//
+// It runs on the GAME thread, from inside Update1pArms, which is a script native and therefore
+// cannot be anywhere else. ProcessEvent off the game thread is not a bug that shows up as a
+// wrong number.
+//
+// It runs ONCE. A verification that repeats is an experiment running in production.
+//
+// And it is wrapped in SEH, which catches the access violation but NOT stack corruption - which
+// is why the arity was measured from `ret 0Ch` rather than assumed. __thiscall has the callee
+// pop its own arguments, so the balance is the callee's promise, and that promise is the one
+// thing read straight out of the shipped code.
+typedef void (__thiscall *PkProcessEventFn)(void* self, void* func, void* parms, void* result);
+
+static uintptr_t PkFindFunction(const char* fnName, const char* outerName)
+{
+    if (!g_gobjAddr || g_offOuter < 0) return 0;
+    uint32_t data = 0, count = 0;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t obj = 0, cls = 0, outer = 0;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+        if (!ObjNameIs(obj, fnName)) continue;
+        if (!SafeU32(obj + 0x34, &cls) || !ObjNameIs((uintptr_t)cls, "Function")) continue;
+        if (!SafeU32(obj + g_offOuter, &outer) || outer < 0x10000) continue;
+        if (!ObjNameIs((uintptr_t)outer, outerName)) continue;
+        return obj;
+    }
+    return 0;
+}
+
+// ================================================ route A, rung 4: ask the game directly
+//
+// The signature, read from the function itself rather than guessed:
+//
+//     CanShimmy(byte ShimmyAction) -> bool ReturnValue
+//       +0x00  ShimmyAction   ByteProperty    in
+//       +0x04  ReturnValue    BoolProperty    out
+//       +0x08..+0x5C          Start, End, Extent, Direction, X, Y, Z, DistanceCheck
+//
+// Everything from +0x08 is LOCALS, not parameters - the chain carries params first and locals
+// after, and the names give it away: a function that traces a Start to an End with an Extent is
+// describing its own working storage. SetGrabType is the control that proves the reader, showing
+// one NewGrabType input and no ReturnValue, exactly as a setter should.
+//
+// ⚠️ READ-ONLY, AND IT CHANGES NOTHING. The point is to put the game's own answer next to the
+// heuristic that has been standing in for it, in the same log line, before anything is rewritten
+// to trust it. A heuristic that has been tuned across a dozen runs is not replaced on the
+// strength of a call that worked once.
+//
+// ShimmyAction's enum values are not known - CurrentShimmyMove has been observed as 0, 2 and 3 -
+// so every value in a small range is asked and the pattern is what identifies them. A direction
+// that answers true only when there is ledge that way will stand out against one that never
+// changes.
+void PkAskCanShimmy()
+{
+    if (g_peSlot < 0 || !g_playerPawn || g_offMoveState < 0) return;
+    if (!g_parkourDebug) return;
+    static long next = 0;
+    if (g_frames < next) return;
+    next = g_frames + 72;               // about once a second; this is a call, not a read
+
+    uint8_t st = 0xFF;
+    uintptr_t obj = 0;
+    char cls[48];
+    if (!SafeRead(g_playerPawn + g_offMoveState, &st, 1) || st != 3) return;
+    if (!ReadMoveClassName(g_playerPawn, (int)st, cls, sizeof(cls), &obj) || !obj) return;
+    const uintptr_t fn = PkFindFunction("CanShimmy", "TdMove_Grab");
+    if (!fn) return;
+    uint32_t vt = 0, pe = 0;
+    if (!SafeU32(obj, &vt) || !InModule(vt)) return;
+    if (!SafeU32(vt + g_peSlot * 4, &pe) || pe < g_textLo || pe >= g_textHi) return;
+
+    char out[96] = "";
+    int n = 0;
+    for (int action = 0; action < 6; ++action) {
+        // Poisoned again, so "it did not answer" and "it answered false" stay distinguishable.
+        unsigned char parms[128];
+        memset(parms, 0xCD, sizeof(parms));
+        parms[0] = (unsigned char)action;
+        bool crashed = false;
+        __try {
+            ((PkProcessEventFn)pe)((void*)obj, (void*)fn, parms, nullptr);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { crashed = true; }
+        if (crashed) {
+            Log("*** [canshimmy] the call FAULTED on action %d - disarming", action);
+            g_peSlot = -2;
+            return;
+        }
+        const unsigned char r = parms[4];
+        n += _snprintf_s(out + n, sizeof(out) - n, _TRUNCATE, " %d=%s", action,
+                         r == 0xCD ? "?" : (r ? "YES" : "no"));
+    }
+    // Beside the heuristic that has been answering this question all along, so the next run says
+    // outright whether the game's answer is better than the stand-in.
+    Log("[canshimmy]%s | heuristic says end%+d, gap %.0f vs resting %.0f, travelling %+d",
+        out, g_pkEndDir, g_pkGapNow, g_pkGapBaseline, g_pkTravelDir);
+}
+
+void PkVerifyProcessEvent()
+{
+    static bool done = false;
+    if (done || g_peSlot < 0 || !g_playerPawn || g_offMoveState < 0 || g_offGrabType < 0) return;
+
+    uint8_t st = 0xFF;
+    uintptr_t obj = 0;
+    char cls[48];
+    if (!SafeRead(g_playerPawn + g_offMoveState, &st, 1) || st != 3) return;   // must be on a ledge
+    if (!ReadMoveClassName(g_playerPawn, (int)st, cls, sizeof(cls), &obj) || !obj) return;
+
+    const uintptr_t fn = PkFindFunction("GetGrabType", "TdMove_Grab");
+    if (!fn) { done = true; Log("[pe] GetGrabType not found - cannot verify"); return; }
+
+    uint32_t vt = 0, pe = 0;
+    if (!SafeU32(obj, &vt) || !InModule(vt)) return;
+    if (!SafeU32(vt + g_peSlot * 4, &pe) || pe < g_textLo || pe >= g_textHi) {
+        done = true;
+        Log("[pe] slot %d on the move object is not in .text - refusing", g_peSlot);
+        return;
+    }
+
+    uint8_t known = 0xFF;
+    SafeRead(obj + g_offGrabType, &known, 1);
+
+    done = true;
+    // ---- ⚠️ POISONED, NOT ZEROED ----
+    //
+    // The first pass zeroed this buffer and reported MATCH because the call returned 0 and
+    // GrabType reads 0. That proves less than it looks like: a slot that did NOTHING AT ALL
+    // would leave the zero it was given and match just as well. Confirming a hypothesis with a
+    // test it cannot fail is how three of the gates in this file came to be wrong.
+    //
+    // 0xCD is a value the answer cannot be. If byte 0 comes back 0, something wrote it; if it
+    // comes back 0xCD, the call was inert and the slot is not ProcessEvent whatever else agreed.
+    unsigned char parms[64];
+    memset(parms, 0xCD, sizeof(parms));
+    bool crashed = false;
+    __try {
+        ((PkProcessEventFn)pe)((void*)obj, (void*)fn, parms, nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        crashed = true;
+    }
+    if (crashed) {
+        Log("*** [pe] the call FAULTED - slot %d is not ProcessEvent, or the convention is wrong."
+            " Nothing else will be called.", g_peSlot);
+        g_peSlot = -2;
+        return;
+    }
+    const uint32_t d0 = *(const uint32_t*)parms;
+    if (parms[0] == 0xCD) {
+        Log("*** [pe] the buffer came back UNTOUCHED (0xCD) - the call did nothing. Slot %d is"
+            " not ProcessEvent, whatever the four static tests agreed on.", g_peSlot);
+        g_peSlot = -2;
+        return;
+    }
+    Log("*** [pe] ProcessEvent(GetGrabType) wrote byte %u (dword %08X) over a 0xCD-poisoned"
+        " buffer; the GrabType property reads %u  -> %s", parms[0], d0, known,
+        parms[0] == known ? "MATCH. The slot, the convention and the parameter layout are"
+                            " confirmed."
+                          : "MISMATCH - the call ran but the answer is wrong, do not build on it");
+    if (parms[0] != known) { g_peSlot = -2; return; }
+
+    // ---- and now the parameters of the function this was all for ----
+    //
+    // A UFunction's Children ARE its parameters, in order, with their offsets into the very
+    // buffer ProcessEvent is handed - so the layout for CanShimmy can be read rather than
+    // guessed, from the same walk the property dumps already use. Guessing it is how you pass a
+    // direction where the game expects a bool.
+    // ---- the parameter list, derived and then used ----
+    //
+    // UFunction::Children is not at the +0x74 that works on every UClass - it reads 00000000
+    // there on every function including GetGrabType, which the call above proved has a
+    // ReturnValue. Scanning the control for a dword pointing at something whose Class name ends
+    // in "Property" found it twice, at +0x4C and +0x70, both naming ReturnValue as a ByteProperty
+    // at parameter offset +0x00 - which is exactly the byte the verified call wrote. Two hits
+    // because UStruct keeps two chains, Children and PropertyLink; for a one-property function
+    // they agree, and either serves.
+    //
+    // (The scan also hit +0xD0 and +0xD4, which walk into weapon and camera fields belonging to
+    // some other class entirely. Kept in mind rather than filtered out: a scan that can land on
+    // an unrelated chain is a scan whose FIRST hit is not automatically the answer, and the
+    // control is what separates them.)
+    for (const char* want : { "SetGrabType", "CanShimmy", "CanShimmyAroundCorner", "CanPullUp" }) {
+        const uintptr_t f = PkFindFunction(want, "TdMove_Grab");
+        if (!f) { Log("[pe] %s not found", want); continue; }
+        for (int head : { 0x4C, 0x70 }) {
+            uint32_t cur = 0;
+            if (!SafeU32(f + head, &cur) || cur < 0x10000) {
+                Log("[pe] %s: +0x%02X is empty", want, head);
+                continue;
+            }
+            Log("[pe] ---- %s parameters via +0x%02X ----", want, head);
+            for (int g2 = 0; g2 < 12 && cur >= 0x10000; ++g2) {
+                char nm[64] = "?", kind[48] = "?";
+                uint32_t k = 0, off = 0, nxt = 0;
+                ReadObjName(cur, nm, sizeof(nm));
+                if (SafeU32(cur + kUObjectClassOff, &k) && k >= 0x10000)
+                    ReadObjName((uintptr_t)k, kind, sizeof(kind));
+                SafeU32(cur + g_offPropOff, &off);
+                Log("[pe]     +0x%02X  %-28s %s", off, nm, kind);
+                if (!SafeU32(cur + g_offNext, &nxt)) break;
+                cur = nxt;
+            }
+        }
+    }
+}
+
+static void DumpNativeFunctions(const char* className, const char* filter)
+{
+    if (!g_gobjAddr || g_offOuter < 0) return;
+    uintptr_t scriptTarget = 0;
+    const int funcOffset = DeriveUFunctionFuncOffset(&scriptTarget);
+    if (funcOffset < 0) { Log("[natives] no UFunction::Func offset - cannot look"); return; }
+
+    uint32_t data = 0, count = 0;
+    if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) return;
+
+    Log("[natives] ---- %s%s%s ----", className, filter ? " names containing " : "",
+        filter ? filter : "");
+    int shown = 0, natives = 0;
+    for (uint32_t i = 0; i < count && shown < 60; ++i) {
+        uint32_t obj = 0, cls = 0, outer = 0, fn = 0;
+        if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+        if (!SafeU32(obj + 0x34, &cls) || !ObjNameIs((uintptr_t)cls, "Function")) continue;
+        if (!SafeU32(obj + g_offOuter, &outer) || outer < 0x10000) continue;
+        if (!ObjNameIs((uintptr_t)outer, className)) continue;
+        char nm[96];
+        if (!ReadObjName(obj, nm, sizeof(nm))) continue;
+        if (filter && !strstr(nm, filter)) continue;
+        ++shown;
+
+        if (!SafeU32(obj + funcOffset, &fn) || fn < g_textLo || fn >= g_textHi) {
+            Log("[natives]   %-38s Func not in .text - script only", nm);
+            continue;
+        }
+        if ((uintptr_t)fn == scriptTarget) {
+            Log("[natives]   %-38s script (shared interpreter entry)", nm);
+            continue;
+        }
+        ++natives;
+        // ⚠️ The same two-sided read the UpdateSkelPose derivation used. `ret N` is the callee
+        // popping its own arguments, which for __thiscall is the only honest statement of arity
+        // the shipped code makes.
+        CodeWalk w{};
+        const bool ok2 = WalkFunction((uintptr_t)fn, 128, 48, &w);
+        Log("[natives]   %-38s NATIVE exec %p  ret %d  calls %d%s", nm, (void*)fn,
+            ok2 ? w.retBytes : -1, ok2 ? w.callCount : -1,
+            (ok2 && w.ended) ? "" : "  (walk did not reach a return - shape unproven)");
+        if (ok2 && w.callCount > 0 && w.calls[0].direct)
+            Log("[natives]       first call -> %p  (%d pushes at the site%s)",
+                (void*)w.calls[0].direct, w.calls[0].pushesBefore,
+                w.calls[0].onThis ? ", this in ecx" : "");
+    }
+    Log("[natives] ---- %d shown, %d with a native exec ----", shown, natives);
 }
 
 void DumpLedgeishClasses()
@@ -22094,11 +22542,36 @@ static void LoadSettings()
         WideCharToMultiByte(CP_UTF8, 0, path, -1, shown, sizeof(shown), nullptr, nullptr);
         Log("[cfg] %s", shown);
     }
-    char buf[8192];
+    // ---- ⚠️ THE WHOLE FILE, AND SAY SO IF IT WILL NOT FIT ----
+    //
+    // This was a fixed char[8192] read with ReadFile(sizeof(buf) - 1) and no check on what came
+    // back. The moment the ini passed 8 KB - which it does the first time the parkour block is
+    // pasted in, at 10,580 bytes - everything past byte 8191 was silently dropped. Four of the
+    // eight Parkour keys applied, four did not, and the log said "18 applied, 0 ignored" with a
+    // straight face.
+    //
+    // That is exactly the failure this parser was hand-written to prevent. Its own comment says
+    // GetPrivateProfileString was rejected because "a typo would silently do nothing, which in a
+    // mod configured while wearing a headset is the worst possible failure" - and then it did the
+    // same thing at a byte offset instead of a key name, which is worse, because a typo is at
+    // least visible in the file you are looking at.
+    LARGE_INTEGER fsz{};
+    if (!GetFileSizeEx(h, &fsz) || fsz.QuadPart < 0 || fsz.QuadPart > (1 << 20)) {
+        CloseHandle(h);
+        Log("[cfg] mevr.ini is missing a size or is absurdly large (%lld bytes) - not read",
+            (long long)fsz.QuadPart);
+        return;
+    }
+    const DWORD want = (DWORD)fsz.QuadPart;
+    char* buf = (char*)malloc((size_t)want + 1);
+    if (!buf) { CloseHandle(h); Log("[cfg] out of memory reading mevr.ini"); return; }
     DWORD got = 0;
-    const bool ok = ReadFile(h, buf, sizeof(buf) - 1, &got, nullptr) != 0;
+    const bool ok = ReadFile(h, buf, want, &got, nullptr) != 0;
     CloseHandle(h);
-    if (!ok) { Log("[cfg] mevr.ini could not be read"); return; }
+    if (!ok) { free(buf); Log("[cfg] mevr.ini could not be read"); return; }
+    if (got != want)
+        Log("[cfg] ⚠️ read %lu of %lu bytes - settings past that point were NOT applied",
+            (unsigned long)got, (unsigned long)want);
     buf[got] = 0;
 
     // Skip a UTF-8 BOM. Notepad and most Windows editors offer "UTF-8 with BOM" and some
@@ -22415,6 +22888,7 @@ static void LoadSettings()
         Log("[cfg]   ^ StickJumpTurn forced ON: GripToGrip leaves jump and quick turn with"
             " nowhere else to go");
     }
+    free(buf);
     Log("[cfg] %d applied, %d ignored. Hotkeys still override anything set here.",
         applied, rejected);
 }
