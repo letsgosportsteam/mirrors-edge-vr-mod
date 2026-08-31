@@ -2238,6 +2238,7 @@ static void ReportSprintLimitsOnce()
 // Declared up here, ahead of the swing gates rather than beside the parkour code, because every
 // one of those gates reads it - and two of them assert buttons that let go of a ledge.
 enum ParkourMode { PK_NONE = 0, PK_LEDGE, PK_CLIMB, PK_BAR };
+extern bool g_pkBypass;   // BACKTICK: stand every pipe-specific write down - the control test
 struct MEVR_Vec3;
 static void PkSnapHandToLedge(int hand, MEVR_Vec3* target);   // defined with the ledge reads
 static bool g_parkour = true;               // Parkour in mevr.ini
@@ -3119,6 +3120,164 @@ static void PkClimbCameraCollision(bool onPipe)
     }
 }
 
+// ================================================================ PK.10: the climb bob
+//
+// ---- what the shake is, measured rather than assumed ----
+//
+// Yaw tracks the head. Pitch holds a constant -22.70 offset to it, steady to two decimals. The
+// pawn's Z is constant. And yet "[vm] camera position steps: mean 1.92 max 8.64 UU, 454 of 600
+// frames in the dither band" - about two centimetres of judder on three quarters of frames, on a
+// pawn that is not moving. The shake is the game's CAMERA POSITION, and nothing about our
+// rotation work was ever going to touch it.
+//
+// That is channel 1 from ENGINE_NOTES - GetCameraAnimation, "the bob and roll". ParkourAnimLock
+// already suppresses the animation's ROTATION on a wall, which is exactly why yaw and pitch came
+// back clean; nothing has ever suppressed its TRANSLATION.
+//
+// ---- and it can be cancelled without finding the native ----
+//
+// GetCameraAnimation is native with no script body, so the source is unreadable. It does not
+// need to be. The camera's offset from the pawn is (camera - pawn), and on a pipe every part of
+// that is either constant - eye height, the authored stance - or bob. So latch it once the entry
+// window has settled and cancel any change from it: the pawn's own motion passes through
+// untouched, because both terms move together, and only movement of the camera RELATIVE to the
+// body is removed. Which is the bob, by definition.
+//
+// ⚠️ Clamped, and only on a pipe. This deliberately separates the view from the game's camera,
+// and the same clamp reasoning as the grab freeze applies - a large separation is a view inside
+// the geometry. Anything past the clamp is not bob and should be let through.
+//
+// ---- ⚠️ AND IT WAS AIMED NINETY-FIVE DEGREES WRONG FOR TWO BUILDS ----
+//
+// Neither of the first two attempts could have worked, and the reason was never in the part
+// either of them changed. The mechanism above is sound; the arithmetic that turned the measured
+// bob into a view offset was decomposing a WORLD-space vector on the head's ROOM-space axes.
+// The whole argument is at PkWorldToHeadLocal, below the ledge reads. The short version is that
+// the two bases are the same physical direction written in different coordinate systems, and
+// the angle between them is whatever the last recentre made it - 95 degrees on the pipe in the
+// 12:16 run. So a bob of the right SIZE was being subtracted in the wrong DIRECTION, which
+// removes nothing and adds a second wobble beside the first.
+//
+// That is worth recording as a class of mistake and not just an instance. Attempt 1 blamed the
+// mechanism, attempt 2 blamed the sampling frame, and both were reasonable stories that a build
+// could not distinguish from the truth, because the player only ever reports "still shakes".
+// Neither attempt shipped a number. The census below and the BACKTICK bypass are the fix for
+// that: this rung is now falsifiable from one run whether or not the cancellation works.
+extern long g_pkEntryHoldPub;               // the entry window, declared with the snap code
+float g_pkClimbCamOff[3] = { 0, 0, 0 };
+float g_pkClimbCamBase[3] = { 0, 0, 0 };
+bool  g_pkClimbCamOk = false;
+
+// ---- what the next run has to come back with ----
+//
+// Three builds have now been aimed at "the bob" without one number saying how big it is on a
+// pipe. The whole-run [vm] census cannot answer it: its 600-frame windows straddle walking,
+// running and hanging, and the one window that fell inside a climb read mean 0.45 max 2.98 UU -
+// which is only twice the 0.21 a LEDGE hang reads, and the ledge does not shake.
+//
+// So measure the two candidates separately and only while on the pipe. The camera's motion
+// RELATIVE TO THE BODY is the bob, and it is what the cancellation removes. The body's own
+// motion is not bob, passes through by design, and if IT is the one dithering then no amount of
+// bob cancellation will ever help and the search moves to the direct drive. One line every two
+// seconds says which, and the bypass says whether either is ours at all.
+float g_pkBobStep = 0.0f, g_pkBodyStep = 0.0f;   // this frame, UU - the overlay reads them
+
+// PK.11, the rotational half of the same question. Yaw/pitch the RENDERED view moved that the
+// head did not ask for, degrees per frame, and the game's own yaw pull at the controller. The
+// first two are what the eye gets; the third is what we are overwriting to keep them down.
+float g_pkYawJitDeg = 0.0f, g_pkPitchJitDeg = 0.0f, g_pkYawPullDeg = 0.0f;
+float g_pkViewStep = 0.0f;   // PK.12: rendered camera step, head still, UU/frame
+
+static void PkClimbBobTick()
+{
+    if (g_pkMode != PK_CLIMB || g_pkBypass ||
+        g_offCamLoc < 0 || g_offActorLocation < 0 || !g_playerPawn) {
+        // ⚠️ g_pkClimbCamOff is NOT cleared here. It is the offset actually being applied, it is
+        // owned by the render thread, and it fades out there - see the apply site. Zeroing it
+        // from this thread is a one-frame step of whatever it held, which is a view pop on the
+        // exact frame the player leaves the pipe.
+        g_pkClimbCamOk = false;
+        g_pkBobStep = g_pkBodyStep = 0.0f;
+        return;
+    }
+    float cam[3], loc[3];
+    if (!SafeRead(g_playerPawn + g_offCamLoc, cam, sizeof(cam)) ||
+        !SafeRead(g_playerPawn + g_offActorLocation, loc, sizeof(loc))) return;
+
+    const float d[3] = { cam[0] - loc[0], cam[1] - loc[1], cam[2] - loc[2] };
+
+    // ---- the census, gated on the frame counter ----
+    //
+    // ParkourTick rides the pad build, and the game polls the pad more than once in some frames.
+    // Counting those twice would halve every mean without changing a max, which is the kind of
+    // wrong number that survives review. SampleLivePivot guards itself the same way.
+    {
+        static long   lastFrame = -1;
+        static bool   have = false;
+        static float  prevD[3] = { 0, 0, 0 }, prevLoc[3] = { 0, 0, 0 };
+        static float  bobSum = 0.0f, bobMax = 0.0f, bodySum = 0.0f, bodyMax = 0.0f;
+        static long   n = 0;
+        if (lastFrame != g_frames) {
+            // ⚠️ And on CONTIGUITY, not just on a new frame. These statics outlive the pipe;
+            // letting them span a gap measures the walk between two pipes as one frame of bob
+            // and puts a metre in the max.
+            const bool contiguous = have && (g_frames - lastFrame) <= 2;
+            lastFrame = g_frames;
+            if (contiguous) {
+                const float bx = d[0] - prevD[0], by = d[1] - prevD[1], bz = d[2] - prevD[2];
+                const float lx = loc[0] - prevLoc[0], ly = loc[1] - prevLoc[1],
+                            lz = loc[2] - prevLoc[2];
+                g_pkBobStep  = sqrtf(bx * bx + by * by + bz * bz);
+                g_pkBodyStep = sqrtf(lx * lx + ly * ly + lz * lz);
+                if (std::isfinite(g_pkBobStep) && std::isfinite(g_pkBodyStep)) {
+                    bobSum += g_pkBobStep;   if (g_pkBobStep  > bobMax)  bobMax  = g_pkBobStep;
+                    bodySum += g_pkBodyStep; if (g_pkBodyStep > bodyMax) bodyMax = g_pkBodyStep;
+                    if (++n >= 150) {
+                        Log("[climb] on the pipe over %ld frames: camera-vs-body (the BOB, which"
+                            " is cancelled) mean %.2f max %.2f UU  |  body itself (which is NOT)"
+                            " mean %.2f max %.2f UU", n, bobSum / (float)n, bobMax,
+                            bodySum / (float)n, bodyMax);
+                        n = 0; bobSum = bobMax = bodySum = bodyMax = 0.0f;
+                    }
+                }
+            }
+            memcpy(prevD, d, sizeof(prevD));
+            memcpy(prevLoc, loc, sizeof(prevLoc));
+            have = true;
+        }
+    }
+
+    if (!g_pkClimbCamOk) {
+        // ⚠️ Not on the first frame. The entry window is when the game is still settling the
+        // pawn onto the pipe, and a base latched mid-arrival bakes the arrival into every frame
+        // after it - the same trap the hand offset fell into twice.
+        if (g_pkEntryHoldPub > 0) return;
+        memcpy(g_pkClimbCamBase, d, sizeof(d));
+        g_pkClimbCamOk = true;
+        Log("[climb] camera sits (%.1f %.1f %.1f) from the pawn - holding that, so the"
+            " animation's bob is cancelled while the body's own motion passes through",
+            d[0], d[1], d[2]);
+        return;
+    }
+
+    // ⚠️ THE DELTA IS NOT COMPUTED HERE. Only the base is.
+    //
+    // This tick runs from the pad build, and g_dofOffset is composed on the render thread inside
+    // the frame. A camera position read here and applied there is one frame old - and this file
+    // has already paid for that exact mistake once: "the 100% judder was a stale sample",
+    // sampled in Present, "which runs after the frame is rendered, so it describes the PREVIOUS
+    // frame ... Present is the wrong place for anything that JUMPS".
+    //
+    // Bob jumps. Cancelling this frame's view with last frame's bob does not remove jitter, it
+    // adds a second copy of it half a frame out of phase. So the delta is taken at the point of
+    // use, against the same frame's camera, and only the slow-moving base lives here.
+    //
+    // ⚠️ That reasoning stands, but it is NOT why the first attempt failed - the sentence
+    // claiming so has been struck. The basis error above was in both attempts and swamps a frame
+    // of latency, so the staleness theory was never tested and remains unproven either way. It
+    // is kept because it is cheap and the argument for it is sound, not because it is a fix.
+}
+
 static void PkReadCorner()
 {
     g_pkCornerSide = 0;
@@ -3179,6 +3338,56 @@ static void PkReadCorner()
 // worst legitimate step and still far below any real teleport. And the gate matters more than
 // the number - off a ledge this has no business looking at the pawn at all.
 static const float kPkJumpUU = 40.0f;
+
+// ---- ⚠️ A WORLD VECTOR IS NOT A HEAD-SPACE ONE, AND THE HEAD BASIS CANNOT CONVERT IT ----
+//
+// g_dofOffset is HEAD-LOCAL - right, up, forward - and ApplySixDof recomposes it onto the game
+// camera's own levelled right and forward before it touches the matrix. So anything that wants
+// to move the view by a GAME-WORLD vector has to be decomposed on that same camera basis.
+//
+// Both callers below were decomposing on g_headRight/g_headForward instead, which are the
+// head's axes in ROOM coordinates. That is correct for the headset's own position delta, and
+// the reasoning is written out beside the wobble diagnostic further down: a room-space delta
+// decomposed on the room head basis IS head-local, and recomposing head-local numbers on the
+// camera basis is right because the camera physically tracks the head.
+//
+// Neither half of that argument survives being handed a world-space vector. The two bases are
+// numerically different frames - the same physical direction written in two coordinate systems
+// - related by the room-to-world yaw offset, and that offset is whatever the last recentre made
+// it. The wobble diagnostic exists precisely because it is a nonzero constant; all it checks is
+// that the constant holds still. On the pipe in the 12:16 run the game camera sat at
+// 174.7 - head where this arithmetic assumes 270 - head, so the climb bob was being subtracted
+// about 95 degrees away from itself: a movement of the right SIZE pointed somewhere else, which
+// removes nothing and adds a second wobble. Two builds went into that and the player felt no
+// difference, which is exactly what a 95-degree error predicts.
+//
+// Decomposing on the matrix's own right axis - the exact pair ApplySixDof recomposes on, from
+// the same g_sceneMat, in the same frame - makes the round trip an identity. What is subtracted
+// is then what was measured, to the bit, whatever the recentre did.
+extern float g_sceneMat[16];
+extern bool  g_sceneMatValid;
+extern bool  g_vmRow;
+
+// One caller is on the render thread and one is on the pad thread, so the two floats read out of
+// g_sceneMat can in principle straddle a frame. It is a basis, not a magnitude: the worst a torn
+// read can do is aim the correction by a fraction of a degree of camera yaw, against a vector a
+// couple of UU long. Locking for that would cost more than it buys.
+static bool PkWorldToHeadLocal(const float* w, float* out)
+{
+    if (!g_sceneMatValid) return false;
+    float rx = g_sceneMat[0];
+    float ry = g_vmRow ? g_sceneMat[4] : g_sceneMat[1];
+    const float rl = sqrtf(rx * rx + ry * ry);
+    if (rl < 1e-6f) return false;               // looking straight along the world up axis
+    rx /= rl; ry /= rl;
+    // ApplySixDof composes world = right*out[0] + fwd*out[2] + worldUp*out[1], with
+    // right = (rx, ry) and fwd = right x worldUp = (ry, -rx). Both are unit and orthogonal, so
+    // projecting onto them is the exact inverse of that composition.
+    out[0] = w[0] * rx + w[1] * ry;             // right
+    out[1] = w[2];                              // up - world Z, the one axis both frames share
+    out[2] = w[0] * ry - w[1] * rx;             // forward
+    return true;
+}
 
 // Called the instant a hand grabs. Takes the reference the DIAGNOSTIC is measured against - how
 // far the pawn and the camera have moved since - which is all this does now.
@@ -3283,13 +3492,23 @@ static void PkFreezeViewTick()
     g_pkFreezeMix *= 0.94f;
     if (g_pkFreezeMix < 0.02f) { g_pkFreezeOn = false; g_pkFreezeMix = 0.0f; }
 
-    const float dx = (loc[0] - g_pkFreezePos[0]) / g_pkUUPerMetre;
-    const float dy = (loc[1] - g_pkFreezePos[1]) / g_pkUUPerMetre;
-    const float dz = (loc[2] - g_pkFreezePos[2]) / g_pkUUPerMetre;
-    // The game is Z-up; the head frame is Y-up with right/forward in the horizontal plane.
-    g_pkFreezeOff[0] = -(dx * g_headRight.x   + dy * g_headRight.z)   * g_pkFreezeMix;
-    g_pkFreezeOff[1] = -(dz)                                          * g_pkFreezeMix;
-    g_pkFreezeOff[2] = -(dx * g_headForward.x + dy * g_headForward.z) * g_pkFreezeMix;
+    // The pawn moved in the WORLD, so the conversion goes through the camera basis, not the
+    // room one - see PkWorldToHeadLocal. This carried the room-basis version for its whole
+    // life; it fired so rarely that nothing ever measured the direction it pushed.
+    const float w[3] = { (loc[0] - g_pkFreezePos[0]) / g_pkUUPerMetre,
+                         (loc[1] - g_pkFreezePos[1]) / g_pkUUPerMetre,
+                         (loc[2] - g_pkFreezePos[2]) / g_pkUUPerMetre };
+    float hl[3];
+    if (!PkWorldToHeadLocal(w, hl)) {
+        // No matrix to decompose against. Push nothing rather than push the wrong way: an
+        // uncancelled teleport is one bad frame, a mis-aimed cancellation is a bad frame plus
+        // an equal-sized shove.
+        g_pkFreezeOff[0] = g_pkFreezeOff[1] = g_pkFreezeOff[2] = 0.0f;
+        return;
+    }
+    g_pkFreezeOff[0] = -hl[0] * g_pkFreezeMix;
+    g_pkFreezeOff[1] = -hl[1] * g_pkFreezeMix;
+    g_pkFreezeOff[2] = -hl[2] * g_pkFreezeMix;
 
     // ⚠️ Clamped, because this deliberately separates the view from the body and a large
     // separation on a ledge means looking from inside the building. It cannot DRIFT - the offset
@@ -3424,6 +3643,7 @@ bool  g_pkHandAnchored[2] = { false, false };   // latched on the grip press: is
 // After that, a grip anchors at: the player's reach projected onto the ledge line, plus that
 // offset. Where along the ledge is theirs; how a hand sits on it is the game's.
 static long g_pkEntryHold = 0;                       // frames the game keeps both hands at entry
+long        g_pkEntryHoldPub = 0;                    // ...published for the bob canceller above
 static long g_pkEntryPrev = 0;                       // ...last frame, so the handback is an edge
 // ---- ⚠️ the corner is a STATE, not a timer ----
 //
@@ -3571,7 +3791,8 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
         g_pkHandLedgeDist[hand] = -1.0f;
     }
 
-    if (!g_pkSnapOn || (g_pkMode != PK_LEDGE && g_pkMode != PK_CLIMB) || !grip ||
+    if (!g_pkSnapOn || (g_pkMode != PK_LEDGE && g_pkMode != PK_CLIMB) ||
+        (g_pkMode == PK_CLIMB && g_pkBypass) || !grip ||
         g_pkEntryHold > 0 || g_pkCornerState != 0) {
         if (g_pkSnapWhy2[hand][0] == 'o')   // keep a more specific reason set above
             g_pkSnapWhy2[hand] = !g_pkSnapOn ? "off"
@@ -3749,6 +3970,18 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
 // that decides between them is one keypress rather than three builds.
 int  g_pkAskMode = 1;
 bool g_pkAsk = true;                        // ParkourAskTheGame; == (g_pkAskMode != 0)
+// ---- ⚠️ THE CONTROL I SHOULD HAVE BUILT BEFORE THE LAST TWO FIXES ----
+//
+// Two builds have now gone into the pipe shake on the assumption that it is ours - first the
+// camera bob, then the bob read in the wrong frame - and neither changed what the player sees.
+// Nothing has ever established that the mod is causing it at all.
+//
+// This is that test, and it has to be a LIVE toggle rather than an ini line, because "is it
+// shaking?" answered from memory across two restarts is not a comparison. With it on, every
+// pipe-specific thing this mod does stands aside - the yaw override, the bob cancellation, the
+// direct body drive, the hand anchoring - and the pipe is the game's own, vanilla. Press it
+// mid-climb and the difference is immediate or it is not ours.
+bool g_pkBypass = false;                    // BACKTICK; pipe-only, see above
 // 2 frames of stick in every 30 - under 7% duty, a 28 ms nudge about twice a second at 72 fps.
 // Down from 3-in-24 because the first pulsed run could still see the fingers open and shut as
 // the game swapped the hang pose for the shimmy one and back.
@@ -3954,6 +4187,16 @@ static void ParkourPollDirectToggle()
             g_pkDirectBody ? "ON (the stick stops driving the shimmy)" : "OFF", g_pkMode);
     }
     prevKey = key;
+
+    static bool prevBypass = false;
+    const bool byp = (GetAsyncKeyState(VK_OEM_3) & 0x8000) != 0;
+    if (byp && !prevBypass) {
+        g_pkBypass = !g_pkBypass;
+        Log("*** [pk] BACKTICK -> pipe bypass %s - %s", g_pkBypass ? "ON" : "OFF",
+            g_pkBypass ? "the mod does nothing on a pipe; this is the game's own camera"
+                       : "the mod's pipe handling is back");
+    }
+    prevBypass = byp;
 
     static bool prevAsk = false;
     const bool ask = (GetAsyncKeyState(VK_CAPITAL) & 0x8000) != 0;
@@ -4549,7 +4792,7 @@ static void PkCornerTick()
 
 static void ParkourDirectBodyTick()
 {
-    const bool onSurface = (g_pkMode == PK_LEDGE || g_pkMode == PK_CLIMB);
+    const bool onSurface = (g_pkMode == PK_LEDGE || (g_pkMode == PK_CLIMB && !g_pkBypass));
     const bool want = g_pkDirectBody && onSurface && g_pkAnchor != PK_HAND_NONE &&
                       g_pkCornerState == 0 && g_playerPawn && g_offActorLocation >= 0;
     if (!want) {
@@ -4835,7 +5078,8 @@ static void ParkourTick(XrTime when)
     PkReadLedge();
     PkReadCorner();
     PkWatchLedgeOffset();
-    PkClimbCameraCollision(g_pkMode == PK_CLIMB);
+    PkClimbCameraCollision(g_pkMode == PK_CLIMB && !g_pkBypass);
+    PkClimbBobTick();
     // ⚠️ ABOVE PkFreezeViewTick, which gates on it. It used to be assigned after, so the freeze
     // read LAST frame's mode - and the one frame that buys is the frame the player leaves the
     // ledge, which is precisely the frame the pawn moves hardest.
@@ -5008,6 +5252,7 @@ static void ParkourTick(XrTime when)
         }
     }
     g_pkEntryPrev = g_pkEntryHold;
+    g_pkEntryHoldPub = g_pkEntryHold;
     if (g_pkEntryHold > 0) {
         --g_pkEntryHold;
         // The resting pawn-to-ledge distance, measured while the game still owns everything.
@@ -11027,7 +11272,7 @@ static void ApplyHeadTracking(XrTime when)
     // frame, which OVERWRITES the game's pull instead of stacking on it. The reference absorbs
     // game-moved yaw only while the player is genuinely turning, so stick rotation is unbounded
     // and a constraint tugging at a still player is simply overwritten.
-    if (g_pkMode == PK_CLIMB) {
+    if (g_pkMode == PK_CLIMB && !g_pkBypass) {
         int32_t cur[3];
         if (SafeRead(ctl + g_offActorRotation, cur, sizeof(cur))) {
             const int32_t want = hy * g_yawSign;
@@ -11045,6 +11290,32 @@ static void ApplyHeadTracking(XrTime when)
             // pull is a quarter degree a frame, and a rejection is harmless anyway because an
             // absolute scheme recomputes from the field next frame instead of losing it.
             dYaw = g_climbYawRef + want - cur[1];
+
+            // ---- and how hard is the game actually pulling? ----
+            //
+            // Last frame's write left the field at ref + wantPrev, by construction. So whatever
+            // it holds now beyond that is the game's own contribution since - the pull this
+            // scheme exists to overwrite. Reconstructing it from the [climb] trace put it near
+            // 0.7 deg a frame with the head near still, but that trace rounds head yaw to 0.1
+            // deg and the arithmetic amplifies the rounding. Measured here it is exact.
+            //
+            // It is the INPUT error. Whether any of it reaches the eye is a separate question,
+            // answered by the rendered-rotation census in the injection hook - the two numbers
+            // are printed on the same line there so they can be read against each other.
+            {
+                static bool  havePrev = false;
+                static int32_t prevWant = 0;
+                static float sum = 0.0f, worst = 0.0f;
+                static long  n = 0;
+                if (havePrev && !turning) {
+                    const float pull = fabsf((float)(int16_t)(cur[1] - (g_climbYawRef + prevWant)))
+                                       * (360.0f / 65536.0f);
+                    sum += pull; if (pull > worst) worst = pull;
+                    if (++n >= 150) { g_pkYawPullDeg = sum / (float)n; n = 0; sum = worst = 0.0f; }
+                }
+                prevWant = want;
+                havePrev = true;
+            }
         }
     } else if (g_climbYawRefOk) {
         g_climbYawRefOk = false;
@@ -17753,6 +18024,61 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                             n = 0; worstVal = 0.0f; sumVal = 0.0f;
                         }
                         g_yawLagRad = d;
+
+                        // ---- PK.11: what the EYE actually gets on a pipe ----
+                        //
+                        // The bob cancellation pins the rendered camera POSITION to pawn + base,
+                        // and the pipe census reports the pawn stepping 0.00 UU while hanging.
+                        // So with it working the view cannot translate, and the shake the player
+                        // still reports has to be rotation, or it is not in this path at all.
+                        //
+                        // psi is the yaw invariant established above - matrix yaw plus head yaw,
+                        // which the two opposite conventions make constant. Its FRAME-TO-FRAME
+                        // CHANGE is therefore rendered yaw movement that the head did not ask
+                        // for, in degrees, with any standing offset differentiated away. The
+                        // pitch pair is the same idea: matrix pitch minus head pitch holds the
+                        // authored hang stance (-22.7 on the pipe measured), so its change is
+                        // rendered pitch nobody asked for.
+                        //
+                        // ⚠️ Deliberately NOT measured as (psi - mean) like the lag census above.
+                        // That mean absorbs `external` - anything the controller's yaw did beyond
+                        // our own writes - the instant it happens, so that it cannot mistake a
+                        // mouse turn for lag. On a pipe the game's pull against us IS exactly
+                        // "yaw that moved beyond our writes", so the lag census is blind to it by
+                        // construction. A difference of consecutive frames has no reference to
+                        // absorb anything into and cannot be fooled the same way.
+                        if (g_pkMode == PK_CLIMB && !g_pkBypass) {
+                            float hp = 0.0f;
+                            const float mfz = g_vmRow ? g_sceneMat[11] : g_sceneMat[14];
+                            const float mh  = sqrtf(mfx * mfx + mfy * mfy);
+                            const bool  pOk = mh > 1e-6f && GetHeadPitchRaw(g_predTime, &hp);
+                            // Same sense, so the difference is the invariant: GetCameraPose has
+                            // the matrix forward as fwd[2] = sin(pitch) with UE3's sign, and
+                            // GetHeadPitchRaw is atan2(up, horizontal). Both grow looking up.
+                            const float phi = pOk ? (atan2f(mfz, mh) - hp * (float)g_pitchSign)
+                                                  : 0.0f;
+                            static bool  have2 = false;
+                            static float pPsi = 0.0f, pPhi = 0.0f;
+                            static float ySum = 0.0f, yMax = 0.0f, pSum = 0.0f, pMax = 0.0f;
+                            static long  n2 = 0;
+                            if (have2) {
+                                const float dy = fabsf(wrapf(psi - pPsi)) * 57.29578f;
+                                const float dp = fabsf(wrapf(phi - pPhi)) * 57.29578f;
+                                g_pkYawJitDeg = dy; g_pkPitchJitDeg = dp;
+                                ySum += dy; if (dy > yMax) yMax = dy;
+                                pSum += dp; if (dp > pMax) pMax = dp;
+                                if (++n2 >= 150) {
+                                    Log("[climb] rendered rotation nobody asked for, over %ld"
+                                        " frames: yaw mean %.3f max %.2f deg  |  pitch mean %.3f"
+                                        " max %.2f deg  (the game's own yaw pull at the"
+                                        " controller was %.3f deg a frame)",
+                                        n2, ySum / (float)n2, yMax, pSum / (float)n2, pMax,
+                                        g_pkYawPullDeg);
+                                    n2 = 0; ySum = yMax = pSum = pMax = 0.0f;
+                                }
+                            }
+                            pPsi = psi; pPhi = phi; have2 = pOk;
+                        }
                     }
                 }
             }
@@ -18634,6 +18960,11 @@ void UpdateSixDof(XrTime when)
     g_dofOffset[1] =  dy                   * g_worldScale;   // up, true vertical
     g_dofOffset[2] = (dx * hfx + dz * hfz) * g_worldScale;   // forward
 
+    // The tracking-only offset, kept before anything else composes onto it. PK.12 below needs to
+    // know which frames the player's head was actually still on, and this is the only point where
+    // that is separable - afterwards the head's motion and every correction are one number.
+    const float trackOnly[3] = { g_dofOffset[0], g_dofOffset[1], g_dofOffset[2] };
+
     // ---- PK.2 composes here, AFTER the headset write, never instead of it ----
     //
     // These three are assigned, not accumulated, so a lead folded in earlier would be discarded
@@ -18646,6 +18977,74 @@ void UpdateSixDof(XrTime when)
     g_dofOffset[1] += g_pkFreezeOff[1] * g_worldScale;
     g_dofOffset[2] += g_pkFreezeOff[2] * g_worldScale;
 
+    // ---- PK.10: cancel the climb animation's camera bob, read IN THIS FRAME ----
+    //
+    // The base comes from PkClimbBobTick, which is slow-moving and safe to carry across threads.
+    // The delta is taken here, beside the matrix it has to agree with, for the reason the
+    // animation-share fix records: a stale sample of something that JUMPS does not cancel jitter,
+    // it doubles it out of phase.
+    //
+    // ⚠️ Decomposed on the CAMERA basis, not the head's. (cam - pawn) is a world-space vector and
+    // the room head axes cannot convert one - PkWorldToHeadLocal carries the whole argument, and
+    // the ~95 degrees it was out by is why the first two attempts at this changed nothing.
+    //
+    // What it leaves is worth stating plainly, because it is the property to check against the
+    // next run: the rendered camera becomes pawn + base, exactly. Every wobble in `cam` is gone
+    // and every movement of the BODY passes through untouched, since both terms carry it. If the
+    // pipe still shakes with this working, the shake is in the pawn or in the rotation, and the
+    // census two functions up will already have said which.
+    //
+    // Units are UU throughout. g_dofOffset is UE3 units and so is the camera; the metres round
+    // trip the first version did was a no-op only because g_worldScale and g_pkUUPerMetre are
+    // both 100, and a world-space quantity has no business being scaled by a comfort setting.
+    static float bobFade[3] = { 0, 0, 0 };
+    bool bobLive = false;
+    if (g_pkClimbCamOk && g_offCamLoc >= 0 && g_offActorLocation >= 0 && g_playerPawn) {
+        float cam[3], pawn[3], off[3];
+        if (SafeRead(g_playerPawn + g_offCamLoc, cam, sizeof(cam)) &&
+            SafeRead(g_playerPawn + g_offActorLocation, pawn, sizeof(pawn))) {
+            // ⚠️ base MINUS the current offset, not the other way round. This is the correction,
+            // not the error: the view has to move by however far the camera has drifted from
+            // where it was latched, in the opposite direction. Written the intuitive way round
+            // it doubles the bob instead of removing it, and the two look identical in a diff.
+            //   rendered = cam + (base - (cam - pawn)) = pawn + base, which is the whole point.
+            const float world[3] = { g_pkClimbCamBase[0] - (cam[0] - pawn[0]),
+                                     g_pkClimbCamBase[1] - (cam[1] - pawn[1]),
+                                     g_pkClimbCamBase[2] - (cam[2] - pawn[2]) };
+            if (PkWorldToHeadLocal(world, off)) {
+                // ⚠️ 25 UU, and it should never be reached. The measured bob is a couple of UU;
+                // a quarter metre of separation between the view and the game's camera is a head
+                // inside the wall, and past that point whatever is moving is not bob.
+                const float lim = 25.0f;
+                for (int i = 0; i < 3; ++i) {
+                    if (off[i] >  lim) off[i] =  lim;
+                    if (off[i] < -lim) off[i] = -lim;
+                    g_dofOffset[i] += off[i];
+                    bobFade[i] = off[i];
+                }
+                g_pkClimbCamOff[0] = off[0];
+                g_pkClimbCamOff[1] = off[1];
+                g_pkClimbCamOff[2] = off[2];
+                bobLive = true;
+            }
+        }
+    }
+    if (!bobLive) {
+        // ---- ⚠️ FADE, DO NOT DROP ----
+        //
+        // Letting go of a pipe clears g_pkClimbCamOk, and an offset that simply stops being
+        // added is a one-frame view teleport the size of whatever it held - on the exact frame
+        // the player is falling or being pulled up, which is already the worst frame to add a
+        // step to. Same lesson as the 6-DOF tracking dropout above: failure decays home.
+        // ~0.13 s at 72 fps, short enough not to fight a real camera move on the way out.
+        for (int i = 0; i < 3; ++i) {
+            bobFade[i] *= 0.90f;
+            if (fabsf(bobFade[i]) < 0.05f) bobFade[i] = 0.0f;   // 0.05 UU is half a millimetre
+            g_dofOffset[i] += bobFade[i];
+            g_pkClimbCamOff[i] = bobFade[i];
+        }
+    }
+
     if (g_pkCamLead != 0.0f || g_pkCamLeadUp != 0.0f || g_pkCamLeadFwd != 0.0f) {
         g_dofOffset[0] += g_pkCamLead    * g_worldScale;
         g_dofOffset[1] += g_pkCamLeadUp  * g_worldScale;
@@ -18657,6 +19056,63 @@ void UpdateSixDof(XrTime when)
             warned = true;
             Log("[pk] camera lead is active but 6-DOF is OFF (PAGE DOWN) - the view will not"
                 " answer the pull until it is on");
+        }
+    }
+
+    // ---- PK.12: the rendered camera's OWN step, which is the positional twin of SPIN ----
+    //
+    // Everything measured so far says this number must be zero, and that is exactly why it has
+    // to be measured. The chain is: the pawn steps 0.00 UU while hanging; the camera the matrix
+    // renders from is the pawn's cached field, confirmed by camLoc and matrixCam agreeing on
+    // every [cam] sample; the offset is computed and applied inside the same upload; and the
+    // decompose/recompose round trip is an orthonormal identity. Each link says the view cannot
+    // translate. The player still reports something. So one of those links is wrong, or the
+    // shake is not in the camera pose at all - and a chain of four sound arguments is precisely
+    // the thing that should be checked end to end rather than trusted.
+    //
+    // ⚠️ Gated on the head being STILL, which is what makes the number readable. The rendered
+    // camera is supposed to move when the player's head moves; that is the whole feature. Only
+    // on frames where the headset itself did not move is the correct answer zero, and the
+    // tracking-only offset captured above is the only thing that can tell those frames apart.
+    if (g_pkMode == PK_CLIMB && !g_pkBypass && g_sceneMatValid &&
+        g_playerPawn && g_offCamLoc >= 0) {
+        float cam[3];
+        float rx = g_sceneMat[0];
+        float ry = g_vmRow ? g_sceneMat[4] : g_sceneMat[1];
+        const float rl = sqrtf(rx * rx + ry * ry);
+        if (rl > 1e-6f && SafeRead(g_playerPawn + g_offCamLoc, cam, sizeof(cam))) {
+            rx /= rl; ry /= rl;
+            // ApplySixDof's own composition, so this is the position the frame renders from.
+            const float rc[3] = { cam[0] + rx * g_dofOffset[0] + ry * g_dofOffset[2],
+                                  cam[1] + ry * g_dofOffset[0] - rx * g_dofOffset[2],
+                                  cam[2] + g_dofOffset[1] };
+            static bool  have = false;
+            static float prev[3] = { 0, 0, 0 }, prevTrack[3] = { 0, 0, 0 };
+            static float sum = 0.0f, worst = 0.0f;
+            static long  n = 0, still = 0, seen = 0;
+            if (have) {
+                ++seen;
+                const float ht = fabsf(trackOnly[0] - prevTrack[0]) +
+                                 fabsf(trackOnly[1] - prevTrack[1]) +
+                                 fabsf(trackOnly[2] - prevTrack[2]);
+                if (ht < 0.10f) {           // 1 mm of headset movement, summed over three axes
+                    ++still;
+                    const float sx = rc[0] - prev[0], sy = rc[1] - prev[1], sz = rc[2] - prev[2];
+                    const float st = sqrtf(sx * sx + sy * sy + sz * sz);
+                    g_pkViewStep = st;
+                    sum += st; if (st > worst) worst = st;
+                    if (++n >= 120) {
+                        Log("[climb] RENDERED camera step with the head still, over %ld frames:"
+                            " mean %.3f max %.2f UU  (%ld of %ld frames qualified - if that count"
+                            " is tiny the head was never still and the number means little)",
+                            n, sum / (float)n, worst, still, seen);
+                        n = 0; sum = 0.0f; worst = 0.0f; still = 0; seen = 0;
+                    }
+                }
+            }
+            memcpy(prev, rc, sizeof(prev));
+            memcpy(prevTrack, trackOnly, sizeof(prevTrack));
+            have = true;
         }
     }
 
@@ -20756,6 +21212,7 @@ static void ResolveMoveProbeProps()
     DumpMoveClassProps("TdLadderVolume");
     DumpMoveClassProps("TdSwingVolume");
     DumpMoveClassProps("TdAnimNodeClimb");
+
     Log("[moveprop] resolving parkour properties on the move classes:");
     for (int i = 0; i < kMoveProbeCount; ++i) {
         MoveProbeProp& p = g_moveProbe[i];
@@ -21345,6 +21802,12 @@ extern float g_pkHandLedgeDist[2];
 extern float g_pkCamLeadFwd, g_pkCamLeadUp;
 extern float g_pkGapNow, g_pkGapBaselinePub;
 extern float g_pkFreezeOff[3];
+extern float g_pkClimbCamOff[3];
+extern float g_pkBobStep, g_pkBodyStep;     // PK.10 census, live - see PkClimbBobTick
+extern float g_pkYawJitDeg, g_pkPitchJitDeg, g_pkYawPullDeg;   // PK.11, the rotational half
+extern float g_pkViewStep;                                     // PK.12, the end-to-end check
+extern float g_pkClimbCamBase[3];
+extern bool  g_pkClimbCamOk;
 extern float g_pkFreezeCm, g_pkFreezeCmPeak;
 extern float g_pkCamMovedCm;
 extern float g_pkStepPeak;
@@ -21461,6 +21924,23 @@ static void DrawOverlay(IDirect3DDevice9* dev)
         // failed or the player simply was not on anything, and those are different bugs.
         OverlayRow(lines, &nl, "PK %s M%d %s", mn, g_animState,
                     g_pkBlock[0] ? g_pkBlock : "driving");
+        // ---- the shake, live, while standing on the thing that shakes ----
+        //
+        // BOB is the camera moving relative to the body and is what the cancellation removes;
+        // BODY is the pawn's own motion and passes through by design. Watching which one moves
+        // while the picture shakes is worth more than any number recovered from a log
+        // afterwards - and BYPASS on the same row says whether the mod is in the loop at all.
+        if (g_pkMode == PK_CLIMB) {
+            OverlayRow(lines, &nl, "BOB %.2f BODY %.2f UU/f | cancel R%+.1f U%+.1f F%+.1f%s",
+                       g_pkBobStep, g_pkBodyStep, g_pkClimbCamOff[0], g_pkClimbCamOff[1],
+                       g_pkClimbCamOff[2], g_pkBypass ? " | BYPASS - game's own camera" : "");
+            // The rotational half. SPIN is what the rendered view moved without being asked;
+            // PULL is what the game did at the controller that we overwrote. SPIN near zero with
+            // PULL large means the overwrite is holding and the shake is elsewhere; both large
+            // means the pull is reaching the eye, and that is the next thing to fix.
+            OverlayRow(lines, &nl, "SPIN yaw %.2f pitch %.2f deg/f | PULL %.2f | VIEW %.2f UU/f",
+                       g_pkYawJitDeg, g_pkPitchJitDeg, g_pkYawPullDeg, g_pkViewStep);
+        }
         if (g_pkDirectBody)
             OverlayRow(lines, &nl, "DIRECT %s %s | ask%s%+d arm%s end%+d",
                         g_pkDirectLive ? "LIVE" : "IDLE", g_pkDirectWhy,
