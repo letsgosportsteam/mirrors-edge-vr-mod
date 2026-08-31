@@ -3055,7 +3055,27 @@ static void PkWatchLedgeOffset()
 // evidence that camera collision was the problem. It was not.
 static uint32_t g_pkClimbFlagsSaved = 0;
 static bool     g_pkClimbFlagsHeld = false;
-static const uint32_t kUseCameraCollision = 1u << 22;
+// ---- ⚠️ THE CHANNEL IS NAMED IN ENGINE_NOTES, AND IT IS NOT CAMERA COLLISION ----
+//
+// The enumeration of "every channel that moves the view without the player asking" lists, as
+// channel 2: Moves[MovementState].UpdateViewRotation, on TdMove and its ~148 subclasses -
+// "forced look-at, and per-move view clamping". It runs inside UpdateRotation every single tick.
+// That is the pull we measured on a pipe, and the move carries its own switches for it at
+// +0x004C: bConstrainLook is bit 6 and bUseAbsoluteYawConstraint is bit 7.
+//
+// It also explains why the symptom CHANGED rather than went away. While the yaw write was a
+// delta, the clamp's pull was never erased and accumulated into a slow drift. Making the write
+// absolute erases it every frame - so instead of accumulating, the two now alternate at frame
+// rate: clamp pulls, we snap back, sixty times a second. That is the shake, and it is the same
+// fight wearing a different shape.
+//
+// Camera collision (bit 22) stays in the mask, but it was measured already-off on every pipe and
+// is not the cause of anything here.
+static const uint32_t kUseCameraCollision      = 1u << 22;
+static const uint32_t kConstrainLook           = 1u << 6;
+static const uint32_t kAbsoluteYawConstraint   = 1u << 7;
+static const uint32_t kClimbViewFlags =
+    kUseCameraCollision | kConstrainLook | kAbsoluteYawConstraint;
 
 static void PkClimbCameraCollision(bool onPipe)
 {
@@ -3075,26 +3095,27 @@ static void PkClimbCameraCollision(bool onPipe)
         if (!g_pkClimbFlagsHeld) {
             g_pkClimbFlagsSaved = w;
             g_pkClimbFlagsHeld = true;
-            Log("[climb] camera collision %s - clearing it while climbing so the view is not"
-                " pushed off the pipe when the head leans in",
-                (w & kUseCameraCollision) ? "was ON" : "was already off");
+            Log("[climb] view flags on entry: bConstrainLook %d, bUseAbsoluteYawConstraint %d,"
+                " bUseCameraCollision %d - clearing all three while climbing",
+                (w & kConstrainLook) ? 1 : 0, (w & kAbsoluteYawConstraint) ? 1 : 0,
+                (w & kUseCameraCollision) ? 1 : 0);
         }
-        if (w & kUseCameraCollision) {
-            const uint32_t off = w & ~kUseCameraCollision;
+        if (w & kClimbViewFlags) {
+            const uint32_t off = w & ~kClimbViewFlags;
             SIZE_T wrote = 0;
             WriteProcessMemory(GetCurrentProcess(), (LPVOID)(obj + 0x4C), &off, sizeof(off),
                                &wrote);
         }
     } else if (g_pkClimbFlagsHeld) {
-        // Only the one bit goes back, not the whole dword - the move owns the other 31 and may
-        // have changed them while we were holding this.
-        const uint32_t restored = (w & ~kUseCameraCollision) |
-                                  (g_pkClimbFlagsSaved & kUseCameraCollision);
+        // Only our bits go back, not the whole dword - the move owns the other 29 and may have
+        // changed them while we were holding these.
+        const uint32_t restored = (w & ~kClimbViewFlags) |
+                                  (g_pkClimbFlagsSaved & kClimbViewFlags);
         SIZE_T wrote = 0;
         WriteProcessMemory(GetCurrentProcess(), (LPVOID)(obj + 0x4C), &restored,
                            sizeof(restored), &wrote);
         g_pkClimbFlagsHeld = false;
-        Log("[climb] camera collision restored on leaving the pipe");
+        Log("[climb] view flags restored on leaving the pipe");
     }
 }
 
@@ -4528,13 +4549,14 @@ static void PkCornerTick()
 
 static void ParkourDirectBodyTick()
 {
-    const bool want = g_pkDirectBody && g_pkMode == PK_LEDGE && g_pkAnchor != PK_HAND_NONE &&
+    const bool onSurface = (g_pkMode == PK_LEDGE || g_pkMode == PK_CLIMB);
+    const bool want = g_pkDirectBody && onSurface && g_pkAnchor != PK_HAND_NONE &&
                       g_pkCornerState == 0 && g_playerPawn && g_offActorLocation >= 0;
     if (!want) {
         // DIRECT-IDLE with no reason has now cost two runs. Say which condition is missing.
         g_pkDirectWhy = !g_pkDirectBody      ? "off"
                       : g_pkCornerState != 0 ? "cornering"
-                      : g_pkMode != PK_LEDGE ? "not on a ledge"
+                      : !onSurface           ? "not on a ledge or pipe"
                       : g_pkAnchor == PK_HAND_NONE ? "no anchor"
                       : !g_playerPawn        ? "no pawn" : "no Location offset";
         if (g_pkDirectLive)
@@ -4554,7 +4576,12 @@ static void ParkourDirectBodyTick()
     // the distance between the player's hands.
     static int prevAnchor = PK_HAND_NONE;
     if (!g_pkDirectHave || prevAnchor != g_pkAnchor) {
-        if (!PkLedgeAxis(g_pkDirectAxis)) { g_pkDirectWhy = "no ledge axis"; return; }
+        // A pipe's axis is not derived - it is up. Only the ledge has to work for one.
+        if (g_pkMode == PK_CLIMB) {
+            g_pkDirectAxis[0] = 0.0f; g_pkDirectAxis[1] = 0.0f; g_pkDirectAxis[2] = 1.0f;
+        } else if (!PkLedgeAxis(g_pkDirectAxis)) {
+            g_pkDirectWhy = "no ledge axis"; return;
+        }
         // ⚠️ Logged, because "dislodged a little outwards over several corners, correct again
         // after each one" is a PERPENDICULAR error and nothing here measures one. The base is
         // whatever the pawn's position was at the latch, and every write after it is that base
@@ -4664,9 +4691,29 @@ static void ParkourDirectBodyTick()
     // or the latch is wrong, and flinging the pawn is a worse outcome than doing nothing.
     if (!(fabsf(d) < 200.0f) || !std::isfinite(d)) { g_pkBlock = "direct step rejected"; return; }
 
-    float want3[3] = { g_pkDirectBase[0] + g_pkDirectAxis[0] * d,
-                       g_pkDirectBase[1] + g_pkDirectAxis[1] * d,
-                       loc[2] };            // Z is never written - see the note above
+    // ---- ⚠️ ON A PIPE, Z IS THE AXIS, AND THAT INVERTS THE SAFETY PROPERTY ----
+    //
+    // "Z is never written - so the worst failure moves you along a wall rather than off it" has
+    // been true of every write this file makes, and it stops being true here: a pipe is vertical,
+    // so Z is the only axis there is. The same class of mistake that slides a hanging player
+    // sideways drops a climbing one off the pipe or pushes them through the ceiling.
+    //
+    // What survives from the ledge: the single-frame step rejection above, which is what stops a
+    // bad latch flinging the pawn, and standing down the moment the move is no longer a climb.
+    // What does NOT exist yet is a top-and-bottom guard - the pipe's version of the end-of-ledge
+    // problem. The ledge got its guard several builds after its movement, and this is the same
+    // staging: the failure is visible and recoverable, and inventing a guard before seeing one
+    // fail is how the last four end-of-ledge attempts were built.
+    float want3[3];
+    if (g_pkMode == PK_CLIMB) {
+        want3[0] = g_pkDirectBase[0];
+        want3[1] = g_pkDirectBase[1];
+        want3[2] = g_pkDirectBase[2] + d;
+    } else {
+        want3[0] = g_pkDirectBase[0] + g_pkDirectAxis[0] * d;
+        want3[1] = g_pkDirectBase[1] + g_pkDirectAxis[1] * d;
+        want3[2] = loc[2];              // a ledge never writes Z - see above
+    }
 
     // ---- ⚠️ ALIGNMENT: NEAR A CORNER, DO NOT OUTRUN THE GAME'S OWN STATE ----
     //
@@ -4689,7 +4736,7 @@ static void ParkourDirectBodyTick()
     // ⚠️ The LIVE axis, not g_pkDirectAxis. That one is latched with the base and goes stale
     // through exactly the yaw change this is trying to survive.
     float liveAxis[3];
-    if (g_pkLedgeOk && PkLedgeAxis(liveAxis)) {
+    if (g_pkMode == PK_LEDGE && g_pkLedgeOk && PkLedgeAxis(liveAxis)) {
         const float vx = want3[0] - g_pkLedgeLoc[0], vy = want3[1] - g_pkLedgeLoc[1];
         const float along = vx * liveAxis[0] + vy * liveAxis[1];
         g_pkAlongLag = along;
@@ -4722,7 +4769,7 @@ static void ParkourDirectBodyTick()
     // wrong place - a player who cannot move at all, with nothing on screen saying why.
     const bool baselineSane = g_pkGapBaselineOk && g_pkGapBaseline > 5.0f &&
                               g_pkGapBaseline < 200.0f;
-    if (g_pkGapGoodOk && baselineSane) {
+    if (g_pkMode == PK_LEDGE && g_pkGapGoodOk && baselineSane) {
         const float ox = want3[0] - g_pkGapGoodPos[0];
         const float oy = want3[1] - g_pkGapGoodPos[1];
         const float out = sqrtf(ox * ox + oy * oy);
@@ -4893,7 +4940,7 @@ static void ParkourTick(XrTime when)
             // axes are logged now, beside the head's own yaw - which also separates the remaining
             // rotation into "the game is moving the world" versus "the headset's yaw is drifting".
             extern float g_padSentRX;
-            extern int32_t g_lastHeadYawPub;
+            extern int32_t g_lastHeadYawPub, g_lastHeadPitchPub;
             // ⚠️ The cached pointer, not FindPlayerController() - that one is static and
             // defined below this, and it walks objects. A telemetry line has no business
             // repeating a search the head write already did this frame.
@@ -4907,7 +4954,8 @@ static void ParkourTick(XrTime when)
                 SafeRead(g_playerPawn + g_offActorRotation, prot, sizeof(prot));
             Log("[climb] pawn (%.0f %.0f %.0f) | drift X%+.1f Y%+.1f dZ%+.1f | stickY %+.2f"
                 " | grips %c%c anchored %c%c | offset %s | yaw ctl %.1f pawn %.1f head %.1f"
-                " dYawWritten %+d | stick LX %+.2f RX %+.2f",
+                " dYawWritten %+d | pitch ctl %.2f head %.2f | stick LX %+.2f RX %+.2f"
+                " | anc %d want %+.3f m direct %s",
                 loc[0], loc[1], loc[2], loc[0] - first[0], loc[1] - first[1], loc[2] - first[2],
                 g_padSentLY,
                 g_gripValue[0] > 0.5f ? 'G' : '-', g_gripValue[1] > 0.5f ? 'G' : '-',
@@ -4915,7 +4963,20 @@ static void ParkourTick(XrTime when)
                 g_pkEntryOffsetValid ? "measured" : "NOT YET",
                 (float)crot[1] * (360.0f / 65536.0f), (float)prot[1] * (360.0f / 65536.0f),
                 (float)g_lastHeadYawPub * (360.0f / 65536.0f), g_lastYawWrite,
-                g_padSentLX, g_padSentRX);
+                // ---- ⚠️ PITCH IS THE AXIS NOBODY HAS LOOKED AT ----
+                //
+                // During the shake: yaw steady, no anchor, direct drive idle. So it is not the
+                // servo and it is not the yaw fight. Pitch is written ABSOLUTELY every frame -
+                // deliberately, so any disturbance corrects itself - and an absolute write being
+                // fought does not drift, it OSCILLATES. Which is what a shake is.
+                //
+                // Signed 16-bit, because the field holds 58697 for -6839 and reading it raw
+                // makes a small negative pitch look like a 322 degree one.
+                (float)((crot[0] & 0xFFFF) > 32767 ? (crot[0] & 0xFFFF) - 65536
+                                                   : (crot[0] & 0xFFFF)) * (360.0f / 65536.0f),
+                (float)g_lastHeadPitchPub * (360.0f / 65536.0f),
+                g_padSentLX, g_padSentRX, g_pkAnchor, g_pkDesired,
+                g_pkDirectLive ? "LIVE" : g_pkDirectWhy);
         }
     }
 
@@ -5019,6 +5080,11 @@ static void ParkourTick(XrTime when)
         // player has abandoned is a camera nobody is steering.
         g_pkBlock = "no hand gripping";
         g_pkAnchor = PK_HAND_NONE;
+        // ⚠️ ParkourDirectBodyTick is below this return, so without setting the reason here it
+        // keeps whatever it last said - and it said "cornering" on a PIPE, hours after the ledge
+        // corner that set it. A stale diagnostic is worse than none: it sent me looking for a
+        // corner state machine running where it cannot.
+        g_pkDirectWhy = "no hand gripping";
         PkDecayLead();
         return;
     }
@@ -5041,7 +5107,10 @@ static void ParkourTick(XrTime when)
         // been reset and the swap steps by the whole of it.
         g_pkCamLeadBiasFwd = g_pkCamLeadFwd;
         g_pkAnchor = want;
-        g_pkAnchorLat = PkLateralOf(want == PK_HAND_L ? g_swingL : g_swingR);
+        {
+            const ArmSwingHand& nh = (want == PK_HAND_L) ? g_swingL : g_swingR;
+            g_pkAnchorLat = (g_pkMode == PK_CLIMB) ? nh.rel.y : PkLateralOf(nh);
+        }
         g_pkAnchorRel = (want == PK_HAND_L ? g_swingL : g_swingR).rel;   // fore/aft reference
         g_pkAnchorRelOk = true;
         // ⚠️ The integrator's previous sample is DROPPED, not re-latched. Differencing the new
@@ -5056,11 +5125,22 @@ static void ParkourTick(XrTime when)
     }
 
     g_pkBlock = "";
-    if (g_pkMode != PK_LEDGE) { g_pkBlock = "mode has no servo yet"; PkZeroLead(); return; }
+    if (g_pkMode != PK_LEDGE && g_pkMode != PK_CLIMB) {
+        g_pkBlock = "mode has no servo yet"; PkZeroLead(); return;
+    }
 
     // Pull the hands LEFT and the body goes RIGHT. Inverse, because the hand is what is anchored
     // - the same relationship the bar measurement confirmed, where hands back meant feet forward.
-    const float lat = PkLateralOf(g_pkAnchor == PK_HAND_L ? g_swingL : g_swingR);
+    // ---- the pull, on whichever axis the surface travels ----
+    //
+    // Identical arithmetic, different component. A ledge measures the anchor hand ALONG the wall
+    // and drives X/Y; a pipe measures it vertically and drives Z. Both are inverse: the hand is
+    // what is fixed in the world, so pulling it down carries the body up.
+    //
+    // ⚠️ rel.y needs no basis. The lateral term has to be projected onto the head's right axis
+    // because "sideways" depends on which way the player faces; up does not.
+    const ArmSwingHand& ah = (g_pkAnchor == PK_HAND_L) ? g_swingL : g_swingR;
+    const float lat = (g_pkMode == PK_CLIMB) ? ah.rel.y : PkLateralOf(ah);
     g_pkDesired = -(lat - g_pkAnchorLat);
 
     // ⚠️ AFTER the anchor is chosen, not before it.
@@ -5162,7 +5242,15 @@ static void ParkourTick(XrTime when)
         // ⚠️ The FIRST frame of any anchor contributes nothing, because there is no previous
         // sample of that hand to difference against. That is the whole mechanism by which the
         // grab moves the view by nothing, and it is a structural zero rather than a tuned one.
-        if (g_pkLeadPrevOk && g_pkCamLeadUpOn) {
+        // ---- ⚠️ NO VERTICAL LEAD ON A PIPE ----
+        //
+        // The vertical lead exists because a hanging body cannot move up or down, so only the
+        // camera can answer a hand that does. On a pipe the body genuinely climbs - that is the
+        // whole feature - and leaving the lead on would move the view AND the body for one hand
+        // motion. It is the same double-count the sideways axis is zeroed for while direct drive
+        // owns a ledge.
+        if (g_pkMode == PK_CLIMB) g_pkCamLeadUp = 0.0f;
+        if (g_pkLeadPrevOk && g_pkCamLeadUpOn && g_pkMode != PK_CLIMB) {
             const float dx = ah.rel.x - g_pkLeadPrevRel.x;
             const float dy = ah.rel.y - g_pkLeadPrevRel.y;
             const float dz = ah.rel.z - g_pkLeadPrevRel.z;
@@ -5207,7 +5295,10 @@ static void ParkourTick(XrTime when)
         // on top of the writes. It still cannot - the writes measured 0.00 UU/frame of fight -
         // and the cost of the silence was that the game was never asked anything, which is why
         // the ledge had no end and the corner was never offered. See PK.7.
-        g_pkShimmy = (float)g_pkProbeDir * g_pkShimmyCap;
+        // ⚠️ Never on a pipe. The probe exists to make the game rule on a LEDGE - whether it
+        // extends, whether a corner is offered - and a pipe has neither question. Handing the
+        // stick a deflection here would just make the game climb on top of our own writes.
+        g_pkShimmy = (g_pkMode == PK_CLIMB) ? 0.0f : (float)g_pkProbeDir * g_pkShimmyCap;
         g_pkCamLead = 0.0f;     // the body IS where the pull asked; there is no debt to lead
         // ⚠️ This used to be an unconditional "direct body drive", which overwrote the end-of-
         // ledge message ParkourDirectBodyTick had just set - so the one state the player most
@@ -10545,6 +10636,7 @@ bool             g_animRollFollow = true;   // ROLL;  NUMPAD4
 bool             g_animYawFollow  = true;   // YAW;   NUMPAD5
 extern int       g_lastYawWrite;            // defined with the pawn globals
 extern int32_t   g_lastHeadYawPub;          // ...and beside it
+extern int32_t   g_lastHeadPitchPub;
 extern float     g_padSentRX;               // the LOOK stick - the axis that actually turns
 extern uintptr_t g_lastPlayerController;    // ...and beside it
 
@@ -11096,6 +11188,7 @@ static void ApplyHeadTracking(XrTime when)
 
     g_lastYawWrite = dYaw;      // for the climb telemetry - see the drift note there
     g_lastHeadYawPub = hy;
+    g_lastHeadPitchPub = hp;
     if (++g_headWrites == 1 || (g_headWrites % 600) == 0)
         Log("[head] write #%ld  dYaw %+d dPitch %+d -> pitch %d yaw %d",
             g_headWrites, dYaw, dPitch, rot[0], rot[1]);
@@ -11962,6 +12055,7 @@ int g_offCamViewTarget = -1;
 uintptr_t g_playerPawn = 0;
 int       g_lastYawWrite = 0;         // last delta the head write applied - read by the climb trace
 int32_t   g_lastHeadYawPub = 0;       // ...and the head yaw it was derived from
+int32_t   g_lastHeadPitchPub = 0;     // ...and the head pitch, for the climb shake
 uintptr_t g_lastPlayerController = 0; // ...and the controller it applied it to
 static long      g_pawnNextTry = 0;
 static bool      g_pawnMissLogged = false;
