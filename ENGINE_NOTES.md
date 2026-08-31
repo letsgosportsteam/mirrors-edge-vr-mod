@@ -1394,3 +1394,143 @@ physical control can drive any pad button.
 - Bindings suggested for `oculus/touch_controller` (what a Quest reports through Virtual Desktop)
   and `khr/simple_controller` as a fallback. Simple carries only select and menu â€” not playable,
   but an unrecognised controller reaches the menus instead of appearing dead.
+
+---
+
+## ⭐ Calling the game's own functions — ProcessEvent found and verified, 2026-08-30
+
+**Status: banked and unused.** The machinery works and nothing in the mod depends on it. It is
+here because it is the only remaining way to get real ledge geometry, and the expensive part —
+finding and proving the call — is done.
+
+### ProcessEvent is vtable slot 61
+
+`UObject::ProcessEvent(UFunction*, void* Parms, void* Result)` — `__thiscall`, three stack
+arguments. On this build:
+
+| | address |
+|---|---|
+| `AActor::ProcessEvent` (the pawn's slot 61) | `00B8E5D0` |
+| `UObject::ProcessEvent` (a non-Actor's slot 61) | `0114AB80` |
+
+⚠️ **Derive it every run; never hardcode the index.** It is build-specific and a stale constant
+calls a destructor. `DumpVtableSlots()` derives it from four independent tests, and only one slot
+of ~120 passes all four:
+
+1. **`ret 0Ch`** — the callee pops three stack arguments. `__thiscall` means arity is the callee's
+   own promise, stated in the shipped code, and it is the property that makes a *wrong* guess
+   survivable: the stack stays balanced whatever else the function does.
+2. **Overridden by `AActor`** — the address differs between an Actor's vtable and a non-Actor's.
+   Compare against a live `TdMove_Grab` object, which is a `UObject` but not an `AActor`.
+3. **Small enough to be an override, not an implementation** — returns within 512 bytes with one
+   or two calls. `UObject::ProcessEvent` is much larger.
+4. **Calls its own super** — the Actor's function contains a direct call to the very address the
+   non-Actor holds in the same slot. This is the decisive one; six other `ret 0Ch` candidates
+   fail it and four "calls its super" candidates have the wrong arity.
+
+An ambiguous derivation must refuse both candidates rather than pick. `ProcessInternal` is **not**
+in the vtable in this build, so it cannot be used as an anchor.
+
+### How the verification was done, and why it matters
+
+Verify against an answer already known by an independent route. `GetGrabType()` was used because
+`GrabType` is a `ByteProperty` at `TdMove_Grab+0x01C0` that `[moveprop]` already prints.
+
+⚠️ **Poison the parameter buffer with `0xCD`, do not zero it.** The first attempt zeroed it,
+`GrabType` reads 0, the call returned 0, and it reported MATCH — which proves nothing, because a
+slot that did *nothing at all* leaves the zero it was given. Poisoned, the correct result is
+unmistakable:
+
+```
+wrote byte 0 (dword CDCDCD00)  <- byte 0 overwritten, bytes 1..3 still poison
+```
+
+That confirms the slot, the calling convention, the parameter layout **and the write width** in
+one call. Wrap in SEH — it catches the access violation but *not* stack corruption, which is why
+the arity is measured rather than assumed.
+
+### Reading a function's parameters
+
+⚠️ `UFunction` does **not** keep its parameter list at the `Children` offset (`+0x74`) that works
+for every `UClass` — that reads `00000000` on every function tried. The real heads are at
+**`+0x4C` and `+0x70`** (`UStruct` keeps both `Children` and `PropertyLink`; for a one-property
+function they agree). Walk the chain with `UField::Next`, read offsets with the usual property
+offset.
+
+Always include a **control** whose shape is known from outside the walk. Without `GetGrabType`
+(must have a `ReturnValue`) and `SetGrabType` (must have an input, no return), an empty list reads
+as "this function takes no parameters" when it actually means the reader is wrong.
+
+A scan for "a dword pointing at something whose Class name ends in `Property`" also hits unrelated
+chains — `+0xD0` on `GetGrabType` walks into weapon-damage fields. **The first hit is not
+automatically the answer.**
+
+`BoolProperty` is a **bitfield**: the truth is `(dword & BitMask)`, not `(low byte != 0)`. Read the
+mask from the property.
+
+### ⛔ CanShimmy is a state query — it does NOT know about ledge ends
+
+```
+CanShimmy(byte ShimmyAction) -> bool ReturnValue
+  +0x00  ShimmyAction   in
+  +0x04  ReturnValue    out          (BoolProperty, mask 00000001)
+  +0x08.. Start, End, Extent, Direction, X, Y, Z, DistanceCheck   <- locals, not parameters
+```
+
+Measured over 88 samples: **all twelve `ShimmyAction` values agreed every single time** — 86
+all-true, 2 all-false, never a mix — and both all-false samples sit on `CurrentShimmyMove=2`,
+during a corner. It answers *"may I shimmy at all right now"*, not *"is there ledge to my left"*.
+The parameter does not change the answer.
+
+**Do not reopen this one.** It cannot replace the end-of-ledge heuristic.
+
+### ⭐ The open path: Actor::Trace for real ledge geometry
+
+Located natives (`Actor`):
+
+| function | exec |
+|---|---|
+| `Trace` | `00EF7090` |
+| `TraceComponent` | `00EF7570` |
+| `FastTrace` | `00EEFE70` |
+| `TraceActors` | `00EF79A0` |
+
+Also native on `TdMove_Grab`: `CheckWallLegPlacement` (`011ABE60`, `ret 8`) and `IsHangingFree`
+(`011ABEA0`, `ret 8`). Everything else on that class is script.
+
+**The probe, once traces work:**
+
+1. Cast **down** from above hand height → the ledge's top face, so the exact edge height.
+2. Cast **forward** → the wall face and its true normal. (`MoveLedgeNormal` reads `(0,0,0)` on
+   this build and has never been usable.)
+3. **March along the ledge** in ~20 UU steps, casting down each time. Where the down-cast stops
+   hitting is the **exact end of the ledge** — replacing the gap heuristic and its 40 UU leash.
+4. Watch the normal **rotate** to locate corners and which way they turn.
+
+**⚠️ Unproven step, do this first:** ProcessEvent was verified on `GetGrabType`, which is a
+**script** function. `Trace` is **native**. UE3's ProcessEvent does dispatch natives and that is
+the standard pattern, but it has not been demonstrated on this build. Verify native dispatch
+against something harmless with a known answer before trusting a trace result.
+
+**Other constraints:** call on the **game thread** — the `Update1pArms` hook is one, since it is a
+script native and cannot be anywhere else. Traces touch the collision hash, so do not call from
+the render thread. Budget roughly 100 traces once per ledge entry, not per frame.
+
+**⚠️ What traces will NOT fix:** they give geometry, not the ability to trigger authored moves.
+The stick pulses exist for two reasons — finding the end of a ledge (traces solve this) and
+getting the game to actually *play* a corner animation (traces do not). Corners still need the
+stick handed to the game, so the finger flicker gets rarer, not eliminated.
+
+### ⛔ Two approaches closed permanently
+
+- **No authored volume class for grab-ledges.** The in-level census found exactly one
+  `TdLedgeWalkVolume`, 19,000 UU from the test ledge — and `LedgeWalk` is the *shuffle along with
+  your back to the wall* move (state 30), not the hang. `TdBalanceWalkVolume` and
+  `TdZiplineVolume` are likewise single and distant. Nothing describes grab-ledges.
+  ⚠️ Run that census **in a level** — the first attempt ran during setup and counted only
+  `Default__` class default objects.
+- **`GrabDesiredLedgeOffset` is posture, not position.** Reads `(30.0, 0.0, 92.8)` and **changed
+  on 0 of 3000 frames**. It is the authored hang stance — 30 UU out from the ledge, 0 along it,
+  92.8 below — so the game cannot be driven through it. It is still useful as the exact hang
+  geometry, and the *along* component of the live pawn-to-ledge delta is the game-defined measure
+  of how far our direct writes have outrun the game's own state (up to 124.9 UU).
