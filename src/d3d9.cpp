@@ -2239,6 +2239,10 @@ static void ReportSprintLimitsOnce()
 // one of those gates reads it - and two of them assert buttons that let go of a ledge.
 enum ParkourMode { PK_NONE = 0, PK_LEDGE, PK_CLIMB, PK_BAR };
 extern bool g_pkBypass;   // BACKTICK: stand every pipe-specific write down - the control test
+extern bool g_pkTopOpen;  // PK.34: the game is climbing the player over the top; stand aside
+extern long g_pkTopOpenFrames;      // ...and how far through that handover we are
+extern float g_pkHandoverStick;     // ...and which phase of it the pad should send
+extern const long kPkHandoverFrames;
 struct MEVR_Vec3;
 static void PkSnapHandToLedge(int hand, MEVR_Vec3* target);   // defined with the ledge reads
 static bool g_parkour = true;               // Parkour in mevr.ini
@@ -2748,6 +2752,7 @@ extern float g_pkPipeZMin, g_pkPipeZMax;
 extern bool  g_pkHandLineClamp;                      // PK.22
 extern float g_pkHandRiseUU;                         // PK.25
 extern float g_pkHandReachUU;                        // PK.29
+extern bool  g_pkTopOpen;                            // PK.32
 extern float g_pkPipeOrg[3], g_pkPipeExt[3];         // ...the volume it is judged against
 extern bool g_pkPipeOk, g_pkPipeGuard;
 extern float g_pkPipeHeadroom, g_pkPipeLegroom;
@@ -3817,8 +3822,34 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
         g_pkHandLedgeDist[hand] = -1.0f;
     }
 
+    // ---- ⚠️ PK.36: THE HANDOVER HAS TO INCLUDE THE HANDS ----
+    //
+    // The player asked whether the ledge's pulse - two frames of stick in thirty, enough for the
+    // game to rule on a corner, seen only as a flicker in the fingers - could work for the pipe.
+    // The pulse itself is the wrong shape here, but the question is the right one, and it points
+    // at what the last two builds missed.
+    //
+    // The handover injects a full climb command and the game receives it: g_padSentLY is sampled
+    // AFTER the injection and reads +0.97 for the whole window. The game still does not climb -
+    // ClimbState stays 0 for two seconds, while every successful dismount on record shows
+    // ClimbState=1. So the input is arriving and being declined.
+    //
+    // What is different is the hands. Every dismount that has ever worked reads
+    // "grips -- anchored --": no hand held, so this function stood down and the game had its own
+    // hands. The handover fires with a grip HELD, so the mod is still anchoring both hands to
+    // world points and posing their fingers - and the climb is a hand-over-hand animation. Pin
+    // the hands and the animation cannot advance, so ClimbState never leaves 0 and the mantle it
+    // leads to is never reached.
+    //
+    // That is precisely why the ledge pulses. Its comment records the same mechanism from the
+    // other side: the fingers "open and shut as the game swapped the hang pose for the shimmy
+    // one and back" - the game needs its hands to run the move. The ledge borrows them for two
+    // frames; the pipe's dismount is a whole animation and needs them for its duration.
+    //
+    // So the handover stands the hands down with the body. Not a pulse, because nothing here
+    // needs sampling - we are not asking a question, we are getting out of the way.
     if (!g_pkSnapOn || (g_pkMode != PK_LEDGE && g_pkMode != PK_CLIMB) ||
-        (g_pkMode == PK_CLIMB && g_pkBypass) || !grip ||
+        (g_pkMode == PK_CLIMB && (g_pkBypass || g_pkTopOpen)) || !grip ||
         g_pkEntryHold > 0 || g_pkCornerState != 0) {
         if (g_pkSnapWhy2[hand][0] == 'o')   // keep a more specific reason set above
             g_pkSnapWhy2[hand] = !g_pkSnapOn ? "off"
@@ -3974,6 +4005,14 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
                 // pipe, by the person it has to feel right for. ';' and ''' move it, the overlay
                 // shows it, and the number gets hard-coded once it stops moving - the same route
                 // the 110 took.
+                // ⚠️ PK.32: the hand ceiling has to open with the body's, or opening the
+                // body's changes nothing. The body is pulled up by the hand, so a hand that
+                // cannot anchor above (top - margin) cannot deliver a body to the real top no
+                // matter what the clamp permits - the guard would be released and the player
+                // would still be unable to reach the dismount. Both ceilings move together.
+                // ⚠️ PK.35: and the hand ceiling follows it back down. It was raised only to
+                // let the body reach a top that no longer opens; leaving it high would let a
+                // hand anchor 90 UU above anything the body can reach.
                 const float handTop = (g_pkPipeZMax - g_pkPipeTopMargin)
                                     + g_pkHandRiseUU + g_pkHandReachUU;
                 offPipe = (cz > handTop) || (cz < g_pkPipeZMin);
@@ -5032,7 +5071,11 @@ static void PkCornerTick()
 
 static void ParkourDirectBodyTick()
 {
-    const bool onSurface = (g_pkMode == PK_LEDGE || (g_pkMode == PK_CLIMB && !g_pkBypass));
+    // ⚠️ PK.34: the handover. While the top is open the game is climbing the player over
+    // the edge and every write here would fight the animation doing it - the mantle moves the
+    // pawn 67 UU up and 36 UU back, and direct drive would put it back each frame.
+    const bool onSurface = (g_pkMode == PK_LEDGE ||
+                            (g_pkMode == PK_CLIMB && !g_pkBypass && !g_pkTopOpen));
     const bool want = g_pkDirectBody && onSurface && g_pkAnchor != PK_HAND_NONE &&
                       g_pkCornerState == 0 && g_playerPawn && g_offActorLocation >= 0;
     if (!want) {
@@ -6352,6 +6395,57 @@ static bool XrSyncInput(XrTime when)
     // the gesture reads them wrong.
     if (g_pkShimmy != 0.0f && sweep <= 0.0f && fabsf(mx) < 0.15f)
         s.Gamepad.sThumbLX = axis(g_pkShimmy);
+    // ---- ⚠️ PK.34: THE DISMOUNT NEEDS THE GAME TO CLIMB, NOT TO BE PUT THERE ----
+    //
+    // Opening the ceiling was necessary and not sufficient: "at the point at the top where it
+    // opened, I didn't actually dismount either by continuing to climb or by pushing the stick
+    // up. I had to push the stick down then back up again to get onto the roof."
+    //
+    // The one successful dismount in that run says why, and every column matters:
+    //
+    //   pawn (-5569 -1632 5563) | stickY +0.97 | grips -- anchored --
+    //   pawn (-5581 -1632 5695) | stickY +0.97 | grips -- anchored --      <- stalls at 5695
+    //   pawn (-5585 -1632 5695) | stickY +0.00 | grips -- anchored --
+    //   pawn (-5599 -1632 5724) | stickY +0.00 | grips -- anchored --      <- the mantle runs
+    //   pawn (-5625 -1632 5762) | stickY +0.00 | grips -- anchored --
+    //
+    // `grips --` on every line: NO HAND WAS GRIPPING, so direct drive was not writing and the
+    // game owned the pawn. It climbed under its own power to 5695 - which is 65 UU BELOW the
+    // volume top, so the trigger was never the top at all - stalled there, and then moved the
+    // pawn itself, 67 UU up and 36 UU back over the lip. That last part is the mantle animation,
+    // and it is the game writing Location.
+    //
+    // Which is exactly what direct drive does every frame. Climbing by hand cannot dismount
+    // because the pawn is placed rather than moved, so the game never stalls at its own trigger;
+    // and even if it fired, our writes would overwrite the animation that carries the player
+    // over the edge. Pushing the stick up did nothing for the same reason - we put the pawn back
+    // each frame. Down-then-up worked because it let go long enough for the game to move.
+    //
+    // So the open ceiling stops being a permission and becomes a HANDOVER: stand our writes down
+    // and hold the climb axis up, and the move that owns this does the whole thing. That is the
+    // ledge's PK.7 argument - "the game then does what only it can" - on the one question a pipe
+    // turns out to have after all.
+    // ---- ⚠️ PK.37: DOWN FIRST, THEN UP - THE SEQUENCE THE PLAYER FOUND BY HAND ----
+    //
+    // Holding the climb axis up does nothing: the pawn freezes at 5661 with ClimbState=0 for the
+    // whole window while g_padSentLY reads +0.97, so the input arrives and the move declines it.
+    // A successful dismount sits at 5695 - 34 UU higher - before anything happens.
+    //
+    // The difference is how the pawn GOT there. In every working case the game climbed it up
+    // from below under its own control; in the handover we place it with direct drive and then
+    // let go, and the move snaps it down to 5661 and refuses to move. The climb evidently tracks
+    // its own position along the ladder, and a pawn teleported up the pipe leaves that tracking
+    // behind - so "climb up" is answered with "you are already at the top of where I think you
+    // are".
+    //
+    // The player found the cure before I understood the cause: "I had to push the stick down
+    // then back up again to get onto the roof." Descending under the game's own power is what
+    // re-synchronises it, and from there a normal climb reaches the trigger and mantles.
+    //
+    // So the handover reproduces that exactly. Down for 30 frames - about 60 UU, enough movement
+    // for the move to re-establish where it is - then up for the rest.
+    if (g_pkTopOpen && fabsf(my) < 0.15f)
+        s.Gamepad.sThumbLY = axis(g_pkHandoverStick);   // PK.38: the phase is decided in the tick
     s.Gamepad.bLeftTrigger  = (BYTE)(flt(g_aLTrig) * 255.0f);
     // AS.3: full, and never below what the physical trigger already asked for. GBA_Crouch is
     // a button as far as the game is concerned; a partial press would only risk sitting under
@@ -9110,6 +9204,7 @@ int g_offActorRotation = -1;
 int g_offActorLocation = -1;
 // PK.13: what the pawn is attached to, and the extent of it. -2 = the one-shot resolve has not
 // run yet, -1 = it ran and the property is absent. See the resolve site for why those differ.
+int g_offClimbState         = -1;   // PK.40: TdMove_Climb::ClimbState, read live
 int g_offActorBase          = -2;
 int g_offActorCollisionComp = -2;
 int g_offPrimBounds         = -2;
@@ -13646,6 +13741,42 @@ float g_pkHandRiseUU = 32.0f;
 float g_pkHandReachUU = 0.0f;
 float g_pkPipeHeadroom = 0.0f, g_pkPipeLegroom = 0.0f;   // overlay: UU to the top and bottom
 static long g_pkPipeHeld = 0;               // frames spent against an end, for the log
+bool g_pkTopOpen = false;                   // PK.32: the game is driving the dismount attempt
+// PK.37: 30 frames of descent to re-synchronise the climb, then long enough to climb back and
+// reach the trigger. Measured: the game climbs about 2 UU a frame, so 60 UU down and 95 UU up is
+// roughly 80 frames of travel; 210 leaves room for the mantle itself, which took 25.
+extern const long kPkHandoverFrames;
+const long kPkHandoverFrames = 300;
+// The volumes that have already answered "no dismount". Small and fixed: a level does not have
+// hundreds of pipes, and forgetting one only costs the awkward attempt again.
+static uintptr_t g_pkPipeRefused[16] = { 0 };
+static int       g_pkPipeRefusedN = 0;
+// PK.41: and the ones that DO. The first climb of a pipe cannot know which kind it is; the
+// second can, and there is no reason to make the player prove it twice.
+static uintptr_t g_pkPipeDismounts[16] = { 0 };
+static int       g_pkPipeDismountsN = 0;
+static bool PkPipeDismountsBefore(uintptr_t v)
+{
+    for (int i = 0; i < g_pkPipeDismountsN; ++i) if (g_pkPipeDismounts[i] == v) return true;
+    return false;
+}
+static void PkPipeRememberDismount(uintptr_t v)
+{
+    if (!v || PkPipeDismountsBefore(v)) return;
+    if (g_pkPipeDismountsN < 16) g_pkPipeDismounts[g_pkPipeDismountsN++] = v;
+}
+static bool PkPipeRefusedBefore(uintptr_t v)
+{
+    for (int i = 0; i < g_pkPipeRefusedN; ++i) if (g_pkPipeRefused[i] == v) return true;
+    return false;
+}
+static void PkPipeRememberRefusal(uintptr_t v)
+{
+    if (!v || PkPipeRefusedBefore(v)) return;
+    if (g_pkPipeRefusedN < 16) g_pkPipeRefused[g_pkPipeRefusedN++] = v;
+}
+long g_pkTopOpenFrames = 0;                 // PK.34: how long the handover may last
+float g_pkHandoverStick = 0.0f;             // PK.38: what the pad sends this frame
 
 // Cheap per-frame refresh. PkFindClimbVolume scans up to 0x1000 bytes on two objects and cannot
 // run every frame, so the pointer is cached with the field it came from and re-read from there;
@@ -13657,6 +13788,7 @@ void PkPipeExtentTick()
 {
     if (g_pkMode != PK_CLIMB) {
         g_pkPipeOk = false; g_pkPipeVol = 0; g_pkPipeSrc = 0;
+        g_pkTopOpen = false; g_pkPipeHeld = 0;   // PK.32: nothing armed on a pipe outlives it
         g_pkPipeHeadroom = g_pkPipeLegroom = 0.0f;
         return;
     }
@@ -13695,6 +13827,150 @@ void PkPipeExtentTick()
             (uint32_t)g_pkPipeVol, g_pkPipeZMin, g_pkPipeZMax,
             (g_pkPipeZMax - g_pkPipeZMin) / 100.0f);
     }
+    // ---- ⚠️ PK.34: THE HANDOVER HAS TO BE ABLE TO END, AND ONLY THIS TICK STILL RUNS ----
+    //
+    // Opening the top stands the direct drive down - which is the point - but g_pkTopOpen is SET
+    // inside the clamp, and the clamp is only reached from the drive that just stood down. So
+    // nothing could ever clear it and the player would be left with no body control at all for
+    // the rest of the climb, on a pipe whose game refused to dismount them.
+    //
+    // Exactly the shape of the flicker one rung ago, inverted: there, entering a state destroyed
+    // the evidence for staying in it; here, entering it destroys the code that could leave. Both
+    // come from putting a latch inside something the latch switches off.
+    //
+    // So the window lives here, in the tick that runs every frame on a pipe regardless of who is
+    // driving. Two seconds is several times the measured mantle - the successful one took about
+    // 25 frames from stall to Walking - so a pipe with a roof is long finished, and one without
+    // hands control back rather than swallowing it.
+    // ---- ⚠️ PK.38: CLIMB UNTIL IT STOPS, THEN LET GO - THE RELEASE IS THE TRIGGER ----
+    //
+    // The descent and the climb both work now: on the left pipe the handover took the pawn from
+    // 5661 down to 5597 and back up to 5658 under the game's own power, with direct drive down
+    // and no grips held - the same state every successful dismount runs in. It then stalled at
+    // 5658 and sat there, 37 UU short of the 5695 a real climb reaches.
+    //
+    // The successful trace shows what we were not doing, in the stick column:
+    //
+    //   Z=5652 s=+0.97      climbing
+    //   Z=5680 s=+0.35      easing off
+    //   Z=5694 s=+0.00      released
+    //   Z=5695 s=+0.00      the mantle fires
+    //
+    // The player lets go near the top, and the dismount happens after they do. Holding the axis
+    // at full deflection forever is a command to keep climbing, and the move keeps obeying it -
+    // pinned against its own ceiling, never idle long enough to consider that it has arrived.
+    // I noticed the release in this data two rungs ago, wrote that it "might be needed", and
+    // then held the stick anyway rather than testing it.
+    //
+    // So the handover has three phases and the middle one ends when the pipe does: descend to
+    // re-synchronise, climb until the pawn stops rising, then release and let the game decide.
+    // Ending the climb on the pawn STALLING rather than on a frame count is what makes this work
+    // on a pipe of any length - the stall is the game saying "that is as far as this goes", which
+    // is exactly the moment a player would ease off.
+    if (g_pkTopOpen) {
+        // ---- ⚠️ PK.40: DESCEND PAST THE TRIGGER, THEN CLIMB THROUGH IT ----
+        //
+        // The whole dismount hangs on one number that took far too long to find. Every
+        // ClimbState=1 first-sample ever logged, across every run and always on the pipe that
+        // has a roof, sits at the same height:
+        //
+        //   Z = 5561, 5563, 5560, 5560, 5563, 5577, 5565, 5567
+        //
+        // It engages at about 5560 - 135 UU BELOW the volume top of 5760, at X -5569, with the
+        // pawn still flat against the pipe. From there the pawn runs to 5695 at ~17 UU a sample
+        // against ~5 for an ordinary climb, drifts off the wall, and mantles. ClimbState=1 IS
+        // the dismount, and it is armed a third of the way down the pipe.
+        //
+        // Every version of this handover has run entirely ABOVE it. The descent bottomed at
+        // 5597 and climbed back from there, so the climb never crossed 5560 going up and the
+        // state was never armed. Which is why the stall, the release, the hands and the stick
+        // all looked identical to a successful dismount and none of it helped: they were all
+        // downstream of a threshold we were not reaching.
+        //
+        // So the descent is measured in DISTANCE, not frames - 150 UU below where the handover
+        // began, which from a stop at (top - 90) lands near (top - 240) and guarantees the climb
+        // crosses the trigger from below. Thirty frames of descent bought 64 UU, less than half
+        // of what was needed, and no amount of tuning at the top could have made up the
+        // difference.
+        //
+        // ⚠️ And ClimbState is now READ rather than inferred. It flips to 1 only on a
+        // pipe that dismounts - it has never once been seen on the roofless pipe - so it answers
+        // both questions this rung has been guessing at: whether the attempt is working, and
+        // whether this pipe was ever going to work. Committed means stand well clear; still zero
+        // when the climb runs out means there is nothing here, say so and give the body back.
+        static float lastZ = 0.0f, startZ = 0.0f;
+        static long  still = 0;
+        static bool  rising = false, committed = false;
+        float pz = 0.0f;
+        if (g_playerPawn && g_offActorLocation >= 0) {
+            float pl[3];
+            if (SafeRead(g_playerPawn + g_offActorLocation, pl, sizeof(pl))) pz = pl[2];
+        }
+        // The game's own verdict, straight off the move object.
+        int climbState = -1;
+        if (g_offClimbState >= 0 && g_playerPawn && g_offMoveState >= 0) {
+            uint8_t st = 0xFF;
+            uintptr_t mv = 0;
+            char cls[48];
+            if (SafeRead(g_playerPawn + g_offMoveState, &st, 1) &&
+                ReadMoveClassName(g_playerPawn, (int)st, cls, sizeof(cls), &mv) && mv) {
+                uint32_t w = 0;
+                if (SafeU32(mv + g_offClimbState, &w)) climbState = (int)(w & 0xFF);
+            }
+        }
+
+        if (g_pkTopOpenFrames == kPkHandoverFrames) { startZ = pz; lastZ = pz; still = 0;
+                                                      rising = false; committed = false; }
+
+        if (!committed && climbState == 1) {
+            committed = true;
+            g_pkHandoverStick = 0.0f;       // it has this now; the successful runs let go here too
+            PkPipeRememberDismount(g_pkPipeVol);
+            Log("[climb] PK.40: ClimbState went to 1 at Z %.0f - the dismount is armed and the"
+                " game is running it. Standing clear. (remembering that this pipe has a roof, so"
+                " the next attempt on it starts immediately)", pz);
+        } else if (committed) {
+            g_pkHandoverStick = 0.0f;
+            // ⚠️ The give-up timer must not fire mid-mantle. Once the game has committed, the
+            // handover ends when the CLIMB does - PkPipeExtentTick clears g_pkTopOpen the moment
+            // the move stops being Climb - so the window is held open under it rather than
+            // counting down into the middle of the animation and snatching the body back.
+            if (g_pkTopOpenFrames < 60) g_pkTopOpenFrames = 60;
+        } else if (g_pkHandoverStick < 0.0f) {
+            // Phase 1: down, by distance, until past the trigger or the pipe runs out under us.
+            // ⚠️ "not descending", which includes STATIONARY. Written as (pz <= lastZ) it
+            // read a pawn resting on the bottom of the pipe as still falling, so a short pipe
+            // would spend the whole window pressed against its floor. Same edge-of-window
+            // mistake as the stall detector that fired before the climb began.
+            if (pz >= lastZ - 0.5f) ++still; else still = 0;
+            lastZ = pz;
+            if (startZ - pz >= 150.0f || still > 15) {
+                g_pkHandoverStick = 0.97f;
+                still = 0; rising = false;
+                Log("[climb] PK.40: descended %.0f UU to Z %.0f - now climbing back up through"
+                    " the trigger", startZ - pz, pz);
+            }
+        } else if (g_pkHandoverStick > 0.0f) {
+            // Phase 2: up. The trigger arms on the way through; a stall with ClimbState still 0
+            // is this pipe saying it has no roof.
+            if (!rising && pz > lastZ + 25.0f) rising = true;
+            if (rising) { if (pz <= lastZ + 0.5f) ++still; else still = 0; }
+            if (pz > lastZ) lastZ = pz;
+            if (rising && still > 10) {
+                Log("[climb] PK.40: the climb stalled at Z %.0f with ClimbState still %d - this"
+                    " pipe does not dismount", pz, climbState);
+                g_pkTopOpenFrames = 1;      // fall through to the give-up path below
+            }
+        }
+    }
+    if (g_pkTopOpen && --g_pkTopOpenFrames <= 0) {
+        g_pkTopOpen = false;
+        PkPipeRememberRefusal(g_pkPipeVol);
+        Log("[climb] PK.37: the game did not dismount within the handover - taking the body back,"
+            " and remembering that this pipe (%08X) has nowhere to go, so it will not be asked"
+            " again this run", (uint32_t)g_pkPipeVol);
+    }
+
     if (g_pkPipeOk && g_playerPawn && g_offActorLocation >= 0) {
         float pl[3];
         if (SafeRead(g_playerPawn + g_offActorLocation, pl, sizeof(pl))) {
@@ -13750,9 +14026,121 @@ static bool PkPipeBaseIsStale(const float* base)
 static float PkPipeClampZ(float wantZ)
 {
     if (!g_pkPipeGuard || !g_pkPipeOk) return wantZ;
+    // ---- ⚠️ PK.32: KEEP PULLING AT THE TOP AND THE GAME GETS TO RULE ----
+    //
+    // Vanilla mantles the player onto the roof at the top of some pipes, and the stop put in by
+    // PK.16 is exactly what prevents it. What the game actually wants is known, from every
+    // Climb -> Walking transition across every log:
+    //
+    //   all seven fired on the SAME pipe, the one at Y -1632, with the pawn at Z 5755..5759
+    //   against that volume's top of 5760;
+    //   one of them fired with stickY +0.00 - under hand climbing, with the pawn WRITTEN there
+    //   by direct drive - so the trigger is the pawn reaching the top, not a stick command;
+    //   and on the other pipe players were written to Z 5592 against a top of 5472 across 1651
+    //   frames and nothing ever fired, so the dismount is authored per pipe rather than being a
+    //   property of tops in general.
+    //
+    // So there is nothing to ask the game and nothing to imitate: it already does this by
+    // itself, given a pawn at the volume top. The only thing needed is to stop holding the pawn
+    // 90 UU below it.
+    //
+    // ⚠️ But not by default, because the 90 is not arbitrary - it is where the player tuned
+    // the stop to look right, and a pipe with no roof would just sit too high. The two cases
+    // cannot be told apart from the volume, so they are told apart by INTENT: press against the
+    // stop and keep pulling, and the ceiling opens to the real top. Reaching the top while
+    // climbing is not that; a second of continued pull after arriving there is unambiguous.
+    //
+    // On a pipe with a roof the game takes over and the player is on it. On one without, they
+    // touch the top and come back down under their own hand - no snap, because the body follows
+    // the hand that put it there.
+    // ---- ⚠️ PK.33: OPENING IT REMOVED THE CONDITION THAT OPENED IT ----
+    //
+    // Reported as "a flicker or brief camera stutter every second or so" at the top of the pipe,
+    // and the log is unambiguous - 34 events, in pairs, one frame apart:
+    //
+    //   PK.32: held at the top for 73 frames and still pulling - opening the ceiling to 5472
+    //   PK.32: no longer pulling at the top - the stop is back at 5382
+    //
+    // Once open the clamp stops engaging, so g_pkPipeHeld resets to zero, so the `held > 0` test
+    // that kept it open fails, so it closes - and the ceiling drops 90 UU, which drops the body,
+    // which re-engages the clamp, which counts back to 72. A 73-frame cycle at 72 fps is the
+    // one-second period the player felt, and the stutter is the body being moved 90 UU each way.
+    //
+    // The mistake is using the same signal for ENTERING a state and for STAYING in it. Pressing
+    // against the stop is evidence for opening; it cannot also be evidence for remaining open,
+    // because opening is precisely what stops it being true. Hysteresis needs two conditions:
+    //
+    //   open   when the player is pressed against the closed ceiling and still asking - held > 72
+    //   stay   while they are still asking to be above the closed ceiling at all
+    //
+    // The second survives the first being satisfied, which is the whole point.
+    if (wantZ > g_pkPipeZMax - g_pkPipeTopMargin) {
+        // ---- ⚠️ PK.37: A PIPE THAT HAS NO ROOF ONLY GETS ASKED ONCE ----
+        //
+        // "If I'm on a pipe that stops before the roof, it should never play out." Right, and it
+        // cannot be known in advance from anything readable here - the dismount is authored per
+        // pipe, the volume carries no property saying so (TdLadderVolume dumps empty), and
+        // whether there is a roof above the top is a geometry question that needs Actor::Trace,
+        // which is located but has never been called.
+        //
+        // What CAN be done is to stop asking twice. The handover is a question put to the game;
+        // if a particular volume answers "no dismount" once, that answer does not change for the
+        // rest of the session, so it is remembered and that pipe is never handed over again.
+        // The cost of not having the geometry is one awkward attempt per pipe per run instead of
+        // one every time the player reaches the top.
+        // ---- ⚠️ PK.41: THE WAIT IS ONLY THERE TO ANSWER A QUESTION WE MAY ALREADY HAVE ----
+        //
+        // "They have to climb above the actual pipe and then hold that position for a couple of
+        // seconds. A little counter-intuitive. Is this simply because we don't know if it's a
+        // pipe that dislodges or one that ends at the top?"
+        //
+        // Exactly that. Pressing at the top is ambiguous on FIRST contact - it means "let me
+        // off" on one pipe and "I have arrived" on the other - and a second of deliberate pull
+        // is what separates them without geometry. But the ambiguity is only real once. A pipe
+        // that has dismounted before will dismount again, so on that pipe pressing up at the top
+        // means one thing and there is nothing left to ask.
+        //
+        // So: 30 frames on a pipe we know nothing about, and none at all on one that has already
+        // put the player on a roof. Down from 72, which was chosen when every pipe was a stranger
+        // and no amount of evidence could accumulate.
+        const long holdNeeded = PkPipeDismountsBefore(g_pkPipeVol) ? 0 : 30;
+        if (!g_pkTopOpen && g_pkPipeHeld >= holdNeeded && !PkPipeRefusedBefore(g_pkPipeVol)) {
+            g_pkTopOpen = true;
+            g_pkTopOpenFrames = kPkHandoverFrames;   // PK.37: down, then up, then give in
+        g_pkHandoverStick = -0.97f;              // PK.38: phase 1 from the first frame
+            Log("[climb] PK.41: handing the body to the game from Z %.0f after %ld frames%s",
+                g_pkPipeZMax - g_pkPipeTopMargin, g_pkPipeHeld,
+                holdNeeded == 0 ? " - this pipe has dismounted before, so no wait was needed"
+                                : " of pulling at the top");
+        }
+    } else if (g_pkTopOpen) {
+        g_pkTopOpen = false;
+        Log("[climb] PK.35: no longer pulling at the top - the body is ours again");
+    }
     // The margin trims the TOP only - the bottom measured correct against the raw volume on both
     // pipes, and trimming a face that is already right would only introduce a second error.
     // Guarded against a margin big enough to invert the range on a short pipe.
+    // ---- ⚠️ PK.35: THE CEILING SHOULD NEVER HAVE OPENED ----
+    //
+    // "It tried to play the animation but I still did not go onto the roof. Maybe I'm too high
+    // up when the animation starts?" - and that is exactly it. All three dismounts on record
+    // trigger at the SAME pawn height, and then accelerate away from it:
+    //
+    //   5684 5691 [5695] 5698 5709 5722 5732 5740 5750 5759
+    //        [5695] 5694  5696 5704 5717 5729 5737 5747 5756
+    //   5686 5693 [5695] 5701 5713 5725 5735 5744 5755
+    //
+    // 5695, against a volume top of 5760. The mantle is authored to start 65 UU BELOW the top,
+    // not at it - so opening the ceiling to the top carried the player straight past the trigger
+    // and handed the game a pawn 65 UU above where its animation begins. It played from the
+    // wrong place, which is what looked bad and what failed to finish.
+    //
+    // The ceiling was the wrong half of the idea. The stop at (top - 90) already sits 25 UU
+    // BELOW the trigger, which is the right side of it: the game has room to climb up into 5695
+    // under its own power, which is precisely what every successful dismount did. Nothing needed
+    // to be let through. The handover alone was always the whole mechanism.
+    //
+    // So the clamp is unconditional again and g_pkTopOpen means only "the game is driving".
     float top = g_pkPipeZMax - g_pkPipeTopMargin;
     if (top < g_pkPipeZMin) top = g_pkPipeZMin;
     float z = wantZ;
@@ -15703,7 +16091,11 @@ static void __fastcall Hook_UpdateSkelPose(void* self, void* edx, float deltaTim
     // An unreadable state does not stand the fingers down. The reason the rest of this file
     // defaults the other way is that an unenumerated camera write stalls a move; this one cannot,
     // and switching the player's hands off because a byte was unreadable is the worse outcome.
-    const bool gameOwns = moveState >= 0 && GameOwnsTheHands(moveState);
+    // ⚠️ PK.36: during a pipe handover the game owns the hands outright, fingers included.
+    // Releasing the anchor is not enough on its own - an unanchored hand falls through to the
+    // player's grip driving the curl, which is a fist, and the game cannot play a climb with one.
+    const bool gameOwns = (moveState >= 0 && GameOwnsTheHands(moveState)) ||
+                          (g_pkMode == PK_CLIMB && g_pkTopOpen);
     {
         static int lastOwned = -2;
         if (gameOwns != (lastOwned == 1)) {
@@ -22579,6 +22971,8 @@ static void ResolveMoveProbeProps()
     for (int i = 0; i < kMoveProbeCount; ++i) {
         MoveProbeProp& p = g_moveProbe[i];
         p.off = LookupProp(p.cls, p.prop, false);
+        // PK.40: this one is read at runtime by the dismount handover, not just printed.
+        if (strcmp(p.prop, "ClimbState") == 0 && p.off >= 0) g_offClimbState = p.off;
         strcpy_s(p.kind, "?");
         if (p.off < 0) {
             // Second opinion from the GObjects owner pass, which reaches properties the
