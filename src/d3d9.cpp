@@ -2587,6 +2587,15 @@ static void PkZeroLead()
 }
 static void PkDecayLead()
 {
+    // ⚠️ PK.21: decayed on a pipe, snapped on a ledge, and the difference is not cosmetic.
+    // On a ledge this axis is a servo error that is genuinely zero the moment nothing is gripped.
+    // On a pipe it is an integrated displacement the player built up, and snapping an integrated
+    // offset to zero is a step in a direction nobody asked for - the same reasoning that gave the
+    // vertical axis a decay here rather than an assignment.
+    if (g_pkMode == PK_CLIMB) {
+        g_pkCamLead *= 0.90f;
+        if (fabsf(g_pkCamLead) < 0.002f) g_pkCamLead = 0.0f;
+    } else
     g_pkCamLead = 0.0f;
     g_pkCamLeadFwd *= 0.90f;
     g_pkCamLeadUp  *= 0.90f;
@@ -2727,6 +2736,22 @@ uint32_t g_maskFoundLedge = 0;
 
 static bool PkLedgeAxis(float* axis);       // defined with the direct-drive code below
 static bool PkHoldLine(float* point, float* axis);   // ...and the ledge/pipe line beside it
+void        PkClimbAnchorProbe();                    // PK.13, defined with the class-name reader
+void        PkScanClimbableOnce();                   // PK.14, one-shot pointer census
+void        PkClimbVolumeTick();                     // PK.15, the pipe's own extent
+void        PkPipeExtentTick();                      // PK.16, refreshes the extent each frame
+static float PkPipeClampZ(float wantZ);              // ...and holds the write inside it
+static bool  PkPipeBaseIsStale(const float* base);    // PK.19, is the latch on this pipe?
+extern bool  g_pkPipeOk;                             // PK.20, and the extent the hands use
+extern float g_pkPipeTopMargin;
+extern float g_pkPipeZMin, g_pkPipeZMax;
+extern bool  g_pkHandLineClamp;                      // PK.22
+extern float g_pkHandRiseUU;                         // PK.25
+extern float g_pkHandReachUU;                        // PK.29
+extern float g_pkPipeOrg[3], g_pkPipeExt[3];         // ...the volume it is judged against
+extern bool g_pkPipeOk, g_pkPipeGuard;
+extern float g_pkPipeHeadroom, g_pkPipeLegroom;
+extern float g_pkPipeTopMargin;                      // PK.17, tuned live in the headset
 static void PkAskTheGameTick();             // PK.7, defined beside the direct-drive code
 void DumpLedgeishClasses();                 // the authored-geometry census, far below
 void GeomCensusTick();                      // ...and its off-by-default, quiet-moment trigger
@@ -3600,7 +3625,8 @@ static void PkReadLedge()
 static float g_pkSnapRadius = 0.22f;        // metres
 static bool  g_pkSnapOn = true;
 static bool  g_pkHandHeld[2] = { false, false };
-bool  g_pkHandAnchored[2] = { false, false };   // latched on the grip press: is this hand ON the ledge
+bool  g_pkHandAnchored[2] = { false, false };
+bool  g_pkHandOffPipe[2] = { false, false };   // PK.28: snap judged this hand past the end   // latched on the grip press: is this hand ON the ledge
 // ---- ⚠️ anchor to where the GAME puts the hand, not to a line we computed ----
 //
 // The anchor was the closest point on a ledge line built from MoveLedgeLocation. That is close -
@@ -3804,6 +3830,11 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
         // and without this the OLD anchor stayed pinned, holding the hand at a world point on
         // the wall being turned away from for the whole animation.
         g_pkHandAnchored[hand] = false;
+        // ⚠️ PK.28: cleared with the anchor, not left latched. This is the path a released
+        // grip takes, and a refusal that outlived the grip that earned it would keep the hand
+        // out of the anchor selection until the player happened to re-grip - a hand that stops
+        // working for reasons it can no longer see.
+        g_pkHandOffPipe[hand] = false;
         g_pkHandPending[hand] = 0;
         return;
     }
@@ -3823,7 +3854,130 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
             const float t  = vx * axis[0] + vy * axis[1] + vz * axis[2];
             const float cx = line[0] + axis[0] * t;
             const float cy = line[1] + axis[1] * t;
+            // ---- ⚠️ PK.20: A PIPE ENDS, AND UNTIL NOW ITS LINE DID NOT ----
+            //
+            // Reported from the headset: "even when I'm at the top of where it lets the camera
+            // go, if I reach my hand up I can still grab thin air as high as I can reach."
+            // Exactly right, and it is this line. PkClimbLine returns the pawn's position with
+            // axis (0,0,1) and no extent, so the closest point slides up it forever and a hand
+            // held above the pipe anchors to empty space above the pipe.
+            //
+            // PK.16 taught the BODY where the pipe stops and nothing taught the HANDS. Same
+            // extent, same margin, so the reach and the climb agree about where the pipe is -
+            // and a hand that cannot anchor past the top is also the honest feedback for why
+            // the body will not go there.
+            // ---- ⚠️ PK.22: AND CLAMPING IT IS THE PRIME SUSPECT FOR THE FIST ----
+            //
+            // Reported next run: "towards the top of the right pipe my hand would go into a
+            // fist, not the proper pipe grab pose, but it would still work as an anchor point."
+            //
+            // My first explanation was the game's own top-of-ladder animation blending in as the
+            // player nears the volume's top. The player killed it in one line - that pipe does
+            // not go onto a roof, so there is no dismount there to blend.
+            //
+            // What the reports DO establish is timing, and it is specific: the build before this
+            // clamp existed, the complaint was "I can still grab thin air as high as I can
+            // reach" - a hand that anchored, with a normal pose. The clamp shipped, and the same
+            // region now produces a fist. The pose changed in the build that changed this line.
+            //
+            // The plausible mechanism is that clamping cz splits the anchor from the hand: above
+            // the top the anchor stops rising while the controller keeps going, so the hand sits
+            // further and further from the pose that was measured for it, and the radius test
+            // below is measured against exactly that. But that is a story, and stories have been
+            // wrong three times on this surface, so it is not being acted on - it is being made
+            // switchable, and the run decides.
+            // ---- ⚠️ PK.23: REFUSE THE GRIP, DO NOT MOVE IT ----
+            //
+            // Confirmed from the headset: pressing ']' restored the hand pose, so clamping this
+            // was the cause of the fist. The mechanism is the one the last note guessed at, and
+            // the guess is now a measurement rather than a story.
+            //
+            // Clamping cz pinned the ANCHOR at the top while the player's hand kept rising, so
+            // the two disagreed by however far they reached - and `dist` below, which decides
+            // whether the grip counts and which pose it wears, is measured from exactly that
+            // point. A hand tens of UU from its own anchor is not a hand holding a pipe, and the
+            // pose followed the geometry it was given.
+            //
+            // So the bound stops moving anything. cz is computed as it always was, the radius
+            // test sees the same numbers it saw in every build with a good pose, and being past
+            // the end of the pipe is expressed the only honest way: there is nothing there to
+            // grab, so the grip is refused and the hand stays free.
+            //
+            // ⚠️ Which is also the right FEEL, not just the right implementation. The body
+            // already stops at the top; a hand that still finds purchase above it is telling the
+            // player the opposite of what the body is about to do. Refusing says the same thing
+            // as the body, in the place the player is looking.
             const float cz = line[2] + axis[2] * t;
+            bool offPipe = false;
+            if (g_pkMode == PK_CLIMB && g_pkPipeOk && g_pkHandLineClamp) {
+                // ---- ⚠️ PK.24: THE HAND'S TOP IS NOT THE BODY'S TOP ----
+                //
+                // Reported: fists at the top "even at the anchor points" - that is, at grips
+                // that are perfectly good. This bound was the body's, borrowed whole, margin
+                // included, and the margin is exactly what makes it wrong for a hand.
+                //
+                // A hanging pawn's Location sits BELOW its hands. The body stops 110 UU under
+                // the volume top precisely so the hands can reach the top; applying that same
+                // 110 to the hands moves their ceiling down by a hand's height, so every
+                // legitimate grip in the top metre was refused and every refusal is a free hand,
+                // which the game poses as a fist. The bound was reporting "no pipe here" about
+                // pipe the player was holding.
+                //
+                // The two ceilings differ by exactly one hand-above-pawn, which is also what the
+                // 110 was measured to be - tuned in the headset until the body stopped in the
+                // right place, which is the same quantity arrived at from the other end. That
+                // agreement is the reason to trust this rather than a second tunable.
+                //
+                // So: the hand may reach anywhere on the pipe the designer authored. The body
+                // stops a hand's height below it. Both are the same fact about the same pipe.
+                // ---- ⚠️ PK.25: AND THE HAND'S HEIGHT IS 32 UU, NOT 110 ----
+                //
+                // Last note assumed the body's 110 margin WAS the hand-above-pawn distance, so
+                // giving the hands the raw volume top would put their ceiling exactly right.
+                // Reported back: better, but "there are still gripping points above the last
+                // true anchor point". The assumption was measurable and wrong.
+                //
+                // Measured, from three anchors in that run against the pawn on the same frames:
+                //   pawn 5309 -> hand 5343   (+34)
+                //   pawn 5260 -> hand 5292   (+32)
+                //   pawn 5202 -> hand 5233   (+31)
+                //
+                // About 32 UU. So the 110 is not a hand's height at all - roughly 78 of it is
+                // the VOLUME overhanging the pipe it describes, which is the thing the body
+                // margin was tuned to absorb without anyone knowing that was what it absorbed.
+                // The real top of the pipe is therefore about zmax - 78, and giving the hands
+                // zmax left them 78 UU of authored-but-empty volume to grip in.
+                //
+                // Derived rather than tuned a second time: the highest a hand can honestly be is
+                // where it sits when the BODY is at its own ceiling. That ties the two together
+                // through the one number the player actually calibrated, so tuning the stopping
+                // point moves both and they cannot drift apart.
+                //
+                // ⚠️ And the hand height is measured live, not pasted in. It is the anchored
+                // hand's Z above the pawn's, averaged while gripping - the same quantity the
+                // three lines above were read off by hand. A constant here would be a third
+                // number to keep in sync with a rig that the wrist calibration can move.
+                // ---- ⚠️ PK.29: AND THE DERIVATION IS ONE TERM SHORT ----
+                //
+                // Derived, the ceiling is "where a hand sits when the body is at its own stop" -
+                // body top plus a measured hand rise. That was too HIGH by 78 UU on the first
+                // try and is now too LOW: "the anchor points don't go high enough."
+                //
+                // The missing term is reach. A climber does not hold the pipe at rest height and
+                // stop; they REACH above their current grip, take a new hold, and pull the body
+                // up to it. So the honest ceiling is a hand's rise plus however far someone can
+                // stretch past it, and the second half is a property of the player's arm and
+                // their headset's play space, not of the pipe. Nothing in this file can derive
+                // it, and two builds have now been spent guessing at it.
+                //
+                // So it becomes what the body's margin already is: tuned in the headset, on the
+                // pipe, by the person it has to feel right for. ';' and ''' move it, the overlay
+                // shows it, and the number gets hard-coded once it stops moving - the same route
+                // the 110 took.
+                const float handTop = (g_pkPipeZMax - g_pkPipeTopMargin)
+                                    + g_pkHandRiseUU + g_pkHandReachUU;
+                offPipe = (cz > handTop) || (cz < g_pkPipeZMin);
+            }
             const float dx = target->x - cx, dy = target->y - cy, dz = target->z - cz;
             const float raw = sqrtf(dx * dx + dy * dy + dz * dz);
 
@@ -3863,7 +4017,19 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
                 against, raw, g_pkSnapRadius * g_pkUUPerMetre,
                 dist <= g_pkSnapRadius * g_pkUUPerMetre ? "ANCHORED" : "too far, hand stays free");
 
-            if (dist <= g_pkSnapRadius * g_pkUUPerMetre) {
+            // PK.22: the whole decision, on the frames where the clamp is actually doing
+            // something. If a fist coincides with "too far" here, the clamp is the cause and the
+            // fix is to refuse the grip honestly rather than anchor to a point the hand is not
+            // at; if the hand anchors normally and the pose is still wrong, it is not this.
+            g_pkHandOffPipe[hand] = offPipe;
+            if (offPipe)
+                Log("[climb] PK.23: %s grip refused - the reach lands at Z %.0f, off the %s of a"
+                    " pipe that runs %.0f..%.0f (the body stops %.0f UU lower; a hand may reach"
+                    " the whole pipe). Nothing there to hold.",
+                    hand ? "RIGHT" : "LEFT", cz,
+                    cz > g_pkPipeZMax ? "TOP" : "BOTTOM",
+                    g_pkPipeZMin, g_pkPipeZMax, g_pkPipeTopMargin);
+            if (!offPipe && dist <= g_pkSnapRadius * g_pkUUPerMetre) {
                 // ---- anchor immediately, from the offset measured at entry ----
                 //
                 // Where ALONG the ledge is the player's - the point on the line nearest the hand
@@ -3881,6 +4047,26 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
                     g_pkHandAnchor[hand][1] = cy + mine.y;
                     g_pkHandAnchor[hand][2] = cz + mine.z;
                     g_pkHandAnchored[hand] = true;
+                    g_pkHandOffPipe[hand] = false;
+                    // PK.25: the hand's height above the body, measured from the thing being
+                    // latched rather than assumed. Slow, because it only has to track the rig.
+                    if (g_pkMode == PK_CLIMB && g_playerPawn && g_offActorLocation >= 0) {
+                        float pl[3];
+                        if (SafeRead(g_playerPawn + g_offActorLocation, pl, sizeof(pl))) {
+                            const float rise = g_pkHandAnchor[hand][2] - pl[2];
+                            // ⚠️ PK.28: not from grips near the ceiling this figure DEFINES.
+                            // The ceiling is (body top + rise), so learning rise from an anchor
+                            // taken against it is a loop feeding on its own output: the estimate
+                            // drifts, the ceiling drifts with it, and grips at the top start
+                            // latching or not depending on which way it wandered - which is the
+                            // reported "sometimes it did, sometimes it didn't". Only grips with
+                            // clear air above them teach it anything.
+                            const float ceil = (g_pkPipeZMax - g_pkPipeTopMargin) + g_pkHandRiseUU;
+                            const bool clear = !g_pkPipeOk || g_pkHandAnchor[hand][2] < ceil - 60.0f;
+                            if (rise > 0.0f && rise < 150.0f && clear)
+                                g_pkHandRiseUU += 0.15f * (rise - g_pkHandRiseUU);
+                        }
+                    }
                     g_pkHandPending[hand] = 0;
                     PkFreezeViewNow();
                     Log("[pk] %s hand anchored at (%.0f %.0f %.0f) = ledge line at the player's"
@@ -4055,6 +4241,7 @@ static long  g_pkCensusFrames = 0, g_pkCensusAdvance = 0, g_pkCensusNoLedge = 0,
 
 static bool  g_pkDirectBody = true;         // ParkourDirectBody in mevr.ini; SCROLL LOCK toggles
 static bool  g_pkDirectLive = false;        // actually writing, right now
+static bool  g_pkDriftReset = true;   // PK.18: set on every climb entry, consumed by the trace
 static bool  g_pkDirectHave = false;
 static float g_pkDirectBase[3] = { 0, 0, 0 };   // pawn Location when the pull was latched
 static float g_pkDirectAxis[3] = { 1, 0, 0 };   // the ledge direction, world, unit
@@ -4187,6 +4374,58 @@ static void ParkourPollDirectToggle()
             g_pkDirectBody ? "ON (the stick stops driving the shimmy)" : "OFF", g_pkMode);
     }
     prevKey = key;
+
+    // '-' and '=' trim the top margin, 10 UU a press. Live, because "is the stopping point
+    // right?" answered from memory across a restart is not a comparison - the same reason the
+    // bypass is a key and not an ini line.
+    {
+        static bool prevMinus = false, prevPlus = false;
+        const bool mk = (GetAsyncKeyState(VK_OEM_MINUS) & 0x8000) != 0;
+        const bool pk = (GetAsyncKeyState(VK_OEM_PLUS)  & 0x8000) != 0;
+        if ((mk && !prevMinus) || (pk && !prevPlus)) {
+            g_pkPipeTopMargin += (pk && !prevPlus) ? 10.0f : -10.0f;
+            if (g_pkPipeTopMargin < 0.0f)   g_pkPipeTopMargin = 0.0f;
+            if (g_pkPipeTopMargin > 400.0f) g_pkPipeTopMargin = 400.0f;
+            Log("*** [pk] pipe TOP margin %.0f UU (%.2f m below the volume top)",
+                g_pkPipeTopMargin, g_pkPipeTopMargin / 100.0f);
+        }
+        prevMinus = mk; prevPlus = pk;
+    }
+
+    {
+        static bool prevRD = false, prevRU = false;
+        const bool rd = (GetAsyncKeyState(VK_OEM_1) & 0x8000) != 0;   // ';'
+        const bool ru = (GetAsyncKeyState(VK_OEM_7) & 0x8000) != 0;   // '''
+        if ((rd && !prevRD) || (ru && !prevRU)) {
+            g_pkHandReachUU += (ru && !prevRU) ? 10.0f : -10.0f;
+            if (g_pkHandReachUU < 0.0f)   g_pkHandReachUU = 0.0f;
+            if (g_pkHandReachUU > 200.0f) g_pkHandReachUU = 200.0f;
+            Log("*** [pk] hand REACH above a resting grip %.0f UU - the top anchor now sits"
+                " %.0f UU above where the body stops", g_pkHandReachUU,
+                g_pkHandRiseUU + g_pkHandReachUU);
+        }
+        prevRD = rd; prevRU = ru;
+    }
+
+    static bool prevHandClamp = false;
+    const bool hk = (GetAsyncKeyState(VK_OEM_6) & 0x8000) != 0;   // ']'
+    if (hk && !prevHandClamp) {
+        g_pkHandLineClamp = !g_pkHandLineClamp;
+        Log("*** [pk] ']' -> hand line bounded to the pipe %s - %s",
+            g_pkHandLineClamp ? "ON" : "OFF",
+            g_pkHandLineClamp ? "a hand cannot anchor past the ends"
+                              : "the hand line is infinite again, as it was before PK.20");
+    }
+    prevHandClamp = hk;
+
+    static bool prevGuard = false;
+    const bool gk = (GetAsyncKeyState(VK_OEM_4) & 0x8000) != 0;   // '['
+    if (gk && !prevGuard) {
+        g_pkPipeGuard = !g_pkPipeGuard;
+        Log("*** [pk] '[' -> pipe top/bottom guard %s%s", g_pkPipeGuard ? "ON" : "OFF",
+            g_pkPipeOk ? "" : " (no extent read on this pipe, so it clamps nothing either way)");
+    }
+    prevGuard = gk;
 
     static bool prevBypass = false;
     const bool byp = (GetAsyncKeyState(VK_OEM_3) & 0x8000) != 0;
@@ -4577,6 +4816,7 @@ static void PkCornerTick()
         g_pkCornerTurned = false;
         g_pkCornerYaw0 = yaw;
         g_pkHandAnchored[0] = g_pkHandAnchored[1] = false;
+        g_pkHandOffPipe[0] = g_pkHandOffPipe[1] = false;    // PK.28
         g_pkHandPending[0] = g_pkHandPending[1] = 0;
         g_pkDirectLive = false;
         g_pkDirectHave = false;             // forces a fresh base AND a fresh axis afterwards
@@ -4865,6 +5105,31 @@ static void ParkourDirectBodyTick()
     // still finds a ledge under the player. That is the difference between noticing we lost the
     // pointer and noticing the player is over open air, and the field report was climbing past
     // the end of a ledge floating in nothing.
+    // ---- ⚠️ PK.18: THIS IS THE LEDGE'S GUARD AND IT WAS RUNNING ON PIPES ----
+    //
+    // Reported as "I jumped onto the left pipe, started climbing, and it stuck me back on the
+    // right one". The log names the mechanism exactly:
+    //
+    //   [pkdirect] ledge ended - pawn restored to (-5569 -1728 5149), the last place the game
+    //              still saw one
+    //
+    // -1728 is the RIGHT pipe. The player was on the left one, at Y -1632.
+    //
+    // bFoundLedge is TdMove_Grab's answer to "is there a ledge under this pawn", and on a pipe
+    // there is not one, so it goes false and this fires. It then restores g_pkLastGood, which is
+    // only ever refreshed while the flag is TRUE - so on a pipe it holds whatever position was
+    // last valid on a LEDGE, or on a previous pipe. Teleporting the player onto a climbable they
+    // left is the worst possible expression of a guard whose whole purpose is to put them
+    // somewhere safe.
+    //
+    // The commit that built the pipe listed what it had switched off there - the vertical camera
+    // lead, the stick probe, the alignment clamp and the leash - "which measure against ledge
+    // geometry that does not exist". This guard measures against exactly that and was missed.
+    //
+    // It is not replaced by anything on the pipe, because it no longer needs to be: PK.16 is the
+    // pipe's own end guard and it is strictly better - the climbable's authored extent, read off
+    // the volume the player is actually on, rather than a flag about a different kind of surface.
+    if (g_pkMode == PK_LEDGE) {
     bool foundLedge = g_pkLedgeOk;
     if (g_offFoundLedge >= 0 && g_maskFoundLedge && g_playerPawn) {
         uint32_t w = 0;
@@ -4892,11 +5157,16 @@ static void ParkourDirectBodyTick()
     }
     memcpy(g_pkLastGood, loc, sizeof(g_pkLastGood));
     g_pkLastGoodOk = true;
+    }   // end of the ledge-only guard
 
     // ⚠️ bFoundLedge alone did not stop the player climbing along open air, so the geometry is
     // checked too: if the pawn has been written far from the ledge point the game still reports,
     // we have carried it somewhere the game is not following, whatever its flag says.
-    {
+    if (g_pkMode == PK_LEDGE) {
+        // ⚠️ Ledge-only for the same reason as the guard above: g_pkLedgeLoc on a pipe is
+        // the LAST LEDGE's location, so this reported a gap of hundreds of UU to a wall in
+        // another room. That mistake is already written up at the hand-snap, where measuring a
+        // hand on a pipe against the last ledge rejected every grip.
         const float gx = loc[0] - g_pkLedgeLoc[0], gy = loc[1] - g_pkLedgeLoc[1];
         const float gap = sqrtf(gx * gx + gy * gy);
         g_pkGapNow = gap;
@@ -4949,9 +5219,39 @@ static void ParkourDirectBodyTick()
     // fail is how the last four end-of-ledge attempts were built.
     float want3[3];
     if (g_pkMode == PK_CLIMB) {
-        want3[0] = g_pkDirectBase[0];
-        want3[1] = g_pkDirectBase[1];
-        want3[2] = g_pkDirectBase[2] + d;
+        // ---- ⚠️ PK.20: THE PIPE HAS NO BUSINESS WRITING X OR Y ----
+        //
+        // The teleport survived two fixes because both were guards on a value that should never
+        // have been written. This branch held X and Y at whatever g_pkDirectBase latched and
+        // re-asserted them every frame for the life of the grip, so ANY staleness in that latch
+        // - by one frame, from one pipe to the next - pins the body 96 UU away until the player
+        // lets go. PK.19 was built to catch exactly that and never fired once, because 96 UU
+        // happens to sit inside a half-extent of 48 plus a stand-off tolerance of 60. A guard
+        // that cannot separate the two pipes in front of it is not a guard.
+        //
+        // The write was never needed. The ledge's own branch is the model and says so in one
+        // line - `want3[2] = loc[2];  // a ledge never writes Z` - passing the live value
+        // straight through for the axis it does not control. A pipe controls height and nothing
+        // else, and the pawn's X/Y on a pipe is the game hugging it, measured steady at
+        // "drift X+0.0 Y+0.0" across every climb this file has logged.
+        //
+        // So the mirror of the ledge: pass X and Y through untouched. There is then no latched
+        // horizontal position in existence to go stale, which removes the whole class rather
+        // than guarding it - and it is less code than either guard that failed to.
+        //
+        // PK.19 stays, log-only, because a stale base still means a wrong Z and that is worth
+        // hearing about. It can no longer move anyone sideways.
+        if (PkPipeBaseIsStale(g_pkDirectBase)) {
+            Log("[climb] PK.19: the latched base (%.0f %.0f) is not on this pipe (centre %.0f %.0f,"
+                " half-extent %.0f %.0f) - dropping the latch rather than writing the player back"
+                " to it", g_pkDirectBase[0], g_pkDirectBase[1], g_pkPipeOrg[0], g_pkPipeOrg[1],
+                g_pkPipeExt[0], g_pkPipeExt[1]);
+            g_pkDirectHave = false;          // a fresh base next frame, from where the pawn is
+        }
+        want3[0] = loc[0];               // PK.20: the game owns the pipe's X/Y, as it always did
+        want3[1] = loc[1];
+        // PK.16: a pipe has a top and a bottom, and until now nothing here knew it.
+        want3[2] = PkPipeClampZ(g_pkDirectBase[2] + d);
     } else {
         want3[0] = g_pkDirectBase[0] + g_pkDirectAxis[0] * d;
         want3[1] = g_pkDirectBase[1] + g_pkDirectAxis[1] * d;
@@ -5041,8 +5341,16 @@ static void ParkourDirectBodyTick()
     // How far the game moved the pawn away from what was written since last frame IS the fight,
     // measured rather than argued about. Zero means the move is not contesting position; a
     // steady number means it is pulling back every frame and by how much.
+    // ⚠️ PK.19: reset across climbs. This static outlived the grip, so the first write on a
+    // new climbable was compared against the last write on the OLD one and reported the distance
+    // between them as the game contesting us - "worst 96.00", which is not contention at all, it
+    // is two different pipes. It is the third stale static in this file to be read as a
+    // measurement today; the other two are marked where they were fixed.
     static float prevWrote[3] = { 0, 0, 0 };
     static bool  havePrev = false;
+    static long  prevWriteN = -99;
+    if (g_pkDirectWrites != prevWriteN + 1) havePrev = false;   // a gap means a new grip
+    prevWriteN = g_pkDirectWrites;
     if (havePrev) {
         const float bx = loc[0] - prevWrote[0], by = loc[1] - prevWrote[1];
         const float drift = sqrtf(bx * bx + by * by);
@@ -5080,6 +5388,10 @@ static void ParkourTick(XrTime when)
     PkWatchLedgeOffset();
     PkClimbCameraCollision(g_pkMode == PK_CLIMB && !g_pkBypass);
     PkClimbBobTick();
+    PkClimbAnchorProbe();   // PK.13: what the pawn is attached to - a probe, it clamps nothing
+    PkScanClimbableOnce();  // PK.14: and where the pipe is referenced, if anywhere
+    PkClimbVolumeTick();    // PK.15: ...and how far that pipe actually extends
+    PkPipeExtentTick();     // PK.16: keep that extent live, so the write can be held inside it
     // ⚠️ ABOVE PkFreezeViewTick, which gates on it. It used to be assigned after, so the freeze
     // read LAST frame's mode - and the one frame that buys is the frame the player leaves the
     // ledge, which is precisely the frame the pawn moves hardest.
@@ -5116,6 +5428,7 @@ static void ParkourTick(XrTime when)
             g_pkDirectHave = false;
             g_pkDirectWhy = "left the ledge";
         }
+        if (g_pkMode != prevMode) g_pkDriftReset = true;   // PK.18
         prevMode = g_pkMode;
         g_pkAnchor = PK_HAND_NONE;
         g_pkProgress = g_pkDesired = 0.0f;
@@ -5152,9 +5465,16 @@ static void ParkourTick(XrTime when)
         float loc[3] = { 0, 0, 0 };
         static float first[3] = { 0, 0, 0 };
         static bool haveFirst = false;
-        static int prevClimbMode = PK_NONE;
-        if (prevClimbMode != PK_CLIMB) haveFirst = false;
-        prevClimbMode = PK_CLIMB;
+        // ⚠️ PK.18: this reset could never fire, and it cost a diagnosis.
+        //
+        // The comment above says "per ENTRY, not per run", and the code cannot do that: the whole
+        // block is inside `if (g_pkMode == PK_CLIMB)`, so prevClimbMode is only ever ASSIGNED
+        // PK_CLIMB and the test against it is dead after the first pipe. It went on reporting
+        // "drift Y+96.0" - which is exactly the distance between these two pipes - and the
+        // comment even names that number as the symptom it was supposed to have fixed.
+        //
+        // It is reset from the mode tick instead, where the mode actually changes.
+        if (g_pkDriftReset) { haveFirst = false; g_pkDriftReset = false; }
         if (g_playerPawn && g_offActorLocation >= 0 &&
             SafeRead(g_playerPawn + g_offActorLocation, loc, sizeof(loc))) {
             if (!haveFirst) { memcpy(first, loc, sizeof(first)); haveFirst = true; }
@@ -5316,9 +5636,25 @@ static void ParkourTick(XrTime when)
     // controller producing a stale anchor would drive the body somewhere nobody asked for. The
     // rule that an untracked hand keeps HOLDING belongs to the release gesture, which is a
     // different question with the opposite failure mode.
+    // ---- ⚠️ PK.28: A HAND WITH NOTHING TO HOLD CANNOT BE THE ANCHOR ----
+    //
+    // Reported: "even above the pipe, even though I properly only made a fist, it was still
+    // functioning as an anchor point, moving the camera around."
+    //
+    // Correct, and the two halves had come apart. PK.23 taught the SNAP to refuse a grip off the
+    // end of the pipe, and this - which decides which hand the body and the camera lead are
+    // measured against - never heard about it. It asks only "is the grip squeezed and the
+    // controller tracked", so a fist waving above the pipe was still the thing the world was
+    // held still relative to. The pose was honest and the physics was not.
+    //
+    // ⚠️ Gated on a POSITIVE refusal, not on the absence of an anchor. Requiring
+    // g_pkHandAnchored here would be much stricter than it sounds - nothing is anchored during
+    // the entry window or while the snap is switched off, and the body would simply stop
+    // responding on those frames. Only a hand the snap has actually judged to be past the end of
+    // the pipe is excluded, so every path that never asks the question behaves as it always did.
     const bool held[2] = {
-        g_swingL.tracked && g_gripValue[0] > 0.5f,
-        g_swingR.tracked && g_gripValue[1] > 0.5f,
+        g_swingL.tracked && g_gripValue[0] > 0.5f && !g_pkHandOffPipe[0],
+        g_swingR.tracked && g_gripValue[1] > 0.5f && !g_pkHandOffPipe[1],
     };
     if (!held[0] && !held[1]) {
         // Letting go zeroes the lead outright. A view still displaced from a pull the
@@ -5495,6 +5831,40 @@ static void ParkourTick(XrTime when)
         // motion. It is the same double-count the sideways axis is zeroed for while direct drive
         // owns a ledge.
         if (g_pkMode == PK_CLIMB) g_pkCamLeadUp = 0.0f;
+
+        // ---- ⚠️ PK.21: AND THE PIPE WANTS THE OPPOSITE AXIS TO THE LEDGE ----
+        //
+        // Asked from the headset: "you know how on the ledge if I move my arm left and right it
+        // moves the camera in the opposite direction? Same thing should apply to the pipe -
+        // unless that would be too hard since the character's body is stuck to the pipe?"
+        //
+        // It is not harder. Being stuck is the CONDITION THE LEAD EXISTS FOR, and the two
+        // surfaces are mirror images:
+        //
+        //   a LEDGE lets the body travel sideways and not vertically, so sideways is a servo
+        //   (g_pkCamLead is the servo error, zeroed under direct drive because the body goes
+        //   exactly where asked and owes no debt) and vertical is a free displacement.
+        //
+        //   a PIPE lets the body travel vertically and not sideways. So vertical is the servo -
+        //   it is zeroed just above for exactly that reason - and SIDEWAYS is the axis with no
+        //   body to answer it, which is where a lead earns its place.
+        //
+        // So the pipe's sideways lead is built the way the ledge's VERTICAL lead is built, not
+        // the way its sideways one is: integrated frame to frame, so the first frame of any
+        // anchor contributes a structural zero and the grab moves the view by nothing. Same
+        // step guard, for the same measured reason - OpenXR has been seen jumping a tracked
+        // pose further in one frame than a limb can travel.
+        //
+        // Projected on the head's own right axis rather than on raw room X, because "sideways"
+        // is wherever the player is facing; that basis is the one every other parkour gesture
+        // is measured against.
+        if (g_pkMode == PK_CLIMB && g_pkLeadPrevOk && g_pkCamLeadOn) {
+            const float dx = ah.rel.x - g_pkLeadPrevRel.x;
+            const float dy = ah.rel.y - g_pkLeadPrevRel.y;
+            const float dz = ah.rel.z - g_pkLeadPrevRel.z;
+            if (dx * dx + dy * dy + dz * dz <= kSwingMaxStepM * kSwingMaxStepM)
+                g_pkCamLead += -(dx * g_headRight.x + dz * g_headRight.z);
+        }
         if (g_pkLeadPrevOk && g_pkCamLeadUpOn && g_pkMode != PK_CLIMB) {
             const float dx = ah.rel.x - g_pkLeadPrevRel.x;
             const float dy = ah.rel.y - g_pkLeadPrevRel.y;
@@ -5531,6 +5901,15 @@ static void ParkourTick(XrTime when)
         if (g_pkCamLeadFwd < -g_pkCamLeadMax) g_pkCamLeadFwd = -g_pkCamLeadMax;
         if (g_pkCamLeadUp  >  g_pkCamLeadMax) g_pkCamLeadUp  =  g_pkCamLeadMax;
         if (g_pkCamLeadUp  < -g_pkCamLeadMax) g_pkCamLeadUp  = -g_pkCamLeadMax;
+        // ⚠️ PK.21: the pipe's sideways axis is bounded here too, and it MUST be. It is an
+        // integrated displacement like the two above, so without this a long slow sideways drift
+        // accumulates forever and walks the view out of the building - which is the exact failure
+        // the comment beside g_pkCamLeadMax describes. The ledge's own use of this axis is a
+        // servo error and clamps itself further down; only the pipe's needs bounding here.
+        if (g_pkMode == PK_CLIMB) {
+            if (g_pkCamLead >  g_pkCamLeadMax) g_pkCamLead =  g_pkCamLeadMax;
+            if (g_pkCamLead < -g_pkCamLeadMax) g_pkCamLead = -g_pkCamLeadMax;
+        }
     } else {
         PkDecayLead();
     }
@@ -5544,7 +5923,12 @@ static void ParkourTick(XrTime when)
         // extends, whether a corner is offered - and a pipe has neither question. Handing the
         // stick a deflection here would just make the game climb on top of our own writes.
         g_pkShimmy = (g_pkMode == PK_CLIMB) ? 0.0f : (float)g_pkProbeDir * g_pkShimmyCap;
-        g_pkCamLead = 0.0f;     // the body IS where the pull asked; there is no debt to lead
+        // ⚠️ Ledge only. There the sideways axis IS the servo and the body has just been
+        // written to exactly where the pull asked, so the debt is nothing and so is the lead. On
+        // a pipe the body cannot go sideways at all, so the same zero would delete PK.21 above -
+        // the one axis on that surface the view is the only possible answer for.
+        if (g_pkMode != PK_CLIMB)
+            g_pkCamLead = 0.0f; // the body IS where the pull asked; there is no debt to lead
         // ⚠️ This used to be an unconditional "direct body drive", which overwrote the end-of-
         // ledge message ParkourDirectBodyTick had just set - so the one state the player most
         // needs to see in the headset was the one the overlay could never show.
@@ -8724,6 +9108,11 @@ static void RunObjectModelScan()
 // worth leaving for someone to trip over later.
 int g_offActorRotation = -1;
 int g_offActorLocation = -1;
+// PK.13: what the pawn is attached to, and the extent of it. -2 = the one-shot resolve has not
+// run yet, -1 = it ran and the property is absent. See the resolve site for why those differ.
+int g_offActorBase          = -2;
+int g_offActorCollisionComp = -2;
+int g_offPrimBounds         = -2;
 int g_offFOVAngle      = -1;
 int g_offDesiredFOV    = -1;   // the INPUT; FOVAngle is recomputed from it every tick
 int g_offDefaultFOV    = -1;
@@ -10924,6 +11313,10 @@ extern float     g_animNow[3];              // camera animation contribution, de
 static bool      g_headPrimed = false;
 static int32_t   g_lastHeadYaw = 0, g_lastHeadPitch = 0;
 static int32_t   g_climbYawRef = 0;         // pipe: the game yaw that corresponds to head yaw 0
+static long      g_climbYawHold = 0;        // PK.24: frames the reference survives off the pipe
+static bool      g_climbYawRelatch = false; // PK.29: adopt the body's facing once, on arrival
+static bool      g_climbYawStickUsed = false;// PK.31: has the stick turned us since the last arrival?
+float            g_viewYawDeg = 0.0f;       // PK.26: yaw of the matrix the eye was built from
 static bool      g_climbYawRefOk = false;
 static long      g_headWrites = 0;
 static long      g_headJumpsRejected = 0;
@@ -11272,24 +11665,272 @@ static void ApplyHeadTracking(XrTime when)
     // frame, which OVERWRITES the game's pull instead of stacking on it. The reference absorbs
     // game-moved yaw only while the player is genuinely turning, so stick rotation is unbounded
     // and a constraint tugging at a still player is simply overwritten.
-    if (g_pkMode == PK_CLIMB && !g_pkBypass) {
+    // ---- ⚠️ PK.27: THE FREEZE KEPT THE REFERENCE AND NEVER USED IT ----
+    //
+    // The frame trace settles this outright, and it is my bug, not the game's. PK.24 kept
+    // g_climbYawRefOk alive across the jump - and the branch that ASSERTS the absolute yaw still
+    // tested g_pkMode == PK_CLIMB, which is false the entire time the player is in the air. So
+    // the reference was preserved and then ignored, and the delta path ran instead.
+    //
+    // What the trace shows, one line per frame, during GrabTransfer(31) and IntoClimb(22):
+    //
+    //   f6958  head +68.1 | ctl +112.5 pawn +180.0 | ref +180.0 | view +110.0
+    //   f6993  head +64.2 | ctl +125.9 pawn +145.3 | ref +180.0 | view +125.9
+    //   f7003  head +63.2 | ctl +174.2 pawn +175.6 | ref +180.0 | view +174.8
+    //
+    // The head moves 5 degrees across the whole hop. The controller moves 62, and `view` tracks
+    // `ctl` to within a degree the entire way - so the pan is the steering path, not the
+    // projection path, and it is the game dragging the controller along with the pawn as it
+    // aligns to the next pipe. ref sits at 180.0 throughout, correct and unused. Landing
+    // re-enables the assert, which yanks 60 degrees back in a few frames: the correction.
+    //
+    // Two errors that cancel, exactly as the player described - right destination, wrong journey.
+    //
+    // So the assert runs whenever the reference is live, in the air as well as on the pipe. The
+    // freeze then actually freezes: ctl is held at ref + head from the moment the player leaves
+    // one pipe to the moment they land on the next, the game's alignment never reaches the view,
+    // and there is nothing to correct on arrival.
+    const bool climbYawLive = !g_pkBypass &&
+                              (g_pkMode == PK_CLIMB || (g_climbYawRefOk && g_climbYawHold > 0));
+    if (climbYawLive) {
         int32_t cur[3];
         if (SafeRead(ctl + g_offActorRotation, cur, sizeof(cur))) {
             const int32_t want = hy * g_yawSign;
             const bool turning = fabsf(g_padSentRX) > 0.15f || fabsf(g_padSentLX) > 0.15f;
-            if (!g_climbYawRefOk) {
-                g_climbYawRef = cur[1] - want;      // enter facing where you already are
+            // ---- ⚠️ PK.21: NOT ON THE FIRST FRAME OF THE CLIMB ----
+            //
+            // Reported: "I look left and jump onto the pipe, and when I land the camera pans
+            // right. But if I turn my BODY to face the pipe with the stick first and then jump,
+            // there is no pan." Those two differ by exactly one thing - whether the game still
+            // has aligning to do when the climb begins.
+            //
+            // The reference is what makes yaw absolute: everything afterwards is asserted as
+            // ref + head. Latching it on the first Climb frame captures the pawn mid-turn, and
+            // the rest of the game's alignment then arrives as a pan the player did not ask for.
+            // Face the pipe before jumping and there is no alignment left to run, which is why
+            // that case was always clean.
+            //
+            // So it waits for the entry window to close, exactly as the climb bob's base does -
+            // "the entry window is when the game is still settling the pawn onto the pipe, and a
+            // base latched mid-arrival bakes the arrival into every frame after it". Same trap,
+            // same surface, third time this file has paid for it.
+        // ⚠️ Re-armed only while genuinely on the pipe; in the air the window runs down.
+        // Latching mid-flight would defeat the freeze it exists to provide.
+        // ---- ⚠️ PK.29: FREEZE IN THE AIR, ADOPT THE NEW BODY ON ARRIVAL ----
+        //
+        // The player's own specification, and the two halves want opposite things:
+        //
+        //   "if I continue to look left while jumping, my view should reflect that"  - so
+        //   nothing may rotate the view in flight, which is the frozen reference.
+        //
+        //   "when I land, I should be able to look straight again and I'm looking at the pipe"
+        //   - so on arrival the reference has to BECOME the new pipe's body facing, because
+        //   that is what makes head-neutral point at the pipe.
+        //
+        // Freezing alone cannot do the second: it would carry the old pipe's facing across and
+        // head-neutral would point wherever the LAST pipe was. So the freeze holds only until
+        // the arrival finishes, and then the reference is re-latched from the body once - the
+        // single deliberate correction at the end, which is the behaviour the player says they
+        // like about the stick case.
+        //
+        // ⚠️ Re-latched at the END of the entry window, not at its start. During the window
+        // the game is still settling the pawn onto the pipe and its yaw is mid-turn; latching
+        // there is the mistake PK.21 fixed, and the frozen reference is exactly what keeps the
+        // view still until the body has stopped moving.
+        static int prevClimbMode = PK_NONE;
+        if (g_pkMode == PK_CLIMB && prevClimbMode != PK_CLIMB) {
+            g_climbYawRelatch = true;
+            if (g_climbYawRefOk && !g_climbYawStickUsed)
+                Log("[head] pipe: arrived with the reference unchanged - head-only approach, so"
+                    " nothing is re-centred and the view does not move");
+        }
+        prevClimbMode = g_pkMode;
+        if (g_pkMode == PK_CLIMB) g_climbYawHold = 90;
+        else if (--g_climbYawHold <= 0) g_climbYawRefOk = false;
+        if (g_pkMode == PK_CLIMB) {
+            // ---- ⚠️ PK.31: WHETHER TO CORRECT AT ALL IS THE STICK'S QUESTION ----
+            //
+            // Six builds have gone into WHEN and HOW FAST to re-centre the view on arrival, and
+            // the player's answer is that half the time it should not happen at all. The reason
+            // is a difference between VR and the flat game that none of those builds accounted
+            // for:
+            //
+            //   In the flat game, look direction and travel direction are the same thing. Push
+            //   the stick left to see the next pipe and you have TURNED; the game re-centres you
+            //   on the pipe when you grab it, and that is the behaviour being reproduced.
+            //
+            //   In VR the two come apart. The stick turns the body - the thing "straight" is
+            //   measured from - while the head turns freely on top of it.
+            //
+            // So there are two arrivals, and they want opposite things:
+            //
+            //   STICK USED. The player rotated their reference to see the pipe. Physically their
+            //   head is straight but their straight now points off to one side, and re-centring
+            //   on arrival is what the flat game does and what they asked to keep.
+            //
+            //   HEAD ONLY. The reference never moved. Their straight IS the pipe already; they
+            //   are simply not looking down it this instant. There is nothing to correct, in the
+            //   air or on the grab, and any correction at all is the mod inventing motion. In
+            //   their words: "I never need the camera to move at all in this case."
+            //
+            // Every previous attempt treated arrival as one event and argued about its timing
+            // and its speed. It is two events, and the discriminator is whether the stick moved.
+            //
+            // ⚠️ The very first climb still latches unconditionally: with no reference there
+            // is nothing to keep, and "do not correct" would mean "assert nothing at all".
+            const bool wantRecentre = !g_climbYawRefOk || g_climbYawStickUsed;
+
+            // ---- ⚠️ PK.30: ON ARRIVAL, NOT AT THE END OF THE ENTRY WINDOW ----
+            //
+            // PK.21 delayed this because latching during the window caught the pawn mid-turn.
+            // The trace says that is no longer the case on this path: through every frame of
+            // st21 above, pawn reads -180.0 and does not move - the alignment finished before
+            // Climb began, and the delay was buying nothing while costing eleven frames of a
+            // stale reference nobody could use.
+            //
+            // Taking it on the first Climb frame means the correction starts the moment the
+            // player grabs, and PK.30's rate limit spreads it. The entry-window wait is kept
+            // only for the case it was written for: a FRESH climb with no frozen reference to
+            // fall back on, where there is nothing to assert until something is latched.
+            if ((!g_climbYawRefOk || g_climbYawRelatch) && wantRecentre &&
+                (g_pkEntryHoldPub == 0 || g_climbYawRefOk)) {
+                // The arrival is over and the body has settled: adopt its facing. If a frozen
+                // reference carried us here, this is the only frame it changes.
+                int32_t pawnRot[3];
+                if (g_playerPawn && g_offActorRotation >= 0 &&
+                    SafeRead(g_playerPawn + g_offActorRotation, pawnRot, sizeof(pawnRot))) {
+                    const int32_t was = g_climbYawRef;
+                    g_climbYawRef = pawnRot[1];
+                    g_climbYawRelatch = false;
+                    g_climbYawStickUsed = false;    // PK.31: spent on this arrival
+                    if (!g_climbYawRefOk || YawDelta(g_climbYawRef, was) != 0)
+                        Log("[head] pipe: reference %s to the body's facing, %.1f deg"
+                            " (moved %.1f from the frozen one)",
+                            g_climbYawRefOk ? "re-latched" : "latched",
+                            (float)g_climbYawRef * (360.0f / 65536.0f),
+                            (float)YawDelta(g_climbYawRef, was) * (360.0f / 65536.0f));
+                    g_climbYawRefOk = true;
+                } else if (!g_climbYawRefOk) {
+                    g_climbYawRef = cur[1] - want;
+                    g_climbYawRefOk = true;
+                }
+            } else if (!g_climbYawRefOk && g_pkEntryHoldPub > 0) {
+                // The game is still arriving. Assert nothing this frame rather than assert a
+                // reference that is about to be wrong.
+                dYaw = 0;
+            } else if (!g_climbYawRefOk) {
+                // ---- ⚠️ PK.23: THE REFERENCE IS THE BODY'S FACING, NOT THE VIEW'S ----
+                //
+                // Diagnosed from the headset, exactly: "I rotate my head right to look at the
+                // other pipe. I jump. It shifts so now I'm looking at the pipe. But my head is
+                // still turned right. So when I look straight again, I'm looking to the LEFT of
+                // the pipe."
+                //
+                // That is this line. `cur[1] - want` means "whatever the view shows right now is
+                // what the current head angle shows", so it bakes the head's turn into the
+                // reference. Head at +40 degrees on arrival, view on the pipe; bring the head
+                // home to 0 and the view swings 40 degrees off it. The player is left holding a
+                // pipe they cannot see straight on, having done nothing but face forwards.
+                //
+                // What the reference should mean is where the BODY faces, because that is what
+                // the head turns relative to - and on a pipe the game has just aligned the pawn
+                // to the climbable, so its yaw IS the answer. Then head-neutral looks at the
+                // pipe, a turned head looks off it by exactly the turn, and returning to centre
+                // returns to the pipe. Which is what a neck does.
+                //
+                // The settled numbers already agreed and nobody read them: "yaw ctl 180.8 pawn
+                // 180.0 head -0.9" - ref works out to 179.9 against a pawn yaw of 180.0. The two
+                // definitions differ ONLY when the head is turned at the moment of arrival,
+                // which is precisely the case being reported.
+                int32_t pawnRot[3];
+                bool haveBody = false;
+                if (g_playerPawn && g_offActorRotation >= 0 &&
+                    SafeRead(g_playerPawn + g_offActorRotation, pawnRot, sizeof(pawnRot))) {
+                    g_climbYawRef = pawnRot[1];
+                    haveBody = true;
+                } else {
+                    g_climbYawRef = cur[1] - want;  // no body to read: the old meaning, unchanged
+                }
                 g_climbYawRefOk = true;
-                Log("[head] pipe: yaw goes absolute, reference latched at %.1f deg",
-                    (float)g_climbYawRef * (360.0f / 65536.0f));
+                Log("[head] pipe: yaw goes absolute, reference latched at %.1f deg (%s; head was"
+                    " %.1f off centre at arrival - that much of a turn is what the old rule used"
+                    " to bake in)", (float)g_climbYawRef * (360.0f / 65536.0f),
+                    haveBody ? "the BODY's facing" : "fallback: the view's",
+                    (float)hy * (360.0f / 65536.0f));
             } else if (turning) {
                 g_climbYawRef = cur[1] - want;      // the player asked for this; keep it
             }
+            // PK.31: remembered across the jump, because the arrival is where it is spent. Set
+            // wherever the stick actually turns, not only in the branch above - the player may
+            // line the shot up and jump in the same motion, and the re-latch above only runs on
+            // frames where nothing else claimed the reference.
+            if (turning) g_climbYawStickUsed = true;
+        }
             // ⚠️ A CORRECTION, not a head motion, though it rides the same write below. The
             // 11-degree implausible-step guard downstream is sized for the latter; the measured
             // pull is a quarter degree a frame, and a rejection is harmless anyway because an
             // absolute scheme recomputes from the field next frame instead of losing it.
-            dYaw = g_climbYawRef + want - cur[1];
+            // ⚠️ Only once the reference exists. While the entry window is still open there
+            // is no reference yet, and computing against an unset one would assert a turn to a
+            // yaw of zero - a whole-circle snap on the frame the player arrives.
+            // ---- ⚠️ PK.29: NEVER SUBTRACT TWO UE3 ANGLES RAW ----
+            //
+            // That rule is written at the top of this file, on the helper that exists for it:
+            // "The shortest signed path between two UE3 angles. Never subtract them raw." This
+            // line broke it, and had been breaking it since the absolute scheme was written.
+            //
+            // The trace caught it because it prints dYaw. Across the frame the controller field
+            // wraps:
+            //
+            //   f8743 st31 ctl -234.2 | dYaw    -64
+            //   f8744 st22 ctl +129.1 | dYaw -66198     <- 363 degrees, in one frame
+            //
+            // A raw subtract of two angles either side of a wrap produces a full turn, the
+            // implausible-step guard below correctly rejects anything past 11 degrees, and the
+            // write is DROPPED. So through every frame of the arrival the absolute assert was
+            // silently doing nothing at all and the game had the controller to itself - which is
+            // the rotation the player sees in the air, and the reason it "fixes itself" the
+            // moment the numbers happen to fall back on the same side of the wrap.
+            //
+            // Both of the last two fixes were aimed at this symptom and neither could have
+            // worked, because the assert they were arranging to run was being thrown away
+            // downstream. YawDelta takes the short way round and the value stays in single
+            // degrees, so the guard passes it and the assert actually lands.
+            if (g_climbYawRefOk) {
+                dYaw = YawDelta(g_climbYawRef + want, cur[1]);
+                // ---- ⚠️ PK.30: RATE-LIMIT THE ABSOLUTE CORRECTION, NEVER DROP IT ----
+                //
+                // "The camera doesn't move while I'm in the air but it moves as soon as I grab
+                // the pipe." The trace shows why, and it is not a snap at the grab - it is
+                // eleven frames of the assert being thrown away, then everything arriving at
+                // once when it finally applies:
+                //
+                //   f11851 st21 ctl -180.0 pawn -180.0 | ref +136.0 | dYaw -9543
+                //   f11861 st21 ctl -180.0 pawn -180.0 | ref +136.0 | dYaw -9735
+                //   [head] pipe: reference re-latched ... (moved 44.0 from the frozen one)
+                //   f11862 st21 ctl -180.0 pawn -180.0 | ref -180.0 | dYaw -1774
+                //
+                // A frozen reference 52 degrees from the body asks for a 52 degree correction,
+                // every frame. The implausible-step guard below rejects anything past 11, so
+                // every one of those writes was dropped and the game owned the yaw throughout -
+                // ctl pinned at exactly the pawn's facing, which is the game holding it, not us.
+                //
+                // The guard's own comment says a rejection is harmless "because an absolute
+                // scheme recomputes from the field next frame instead of losing it". That is
+                // true of a one-off glitch and false of a standing disagreement: recomputing an
+                // unreachable correction just produces the same unreachable correction forever.
+                // The assert was inert exactly when it was most needed.
+                //
+                // ⚠️ Clamped rather than rejected, and the file already argues for this on the
+                // other axis: "An absolute pitch cannot inject a bogus turn no matter how large
+                // the step is - it names a destination, not a movement." Yaw is absolute here
+                // for the same reason, so the only question is how fast to travel, not whether
+                // to go. 600 units is 3.3 degrees a frame - 0.24 s for the 52 above, read as the
+                // view settling rather than cutting, and far too slow to throw anyone.
+                const int32_t kAbsRate = 600;
+                if (dYaw >  kAbsRate) dYaw =  kAbsRate;
+                if (dYaw < -kAbsRate) dYaw = -kAbsRate;
+            }
 
             // ---- and how hard is the game actually pulling? ----
             //
@@ -11317,9 +11958,85 @@ static void ApplyHeadTracking(XrTime when)
                 havePrev = true;
             }
         }
-    } else if (g_climbYawRefOk) {
+    } else if (g_climbYawRefOk && (g_pkBypass || g_climbYawHold <= 0)) {
+        // ---- ⚠️ PK.24: FREEZE IT ACROSS THE JUMP, DO NOT RE-DERIVE IT ON LANDING ----
+        //
+        // "It ends up in the proper spot but the way it gets there is not correct - when I'm
+        // jumping the camera pans, and when I land it has to pan back. Why not simply freeze
+        // it?" Which is the right question, and the answer is that nothing was holding the
+        // reference in the air.
+        //
+        // Leaving Climb dropped it outright, so mid-flight the yaw fell back to the DELTA path -
+        // and a delta write cannot undo what the game does on top of it, which is the argument
+        // already written out above for why a pipe needs an absolute yaw at all. The game
+        // aligning the pawn toward the next pipe therefore reached the view as a pan. Landing
+        // latched a fresh reference from the body and took it straight back out. Two errors that
+        // cancel, which is why the destination was right and the journey was not.
+        //
+        // Frozen instead: the reference outlives the jump, so the same absolute yaw is asserted
+        // the whole way across and the game's alignment never reaches the view. Nothing pans,
+        // so nothing needs to pan back, and the head keeps steering throughout.
+        //
+        // ⚠️ Bounded, because this is asserting an absolute yaw while the player is in the
+        // air and that must not become the permanent state. 90 frames is 1.25 s at 72 fps - the
+        // measured pipe-to-pipe hop takes about 30 - and when it expires the reference goes and
+        // ordinary delta steering resumes. A jump that ends anywhere but another climb simply
+        // runs the window out.
+        // Reached only when the window has already run out, or the bypass stood everything
+        // down. The countdown itself now lives inside the assert, where it belongs.
         g_climbYawRefOk = false;
+        g_climbYawStickUsed = false;    // PK.31: nothing to spend it on any more
     }
+        // ---- ⚠️ PK.26: THE FRAME-BY-FRAME TRACE, BECAUSE GUESSING HAS COST THREE BUILDS ----
+        //
+        // Asked for directly, and rightly: "when I jump to the left facing left, something
+        // shifts the camera view, and then it corrects itself - look into the code, log or
+        // build something that can show us what is going on frame by frame."
+        //
+        // Three explanations have been offered for this pan and two have already been wrong.
+        // The reason is that every diagnosis so far has been made from values sampled every
+        // sixth frame, and the event lasts about thirty. So: one line per frame for the
+        // whole hop, with every quantity that could be moving the view, side by side.
+        //
+        //   head  what the player's neck is doing        (ours, an input)
+        //   ctl   the controller yaw we assert into      (ours, the output)
+        //   pawn  the body, which the game aligns        (the game's)
+        //   ref   the absolute reference, and hold       (ours, the thing PK.24 froze)
+        //   view  the yaw of the matrix the eye was BUILT from  (what was actually seen)
+        //
+        // If view tracks head+ref throughout, we are not the one panning. If view departs
+        // from it and ctl does not, the pan enters after our write - the projection path,
+        // not the steering path. If ctl departs, the game is turning the controller and the
+        // absolute assert is losing. Those are three different bugs and this separates them
+        // without another round of inference.
+        //
+        // ⚠️ Armed by the move LEAVING a climb and self-limiting to 150 frames, so it
+        // costs nothing during ordinary play and cannot flood a run.
+        {
+            static long trace = 0;
+            static bool wasClimb = false;
+            const bool isClimb = (g_pkMode == PK_CLIMB);
+            if (wasClimb && !isClimb) trace = 150;      // the hop starts here
+            wasClimb = isClimb;
+            if (trace > 0) {
+                --trace;
+                int32_t cr[3] = { 0, 0, 0 };
+                const bool haveC = SafeRead(ctl + g_offActorRotation, cr, sizeof(cr));
+                int32_t pr[3] = { 0, 0, 0 };
+                const bool haveP = g_playerPawn && g_offActorRotation >= 0 &&
+                                   SafeRead(g_playerPawn + g_offActorRotation, pr, sizeof(pr));
+                uint8_t st = 0xFF;
+                if (g_offMoveState >= 0 && g_playerPawn)
+                    SafeRead(g_playerPawn + g_offMoveState, &st, 1);
+                const float k = 360.0f / 65536.0f;
+                Log("[yawtrace] f%-6ld st%-3d head %+7.1f | ctl %+7.1f pawn %+7.1f |"
+                    " ref %+7.1f hold %-3ld refOk %d | dYaw %+6d | view %+7.1f",
+                    g_frames, (int)st, (float)hy * k, haveC ? (float)(int16_t)cr[1] * k : 0.0f,
+                    haveP ? (float)(int16_t)pr[1] * k : 0.0f, (float)(int16_t)g_climbYawRef * k,
+                    g_climbYawHold, g_climbYawRefOk ? 1 : 0, dYaw, g_viewYawDeg);
+            }
+        }
+
     int32_t dPitch = YawDelta(hp, g_lastHeadPitch) * g_pitchSign;
     g_lastHeadYaw = hy; g_lastHeadPitch = hp;
     // An absolute pitch has to be re-asserted every frame even when the head has not moved -
@@ -12539,6 +13256,520 @@ static bool ReadClassName(uintptr_t obj, char* out, size_t cap)
     uint32_t cls = 0;
     return obj >= 0x10000 && SafeU32(obj + 0x34, &cls) && cls >= 0x10000 &&
            ReadObjName(cls, out, cap);
+}
+
+// ================================================================ PK.13: what IS the pipe?
+//
+// The whole argument for asking this question is at the resolve site in ResolveMoveProbeProps.
+// This is the read: while the player is on a pipe, what does the engine say they are attached
+// to, where is it, and how far does it extend.
+//
+// ⚠️ Reports and clamps NOTHING. The player can still climb off the top; that is today's bug and
+// it stays until something has measured what the answer looks like. Four end-of-ledge guards
+// were built before their measurement and all four were wrong.
+void PkClimbAnchorProbe()
+{
+    if (g_pkMode != PK_CLIMB || !g_playerPawn || g_offActorLocation < 0) return;
+    if (g_offActorBase == -2) return;          // the one-shot resolve has not run yet
+    if (g_offActorBase < 0) {
+        static bool said = false;
+        if (!said) { said = true; Log("[climb] Actor::Base is absent - PK.13 cannot run"); }
+        return;
+    }
+    // Once a second at most. This is several object reads and a class-name walk, not a field
+    // read, and it is running while the player is hanging on something.
+    static long next = 0;
+    if (g_frames < next) return;
+    next = g_frames + 72;
+
+    float pl[3];
+    if (!SafeRead(g_playerPawn + g_offActorLocation, pl, sizeof(pl))) return;
+
+    uint32_t base = 0;
+    if (!SafeU32(g_playerPawn + g_offActorBase, &base) || base < 0x10000) {
+        // A real answer, and the one that closes this route if it holds: no Base means the
+        // climbable is referenced somewhere else, and the next place to look is the pawn's own
+        // fields rather than the engine's attachment slot.
+        Log("[climb] PK.13: the pawn has NO Base while on the pipe (raw %08X) - the climbable is"
+            " referenced somewhere else", base);
+        return;
+    }
+
+    char cls[64] = "?";
+    ReadClassName(base, cls, sizeof(cls));
+    float bl[3] = { 0, 0, 0 };
+    const bool haveB = SafeRead(base + g_offActorLocation, bl, sizeof(bl));
+
+    // ---- the extent, if the component chain is readable ----
+    //
+    // FBoxSphereBounds is { FVector Origin; FVector BoxExtent; FLOAT SphereRadius; } - Origin.Z
+    // plus and minus BoxExtent.Z is exactly the top and the bottom of the pipe, in world units,
+    // as the designer placed it. Everything the guard needs, if this reads.
+    float bo[3] = { 0, 0, 0 }, be[3] = { 0, 0, 0 };
+    bool haveBounds = false;
+    if (g_offActorCollisionComp >= 0 && g_offPrimBounds >= 0) {
+        uint32_t comp = 0;
+        if (SafeU32(base + g_offActorCollisionComp, &comp) && comp >= 0x10000)
+            haveBounds = SafeRead(comp + g_offPrimBounds, bo, sizeof(bo)) &&
+                         SafeRead(comp + g_offPrimBounds + 12, be, sizeof(be));
+    }
+
+    if (haveBounds) {
+        Log("[climb] PK.13: Base is %08X \"%s\" at (%.0f %.0f %.0f) | bounds origin"
+            " (%.0f %.0f %.0f) extent (%.0f %.0f %.0f) -> the pipe runs Z %.0f to %.0f"
+            " | the pawn is at Z %.0f, %.0f UU below the top and %.0f above the bottom",
+            base, cls, haveB ? bl[0] : 0.0f, haveB ? bl[1] : 0.0f, haveB ? bl[2] : 0.0f,
+            bo[0], bo[1], bo[2], be[0], be[1], be[2],
+            bo[2] - be[2], bo[2] + be[2], pl[2], (bo[2] + be[2]) - pl[2], pl[2] - (bo[2] - be[2]));
+    } else {
+        Log("[climb] PK.13: Base is %08X \"%s\" at (%.0f %.0f %.0f), pawn at (%.0f %.0f %.0f),"
+            " %+.0f UU above it | NO bounds (CollisionComponent %+d, Bounds %+d) - the extent"
+            " has to come from somewhere else",
+            base, cls, haveB ? bl[0] : 0.0f, haveB ? bl[1] : 0.0f, haveB ? bl[2] : 0.0f,
+            pl[0], pl[1], pl[2], haveB ? pl[2] - bl[2] : 0.0f,
+            g_offActorCollisionComp, g_offPrimBounds);
+    }
+}
+
+// ================================================================ PK.14: find the pipe by scan
+//
+// Three named routes to "which pipe am I on" are now closed, each by a measurement rather than a
+// guess: this level has 0 placed TdLadderVolume and 0 TdSwingVolume instances; Actor::Base
+// resolves at +0x0074 and reads NULL on every pipe sample; and the game holds move state Climb
+// while the pawn is written 1866 UU through it, so its own state machine will not object either.
+//
+// What has not been tried is not guessing the name. A UObject pointer is recognisable without
+// knowing what property holds it - it has a vtable inside the module and a Class at +0x34 whose
+// own name is readable - so every pointer-shaped field on the pawn, on its controller and on the
+// live TdMove_Climb can be enumerated and named. If the climbable is referenced anywhere in
+// those three objects, this prints its class and its offset, and the guard reads its bounds from
+// there. If nothing in the list looks like level geometry, that is the answer too: the reference
+// is not held, and Actor::Trace - located, with ProcessEvent already derived and verified - is
+// what is left.
+//
+// ⚠️ ONE-SHOT and bounded. 0x1000 bytes is 1024 dwords per object, each costing a few guarded
+// reads and a name lookup. That is far too much to do per frame and completely affordable once,
+// which is why it latches after the first pipe rather than sampling.
+static void PkScanObjectPointers(uintptr_t obj, const char* what)
+{
+    if (!obj) return;
+    Log("[climb] PK.14: ---- pointer-shaped fields on %s (%08X) ----", what, (uint32_t)obj);
+    int shown = 0;
+    for (uint32_t off = 4; off < 0x1000 && shown < 60; off += 4) {
+        uint32_t v = 0;
+        if (!SafeU32(obj + off, &v) || v < 0x10000) continue;
+        uint32_t vt = 0, cls = 0;
+        if (!SafeU32(v, &vt) || !InModule(vt)) continue;          // no vtable = not a UObject
+        if (!SafeU32(v + 0x34, &cls) || cls < 0x10000) continue;   // UObject::Class; the
+                                                                  // kUObjectClassOff below
+        char cn[96] = "?", on[96] = "?";
+        if (!ReadObjName(cls, cn, sizeof(cn))) continue;          // class name must read
+        ReadObjName(v, on, sizeof(on));
+        // Its Location, when the offset is known and the object is an Actor-shaped thing. A
+        // climbable's position is the discriminator: the pipe is metres away, a component or an
+        // anim node reads as the pawn's own position or as nonsense.
+        float l[3] = { 0, 0, 0 };
+        const bool haveL = g_offActorLocation >= 0 &&
+                           SafeRead(v + g_offActorLocation, l, sizeof(l));
+        ++shown;
+        Log("[climb] PK.14:   +0x%04X  %-30s  %-28s  loc (%.0f %.0f %.0f)%s",
+            off, cn, on, haveL ? l[0] : 0.0f, haveL ? l[1] : 0.0f, haveL ? l[2] : 0.0f,
+            haveL ? "" : "  <- unreadable");
+    }
+    Log("[climb] PK.14: ---- %d on %s ----", shown, what);
+}
+
+// Fires once, on the first pipe of the run, from the parkour tick.
+void PkScanClimbableOnce()
+{
+    if (g_pkMode != PK_CLIMB || !g_playerPawn) return;
+    static bool done = false;
+    if (done) return;
+    done = true;
+
+    float pl[3] = { 0, 0, 0 };
+    if (g_offActorLocation >= 0) SafeRead(g_playerPawn + g_offActorLocation, pl, sizeof(pl));
+    Log("[climb] PK.14: scanning for the climbable; the pawn is at (%.0f %.0f %.0f) - anything"
+        " in the lists below sitting a few metres from that, and not moving with it, is a"
+        " candidate for the pipe", pl[0], pl[1], pl[2]);
+
+    PkScanObjectPointers(g_playerPawn, "the pawn");
+    if (g_playerCtl) PkScanObjectPointers(g_playerCtl, "the controller");
+    {
+        uint8_t st = 0xFF;
+        uintptr_t mv = 0;
+        char cls[48];
+        if (g_offMoveState >= 0 && SafeRead(g_playerPawn + g_offMoveState, &st, 1) &&
+            ReadMoveClassName(g_playerPawn, (int)st, cls, sizeof(cls), &mv) && mv)
+            PkScanObjectPointers(mv, cls);
+    }
+}
+
+// ================================================================ PK.15: the pipe, measured
+//
+// ---- ⚠️ AND THE INSTANCE CENSUS THAT SAID THERE WERE NONE WAS ASKED TOO EARLY ----
+//
+// PK.13 walked GObjects for placed TdLadderVolume instances, found zero, and reported "this
+// level does not use them, and the pipe is something else". The pointer census then found one
+// referenced three times from a pawn that was standing on it.
+//
+// The census is not wrong about what it saw; it was asked before there was anything to see. It
+// runs at the move-probe one-shot, which fires as soon as a live pawn exists - and this game
+// streams its levels, so the sublevel holding the pipes had not loaded yet. That is the SAME
+// mistake the geometry census records at length ("It was not a negative result about the level;
+// it was a question asked before there was anything to answer it"), repeated by someone who had
+// read that comment.
+//
+// The rule it should have followed: a census that can only produce a negative must say WHEN it
+// looked. This one is driven off the pipe the player is actually on, so the question cannot be
+// asked before its answer exists.
+//
+// ---- the reference, found by class rather than by offset ----
+//
+// The pointer sits at TdMove_Climb+0x0198 and at pawn +0x00E4 / +0x02B4 in the run that found
+// it. None of those is hard-coded here. Offsets like that have moved across builds twice in this
+// file already, and "the first field that points at a TdLadderVolume" is both cheaper to verify
+// and immune to the layout shifting.
+static uintptr_t PkFindClimbVolumeWhere(uintptr_t* srcOut, uint32_t* offOut)
+{
+    if (srcOut) *srcOut = 0;
+    if (offOut) *offOut = 0;
+    if (!g_playerPawn) return 0;
+    uintptr_t objs[2] = { 0, g_playerPawn };
+    {
+        uint8_t st = 0xFF;
+        char cls[48];
+        uintptr_t mv = 0;
+        if (g_offMoveState >= 0 && SafeRead(g_playerPawn + g_offMoveState, &st, 1) &&
+            ReadMoveClassName(g_playerPawn, (int)st, cls, sizeof(cls), &mv))
+            objs[0] = mv;                    // the move object first: it is the narrower scope
+    }
+    for (int o = 0; o < 2; ++o) {
+        if (!objs[o]) continue;
+        for (uint32_t off = 4; off < 0x1000; off += 4) {
+            uint32_t v = 0, vt = 0, cls = 0;
+            if (!SafeU32(objs[o] + off, &v) || v < 0x10000) continue;
+            if (!SafeU32(v, &vt) || !InModule(vt)) continue;
+            if (!SafeU32(v + 0x34, &cls) || cls < 0x10000) continue;
+            char cn[96];
+            if (!ReadObjName(cls, cn, sizeof(cn))) continue;
+            if (strcmp(cn, "TdLadderVolume") == 0) {
+                if (srcOut) *srcOut = objs[o];
+                if (offOut) *offOut = off;
+                return v;
+            }
+        }
+    }
+    return 0;
+}
+
+static uintptr_t PkFindClimbVolume() { return PkFindClimbVolumeWhere(nullptr, nullptr); }
+
+// ---- the extent, derived rather than looked up ----
+//
+// PrimitiveComponent::Bounds is not in UClass::Children - the walk reports "no readable Children
+// pointer" on both PrimitiveComponent and ActorComponent - so there is no property offset to
+// read. It is a native field, and native fields are what this file derives from their own shape:
+// DerivePropertyOffsets does exactly this against TdSwanNeck's known values.
+//
+// FBoxSphereBounds is { FVector Origin; FVector BoxExtent; FLOAT SphereRadius; }, and it carries
+// its own signature: SphereRadius IS the magnitude of BoxExtent for bounds built from a box.
+// That relation holds over seven consecutive floats and essentially nothing else in an object
+// satisfies it by accident, so a match validates itself rather than being asserted.
+static bool PkDeriveBounds(uintptr_t obj, const float* nearPos, float* org, float* ext, int* atOff)
+{
+    if (!obj) return false;
+    for (uint32_t off = 0; off < 0x400; off += 4) {
+        float f[7];
+        if (!SafeRead(obj + off, f, sizeof(f))) continue;
+        bool ok = true;
+        for (int i = 0; i < 7 && ok; ++i) ok = std::isfinite(f[i]);
+        if (!ok) continue;
+        // The extent must be a real box: positive, and not absurd for a level.
+        for (int i = 3; i < 6 && ok; ++i) ok = (f[i] > 0.5f && f[i] < 20000.0f);
+        if (!ok) continue;
+        // The origin must be near the actor this belongs to, or it describes something else.
+        if (nearPos) {
+            const float dx = f[0] - nearPos[0], dy = f[1] - nearPos[1], dz = f[2] - nearPos[2];
+            if (sqrtf(dx*dx + dy*dy + dz*dz) > 4000.0f) continue;
+        }
+        // ...and the self-check: SphereRadius == |BoxExtent|.
+        const float mag = sqrtf(f[3]*f[3] + f[4]*f[4] + f[5]*f[5]);
+        if (mag < 1e-3f || fabsf(f[6] - mag) > mag * 0.01f) continue;
+        org[0] = f[0]; org[1] = f[1]; org[2] = f[2];
+        ext[0] = f[3]; ext[1] = f[4]; ext[2] = f[5];
+        if (atOff) *atOff = (int)off;
+        return true;
+    }
+    return false;
+}
+
+// Reports once per DISTINCT volume, so a run that visits two pipes reports both - the last run
+// only got one because the scan latched after the first, and the player had deliberately gone
+// and found a second for comparison.
+void PkClimbVolumeTick()
+{
+    if (g_pkMode != PK_CLIMB || !g_playerPawn) return;
+    static uintptr_t said = 0;
+    const uintptr_t vol = PkFindClimbVolume();
+    if (!vol) {
+        static bool moaned = false;
+        if (!moaned) {
+            moaned = true;
+            Log("[climb] PK.15: no TdLadderVolume is referenced from the move object or the pawn"
+                " on this pipe - the reference found last run is not universal");
+        }
+        return;
+    }
+    if (vol == said) return;
+    said = vol;
+
+    float vl[3] = { 0, 0, 0 }, pl[3] = { 0, 0, 0 };
+    const bool haveV = g_offActorLocation >= 0 && SafeRead(vol + g_offActorLocation, vl, sizeof(vl));
+    if (g_offActorLocation >= 0) SafeRead(g_playerPawn + g_offActorLocation, pl, sizeof(pl));
+
+    float org[3], ext[3];
+    int at = -1;
+    uintptr_t from = 0;
+    bool have = false;
+    // The component first - Bounds lives on the PrimitiveComponent - then the volume itself, in
+    // case this build keeps a copy there.
+    if (g_offActorCollisionComp >= 0) {
+        uint32_t comp = 0;
+        if (SafeU32(vol + g_offActorCollisionComp, &comp) && comp >= 0x10000) {
+            have = PkDeriveBounds(comp, haveV ? vl : nullptr, org, ext, &at);
+            if (have) from = comp;
+        }
+    }
+    if (!have) {
+        have = PkDeriveBounds(vol, haveV ? vl : nullptr, org, ext, &at);
+        if (have) from = vol;
+    }
+
+    if (have)
+        Log("[climb] PK.15: pipe %08X TdLadderVolume at (%.0f %.0f %.0f) | bounds at %08X+0x%03X:"
+            " origin (%.0f %.0f %.0f) extent (%.0f %.0f %.0f) -> the pipe runs Z %.0f to %.0f |"
+            " the pawn is at Z %.0f, %.0f UU below the top, %.0f above the bottom",
+            (uint32_t)vol, vl[0], vl[1], vl[2], (uint32_t)from, at,
+            org[0], org[1], org[2], ext[0], ext[1], ext[2],
+            org[2] - ext[2], org[2] + ext[2], pl[2],
+            (org[2] + ext[2]) - pl[2], pl[2] - (org[2] - ext[2]));
+    else
+        Log("[climb] PK.15: pipe %08X TdLadderVolume at (%.0f %.0f %.0f), pawn at Z %.0f | NO"
+            " bounds matched the FBoxSphereBounds signature in the volume or its"
+            " CollisionComponent (+0x%04X) - the extent is stored some other way",
+            (uint32_t)vol, vl[0], vl[1], vl[2], pl[2], g_offActorCollisionComp);
+}
+
+// ---- PK.16: the top-and-bottom guard, off the pipe's own extent ----
+//
+// The gap this closes has been flagged in the direct-drive write since the pipe first moved:
+// "What does NOT exist yet is a top-and-bottom guard - the pipe's version of the end-of-ledge
+// problem." Measured, the pawn was written 1866 UU through a pipe while the game held Climb
+// throughout, so nothing was ever going to stop it but this.
+//
+// The extent is the designer's, read off the TdLadderVolume the player is actually on, and it
+// reproduced across two different pipes at the same component offset:
+//
+//   pipe 1  extent (64 48 608)  ->  Z 4256 to 5472
+//   pipe 2  extent (64 48 400)  ->  Z 4960 to 5760
+//
+// ---- ⚠️ IT FAILS OPEN, AND THAT IS THE PROPERTY THAT MATTERS ----
+//
+// Same reasoning the ledge's blocker is built on, and worth restating because the failure modes
+// are not symmetric. With no volume and no bounds this clamps NOTHING and the player can climb
+// off the end exactly as they can today - a known bug, visible, recoverable. A guard that failed
+// CLOSED on a signal it could not read would pin the player somewhere in the middle of a pipe
+// with no way out, which is worse than the bug it replaces.
+//
+// The reference genuinely does go away: it read absent one frame before Climb -> Walking as the
+// game tore the climb down. So an absent volume is normal at the edges of a climb, not an error,
+// and it must not latch the last pipe's extent onto the next thing the player touches.
+//
+// ⚠️ The clamp is on the WRITE, not on the pull. g_pkDesired stays whatever the player's arm
+// asked for, so a hand that keeps pulling past the top does not accumulate a debt that fires
+// when they come back down - the same reason the ledge's leash clamps the world position rather
+// than `travel`.
+//
+// ⚠️ And what it does NOT do: at the top of a pipe vanilla dismounts you onto the roof, and this
+// only stops you. That is a smaller behaviour than the game's, deliberately - the dismount needs
+// the game's own climb logic to run, which is the stick-probe question the ledge answers and the
+// pipe has never been asked. Stopping at the top is strictly better than flying past it, and it
+// makes the extent's correctness visible before anything is built on top of it.
+// ---- ⚠️ THE TOP NEEDS A MARGIN AND THE BOTTOM DOES NOT ----
+//
+// Measured in the headset over two pipes: clamping the write to the raw volume stopped the
+// player exactly right at the BOTTOM of both, and too high at the TOP of both. So the volume is
+// not symmetric padding around the climbable - its lower face sits where a hanging pawn belongs,
+// and its upper face is somewhere above where one does.
+//
+// That asymmetry is what a ladder volume is FOR. The game has to notice "the player has reached
+// the top" while they are still inside the volume, so the volume has to extend past the last
+// position they can legitimately hold - and the run bears that out: the game's own dismount to
+// Walking fired with the pawn at Z 5749 against a volume top of 5760.
+//
+// The size of that gap is not derivable from anything readable. TdLadderVolume dumps EMPTY even
+// with the walk raised to ten levels, so the retail cook has stripped its property list and
+// there is no authored TopOffset to read. It is a feel value, and this project already has the
+// idiom for feel values: tune it live in the headset against the F3 overlay, then hard-code the
+// measured number back into the global. g_wristCalibrationDeg and g_forearmRollCalibrationDeg
+// were both settled that way, and their comments carry the same warning this one does -
+// once tuned, THIS CONSTANT IS A MEASUREMENT. Do not "clean it up".
+//
+// Starts at 0, which is exactly the behaviour just tested, so the first press moves away from a
+// known state rather than from a guess.
+// ⚠️ 90 IS A MEASUREMENT, and it is now doing two jobs. Tuned live in the headset on
+// 2026-08-31, ten centimetres a press: first to 110 against the body's stopping point alone,
+// then down to 90 once the HAND ceiling was derived from it and the anchors would not reach high
+// enough. The bottom needs no margin at all; see the asymmetry above. Do not round it off.
+//
+// ⚠️ The two are coupled on purpose - handTop = (volume top - this) + rise + reach - so
+// moving this moves both the body's stop and the hands' ceiling together. That is why 20 UU came
+// off it to fix the anchors, and it means the body now stops 20 UU higher than the value tuned
+// for the body alone. If that reads wrong, the fix is g_pkHandReachUU (';' and '''), which
+// raises the hands WITHOUT moving the body - that axis exists precisely so these two do not have
+// to share one number.
+float g_pkPipeTopMargin = 90.0f;            // UU below the volume top that the pawn may reach
+float g_pkPipeOrg[3] = { 0, 0, 0 }, g_pkPipeExt[3] = { 0, 0, 0 };   // PK.19
+float g_pkPipeZMin = 0.0f, g_pkPipeZMax = 0.0f;   // PK.20: the hands read these too
+bool  g_pkPipeOk = false;                   // is there a believable extent right now?
+bool  g_pkPipeGuard = true;                 // '[' toggles, so the clamp can be A/B'd in place
+// PK.22: ']' toggles the HAND half of the extent independently of the body half, so the fist
+// and the stopping point can be told apart in one climb instead of two builds.
+bool  g_pkHandLineClamp = true;
+// PK.25: the anchored hand's height above the pawn, UU, measured live. Seeded at the 32 the
+// first three anchors measured, so the very first grip of a run is already close.
+float g_pkHandRiseUU = 32.0f;
+// PK.29: how far past a resting grip the player can take a new hold. Tuned live with ';' / '''.
+// Starts at 0, which is exactly the behaviour just reported as too low, so the first press
+// moves away from a known state rather than from a guess.
+float g_pkHandReachUU = 0.0f;
+float g_pkPipeHeadroom = 0.0f, g_pkPipeLegroom = 0.0f;   // overlay: UU to the top and bottom
+static long g_pkPipeHeld = 0;               // frames spent against an end, for the log
+
+// Cheap per-frame refresh. PkFindClimbVolume scans up to 0x1000 bytes on two objects and cannot
+// run every frame, so the pointer is cached with the field it came from and re-read from there;
+// a full rescan happens only when that check fails. On a settled pipe this is two reads.
+static uintptr_t g_pkPipeVol = 0, g_pkPipeSrc = 0;
+static uint32_t  g_pkPipeOff = 0;
+
+void PkPipeExtentTick()
+{
+    if (g_pkMode != PK_CLIMB) {
+        g_pkPipeOk = false; g_pkPipeVol = 0; g_pkPipeSrc = 0;
+        g_pkPipeHeadroom = g_pkPipeLegroom = 0.0f;
+        return;
+    }
+    // Still the same volume in the same slot?
+    bool still = false;
+    if (g_pkPipeVol && g_pkPipeSrc) {
+        uint32_t v = 0;
+        still = SafeU32(g_pkPipeSrc + g_pkPipeOff, &v) && (uintptr_t)v == g_pkPipeVol;
+    }
+    if (!still) {
+        // ⚠️ A new pipe invalidates everything measured against the old one. The restore
+        // above is what made this urgent, but the principle is general and the ledge learned it
+        // the same way: "Nothing armed on a ledge may outlive it."
+        if (g_pkPipeVol) { g_pkLastGoodOk = false; g_pkGapGoodOk = false; }
+        g_pkPipeOk = false;
+        g_pkPipeVol = PkFindClimbVolumeWhere(&g_pkPipeSrc, &g_pkPipeOff);
+        if (!g_pkPipeVol) { g_pkPipeHeadroom = g_pkPipeLegroom = 0.0f; return; }
+        float vl[3], org[3], ext[3];
+        const bool haveV = g_offActorLocation >= 0 &&
+                           SafeRead(g_pkPipeVol + g_offActorLocation, vl, sizeof(vl));
+        int at = -1;
+        bool have = false;
+        if (g_offActorCollisionComp >= 0) {
+            uint32_t comp = 0;
+            if (SafeU32(g_pkPipeVol + g_offActorCollisionComp, &comp) && comp >= 0x10000)
+                have = PkDeriveBounds(comp, haveV ? vl : nullptr, org, ext, &at);
+        }
+        if (!have) have = PkDeriveBounds(g_pkPipeVol, haveV ? vl : nullptr, org, ext, &at);
+        if (!have) return;                  // fail open: no extent, no clamp
+        memcpy(g_pkPipeOrg, org, sizeof(g_pkPipeOrg));
+        memcpy(g_pkPipeExt, ext, sizeof(g_pkPipeExt));
+        g_pkPipeZMin = org[2] - ext[2];
+        g_pkPipeZMax = org[2] + ext[2];
+        g_pkPipeOk = true;
+        Log("[climb] PK.16: on pipe %08X, Z %.0f to %.0f (%.1f m of pipe)",
+            (uint32_t)g_pkPipeVol, g_pkPipeZMin, g_pkPipeZMax,
+            (g_pkPipeZMax - g_pkPipeZMin) / 100.0f);
+    }
+    if (g_pkPipeOk && g_playerPawn && g_offActorLocation >= 0) {
+        float pl[3];
+        if (SafeRead(g_playerPawn + g_offActorLocation, pl, sizeof(pl))) {
+            g_pkPipeHeadroom = (g_pkPipeZMax - g_pkPipeTopMargin) - pl[2];
+            g_pkPipeLegroom  = pl[2] - g_pkPipeZMin;
+        }
+    }
+}
+
+// ---- ⚠️ PK.19: A BASE FROM ANOTHER PIPE IS NOT A BASE ----
+//
+// Reported as "I jumped from the right pipe to the left one and it teleported me back", and it
+// survived the fix for the ledge-restore that was doing it before - so this is a second path to
+// the same place, and the player is right that it is recent.
+//
+// On a pipe the direct drive writes want3.xy straight from g_pkDirectBase, which is latched from
+// the pawn when an anchor is taken. Every XY the player ever gets is therefore whatever that
+// latch captured, held for the life of the grip. If the latch is even one frame stale - taken
+// before the game finished moving the pawn to the new climbable - the body is pinned 96 UU away
+// for the whole climb, which is exactly the distance between these two pipes.
+//
+// Chasing WHICH frame is the stale one has already cost this session two wrong answers, both
+// times because a diagnostic lied: the drift trace whose reset could never fire, and the
+// contention number measured against a static that outlives the climb. So this does not try to
+// identify the moment. It states the invariant instead, which is true whatever the cause:
+//
+//   the pawn is climbing THIS pipe, so the position written for it must lie within THIS pipe's
+//   volume.
+//
+// The volume's own XY extent is the test, plus a tolerance for the stand-off - the pawn hugs the
+// pipe from a distance rather than sitting on its axis, measured at about 34 UU. A base outside
+// that cannot belong to the pipe the player is on, and the response is to drop the latch so the
+// next frame takes a fresh one from wherever the pawn actually is.
+//
+// ⚠️ It re-latches rather than clamping. Clamping the write would hold the body at the edge
+// of the volume while the base stayed wrong, so every frame would fight and the player would sit
+// pinned against an invisible wall - the saturation failure this file has already paid for twice
+// (the camera lead, and the grab freeze). Dropping the latch fixes the cause in one frame.
+//
+// ⚠️ And it fails open in the direction that matters: with no volume there is no test and
+// nothing changes.
+static bool PkPipeBaseIsStale(const float* base)
+{
+    if (!g_pkPipeOk || !base) return false;
+    const float dx = fabsf(base[0] - g_pkPipeOrg[0]);
+    const float dy = fabsf(base[1] - g_pkPipeOrg[1]);
+    const float tol = 60.0f;                 // the stand-off, measured at ~34 UU, with headroom
+    return dx > g_pkPipeExt[0] + tol || dy > g_pkPipeExt[1] + tol;
+}
+
+// Applied to the Z the direct drive is about to write. Returns it unchanged whenever anything
+// needed to judge it is missing.
+static float PkPipeClampZ(float wantZ)
+{
+    if (!g_pkPipeGuard || !g_pkPipeOk) return wantZ;
+    // The margin trims the TOP only - the bottom measured correct against the raw volume on both
+    // pipes, and trimming a face that is already right would only introduce a second error.
+    // Guarded against a margin big enough to invert the range on a short pipe.
+    float top = g_pkPipeZMax - g_pkPipeTopMargin;
+    if (top < g_pkPipeZMin) top = g_pkPipeZMin;
+    float z = wantZ;
+    if (z > top) z = top;
+    if (z < g_pkPipeZMin) z = g_pkPipeZMin;
+    if (z != wantZ) {
+        const bool atTop = (wantZ > top);
+        if (++g_pkPipeHeld == 1 || (g_pkPipeHeld % 72) == 0)
+            Log("[climb] PK.17: holding at the %s - asked for Z %.0f, held at %.0f"
+                " (volume %.0f..%.0f, top margin %.0f UU, %ld frames against it)",
+                atTop ? "TOP" : "BOTTOM", wantZ, z, g_pkPipeZMin, g_pkPipeZMax,
+                g_pkPipeTopMargin, g_pkPipeHeld);
+        g_pkBlock = atTop ? "at the top of the pipe" : "at the bottom of the pipe";
+    } else {
+        g_pkPipeHeld = 0;
+    }
+    return z;
 }
 
 static bool LooksLikeRigObject(uintptr_t obj, const char* expectedClass)
@@ -17962,6 +19193,11 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                             while (a < -3.14159265f) a += 6.28318531f;
                             return a;
                         };
+                        // PK.26: the rendered yaw itself, published for the jump trace. Every
+                        // other number in that trace is something we WROTE; this is the only one
+                        // that says what the player was actually shown, and the complaint is
+                        // about what the player was shown.
+                        g_viewYawDeg = atan2f(mfy, mfx) * 57.29578f;
                         const float psi = wrapf(atan2f(mfy, mfx) + hy);
                         static bool  have = false;
                         static float mean = 0.0f;
@@ -20495,7 +21731,14 @@ static int BitIndexOf(uint32_t mask)
 // capped at 3 because the chain continues into Object and its hundreds of engine fields, and
 // functions are dropped for the reason ResolveMoveProbeProps drops them: Children holds methods
 // too, and a method's offset dword is not an offset.
-static void DumpMoveClassProps(const char* className)
+// ⚠️ maxDepth defaults to 3, which is what every move class needs and what TdLadderVolume
+// was silently starved by. A class that declares nothing of its own consumes a level per
+// EMPTY ancestor - the null-Children path below does `continue`, which still increments
+// depth - so three levels reached nothing at all on a class whose fields are inherited from
+// further up. It read as "the class is empty", and I reported it as "the class is absent".
+// It is neither: FindClassByName finds it every run, and the header printing without
+// NOT FOUND beside it says so on every one of those runs.
+static void DumpMoveClassProps(const char* className, int maxDepth = 3)
 {
     if (g_offChildren < 0 || g_offNext < 0 || g_offPropOff < 0) return;
     uintptr_t cls = FindClassByName(className);
@@ -20503,7 +21746,7 @@ static void DumpMoveClassProps(const char* className)
 
     Log("[moveprop] ---- %s ----", className);
     int lines = 0;
-    for (int depth = 0; cls && depth < 3 && lines < 160; ++depth) {
+    for (int depth = 0; cls && depth < maxDepth && lines < 160; ++depth) {
         char cn[96] = "?";
         ReadObjName(cls, cn, sizeof(cn));
         // ⚠️ continue, NOT break. A class that declares no properties of its own has a null
@@ -21209,9 +22452,128 @@ static void ResolveMoveProbeProps()
     // TdMove_Swing while SwingAngle sits right there. Both point the same way: the MOVE runs the
     // animation, the VOLUME owns the thing being climbed or swung from. These three dumps are
     // what turn that from a hypothesis into offsets.
-    DumpMoveClassProps("TdLadderVolume");
-    DumpMoveClassProps("TdSwingVolume");
-    DumpMoveClassProps("TdAnimNodeClimb");
+    // 10, not 3: these three declare nothing themselves and inherit everything, so the
+    // default cap spent every level on empty ancestors. Actor is about six above a Volume.
+    DumpMoveClassProps("TdLadderVolume", 10);
+    DumpMoveClassProps("TdSwingVolume", 10);
+    DumpMoveClassProps("TdAnimNodeClimb", 10);
+
+    // ---- PK.13: WHICH pipe, and where does it stop? ----
+    //
+    // The player can climb above the top of a pipe and below its bottom, because nothing in this
+    // file knows a pipe HAS a top or a bottom. PkClimbLine returns the pawn's own position with
+    // axis (0,0,1): an infinite vertical line through wherever the player happens to be. Every
+    // guard downstream is built on that line, so all of them are guarding an infinite pipe.
+    //
+    // The ledge solved the same problem by reading the game's verdict - ask to shimmy, watch
+    // MoveLedgeLocation advance or not. That does not transpose. The pipe's equivalent field is
+    // the pawn's own Z, which direct drive WRITES, so there is no independent value left to
+    // watch: we would be asking the game a question and then answering it ourselves.
+    //
+    // ---- ⚠️ THE FIRST ATTEMPT AT THIS ASKED THREE QUESTIONS AND MISREAD ALL THREE ----
+    //
+    // It reported Base, CollisionComponent and Bounds all ABSENT and I read that as the engine
+    // answering. It was the probe failing, three separate ways, and each one is a lesson this
+    // file has already written down somewhere else:
+    //
+    //   verbose=false. LookupProp says "class NOT FOUND" and "property NOT FOUND after walking
+    //   N fields" - two completely different failures - and both were silenced. A -1 that cannot
+    //   say why is not a measurement. Verbose now.
+    //
+    //   No owner fallback. Every entry in the probe table below takes a second opinion from the
+    //   GObjects owner pass, because the retail cook strips properties from UClass::Children
+    //   while their storage survives - that is written up twice in this file and the motion rig
+    //   depends on it. This asked the Children walk only.
+    //
+    //   And the class chain. Location is resolved as TdPlayerController::Location, not
+    //   Actor::Location, and it works because LookupProp climbs SuperField. Asking "Actor"
+    //   directly rests on FindClassByName resolving the root class by name, which nothing here
+    //   had ever tested. Concrete classes are asked first now, with Actor as the last resort.
+    //
+    // ---- and TdLadderVolume was never the dead end I called it ----
+    //
+    // It dumped empty for three runs and I reported the authored-volume route closed. The class
+    // is found every single run - the header prints without NOT FOUND beside it - and the empty
+    // dump was the depth cap above, spending all three levels on ancestors that declare nothing.
+    // The deep walk is what settles whether it carries an extent.
+    //
+    // The geom census missed it for a third, unrelated reason: its name filter is
+    // { Ledge, Grab, Climb, Vault, Zip, Pipe, Balance } and "TdLadderVolume" contains none of
+    // them, so its instance count was never taken either. Three independent gaps, all reading as
+    // one confident negative. Hence the instance walk below, which asks the question directly.
+    {
+        struct Want { const char* prop; const char* const* classes; int* out; };
+        static const char* kBaseClasses[]  = { "TdPlayerPawn", "TdPawn", "Pawn", "Actor", nullptr };
+        static const char* kCompClasses[]  = { "TdPlayerPawn", "TdPawn", "Pawn", "Actor", nullptr };
+        static const char* kBoundsClasses[]= { "PrimitiveComponent", "ActorComponent", nullptr };
+        const Want wants[] = {
+            { "Base",               kBaseClasses,   &g_offActorBase },
+            { "CollisionComponent", kCompClasses,   &g_offActorCollisionComp },
+            { "Bounds",             kBoundsClasses, &g_offPrimBounds },
+        };
+        for (const Want& w : wants) {
+            *w.out = -1;
+            for (int c = 0; w.classes[c] && *w.out < 0; ++c)
+                *w.out = LookupProp(w.classes[c], w.prop, true);
+            if (*w.out < 0) {
+                char kind[32] = "?", owner[64] = "?";
+                uint32_t m = 0;
+                const int o = OwnerLookupAnyClass(w.prop, kind, sizeof(kind),
+                                                  owner, sizeof(owner), &m);
+                if (o >= 0) {
+                    *w.out = o;
+                    Log("[climb] PK.13: %s at +0x%04X via the OWNER pass, declared on %s (%s)"
+                        " - the Children walk does not reach it", w.prop, o, owner, kind);
+                }
+            }
+            if (*w.out < 0) Log("[climb] PK.13: %-18s -> ABSENT", w.prop);
+            else            Log("[climb] PK.13: %-18s -> +0x%04X", w.prop, *w.out);
+        }
+    }
+
+    // ---- every climbable in the level, and where it is ----
+    //
+    // If TdLadderVolume instances exist, this is the guard: the pipe's own extent, authored, and
+    // at runtime the player is on whichever one is nearest. One walk of GObjects at the same
+    // one-shot moment the rest of this resolves - the same cost FindClassByName already pays a
+    // dozen times up there, and never anywhere near gameplay.
+    for (int pass = 0; pass < 2; ++pass) {
+        const char* want = pass ? "TdSwingVolume" : "TdLadderVolume";
+        const uintptr_t wantCls = FindClassByName(want);
+        if (!wantCls) { Log("[climb] PK.13: no %s class in this build", want); continue; }
+        uint32_t data = 0, count = 0;
+        if (!SafeU32(g_gobjAddr, &data) || !SafeU32(g_gobjAddr + 4, &count)) break;
+        int found = 0;
+        for (uint32_t i = 0; i < count && found < 40; ++i) {
+            uint32_t obj = 0, cls = 0, vt = 0;
+            if (!SafeU32(data + i * 4, &obj) || obj < 0x10000) continue;
+            if (!SafeU32(obj, &vt) || !InModule(vt)) continue;
+            if (!SafeU32(obj + kUObjectClassOff, &cls) || (uintptr_t)cls != wantCls) continue;
+            char nm[96] = "?";
+            ReadObjName(obj, nm, sizeof(nm));
+            if (strncmp(nm, "Default__", 9) == 0) continue;   // the CDO is not a placed actor
+            ++found;
+            float l[3] = { 0, 0, 0 };
+            const bool haveL = g_offActorLocation >= 0 &&
+                               SafeRead((uintptr_t)obj + g_offActorLocation, l, sizeof(l));
+            float bo[3] = { 0, 0, 0 }, be[3] = { 0, 0, 0 };
+            bool haveB = false;
+            if (g_offActorCollisionComp >= 0 && g_offPrimBounds >= 0) {
+                uint32_t comp = 0;
+                if (SafeU32((uintptr_t)obj + g_offActorCollisionComp, &comp) && comp >= 0x10000)
+                    haveB = SafeRead(comp + g_offPrimBounds, bo, sizeof(bo)) &&
+                            SafeRead(comp + g_offPrimBounds + 12, be, sizeof(be));
+            }
+            if (haveB)
+                Log("[climb] PK.13: %s %-28s at (%.0f %.0f %.0f) | extent Z %.0f to %.0f",
+                    want, nm, l[0], l[1], l[2], bo[2] - be[2], bo[2] + be[2]);
+            else
+                Log("[climb] PK.13: %s %-28s at (%.0f %.0f %.0f) | no bounds",
+                    want, nm, haveL ? l[0] : 0.0f, haveL ? l[1] : 0.0f, haveL ? l[2] : 0.0f);
+        }
+        Log("[climb] PK.13: %d placed %s instance(s)%s", found, want,
+            found ? "" : " - this level does not use them, and the pipe is something else");
+    }
 
     Log("[moveprop] resolving parkour properties on the move classes:");
     for (int i = 0; i < kMoveProbeCount; ++i) {
@@ -21940,6 +23302,17 @@ static void DrawOverlay(IDirect3DDevice9* dev)
             // means the pull is reaching the eye, and that is the next thing to fix.
             OverlayRow(lines, &nl, "SPIN yaw %.2f pitch %.2f deg/f | PULL %.2f | VIEW %.2f UU/f",
                        g_pkYawJitDeg, g_pkPitchJitDeg, g_pkYawPullDeg, g_pkViewStep);
+            // PK.16: how much pipe is left in each direction, and whether the guard can see it.
+            // "no extent" is a fact worth showing - the clamp is silently inert without one.
+            if (g_pkPipeOk) {
+                OverlayRow(lines, &nl, "PIPE up %.0f down %.0f UU | top-margin %.0f (-/=) |"
+                           " guard %s", g_pkPipeHeadroom, g_pkPipeLegroom, g_pkPipeTopMargin,
+                           g_pkPipeGuard ? "ON" : "OFF");
+                OverlayRow(lines, &nl, "HAND rise %.0f + reach %.0f (;/') = %.0f above the stop",
+                           g_pkHandRiseUU, g_pkHandReachUU,
+                           g_pkHandRiseUU + g_pkHandReachUU);
+            } else
+                OverlayRow(lines, &nl, "PIPE no extent - guard inert (clamps nothing)");
         }
         if (g_pkDirectBody)
             OverlayRow(lines, &nl, "DIRECT %s %s | ask%s%+d arm%s end%+d",
