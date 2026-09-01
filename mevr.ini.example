@@ -201,6 +201,19 @@ ParkourLetGoDrops = on
 ; or two across a swap. 12 is about a fifth of a second. Range 4..120.
 ParkourLetGoFrames = 12
 
+; ParkourPullUp: hanging from a ledge with BOTH hands anchored, push both controllers down and
+; the climb axis is asserted for you - the physical action of pushing off an edge, instead of
+; reaching for the stick. It measures each hand's height relative to your own head, so squatting
+; to look at the drop RAISES that number and cannot trigger it. The physical stick wins the
+; instant you touch it.
+ParkourPullUp = on
+
+; How far both hands must fall below their recent highest position, in metres. The baseline rises
+; to a new high at once and forgets slowly, so this is "a deliberate push down", not "your hands
+; are low". Range 0.05..0.60. Watch the PULLUP row in the overlay to tune it - it shows each
+; hand's live drop against this threshold.
+ParkourPullUpDrop = 0.20
+
 ; ParkourGhostHands: at the moment control is handed back, the pose the game just left on the
 ; ledge is frozen and drawn translucently where it stands. Your own hands stay yours to move;
 ; the ghost marks the ledge and shows what holding it looks like, so reaching into it and

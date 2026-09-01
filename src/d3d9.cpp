@@ -3632,6 +3632,23 @@ static bool  g_pkSnapOn = true;
 static bool  g_pkHandHeld[2] = { false, false };
 bool  g_pkHandAnchored[2] = { false, false };
 bool  g_pkHandOffPipe[2] = { false, false };   // PK.28: snap judged this hand past the end   // latched on the grip press: is this hand ON the ledge
+// ---- ⚠️ PK.45: THE SAME FACT FOR A LEDGE, WHICH PK.28 ONLY EVER FIXED FOR A PIPE ----
+//
+// PK.28's report was "even above the pipe, even though I properly only made a fist, it was still
+// functioning as an anchor point, moving the camera around". The fix taught the anchor selection
+// about ONE refusal - off the end of a pipe - and left the other one, which is older and applies
+// to both surfaces: a grip closed further from the hold than the snap radius. That hand is
+// refused, poses a fist, and until now still drove the body and the camera lead, because the
+// selection asks only "is the grip squeezed and the controller tracked".
+//
+// Reported again, on a ledge, in exactly the same words. Same bug, same shape, other surface.
+//
+// ⚠️ A POSITIVE refusal, like g_pkHandOffPipe and for the same reason. Gating on
+// !g_pkHandAnchored would be far stricter than it sounds - nothing is anchored during the entry
+// window or while the snap is off, and the body would stop responding on those frames. This is
+// only ever set where the snap actually measured a distance and judged it too far, and it is
+// cleared on every path that stands the snap down, so it cannot be stale.
+bool  g_pkHandTooFar[2] = { false, false };   // PK.45: snap judged this hand out of reach
 // ---- ⚠️ anchor to where the GAME puts the hand, not to a line we computed ----
 //
 // The anchor was the closest point on a ledge line built from MoveLedgeLocation. That is close -
@@ -3998,6 +4015,7 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
         // out of the anchor selection until the player happened to re-grip - a hand that stops
         // working for reasons it can no longer see.
         g_pkHandOffPipe[hand] = false;
+        g_pkHandTooFar[hand] = false;       // PK.45: cleared with the anchor, never left latched
         g_pkHandPending[hand] = 0;
         return;
     }
@@ -4213,6 +4231,7 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
             // fix is to refuse the grip honestly rather than anchor to a point the hand is not
             // at; if the hand anchors normally and the pose is still wrong, it is not this.
             g_pkHandOffPipe[hand] = offPipe;
+            g_pkHandTooFar[hand] = dist > g_pkSnapRadius * g_pkUUPerMetre;   // PK.45
             if (offPipe)
                 Log("[climb] PK.23: %s grip refused - the reach lands at Z %.0f, off the %s of a"
                     " pipe that runs %.0f..%.0f (the body stops %.0f UU lower; a hand may reach"
@@ -4239,6 +4258,7 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
                     g_pkHandAnchor[hand][2] = cz + mine.z;
                     g_pkHandAnchored[hand] = true;
                     g_pkHandOffPipe[hand] = false;
+                    g_pkHandTooFar[hand] = false;       // PK.45
                     // PK.25: the hand's height above the body, measured from the thing being
                     // latched rather than assumed. Slow, because it only has to track the rig.
                     if (g_pkMode == PK_CLIMB && g_playerPawn && g_offActorLocation >= 0) {
@@ -5008,6 +5028,7 @@ static void PkCornerTick()
         g_pkCornerYaw0 = yaw;
         g_pkHandAnchored[0] = g_pkHandAnchored[1] = false;
         g_pkHandOffPipe[0] = g_pkHandOffPipe[1] = false;    // PK.28
+        g_pkHandTooFar[0] = g_pkHandTooFar[1] = false;      // PK.45
         g_pkHandPending[0] = g_pkHandPending[1] = 0;
         g_pkDirectLive = false;
         g_pkDirectHave = false;             // forces a fresh base AND a fresh axis afterwards
@@ -5599,6 +5620,107 @@ static void ParkourDirectBodyTick()
     havePrev = true;
 }
 
+// ================================================================ PK.44: push down to get up
+//
+// Hanging from a ledge, the one thing left that still needed the stick was getting ON to it. The
+// physical action is unambiguous and everybody already knows it: both hands on the edge, push
+// down, and your body goes up. So that gesture asserts the stick the game wants for a pull-up,
+// and the mantle is a thing you do with your arms rather than a thing you ask for with a thumb.
+//
+// ⚠️ rel.y IS THE RIGHT SIGNAL AND SQUATTING IS THE TEST OF IT.
+//
+// ArmSwingHand::rel is grip-minus-head in room axes, so rel.y is each hand's height relative to
+// the player's own head. Pushing the controllers down drops it, which is the gesture. Squatting
+// - which lowers the head while the hands stay put - RAISES it, so a player crouching to look at
+// the drop below them cannot trigger a pull-up. Absolute room height would have confused the two,
+// and this file has already paid for that once: AS.3's crouch gesture is suppressed outright on
+// a ledge because the button it presses is the let-go.
+//
+// ---- both hands, anchored, and a drop measured from where the hands have BEEN ----
+//
+// Both, because one hand pushing down is half a hand-over-hand cycle and happens constantly.
+// Anchored, because a hand that is not on the ledge is not pushing off it - a fist waving in
+// open air must not mantle the player.
+//
+// The baseline follows the hands the way AS.3's crouch baseline follows the head: it rises to a
+// new high immediately and decays back only very slowly. So the number tested is "how far below
+// their recent highest position are these hands", which survives the player drifting up and down
+// the ledge over a long hang and still reads a deliberate push as the sharp change it is.
+static bool  g_pkPullUp = true;             // ParkourPullUp in mevr.ini
+static float g_pkPullUpDrop = 0.20f;        // metres both hands must fall below their baseline
+static float g_pkPullUpHyst = 0.08f;        // ...and come back within, before it can fire again
+static const long kPkPullUpAssert = 20;     // frames the stick is then held up
+// Not full deflection: the same 0.97 the pipe handover uses, which is the only value in this file
+// measured to make the game act on an injected climb axis.
+static const float kPkPullUpStick = 0.97f;
+static float g_pkPullUpBase[2] = { 0.0f, 0.0f };
+static float g_pkPullUpFell[2] = { 0.0f, 0.0f };   // live drop per hand, for the overlay
+static bool  g_pkPullUpBaseOk = false;
+static bool  g_pkPullUpArmed = true;        // cleared on firing, restored by the hysteresis
+static long  g_pkPullUpHold = 0;            // frames of stick-up left to assert
+static long  g_pkPullUps = 0;
+static const char* g_pkPullUpWhy = "off the wall";
+
+static void PkPullUpTick()
+{
+    // ⚠️ Decremented first and unconditionally, exactly as PK.42's drop assert is. A successful
+    // pull-up ENDS the ledge, so the mode has already changed while the stick still needs to be
+    // held; standing the assert down with the mode would release it on the frame the game began
+    // acting on it.
+    if (g_pkPullUpHold > 0) --g_pkPullUpHold;
+
+    const bool eligible = g_pkPullUp && g_pkMode == PK_LEDGE &&
+                          g_pkHandAnchored[0] && g_pkHandAnchored[1] &&
+                          g_swingL.tracked && g_swingR.tracked;
+    if (!eligible) {
+        g_pkPullUpBaseOk = false;
+        g_pkPullUpArmed = true;
+        g_pkPullUpFell[0] = g_pkPullUpFell[1] = 0.0f;
+        g_pkPullUpWhy = !g_pkPullUp ? "off"
+                      : g_pkMode != PK_LEDGE ? "not a ledge"
+                      : "need both hands";
+        return;
+    }
+
+    const float y[2] = { g_swingL.rel.y, g_swingR.rel.y };
+    if (!g_pkPullUpBaseOk) {
+        g_pkPullUpBase[0] = y[0];
+        g_pkPullUpBase[1] = y[1];
+        g_pkPullUpBaseOk = true;
+        g_pkPullUpWhy = "ready";
+        return;                     // never fire on the frame the baseline is seeded
+    }
+
+    for (int h = 0; h < 2; ++h) {
+        if (y[h] > g_pkPullUpBase[h]) g_pkPullUpBase[h] = y[h];        // rises at once
+        else g_pkPullUpBase[h] += (y[h] - g_pkPullUpBase[h]) * 0.002f; // and forgets slowly
+        g_pkPullUpFell[h] = g_pkPullUpBase[h] - y[h];
+    }
+
+    if (!g_pkPullUpArmed) {
+        const float back = g_pkPullUpDrop - g_pkPullUpHyst;
+        if (g_pkPullUpFell[0] < back && g_pkPullUpFell[1] < back) {
+            g_pkPullUpArmed = true;
+            g_pkPullUpWhy = "ready";
+        } else {
+            g_pkPullUpWhy = "hands still down";
+        }
+        return;
+    }
+
+    if (g_pkPullUpFell[0] >= g_pkPullUpDrop && g_pkPullUpFell[1] >= g_pkPullUpDrop) {
+        g_pkPullUpArmed = false;
+        g_pkPullUpHold = kPkPullUpAssert;
+        ++g_pkPullUps;
+        g_pkPullUpWhy = "PULLING UP";
+        Log("*** [pk] PK.44: both hands pushed down %.2f / %.2f m below their baseline while"
+            " anchored - asserting the climb axis for %ld frames. Pull-up #%ld",
+            g_pkPullUpFell[0], g_pkPullUpFell[1], kPkPullUpAssert, g_pkPullUps);
+    } else {
+        g_pkPullUpWhy = "ready";
+    }
+}
+
 // ---- PK.42: is the player still holding on, and what happens when they stop ----
 //
 // ⚠️ THE DECREMENT IS FIRST AND UNCONDITIONAL, and that is the whole design.
@@ -5784,6 +5906,7 @@ static void ParkourTick(XrTime when)
     // return, it would tick exactly until it succeeded and then never again - releasing the
     // button at the instant the game was acting on it.
     PkLetGoTick();
+    PkPullUpTick();     // PK.44 - above the return for the same reason, see its own note
 
     if (g_pkMode == PK_NONE) {
         g_pkBlock = "not on a wall"; g_pkAnchor = PK_HAND_NONE; PkZeroLead();
@@ -6005,9 +6128,11 @@ static void ParkourTick(XrTime when)
     // the entry window or while the snap is switched off, and the body would simply stop
     // responding on those frames. Only a hand the snap has actually judged to be past the end of
     // the pipe is excluded, so every path that never asks the question behaves as it always did.
+    // PK.45 adds the second refusal beside PK.28's. A fist is the pose saying "there is nothing
+    // here to hold"; the body and the camera lead now agree with it on a ledge as well as a pipe.
     const bool held[2] = {
-        g_swingL.tracked && g_gripValue[0] > 0.5f && !g_pkHandOffPipe[0],
-        g_swingR.tracked && g_gripValue[1] > 0.5f && !g_pkHandOffPipe[1],
+        g_swingL.tracked && g_gripValue[0] > 0.5f && !g_pkHandOffPipe[0] && !g_pkHandTooFar[0],
+        g_swingR.tracked && g_gripValue[1] > 0.5f && !g_pkHandOffPipe[1] && !g_pkHandTooFar[1],
     };
     if (!held[0] && !held[1]) {
         // Letting go zeroes the lead outright. A view still displaced from a pull the
@@ -6705,6 +6830,14 @@ static bool XrSyncInput(XrTime when)
     // the gesture reads them wrong.
     if (g_pkShimmy != 0.0f && sweep <= 0.0f && fabsf(mx) < 0.15f)
         s.Gamepad.sThumbLX = axis(g_pkShimmy);
+    // ---- PK.44: and the pull-up owns Y, on the same terms ----
+    //
+    // Precedence, not a sum, for the reason directly above - and the physical stick wins the
+    // instant it is touched, which is how the player takes back a gesture that read them wrong.
+    // Y is free on a ledge: its only other claimant is the pipe's dismount handover, which
+    // cannot be running while the mode is PK_LEDGE.
+    if (g_pkPullUpHold > 0 && sweep <= 0.0f && fabsf(my) < 0.15f)
+        s.Gamepad.sThumbLY = axis(kPkPullUpStick);
     // ---- ⚠️ PK.34: THE DISMOUNT NEEDS THE GAME TO CLIMB, NOT TO BE PUT THERE ----
     //
     // Opening the ceiling was necessary and not sufficient: "at the point at the top where it
@@ -24087,6 +24220,15 @@ static void DrawOverlay(IDirect3DDevice9* dev)
         // PK.43. A ghost that is not on screen has three possible reasons - never captured, the
         // ledge is already held, or the game still has the hands - and they need different
         // fixes. SEG says whether there is anything to draw at all.
+        // PK.44/45. FAR is the refusal that now stands a hand down as an anchor - a fist that
+        // still moved the camera was the whole bug, so whether the mod agrees the hand is out of
+        // reach belongs on screen beside the pose. PUSH is each hand's live drop toward the
+        // pull-up, which is the only way to tune the threshold without guessing.
+        if (g_pkMode == PK_LEDGE)
+            OverlayRow(lines, &nl, "PULLUP %s  PUSH %.2f/%.2f of %.2f m  FAR %c%c  DONE %ld",
+                       g_pkPullUpWhy, g_pkPullUpFell[0], g_pkPullUpFell[1], g_pkPullUpDrop,
+                       g_pkHandTooFar[0] ? 'L' : '-', g_pkHandTooFar[1] ? 'R' : '-',
+                       g_pkPullUps);
         if (g_pkMode == PK_LEDGE || g_pkMode == PK_CLIMB)
             OverlayRow(lines, &nl, "GHOST %s  SEG L%ld R%ld  CAP %ld  A%ld",
                        !g_pkGhost ? "OFF" : (PkGhostShowing() ? "UP" : "hidden"),
@@ -26123,6 +26265,22 @@ static void LoadSettings()
                 Log("[cfg]   ParkourLetGoFrames = %ld  (empty frames before PK.42 drops you)", fr);
                 applied++;
             } else { Log("[cfg]   ParkourLetGoFrames '%s' out of range 4..120 - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourPullUp") == 0) {
+            if (SettingBool(val, &b)) {
+                g_pkPullUp = b;
+                Log("[cfg]   ParkourPullUp = %s%s", b ? "on" : "off",
+                    b ? "  (PK.44: hanging with both hands on a ledge, push both controllers"
+                        " down and the climb axis is asserted for you)"
+                      : "  (the stick is the only way onto a ledge)");
+                applied++;
+            } else { Log("[cfg]   ParkourPullUp '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourPullUpDrop") == 0) {
+            const float d = (float)atof(val);
+            if (d >= 0.05f && d <= 0.60f) {
+                g_pkPullUpDrop = d;
+                Log("[cfg]   ParkourPullUpDrop = %.2f m  (how far both hands must push down)", d);
+                applied++;
+            } else { Log("[cfg]   ParkourPullUpDrop '%s' out of range 0.05..0.60 - ignored", val); rejected++; }
         } else if (_stricmp(key, "ParkourGhostHands") == 0) {
             if (SettingBool(val, &b)) {
                 g_pkGhost = b;
