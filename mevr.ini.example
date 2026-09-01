@@ -182,6 +182,41 @@ ParkourCamLeadFwd = on
 ; CAPS LOCK toggles it live.
 ParkourAskTheGame = on
 
+; ---- Letting go of a ledge, and the moment before you have hold of one (PK.42 / PK.43) ----
+;
+; A hold does not begin with you reaching for anything. The game's animation puts both hands on
+; the ledge, the mod measures that pose and hands the arms back - and at that instant your real
+; hands are wherever your real arms are, which is usually at your sides. So you hang in front of
+; a wall holding nothing. Two settings deal with the two halves of that.
+;
+; ParkourLetGoDrops: once you have actually held a ledge or pipe, holding it with no hands
+; presses crouch, which is the game's own let-go, and you fall. BEFORE the first grab nothing
+; drops you - hang there and look around for as long as you like. That grace period reopens at
+; every handback: a new ledge, a new pipe, the far side of a corner, and after a pipe's
+; down-then-up dismount probe finds nowhere to go.
+ParkourLetGoDrops = on
+
+; How many consecutive frames with nothing on the hold before it drops you. Do not set this low:
+; hand over hand is a sequence of releases, and human timing leaves both hands open for a frame
+; or two across a swap. 12 is about a fifth of a second. Range 4..120.
+ParkourLetGoFrames = 12
+
+; ParkourGhostHands: at the moment control is handed back, the pose the game just left on the
+; ledge is frozen and drawn translucently where it stands. Your own hands stay yours to move;
+; the ghost marks the ledge and shows what holding it looks like, so reaching into it and
+; squeezing is obvious rather than a guess. It clears the instant you actually hold on.
+;
+; It is a copy of the POSE, drawn as the hand's own twenty bones with thickness - not a second
+; copy of the arm mesh, which would mean re-issuing the game's skinned draw with a frozen bone
+; block and is not something this build can identify in the draw stream yet.
+ParkourGhostHands = on
+
+; How solid the ghost is, 0..255. Low enough to see the wall through, high enough to aim at.
+ParkourGhostAlpha = 110
+
+; Drawn half-thickness of one ghost bone, in Unreal units - roughly a finger's radius. 0.1..10.
+ParkourGhostRadius = 0.9
+
 ; Dense parkour diagnostics: a per-frame trace of every corner, the ledge-offset watcher, and
 ; the CanShimmy-vs-heuristic comparison. A VERY large log - the corner trace alone was a fifth of
 ; one run's lines - so on only while you are chasing something.

@@ -3723,6 +3723,138 @@ static bool g_pkEntryOffsetValid = false;
 static MEVR_Vec3 g_pkEntryOffsetH[2] = {};
 static bool g_pkEntryOffsetHOk[2] = { false, false };
 
+// ================================================================ PK.42: let go and you fall
+//
+// Every VR climbing game has one rule the player already knows: what you are not holding, you
+// are not hanging from. This mod cannot have that rule for free, because a hold does not begin
+// with the player reaching for anything - it begins with the game's own animation putting both
+// hands on the ledge while the player's controllers are wherever they happened to be. The mod
+// then measures that pose, hands the arms back, and the player is left hanging by hands that
+// are not touching anything. Letting go of a ledge you were never holding is not a decision,
+// so a rule that dropped them for it would be punishing the animation, not the player.
+//
+// So the rule is armed, not absolute. It has two halves:
+//
+//   THE GRACE PERIOD. From the moment the game hands the arms back until the first time the
+//   player actually holds the ledge, nothing drops them. They can hang there indefinitely and
+//   look around, which is exactly what someone does when they arrive somewhere new in VR and
+//   the game has just moved their arms for them.
+//
+//   THE RULE. Once a hand has been on the hold, holding it with none is a release, and the
+//   player falls. That is g_pkHoldGripped: it latches on the first hand and un-latches only
+//   when the hold itself ends.
+//
+// ---- the drop is the crouch button, and that is already measured ----
+//
+// GBA_Crouch is bRequestDropDown - the let-go path on TdMove_Grab, measured flipping on a real
+// hang. It is the reason ArmSwingCrouchTick stands itself down on a ledge in the first place:
+// "ducking to look down at the drop would otherwise release the ledge, and the fall is fatal".
+// That whole comment is a description of this feature, written when it was still a hazard.
+//
+// So nothing new has to be discovered to make the player fall. The button that does it is the
+// one the mod has spent two builds carefully not pressing.
+//
+// ⚠️ A PIPE IS NOT PROVEN. bRequestDropDown is a TdMove_Grab property; whether TdMove_Climb
+// shares a let-go path has never been measured. The rule runs on a pipe and the log says which
+// surface it fired on, so the next pipe run answers it - but a pipe that does not drop is an
+// unfinished measurement, not a broken feature, and must not be read as one.
+static bool  g_pkLetGoDrops = true;         // ParkourLetGoDrops in mevr.ini
+// ---- ⚠️ the debounce is load-bearing, not a nicety ----
+//
+// Hand over hand is a sequence of releases. The player lets go with one hand, moves it, and
+// closes it again - and human timing means the other hand is frequently open across that swap
+// for a frame or two, especially at speed. Firing on the first empty frame would drop the
+// player in the middle of the shimmy this whole mode exists for.
+static long  g_pkLetGoFrames = 12;      // empty frames before it fires - about a fifth of a second
+static const long kPkDropAssert = 10;   // frames the synthesised crouch is then held
+static bool  g_pkHoldGripped = false;   // has a hand been on THIS hold? (false = grace period)
+static long  g_pkHoldEmpty = 0;         // consecutive frames with nothing on it
+static long  g_pkHoldDrop = 0;          // frames of synthesised crouch left to assert
+static long  g_pkHoldDrops = 0;         // how many times it has fired, for the overlay
+static const char* g_pkHoldWhy = "no hold";   // the rule's state, for the overlay
+
+
+// ================================================================ PK.43: the hands you left there
+//
+// PK.42 makes letting go mean something. This is what makes the moment BEFORE it legible.
+//
+// The problem is entirely visual and entirely caused by how a hold begins. The game's animation
+// puts both hands on the ledge; the mod measures that pose, hands the arms back, and from that
+// instant the player's real hands are wherever their real arms happen to be - at their sides,
+// usually, because nobody reaches for a ledge they just watched the game grab for them. So they
+// hang in mid air in front of a wall, with their arms down, holding nothing. Everything is
+// working exactly as designed and it looks like a bug.
+//
+// The fix is not to take the hands away again - a player who cannot see their own hands cannot
+// aim the grab, and the grab has a radius. It is to leave a copy behind: at the moment control
+// is handed back, the pose the game had just composed is frozen and drawn translucently, in
+// world space, where the game put it. The player's own hands are theirs to move; the ghost says
+// "this is the ledge, and this is what holding it looks like". Reaching into it and squeezing is
+// then an obvious act rather than a guess, and the 0.22 m snap radius stops being invisible.
+//
+// It clears the moment the ledge is actually held, because from then on the real hands are on
+// the ledge and a second pair would be clutter. PK.42's latch is exactly that fact, already
+// computed, so the ghost's whole lifetime is "the grace period" and needs no timer of its own.
+//
+// ---- ⚠️ WHAT THIS IS AND IS NOT ----
+//
+// It is a copy of the POSE, drawn as the hand's own bones with thickness - twenty segments a
+// hand, the nineteen HumanIK finger bones plus the wrist, from the same SpaceBases the mod
+// already reads and the same kFingerBones parent map already verified rigid in-game.
+//
+// It is NOT a second copy of the arm MESH. That would mean re-issuing the game's own skinned
+// draw with a frozen bone-constant block, and two things would have to be measured first that
+// nothing in this file knows: which draw call in the stream is Mesh1p, and which registers its
+// skinning matrices live in. Neither is guessable, and the place to find out is inside the
+// stereo duplication path, which is the code least able to absorb a wrong guess. The bones are
+// available today, exactly, in world space, and they draw the same pose.
+static bool  g_pkGhost = true;              // ParkourGhostHands in mevr.ini
+static float g_pkGhostRadius = 0.9f;        // UU; a finger bone's drawn half-thickness
+static long  g_pkGhostAlpha = 110;          // 0..255 - present enough to aim at, not to obstruct
+// ---- the frozen pose ----
+//
+// Twenty segments a hand: the nineteen finger bones against their parents, plus hand-to-forearm
+// for the wrist. World space, captured once, then constant - the ledge does not move, so neither
+// does the ghost, and nothing has to be recomputed while it is up.
+struct PkGhostSeg { MEVR_Vec3 a, b; };
+static const int kPkGhostSegMax = 20;
+static PkGhostSeg g_pkGhostSeg[2][kPkGhostSegMax];
+// ⚠️ Written from the pose path and read at Present, which is a different thread. The count is
+// published LAST and zeroed FIRST, so a reader either sees the previous complete capture or none
+// - never a segment list longer than the points backing it. The points themselves are constant
+// for the whole life of a capture, so there is no second race to lose.
+static volatile LONG g_pkGhostSegs[2] = { 0, 0 };
+static long g_pkGhostCaptures = 0;
+// Reset by PkBeginHold, which every one of the four handbacks calls. See the capture site for
+// why this is not g_pkEntryOffsetHOk.
+static bool g_pkGhostTaken[2] = { false, false };
+// Defined with the drawing code, which needs the D3D state it lives among; declared here because
+// the overlay reports on it and is written further up the file.
+static bool PkGhostShowing();
+
+// A hold begins: at a ledge or pipe entry, on the far side of a corner, and after a pipe's
+// dismount probe comes back empty. All four hand the player a pose they did not choose, so all
+// four open a fresh grace period - the player has to have held the NEW hold, not the old one.
+static void PkBeginHold(const char* why)
+{
+    if (g_pkHoldGripped)
+        Log("[pk] PK.42: %s - a new hold, so the grace period opens again and nothing drops"
+            " the player until they have held this one", why);
+    g_pkHoldGripped = false;
+    g_pkHoldEmpty = 0;
+    // ---- ⚠️ PK.43: the old ghost dies HERE, at the start of the window, not when it is drawn ----
+    //
+    // A capture can fail - the entry measurement it rides on fails often enough to have its own
+    // retry, "RIGHT hand reads 70.8 UU off the ledge at entry, ignored". Left standing, the
+    // previous hold's segments are still valid world points and would be drawn perfectly
+    // correctly at the ledge the player is no longer on: a pair of hands hanging in space across
+    // the room, pointing at the last ledge instead of this one. Clearing on entry means a failed
+    // capture shows nothing, which is the honest outcome.
+    InterlockedExchange(&g_pkGhostSegs[0], 0);
+    InterlockedExchange(&g_pkGhostSegs[1], 0);
+    g_pkGhostTaken[0] = g_pkGhostTaken[1] = false;
+}
+
 // ---- the corner, and the end of the ledge ----
 //
 // Direct drive writes the position itself, so the game is never asked and can never refuse. Both
@@ -4034,9 +4166,29 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
             // far from where the game puts a hand", and the radius goes back to meaning what it
             // was tuned to mean. On a ledge the two are within a few UU of each other, so this
             // does not move that behaviour.
-            const MEVR_Vec3 mine = g_pkEntryOffsetHOk[hand] ? g_pkEntryOffsetH[hand]
-                                                            : g_pkEntryOffset;
-            const bool haveMine = g_pkEntryOffsetHOk[hand] || g_pkEntryOffsetValid;
+            // ---- ⚠️ PER HAND ON A PIPE, SHARED ON A LEDGE - AS ORIGINALLY ARGUED ----
+            //
+            // The per-hand offset was introduced for the pipe, and its own comment says why: a
+            // pipe's line is vertical, "along" is height, and the two hands wrap the barrel from
+            // OPPOSITE sides, so one hand's offset applied to the other lands it across the pipe.
+            // The same comment says the shared offset "was right on a ledge" - both hands wrap
+            // the same edge the same way, and what differs between them is their position ALONG
+            // it, which is the player's own reach and is not in the offset at all.
+            //
+            // Generalising per-hand to both surfaces quietly undid that. Reported as "there is a
+            // grab animation where the left hand is lower than the right, so the anchor points
+            // are at different heights", and the capture log is the measurement: LEFT ghosted at
+            // Z 8424 and RIGHT at Z 8430 off a ledge at Z 8441 - 17 UU below it against 11. The
+            // file's own figure for a hand resting on a ledge is 10 to 12 UU, so the right hand
+            // is canonical and that animation simply plants the left one lower. Per-hand offsets
+            // faithfully reproduce the animation's asymmetry in the anchors, and the player then
+            // shimmies along a ledge that is tilted by six centimetres.
+            //
+            // A ledge is one edge. Both hands hang off it at the same depth, whatever the
+            // animation that put them there did.
+            const bool perHand = (g_pkMode == PK_CLIMB) && g_pkEntryOffsetHOk[hand];
+            const MEVR_Vec3 mine = perHand ? g_pkEntryOffsetH[hand] : g_pkEntryOffset;
+            const bool haveMine = perHand || g_pkEntryOffsetValid;
             float dist = raw;
             const char* against = "line";
             if (haveMine) {
@@ -4974,8 +5126,36 @@ static void PkCornerTick()
         if (!g_pkCornerTurned && g_pkCornerFrames > 20 && swept < 2.0f) {
             g_pkCornerState = 0;
             g_pkCornerSettle = 0;
+            // ---- ⚠️ "STRAIGHT BACK" GAVE THE HANDS BACK TO NOBODY ----
+            //
+            // This path cleared the corner state and returned, and the comment above says the
+            // player "gets their hands and their body straight back". The body did. The hands
+            // did not, and could not: PkCornerTick dropped both anchors when it opened the
+            // corner, and PkSnapHandToLedge only ever re-latches on a grip EDGE or on the entry
+            // window's handback. A player who never let go of the grip - which is everyone, mid
+            // shimmy - has no rising edge coming, so the anchors stayed dropped for the rest of
+            // that grip. The mod had quietly stopped holding the ledge while the player was
+            // still holding the button.
+            //
+            // It was invisible until PK.42, which reads "nothing is on the hold" and drops you
+            // for it. Run 2026-09-01 f9184-f9253 is the whole sequence in nine lines: RIGHT hand
+            // ANCHORED, corner opens and anchors dropped, "no turn came in 21 frames", and
+            // twelve frames later Drop #4 - with [moveprop] still reporting anc=1 and "direct
+            // body drive", because the SERVO reads the raw grip and never agreed the hand was
+            // gone. Two subsystems disagreed about whether the player was holding on, and the
+            // one that was wrong is the one that dropped them.
+            //
+            // The entry window is the mechanism that already exists for "the game had the hands
+            // and is giving them back". Opening it here produces the handback edge that
+            // re-latches the grip, and re-arms PK.43's capture so the ghost reappears. The
+            // measured offsets are deliberately NOT cleared: this ledge never changed, so the
+            // numbers are still good, and clearing them risks a failed re-measure leaving
+            // nothing to anchor against at all.
+            g_pkEntryHold = 30;
+            PkBeginHold("a corner was announced and never came");
             Log("[pk] no turn came in %ld frames (yaw moved %.1f deg) - that was not a corner,"
-                " handing everything straight back", g_pkCornerFrames, swept);
+                " handing everything straight back through the entry window, so the grip"
+                " re-latches", g_pkCornerFrames, swept);
             return;
         }
         if (havePrevYaw && fabsf(PkYawDelta(yaw, prevYaw)) < 0.5f) ++g_pkCornerStill;
@@ -4996,6 +5176,14 @@ static void PkCornerTick()
         if (g_pkCornerTurned && g_pkCornerStill >= 10 && g_pkCornerSettle == 0) {
             g_pkCornerSettle = 30;
             g_pkEntryHold = 30;
+            // ⚠️ PK.42/43: HERE, where the window opens - not at the completion below.
+            //
+            // PkBeginHold clears the previous hold's ghost, and the capture happens on the last
+            // frame of this window. Called at completion it would run AFTER that capture and
+            // erase the pose it had just taken, so the one handback that most needs a ghost -
+            // the player has been swung round a corner and has no idea where their hands are -
+            // would be the only one that never showed one.
+            PkBeginHold("the corner animation placed the hands");
             g_pkEntryOffsetValid = false;
             g_pkGapBaselineOk = false;
             g_pkGapBaselineOkPub = false;
@@ -5018,6 +5206,7 @@ static void PkCornerTick()
             " and re-measuring the ordinary way",
             haveYaw ? PkYawDelta(yaw, g_pkCornerYaw0) : 0.0f, g_pkCornerFrames);
         g_pkEntryHold = 30;
+        PkBeginHold("a corner that turned but never settled");   // PK.42/43
         return;
     }
     if (!done) return;
@@ -5410,6 +5599,114 @@ static void ParkourDirectBodyTick()
     havePrev = true;
 }
 
+// ---- PK.42: is the player still holding on, and what happens when they stop ----
+//
+// ⚠️ THE DECREMENT IS FIRST AND UNCONDITIONAL, and that is the whole design.
+//
+// Every other early return in this file stands a feature down when the player leaves the ledge.
+// This one must not: the crouch it asserts is what MAKES them leave, so the mode has already
+// changed by the time the button has finished being pressed. Ticking the assert down at the top,
+// before anything can return, is what lets it outlive the state that armed it. Standing it down
+// with the mode would press the button for exactly as long as it took to work and then release
+// it, which is the one shape guaranteed not to.
+static void PkLetGoTick()
+{
+    if (g_pkHoldDrop > 0) --g_pkHoldDrop;
+
+    if (!g_parkour || (g_pkMode != PK_LEDGE && g_pkMode != PK_CLIMB)) {
+        g_pkHoldGripped = false;
+        g_pkHoldEmpty = 0;
+        g_pkHoldWhy = "no hold";
+        return;
+    }
+
+    // ---- ⚠️ while the game owns the hands, the player's grips are not an answer ----
+    //
+    // The same four states PkSnapHandToLedge stands down for: the entry window, a corner, and a
+    // pipe's bypass or dismount handover. In every one of them the animation is placing the
+    // hands and the mod has deliberately let go of them, so nothing is anchored and the empty
+    // count would run whether or not the player was holding anything. Dropping someone in the
+    // middle of the corner animation the game is playing for them is precisely the "punishing
+    // the animation" failure this feature is built to avoid.
+    if (g_pkEntryHold > 0 || g_pkCornerState != 0 ||
+        (g_pkMode == PK_CLIMB && (g_pkBypass || g_pkTopOpen))) {
+        g_pkHoldEmpty = 0;
+        g_pkHoldWhy = "the game has the hands";
+        return;
+    }
+
+    // ⚠️ PkHandIsTheGames, not the raw grip. A grip closed in open air a metre from the ledge is
+    // refused by the snap and the hand stays free - it is a squeeze, not a hold, and counting it
+    // would both end the grace period without the player ever touching the ledge AND keep them
+    // hanging afterwards by nothing. The pending case is in there too: a hand mid-capture is on
+    // its way onto the ledge, and a two-frame gap while the game's pose is read is not a release.
+    // ---- ⚠️ TWO DIFFERENT QUESTIONS, AND THE FIRST BUILD ANSWERED BOTH WITH ONE TEST ----
+    //
+    // ARMING the rule asks "has the player ever really had hold of this?", and for that the raw
+    // grip is not enough: a grip closed in open air a metre from the ledge is refused by the
+    // snap and the hand stays free. It is a squeeze, not a hold, and counting it would end the
+    // grace period without the player ever touching the ledge. So arming needs an anchor.
+    //
+    // STAYING UP asks "is the player letting go?", and there the anchor is the wrong signal -
+    // measured, not argued. g_pkHandAnchored is the MOD'S snap state, and it gets dropped for
+    // reasons that have nothing to do with the player's hands: PkCornerTick drops both anchors
+    // the moment a corner is announced, and until the fix above, an announcement that came to
+    // nothing left them dropped with no edge to re-latch on. Drop #4 of run 2026-09-01 fired
+    // while the player's grip had been closed continuously for two seconds, and [moveprop] on
+    // the very next line still read anc=1 and "direct body drive" - the servo, which reads the
+    // raw grip, never agreed the hand was gone.
+    //
+    // The player's own grip is the honest answer to the second question, and it is also what was
+    // actually asked for: "holding the ledge with 0 hands". Hands, not anchors. A player
+    // squeezing at nothing after a real grab keeps hanging, which is the mild cost; a player
+    // squeezing the ledge and falling anyway is the failure that matters.
+    const bool anchored = PkHandIsTheGames(0) || PkHandIsTheGames(1);
+    const bool gripping = g_gripValue[0] > 0.5f || g_gripValue[1] > 0.5f;
+
+    if (anchored && !g_pkHoldGripped) {
+        g_pkHoldGripped = true;
+        Log("[pk] PK.42: first hand on this %s - the grace period is over, and letting go"
+            " with both now drops the player",
+            g_pkMode == PK_CLIMB ? "pipe" : "ledge");
+    }
+    if (anchored || gripping) {
+        g_pkHoldEmpty = 0;
+        g_pkHoldWhy = anchored ? "holding" : "gripping";
+        return;
+    }
+
+    if (!g_pkHoldGripped) {
+        // The grace period, and it has no timer. The player has been handed a pose they did not
+        // choose and can hang in it for as long as they like; the rule starts when they do.
+        g_pkHoldEmpty = 0;
+        g_pkHoldWhy = "grace";
+        return;
+    }
+
+    ++g_pkHoldEmpty;
+    g_pkHoldWhy = "letting go";
+    if (!g_pkLetGoDrops) { g_pkHoldWhy = "let-go off"; return; }
+    // ⚠️ ==, not >=. One firing per release: the assert is a fixed number of frames and
+    // re-arming it every frame afterwards would hold the crouch down for as long as the player
+    // stayed off the ledge, which on the ground is a slide.
+    if (g_pkHoldEmpty == g_pkLetGoFrames) {
+        g_pkHoldDrop = kPkDropAssert;
+        ++g_pkHoldDrops;
+        g_pkHoldWhy = "DROPPING";
+        // ⚠️ The state that produced it, not just the fact of it. The first spurious drop cost a
+        // run to diagnose because this line said only that it had happened - the cause was three
+        // lines earlier in a DIFFERENT subsystem's trace, and visible only because that one
+        // happened to print its own view of whether a hand was held.
+        Log("*** [pk] PK.42: nothing on the %s for %ld frames after holding it - asserting crouch"
+            " (bRequestDropDown) for %ld to let go. Drop #%ld | grips %.2f/%.2f anchored %c%c"
+            " pending %d/%d corner %d entry %ld",
+            g_pkMode == PK_CLIMB ? "pipe" : "ledge", g_pkHoldEmpty, kPkDropAssert, g_pkHoldDrops,
+            g_gripValue[0], g_gripValue[1],
+            g_pkHandAnchored[0] ? '+' : '-', g_pkHandAnchored[1] ? '+' : '-',
+            g_pkHandPending[0], g_pkHandPending[1], g_pkCornerState, g_pkEntryHold);
+    }
+}
+
 static void ParkourTick(XrTime when)
 {
     (void)when;
@@ -5455,6 +5752,7 @@ static void ParkourTick(XrTime when)
             g_pkEntryOffsetHOk[0] = g_pkEntryOffsetHOk[1] = false;
             g_pkGapBaselineOk = false;
             g_pkGapBaselineOkPub = false;
+            PkBeginHold(g_pkMode == PK_CLIMB ? "a pipe" : "a ledge");   // PK.42
             Log("[pk] %s entered - the game keeps both hands for %ld frames while the"
                 " hand offset is measured off its own planted pose",
                 g_pkMode == PK_CLIMB ? "pipe" : "ledge", g_pkEntryHold);
@@ -5478,6 +5776,15 @@ static void ParkourTick(XrTime when)
         g_pkHavePrevLoc = false;
         g_pkExtentHave = false;      // a new ledge is a new span, not a longer one
     }
+
+    // ⚠️ ABOVE the "not on a wall" return, not below it with the rest of the parkour work.
+    //
+    // PK.42's assert has to keep being written for a few frames after the crouch has worked,
+    // and the frame it works is the frame this mode stops being a ledge. Called from below the
+    // return, it would tick exactly until it succeeded and then never again - releasing the
+    // button at the instant the game was acting on it.
+    PkLetGoTick();
+
     if (g_pkMode == PK_NONE) {
         g_pkBlock = "not on a wall"; g_pkAnchor = PK_HAND_NONE; PkZeroLead();
         g_pkCornerState = 0; g_pkCornerUrge = false;
@@ -5610,6 +5917,9 @@ static void ParkourTick(XrTime when)
         if (g_frames > retryAt) {
             retryAt = g_frames + 120;
             g_pkEntryHold = 30;
+            // The offset never measured, so nothing can have anchored, so nothing can have been
+            // held - the latch is already clear and this only re-arms the ghost's own capture.
+            PkBeginHold("the entry measurement is being retried");   // PK.42/43
             Log("[pk] no hand-to-ledge offset yet - re-opening the entry window to measure it"
                 " again");
         }
@@ -6451,6 +6761,10 @@ static bool XrSyncInput(XrTime when)
     // a button as far as the game is concerned; a partial press would only risk sitting under
     // whatever threshold it applies.
     if (swingCrouch) s.Gamepad.bLeftTrigger = 0xFF;
+    // PK.42: the same button, for the opposite reason. AS.3 refuses to press it on a ledge
+    // because it lets go; this presses it BECAUSE it lets go, once the player has stopped
+    // holding a hold they were holding. Full, for the reason directly above.
+    if (g_pkHoldDrop > 0) s.Gamepad.bLeftTrigger = 0xFF;
     s.Gamepad.bRightTrigger = (BYTE)(flt(g_aRTrig) * 255.0f);
 
     WORD b = 0;
@@ -6992,8 +7306,11 @@ static bool EnsureSwapchain(uint32_t w, uint32_t h)
 // Formats line up without conversion, which is why this is a copy and not a shader:
 // D3D9 A8R8G8B8 is BGRA byte order, i.e. exactly DXGI_FORMAT_B8G8R8A8_UNORM.
 
+static void PkGhostReleaseState();
+
 static void ReleaseFrameCapture()
 {
+    PkGhostReleaseState();      // PK.43: a state block dies with the device, like everything here
     if (g_sysSurf) { g_sysSurf->Release(); g_sysSurf = nullptr; }
     if (g_upload)  { g_upload->Release();  g_upload  = nullptr; }
     g_capW = g_capH = 0;
@@ -13966,6 +14283,19 @@ void PkPipeExtentTick()
     if (g_pkTopOpen && --g_pkTopOpenFrames <= 0) {
         g_pkTopOpen = false;
         PkPipeRememberRefusal(g_pkPipeVol);
+        // ---- ⚠️ PK.42: this handback had no entry window at all, and it is one ----
+        //
+        // The other three places the game gives the hands back all re-open the 30-frame window
+        // that measures the hand-to-surface offset off the settled pose. This one never did: the
+        // handover stands the hands down for its whole duration (PkSnapHandToLedge returns on
+        // g_pkTopOpen), the down-then-up drags the pawn through 150 UU of pipe, and then the
+        // body is simply taken back with whatever offset was measured at a height the player has
+        // long since left. So it re-measures, exactly like every other handback - and opens the
+        // grace period, because the down-then-up is an animation the player did not ask for.
+        g_pkEntryHold = 30;
+        g_pkEntryOffsetValid = false;
+        g_pkEntryOffsetHOk[0] = g_pkEntryOffsetHOk[1] = false;
+        PkBeginHold("the pipe's dismount probe found nowhere to go");
         Log("[climb] PK.37: the game did not dismount within the handover - taking the body back,"
             " and remembering that this pipe (%08X) has nowhere to go, so it will not be asked"
             " again this run", (uint32_t)g_pkPipeVol);
@@ -16572,6 +16902,49 @@ static bool BoneWorldPosition(const DetachedRigFrame& rig, int boneIndex, MEVR_V
     return true;
 }
 
+// ---- PK.43: freeze one hand's pose, in world space, on the frame control is handed back ----
+//
+// ⚠️ THE SAME FRAME THE ENTRY OFFSET IS MEASURED, AND FOR THE SAME REASON.
+//
+// The entry window exists because a hand arriving from IntoGrab is not yet a hand on a ledge -
+// capturing at the START of it read 54.6 UU below the ledge, "which is where a hand is on its way
+// up, not where it rests". A ghost taken then would be frozen mid-reach: a pair of hands hanging
+// under the ledge, pointing at nothing, which is worse than no ghost at all because the player
+// would aim at it. So this rides on exactly the same edge the offset does - the last frame of the
+// window, off the settled hang pose - and inherits that measurement's reasoning wholesale.
+static void PkCaptureGhostHand(const DetachedRigFrame& rig, int hand)
+{
+    if (!g_pkGhost || hand < 0 || hand > 1) return;
+    const int handBone = hand ? 48 : 19;        // LeftHand 19 / RightHand 48
+    const int foreArm  = hand ? 47 : 18;        // ...and the forearm above each, for the wrist
+
+    PkGhostSeg seg[kPkGhostSegMax];
+    int n = 0;
+    MEVR_Vec3 wrist{}, palm{};
+    if (BoneWorldPosition(rig, foreArm, &wrist) && BoneWorldPosition(rig, handBone, &palm))
+        seg[n++] = { wrist, palm };
+
+    // kFingerBones is in chain order, left hand first - the same table and the same parent map
+    // the finger census proved rigid in-game, so a wrong parent here would already have shown up
+    // there as a bone whose length changed with the pose.
+    for (int k = 0; k < kJointsPerHand && n < kPkGhostSegMax; ++k) {
+        const FingerBone& fb = kFingerBones[hand * kJointsPerHand + k];
+        MEVR_Vec3 a{}, b{};
+        if (BoneWorldPosition(rig, fb.parent, &a) && BoneWorldPosition(rig, fb.index, &b))
+            seg[n++] = { a, b };
+    }
+
+    // ⚠️ Zero the count before touching the points, publish it after. See the declaration.
+    InterlockedExchange(&g_pkGhostSegs[hand], 0);
+    memcpy(g_pkGhostSeg[hand], seg, sizeof(PkGhostSeg) * (size_t)n);
+    InterlockedExchange(&g_pkGhostSegs[hand], n);
+
+    ++g_pkGhostCaptures;
+    Log("[pk] PK.43: %s hand ghosted at (%.0f %.0f %.0f) from %d bone segments - it stays until"
+        " the %s is actually held", hand ? "RIGHT" : "LEFT", palm.x, palm.y, palm.z, n,
+        g_pkMode == PK_CLIMB ? "pipe" : "ledge");
+}
+
 static bool ShoulderWorldPosition(const DetachedRigFrame& rig, int boneIndex,
                                   const MEVR_Vec3& previousOffset, MEVR_Vec3* out)
 {
@@ -16839,6 +17212,30 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
                         meshHand.y - (ln[1] + ax[1] * t),
                         meshHand.z - (ln[2] + ax[2] * t) };
                     const float mag = sqrtf(off.x * off.x + off.y * off.y + off.z * off.z);
+                    // ---- ⚠️ PK.43: OUTSIDE the 60 UU gate, and its own latch ----
+                    //
+                    // Two mistakes, both of which cost this hand its ghost.
+                    //
+                    // The latch was g_pkEntryOffsetHOk, and of the sites that re-open this
+                    // window the corner is the one that does not clear the per-hand offset
+                    // flags - so `!HOk` was already false on arrival and the capture could
+                    // never fire after a corner. It has its own flag now, cleared by the
+                    // function that begins a hold, which every site calls.
+                    //
+                    // And it sat inside `mag < 60`, which is a sanity bound on the OFFSET - the
+                    // number the anchor arithmetic is built on, where a wrong value throws a
+                    // hand out of sight. The ghost is not that number. It is the bone positions
+                    // the game itself just composed, in world space, correct by construction
+                    // whatever the offset reads. Run 2026-09-01 rejected the right hand six
+                    // times, always at exactly 70.8 UU - one particular grab animation plants it
+                    // there - and the player saw six one-handed ghosts and called it weird. It
+                    // was: a hand really is at that spot, and refusing to DRAW it because its
+                    // offset was implausible confused "do not anchor to this" with "do not show
+                    // this".
+                    if (g_pkEntryHold <= 1 && !g_pkGhostTaken[hand]) {
+                        g_pkGhostTaken[hand] = true;
+                        PkCaptureGhostHand(rig, hand);
+                    }
                     if (mag < 60.0f) {
                         g_pkEntryOffset = off;      // kept fresh; believed when the window closes
                         g_pkEntryOffsetH[hand] = off;
@@ -23680,6 +24077,20 @@ static void DrawOverlay(IDirect3DDevice9* dev)
         // failed or the player simply was not on anything, and those are different bugs.
         OverlayRow(lines, &nl, "PK %s M%d %s", mn, g_animState,
                     g_pkBlock[0] ? g_pkBlock : "driving");
+        // PK.42, on screen because the two states it distinguishes look identical from inside
+        // the headset: hanging in the grace period and hanging about to be dropped are the same
+        // picture. GRIP is the latch, EMPTY counts toward the drop, and DROP is the button
+        // actually being held.
+        if (g_pkMode == PK_LEDGE || g_pkMode == PK_CLIMB)
+            OverlayRow(lines, &nl, "LETGO %s  EMPTY %ld/%ld  DROP %ld  FIRED %ld",
+                       g_pkHoldWhy, g_pkHoldEmpty, g_pkLetGoFrames, g_pkHoldDrop, g_pkHoldDrops);
+        // PK.43. A ghost that is not on screen has three possible reasons - never captured, the
+        // ledge is already held, or the game still has the hands - and they need different
+        // fixes. SEG says whether there is anything to draw at all.
+        if (g_pkMode == PK_LEDGE || g_pkMode == PK_CLIMB)
+            OverlayRow(lines, &nl, "GHOST %s  SEG L%ld R%ld  CAP %ld  A%ld",
+                       !g_pkGhost ? "OFF" : (PkGhostShowing() ? "UP" : "hidden"),
+                       g_pkGhostSegs[0], g_pkGhostSegs[1], g_pkGhostCaptures, g_pkGhostAlpha);
         // ---- the shake, live, while standing on the thing that shakes ----
         //
         // BOB is the camera moving relative to the body and is what the cancellation removes;
@@ -24029,6 +24440,227 @@ static void LogAddressSpace(const char* when)
         when, (unsigned long long)(freeTotal >> 20), (unsigned long long)(freeLargest >> 20));
 }
 
+// ================================================================ PK.43: drawing the ghost
+//
+// ---- ⚠️ WHY THIS DRAWS AT PRESENT AND NOT IN THE DRAW STREAM ----
+//
+// The obvious place is inside the scene, alongside the geometry it belongs with, going through
+// DuplicateDraw like everything else. It is the wrong place, for a reason this file has already
+// paid for once: "a wrong guess here means splitting a pass that must not be split". To put a
+// draw in that stream we would have to pick a moment in it - after the world, before the HUD,
+// while the scene target is still bound - and nothing identifies that moment. Every candidate is
+// a guess about someone else's frame.
+//
+// At Present there is no guess left to make. The backbuffer holds the finished side-by-side
+// frame, CaptureFrame has not run yet so anything drawn here reaches the headset, and the two
+// eyes are the two halves of a surface whose size can be asked for directly. The overlay has
+// drawn from exactly here since the first rung.
+//
+// The cost of that choice is depth: the depth buffer at Present belongs to whatever pass ran
+// last, not to the world, so this cannot depth-test honestly and does not try - ZENABLE is off
+// and the ghost draws over everything. For a marker saying "the ledge is here", that is the
+// behaviour you would choose anyway; the player is hanging in front of the wall it sits on and
+// there is nothing legitimate for it to be occluded by.
+//
+// ---- the matrix is not guessed either ----
+//
+// g_sceneMat is the view-projection the engine uploads to c0, and the scan says of this build's
+// register, every run, "c0 ROW". TestWindow's asRow case reads w as x*at(0,3) + y*at(1,3) +
+// z*at(2,3) + at(3,3) with at(r,c) = m[r*4+c] - that is w = dot(v, column 3), which is the
+// row-vector convention stored row-major. D3DMATRIX is the row-vector convention stored
+// row-major. So it goes into D3DTS_PROJECTION with WORLD and VIEW left at identity and no
+// transpose, and BuildEyeMatrix - already proven correct by every stereo frame the mod renders -
+// supplies the per-eye version.
+struct PkGhostVtx { float x, y, z; DWORD c; };
+static const DWORD kPkGhostFVF = D3DFVF_XYZ | D3DFVF_DIFFUSE;
+// 2 hands x 20 segments x 2 crossed quads x 6 vertices.
+static const int kPkGhostVtxMax = 2 * kPkGhostSegMax * 2 * 6;
+static IDirect3DStateBlock9* g_pkGhostSB = nullptr;
+static long g_pkGhostFrames = 0;
+
+// Released with the frame capture, which is the mod's one place for "the device changed, drop
+// what belongs to it" - a state block does not survive a Reset.
+static void PkGhostReleaseState()
+{
+    if (g_pkGhostSB) { g_pkGhostSB->Release(); g_pkGhostSB = nullptr; }
+}
+
+// The ghost's whole lifetime is PK.42's grace period, which is already computed: it is up from
+// the frame the game hands the arms back until the frame a hand is actually on the hold. The
+// three states where the game owns the hands are excluded because in all of them the real hands
+// are on the ledge and the ghost would be drawn exactly on top of them.
+static bool PkGhostShowing()
+{
+    if (!g_pkGhost || !g_parkour) return false;
+    if (g_pkMode != PK_LEDGE && g_pkMode != PK_CLIMB) return false;
+    if (g_pkHoldGripped) return false;
+    if (g_pkEntryHold > 0 || g_pkCornerState != 0 || g_pkTopOpen) return false;
+    return g_pkGhostSegs[0] > 0 || g_pkGhostSegs[1] > 0;
+}
+
+// One bone becomes two quads crossed at right angles about its own axis.
+//
+// ⚠️ NOT a billboard, and the difference matters here specifically. A billboard needs the camera
+// basis, and a stereo frame has two of those - a quad built to face one eye is nearer edge-on in
+// the other, so the ghost would differ between the eyes and read as depth that is not there.
+// Crossed quads have no preferred direction and present the same silhouette to both.
+static int PkGhostAppendBone(PkGhostVtx* out, int n, const MEVR_Vec3& a, const MEVR_Vec3& b,
+                             float r, DWORD colour)
+{
+    if (n + 12 > kPkGhostVtxMax) return n;
+    float d[3] = { b.x - a.x, b.y - a.y, b.z - a.z };
+    const float len = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+    if (!std::isfinite(len) || len < 1e-3f) return n;   // a zero-length bone draws nothing
+    d[0] /= len; d[1] /= len; d[2] /= len;
+
+    // Any vector not parallel to the bone serves as a seed for the first perpendicular. World up
+    // IS parallel to a finger pointing straight up, which happens on a ledge, so that case seeds
+    // from world X instead.
+    float s[3] = { 0.0f, 0.0f, 1.0f };
+    if (fabsf(d[2]) > 0.9f) { s[0] = 1.0f; s[1] = 0.0f; s[2] = 0.0f; }
+
+    float n1[3] = { d[1]*s[2] - d[2]*s[1], d[2]*s[0] - d[0]*s[2], d[0]*s[1] - d[1]*s[0] };
+    const float n1l = sqrtf(n1[0]*n1[0] + n1[1]*n1[1] + n1[2]*n1[2]);
+    if (!std::isfinite(n1l) || n1l < 1e-6f) return n;
+    n1[0] /= n1l; n1[1] /= n1l; n1[2] /= n1l;
+    const float n2[3] = { d[1]*n1[2] - d[2]*n1[1], d[2]*n1[0] - d[0]*n1[2],
+                          d[0]*n1[1] - d[1]*n1[0] };
+
+    const float* perp[2] = { n1, n2 };
+    for (int q = 0; q < 2; ++q) {
+        const float* p = perp[q];
+        const PkGhostVtx v0 = { a.x - p[0]*r, a.y - p[1]*r, a.z - p[2]*r, colour };
+        const PkGhostVtx v1 = { a.x + p[0]*r, a.y + p[1]*r, a.z + p[2]*r, colour };
+        const PkGhostVtx v2 = { b.x + p[0]*r, b.y + p[1]*r, b.z + p[2]*r, colour };
+        const PkGhostVtx v3 = { b.x - p[0]*r, b.y - p[1]*r, b.z - p[2]*r, colour };
+        out[n++] = v0; out[n++] = v1; out[n++] = v2;
+        out[n++] = v0; out[n++] = v2; out[n++] = v3;
+    }
+    return n;
+}
+
+// Both hands' frozen segments, as one triangle list in world space.
+static int PkGhostBuild(PkGhostVtx* out)
+{
+    long al = g_pkGhostAlpha;
+    if (al < 0) al = 0;
+    if (al > 255) al = 255;
+    // A cool near-white. Faith's gloves are red and the world is white with red accents, so a
+    // pale blue is the one thing on screen that cannot be mistaken for level geometry.
+    const DWORD colour = D3DCOLOR_ARGB((int)al, 176, 224, 255);
+    int n = 0;
+    for (int h = 0; h < 2; ++h) {
+        const int segs = (int)InterlockedCompareExchange(&g_pkGhostSegs[h], 0, 0);
+        for (int i = 0; i < segs && i < kPkGhostSegMax; ++i)
+            n = PkGhostAppendBone(out, n, g_pkGhostSeg[h][i].a, g_pkGhostSeg[h][i].b,
+                                  g_pkGhostRadius, colour);
+    }
+    return n;
+}
+
+static void PkDrawGhostHands(IDirect3DDevice9* dev)
+{
+    if (!dev || !PkGhostShowing() || !g_sceneMatValid || g_vmReg < 0) return;
+
+    static PkGhostVtx verts[kPkGhostVtxMax];
+    const int nv = PkGhostBuild(verts);
+    if (nv < 3) return;
+
+    // The render target's own size, not g_capW: capture has not run yet on the first frame of a
+    // resolution change, so g_capW can still describe the previous backbuffer - and this splits
+    // that number in half to place an eye.
+    IDirect3DSurface9* rt = nullptr;
+    if (FAILED(dev->GetRenderTarget(0, &rt)) || !rt) return;
+    D3DSURFACE_DESC desc = {};
+    const HRESULT dhr = rt->GetDesc(&desc);
+    rt->Release();
+    if (FAILED(dhr) || desc.Width < 4 || desc.Height < 4) return;
+
+    if (!g_pkGhostSB && FAILED(dev->CreateStateBlock(D3DSBT_ALL, &g_pkGhostSB))) {
+        g_pkGhostSB = nullptr;
+        return;              // no way to put the engine's state back: do not touch it at all
+    }
+    if (FAILED(g_pkGhostSB->Capture())) return;
+
+    D3DMATRIX ident = {};
+    ident._11 = ident._22 = ident._33 = ident._44 = 1.0f;
+    dev->SetVertexShader(nullptr);
+    dev->SetPixelShader(nullptr);
+    dev->SetFVF(kPkGhostFVF);
+    dev->SetTexture(0, nullptr);
+    dev->SetTransform(D3DTS_WORLD, &ident);
+    dev->SetTransform(D3DTS_VIEW, &ident);
+    dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+    dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);      // crossed quads are two-sided
+    dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);        // see the note above
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0x0F);
+    dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+    // With no texture bound the default stage op is MODULATE against a white texture on most
+    // drivers and black on some. Saying it outright removes the difference.
+    dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+    dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+
+    // ⚠️ g_origDrawPrimUP, not dev->DrawPrimitiveUP. Slot 83 is hooked, and going through the
+    // hook would hand our own geometry to the user-pointer census and to whatever duplication
+    // that path grows later. The eye split is done here, explicitly, once.
+    const UINT tris = (UINT)(nv / 3);
+    D3DMATRIX proj = {};
+    if (g_stereoMode && g_simulStereo) {
+        for (int eye = 0; eye < 2; ++eye) {
+            D3DVIEWPORT9 vp = {};
+            vp.X = (eye == 0) ? 0 : desc.Width / 2;
+            vp.Y = 0;
+            vp.Width = desc.Width / 2;
+            vp.Height = desc.Height;
+            vp.MinZ = 0.0f; vp.MaxZ = 1.0f;
+            if (FAILED(dev->SetViewport(&vp))) continue;
+            float eyeMat[16];
+            BuildEyeMatrix(eyeMat, eye);
+            memcpy(&proj, eyeMat, sizeof(proj));
+            dev->SetTransform(D3DTS_PROJECTION, &proj);
+            if (g_origDrawPrimUP)
+                g_origDrawPrimUP(dev, D3DPT_TRIANGLELIST, tris, verts, sizeof(PkGhostVtx));
+            else
+                dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, tris, verts, sizeof(PkGhostVtx));
+        }
+    } else {
+        // Mono, or the alternate-eye fallback. Alternate-eye modifies c0 in place per frame and
+        // g_sceneMat is deliberately the UNMODIFIED matrix, so the ghost sits at the centre eye
+        // rather than the one being rendered - half an IPD out, on a fallback mode, which is
+        // worth saying but not worth a second mechanism.
+        D3DVIEWPORT9 vp = {};
+        vp.X = 0; vp.Y = 0; vp.Width = desc.Width; vp.Height = desc.Height;
+        vp.MinZ = 0.0f; vp.MaxZ = 1.0f;
+        if (SUCCEEDED(dev->SetViewport(&vp))) {
+            memcpy(&proj, g_sceneMat, sizeof(proj));
+            dev->SetTransform(D3DTS_PROJECTION, &proj);
+            if (g_origDrawPrimUP)
+                g_origDrawPrimUP(dev, D3DPT_TRIANGLELIST, tris, verts, sizeof(PkGhostVtx));
+            else
+                dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, tris, verts, sizeof(PkGhostVtx));
+        }
+    }
+
+    g_pkGhostSB->Apply();
+
+    if ((++g_pkGhostFrames % 300) == 1)
+        Log("[pk] PK.43: ghost up - %u triangles, L %ld segs R %ld segs, %s",
+            tris, g_pkGhostSegs[0], g_pkGhostSegs[1],
+            (g_stereoMode && g_simulStereo) ? "both eyes" : "single viewport");
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT* src,
                                               const RECT* dst, HWND wnd, const RGNDATA* dirty)
 {
@@ -24084,6 +24716,11 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     // Desktop looking for a readout that could not appear there. A diagnostic that requires
     // the subsystem it is diagnosing is not a diagnostic.
     DrawOverlay(dev);
+
+    // PK.43: above the XR block and above CaptureFrame, for the same reason DrawOverlay is -
+    // the backbuffer holds the finished frame here and the capture has not taken it yet, so
+    // this is the last moment anything can be added to what reaches the headset.
+    PkDrawGhostHands(dev);
 
     // ---- rung 2: drive the XR frame loop from the game's Present ----
     //
@@ -25467,6 +26104,48 @@ static void LoadSettings()
                       : "  (no end-of-ledge or corner verdict is available)");
                 applied++;
             } else { Log("[cfg]   ParkourAskTheGame '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourLetGoDrops") == 0) {
+            if (SettingBool(val, &b)) {
+                g_pkLetGoDrops = b;
+                Log("[cfg]   ParkourLetGoDrops = %s%s", b ? "on" : "off",
+                    b ? "  (PK.42: once you have held a ledge or pipe, holding it with no hands"
+                        " presses crouch and drops you - the grace period before the first grab"
+                        " is unaffected)"
+                      : "  (letting go leaves you hanging, as before)");
+                applied++;
+            } else { Log("[cfg]   ParkourLetGoDrops '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourLetGoFrames") == 0) {
+            const long fr = atol(val);
+            // The floor is not cosmetic: hand over hand passes through empty frames, and a
+            // debounce short enough to catch one drops the player mid-shimmy.
+            if (fr >= 4 && fr <= 120) {
+                g_pkLetGoFrames = fr;
+                Log("[cfg]   ParkourLetGoFrames = %ld  (empty frames before PK.42 drops you)", fr);
+                applied++;
+            } else { Log("[cfg]   ParkourLetGoFrames '%s' out of range 4..120 - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourGhostHands") == 0) {
+            if (SettingBool(val, &b)) {
+                g_pkGhost = b;
+                Log("[cfg]   ParkourGhostHands = %s%s", b ? "on" : "off",
+                    b ? "  (PK.43: the pose the game left on the ledge stays as a translucent"
+                        " copy until you actually hold it)"
+                      : "  (nothing marks where the ledge was grabbed)");
+                applied++;
+            } else { Log("[cfg]   ParkourGhostHands '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourGhostAlpha") == 0) {
+            const long al = atol(val);
+            if (al >= 0 && al <= 255) {
+                g_pkGhostAlpha = al;
+                Log("[cfg]   ParkourGhostAlpha = %ld  (0 invisible, 255 solid)", al);
+                applied++;
+            } else { Log("[cfg]   ParkourGhostAlpha '%s' out of range 0..255 - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourGhostRadius") == 0) {
+            const float gr = (float)atof(val);
+            if (gr >= 0.1f && gr <= 10.0f) {
+                g_pkGhostRadius = gr;
+                Log("[cfg]   ParkourGhostRadius = %.2f UU  (drawn half-thickness of a bone)", gr);
+                applied++;
+            } else { Log("[cfg]   ParkourGhostRadius '%s' out of range 0.1..10 - ignored", val); rejected++; }
         } else if (_stricmp(key, "ParkourDebug") == 0) {
             if (SettingBool(val, &b)) {
                 g_parkourDebug = b;
