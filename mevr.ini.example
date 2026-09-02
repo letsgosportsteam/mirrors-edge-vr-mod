@@ -201,6 +201,76 @@ ParkourLetGoDrops = on
 ; or two across a swap. 12 is about a fifth of a second. Range 4..120.
 ParkourLetGoFrames = 12
 
+; ParkourSwipeJump: on a vertical pipe, swipe a holding hand sideways and let go to jump the
+; other way - the hands are the anchored thing, so swiping right carries you left. One hand
+; holding decides on its own; if BOTH are holding they must have swiped the same way, because
+; there is no reading of "the hands went opposite ways" that means a confident sideways jump.
+;
+; It asserts a stick DIRECTION as well as jump, not a bare jump - a bare jump takes its heading
+; from where the camera points and would ignore the swipe entirely. The stick is read in the
+; controller's yaw frame, which this mod writes from your head, so "left" means your left however
+; you are facing. Looking a long way off the pipe is the case that still misbehaves: your left
+; then points along the wall rather than off it. The log prints the head-vs-pawn yaw at every
+; firing so that can be fixed from measurements rather than guesses.
+ParkourSwipeJump = on
+
+; Lateral hand speed that counts as a swipe, m/s. Lower catches gentler flicks and risks reading
+; an ordinary hand-over-hand reach as one. Range 0.3..5.0.
+ParkourSwipeSpeed = 1.2
+
+; ---- The horizontal bar (PK.46 / PK.47) ----
+;
+; The bar is the one surface where the game already does the physics properly: TdMove_Swing runs
+; a real damped pendulum whose length it will tell you, and a logged swing decayed with a 2.1 s
+; period against the 2.20 s that 2*pi*sqrt(1.2/9.81) predicts. So the mod takes the hands and the
+; gesture and leaves the physics alone.
+;
+; ParkourSwingPump: hanging from a bar with BOTH hands anchored, pumping your hands fore and aft
+; drives the stick the pendulum takes as input - so the swing speed is the game's own, not a
+; number this mod invented. Letting go of a bar with no hands presses JUMP rather than crouch,
+; because a swing's whole purpose is the launch at the end of it.
+ParkourSwingPump = on
+
+; How far the hands must travel fore/aft for full stick deflection, in metres. Range 0.08..1.00.
+ParkourSwingPumpFull = 0.30
+
+; Which way round the pump reads. -1 is the anchored-hand inversion the ledge servo also runs on:
+; the hands are the fixed thing, so pushing them forward carries the body back. +1 follows the
+; hands directly. If pumping kills the swing instead of building it, this is the setting - flip
+; it rather than fighting the gesture.
+ParkourSwingPumpSign = -1
+
+; ParkourBarWrap: fallback for how far below the bar's line a closed hand sits, in Unreal units.
+; Normally unused - the real figure is measured from the game at the bottom of the swing, where
+; the pendulum is at rest and the animation is displacing nothing, and comes out around 65. This
+; only applies if that measurement never lands. Range 0..40 is deliberately below what a real bar
+; reads, because a fallback that looks plausible would hide the measurement having failed.
+ParkourBarWrap = 63
+
+; ParkourBarShimmy: move your anchored hand sideways to travel along the bar. Nothing readable
+; gives a bar's extent - this level places no TdSwingVolume at all - so the mod does not try to
+; know where the ends are. It asks with the stick and watches SwingLocation slide along
+; BarDirection; when that stops advancing, the bar has stopped and the game clamps you. The same
+; ask-rather-than-know the ledge's end detection is built on.
+ParkourBarShimmy = on
+
+; Sideways hand travel for full deflection along the bar, metres. Range 0.05..1.0.
+ParkourBarShimmyFull = 0.25
+
+; ParkourSwingExitBoost: scales TdMove_Swing::ExitVelocityModifier, which the game reads as
+; 600.00 and multiplies its own swing launch by.
+;
+; ⚠️ This is a cheat, and the only one on any parkour surface - everything else reproduces what
+; the game does rather than changing it. It exists because measured exit speeds of 575-772 UU/s
+; were not enough to clear the gap, and the alternative was this file computing launch velocities
+; on the one surface where the game's own pendulum is provably correct.
+;
+; 1.0 writes nothing and restores the original. Range 0.5..4.0, linear, so overshoot halves
+; cleanly. The session's true original is latched on the first swing and never re-read from a
+; value the mod has written - an earlier version did, and compounded 600 to 6834 over seven
+; swings.
+ParkourSwingExitBoost = 1.0
+
 ; ParkourPullUp: hanging from a ledge with BOTH hands anchored, push both controllers down and
 ; the climb axis is asserted for you - the physical action of pushing off an edge, instead of
 ; reaching for the stick. It measures each hand's height relative to your own head, so squatting

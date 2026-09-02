@@ -1730,6 +1730,7 @@ static void ArmSwingForgetHistory()
 // The orientation was in the locate result the whole time and simply was not published. Taken
 // horizontally and renormalised, so leaning or looking down does not tilt the axis the gesture
 // is measured against; a shimmy should not weaken because the player looked at their feet.
+static long       g_headAxesAge = 0;    // frames since the levelled basis could last be updated
 static XrVector3f g_headRight   = { 1.0f, 0.0f, 0.0f };
 static XrVector3f g_headForward = { 0.0f, 0.0f, -1.0f };
 static bool       g_headAxesOk  = false;
@@ -1757,10 +1758,54 @@ static bool ArmSwingLocateHead(XrTime when, XrVector3f* out)
         // Looking straight up or down collapses the horizontal projection. Keep the last good
         // pair rather than normalising a zero - a gesture axis that flips at the zenith would
         // reverse the player's controls exactly when they are looking where they are going.
-        if (rl > 0.1f && fl > 0.1f) {
-            g_headRight   = { r.x / rl, 0.0f, r.z / rl };
+        // ---- ⚠️ RIGHT AND FORWARD CANNOT BOTH COLLAPSE, SO STOP REQUIRING BOTH ----
+        //
+        // Requiring rl AND fl to survive was the bug behind two different swipe implementations
+        // behaving in two different wrong ways, and it hid for a long time because the frozen
+        // basis is stable rather than noisy - a confidently wrong answer, not a jittery one.
+        //
+        // Looking up at your own hands is the normal posture on a pipe and a bar, and it is
+        // exactly what collapses fl. But right and forward are orthogonal, so they cannot both go
+        // vertical: at the zenith the forward vector is straight up and USELESS while the right
+        // vector is still perfectly horizontal. Whichever has the longer horizontal projection is
+        // trustworthy, and the other follows from it by a quarter turn about world up.
+        //
+        // The run bears out what that cost. Across a 106-degree sweep of head yaw - -24 to +82 -
+        // the fwd component stayed pinned between -2 and -5 m/s. A live basis would have rotated
+        // lat and fwd into one another over that range; a frozen one projects onto a fixed room
+        // direction no matter where the player looks. That is why the first implementation needed
+        // a physically-rightward push whatever the player faced (a world-frame gesture, by
+        // accident), and why the second - which rotated those components by the LIVE head yaw -
+        // only worked at the one facing where the live yaw agreed with the frozen basis.
+        //
+        // OpenXR room axes are X right, Y up, -Z forward, so right = (-fz, 0, fx) and inversely
+        // forward = (rz, 0, -rx).
+        if (fl >= rl && fl > 0.1f) {
             g_headForward = { f.x / fl, 0.0f, f.z / fl };
+            g_headRight   = { -g_headForward.z, 0.0f, g_headForward.x };
             g_headAxesOk  = true;
+            g_headAxesAge = 0;
+        } else if (rl > 0.1f) {
+            g_headRight   = { r.x / rl, 0.0f, r.z / rl };
+            g_headForward = { g_headRight.z, 0.0f, -g_headRight.x };
+            g_headAxesOk  = true;
+            g_headAxesAge = 0;
+        } else if (g_headAxesAge < 100000) {
+            // ---- ⚠️ HOW LONG THIS HAS BEEN FROZEN IS A LOAD-BEARING NUMBER ----
+            //
+            // Keeping the last good pair is right for the case this was written for - a player
+            // running and swinging their arms, who glances at the sky for a moment. It is a trap
+            // on a pipe and a bar, where looking UP AT YOUR OWN HANDS is the normal posture and
+            // fl collapses for as long as you hold it. Every gesture that projects onto this
+            // basis - the ledge shimmy, the swing pump, the pipe swipe - is then measuring
+            // against a facing the player may have left entirely.
+            //
+            // The swipe's components were read as "the hand is travelling backwards" on that
+            // basis, and the player says plainly that it was not. A frozen basis explains a
+            // consistent, confident, wrong answer far better than eight identical arm movements
+            // do. So the age is published, and no reading that depends on these axes should be
+            // believed without it.
+            ++g_headAxesAge;
         }
     }
     return true;
@@ -2238,8 +2283,16 @@ static void ReportSprintLimitsOnce()
 // Declared up here, ahead of the swing gates rather than beside the parkour code, because every
 // one of those gates reads it - and two of them assert buttons that let go of a ledge.
 enum ParkourMode { PK_NONE = 0, PK_LEDGE, PK_CLIMB, PK_BAR };
+// What the player is on, for the log lines. Seven copies of a two-surface ternary read
+// "pipe or else ledge", and every one of them would have called a bar a ledge - a ternary
+// silently misreports the case that did not exist when it was written.
+static const char* PkSurfaceName();
 extern bool g_pkBypass;   // BACKTICK: stand every pipe-specific write down - the control test
 extern bool g_pkTopOpen;  // PK.34: the game is climbing the player over the top; stand aside
+// PK.44's assert, declared up here for the same reason g_pkTopOpen is: the hand snap sits above
+// the gesture code and has to stand down while a pull-up is using the arms.
+extern long g_pkPullUpHold;
+extern long g_pkBarJumpHold;    // PK.50: ...and while a bar's jump animation needs them
 extern long g_pkTopOpenFrames;      // ...and how far through that handover we are
 extern float g_pkHandoverStick;     // ...and which phase of it the pad should send
 extern const long kPkHandoverFrames;
@@ -2686,6 +2739,11 @@ static float g_pkUUPerMetre = 100.0f;       // 1 UU ~ 1 cm, from the pendulum pe
 static int  ParkourModeNow();      // defined with the move code, which owns the reads
 void ParkourAnimLock(bool onWall);          // defined beside the anim-follow flags it toggles
 
+static const char* PkSurfaceName()
+{
+    return g_pkMode == PK_CLIMB ? "pipe" : g_pkMode == PK_BAR ? "bar" : "ledge";
+}
+
 static float PkLateralOf(const ArmSwingHand& h)
 {
     return h.rel.x * g_headRight.x + h.rel.z * g_headRight.z;
@@ -2725,6 +2783,67 @@ static float PkBodyStep()
 //
 // TdPawn::MoveLedgeLocation and MoveLedgeNormal were located by the owner pass at +0x0648 and
 // +0x0654, and the two live in world UU while the hands live in metres in the player's room.
+// ---- PK.46: the bar's equivalent, declared here for the same reason the ledge's is ----
+// PkHoldLine is defined above the swing code and reads all three surfaces, so the state has to
+// exist by then. The functions that FILL these live with the rest of the bar work.
+int g_offSwingAngle = -1;       // TdMove_Swing::SwingAngle, radians
+int g_offSwingVel   = -1;       // ...::SwingVelocity
+int g_offSwingLoc   = -1;       // ...::SwingLocation, the bar's own point
+int g_offBarDir     = -1;       // ...::BarDirection, along the bar
+int g_offSwingLen   = -1;       // ...::SwingPendulumLength, UU
+int g_offExitVel    = -1;       // ...::ExitVelocityModifier - PK.49's suspect
+static bool  g_pkSwingOk = false;
+static float g_pkSwingAngle = 0.0f;      // radians, live
+static float g_pkSwingVel = 0.0f;
+static float g_pkSwingLen = 0.0f;        // UU
+static float g_pkBarLoc[3] = { 0, 0, 0 };
+static float g_pkBarAxis[3] = { 0, 0, 0 };
+static bool  g_pkBarLineOk = false;      // ...and whether the two of those survived the checks
+static const char* g_pkBarWhy = "not on a bar";
+// ---- ⚠️ 8 UU WAS PHYSICALLY RIGHT AND PRACTICALLY UNREACHABLE ----
+//
+// The reasoning was that a hand grips a bar, so it sits a knuckle below the bar. True, and it put
+// the anchor somewhere the player cannot get to: reported as "I'm too low", and the run agrees in
+// the bluntest possible terms - 452 frames of `grips GG anchored --`. Both hands squeezing, on a
+// bar, and not one anchor in the whole session.
+//
+// The measurement says why. hand-to-line tracks |SwingAngle| exactly as predicted - 63, 72, 83,
+// 95, 106, 116 UU as the angle runs 0.02 to 0.93 - which confirms the arms are animated relative
+// to the camera. But look at where that series STARTS: at the bottom of the swing, hanging dead
+// still, the game's own hands are 63 to 66 UU below the bar line. That is not an error. It is
+// where a first-person hang puts the hands so the shot reads correctly, and it is therefore the
+// only height at which the player's real hands and the virtual ones can agree.
+//
+// So the offset is taken from the game at the bottom of the swing, where the pendulum is at rest
+// and the animation is not displacing anything. Measured, per bar, rather than a constant that
+// was right about physics and wrong about reach.
+static float g_pkBarWrap = 63.0f;       // ParkourBarWrap: the fallback, if nothing is measured
+static MEVR_Vec3 g_pkBarOffset = {};    // ...and the measured article, taken at |angle| < 0.15
+static bool  g_pkBarOffsetOk = false;
+static float g_pkBarOffsetAt = 0.0f;    // the angle it was taken at, for the log
+static float g_pkExitVel = 0.0f;        // TdMove_Swing::ExitVelocityModifier, live
+static float g_pkExitBoost = 1.0f;      // ParkourSwingExitBoost - 1.0 writes nothing
+static float g_pkExitOrig = 0.0f;       // ...and what it read before we touched it
+static bool  g_pkExitSaved = false;
+static float g_pkSwingPeak = 0.0f;      // biggest |angle| this swing has reached
+// ---- ⚠️ PK.49: DOES A BIGGER SWING ACTUALLY LAUNCH YOU HARDER? ----
+//
+// Everything else about the bar now measures well. The pump builds real amplitude - six episodes
+// of 2026-09-01 read 1.000 rad when there was no time to pump (40 and 44 frames on the bar) and
+// 1.308 to 1.364 when there was. And the launch is not a timing problem the player can lose:
+// all six fired between +0.741 and +0.903 rad, a 20% spread across five button presses and one
+// release-frame launch, which is the GAME choosing the phase rather than the player.
+//
+// A rigid pendulum at +0.8 rad carries v^2 proportional to (cos 0.8 - cos A). Unpumped that is
+// 0.156; pumped to 1.36 it is 0.488 - so a pumped swing should leave the bar 1.77x faster. If it
+// does not, the exit speed is not being taken from the pendulum at all, and no amount of pumping
+// will ever help. ExitVelocityModifier sitting on the same move is the obvious suspect.
+//
+// So the launch is watched: peak amplitude going in, angle at release, and the fastest the pawn
+// actually travels afterwards. Two launches - one pumped, one not - answer it outright.
+static long  g_pkLaunchWatch = 0;
+static float g_pkLaunchPeak = 0.0f, g_pkLaunchAt = 0.0f, g_pkLaunchSpeed = 0.0f;
+
 static float g_pkLedgeLoc[3] = { 0, 0, 0 };
 static float g_pkLedgeNrm[3] = { 0, 0, 0 };
 static bool  g_pkLedgeOk = false;
@@ -3788,6 +3907,7 @@ static bool  g_pkHoldGripped = false;   // has a hand been on THIS hold? (false 
 static long  g_pkHoldEmpty = 0;         // consecutive frames with nothing on it
 static long  g_pkHoldDrop = 0;          // frames of synthesised crouch left to assert
 static long  g_pkHoldDrops = 0;         // how many times it has fired, for the overlay
+static bool  g_pkHoldDropJump = false;  // PK.46: a bar releases into a jump, not a crouch
 static const char* g_pkHoldWhy = "no hold";   // the rule's state, for the overlay
 
 
@@ -3870,6 +3990,8 @@ static void PkBeginHold(const char* why)
     InterlockedExchange(&g_pkGhostSegs[0], 0);
     InterlockedExchange(&g_pkGhostSegs[1], 0);
     g_pkGhostTaken[0] = g_pkGhostTaken[1] = false;
+    g_pkBarOffsetOk = false;        // PK.46: a new bar hangs its own way
+    g_pkBarOffsetAt = 0.0f;
 }
 
 // ---- the corner, and the end of the ledge ----
@@ -3997,13 +4119,30 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
     //
     // So the handover stands the hands down with the body. Not a pulse, because nothing here
     // needs sampling - we are not asking a question, we are getting out of the way.
-    if (!g_pkSnapOn || (g_pkMode != PK_LEDGE && g_pkMode != PK_CLIMB) ||
-        (g_pkMode == PK_CLIMB && (g_pkBypass || g_pkTopOpen)) || !grip ||
+    // ---- ⚠️ PK.44 HAS TO LET GO OF THE HANDS TO USE THEM ----
+    //
+    // Reported as the wrong animation playing on the pull-up, and the comparison is exact. The
+    // gesture pull-up at frame 31500 ran with anc=0 - the mod holding both hands, because PK.44
+    // REQUIRES both anchored before it will fire. The three stick pull-ups at 33728, 37036 and
+    // 38727 all ran with anc=-1 and "no hand gripping": the game had its own arms.
+    //
+    // That is PK.34's finding again, and its comment already says why: "Every dismount that has
+    // ever worked reads no hand held, so this function stood down and the game had its own
+    // hands... Pin the hands and the animation cannot advance." GrabPullUp is a climbing
+    // animation. The gesture that asks for it cannot also be holding the arms that play it.
+    //
+    // So the assert stands the hands down for its whole duration, exactly as the pipe handover
+    // does. Not a pulse - we are not asking a question here, we are getting out of the way.
+    if (!g_pkSnapOn || (g_pkMode != PK_LEDGE && g_pkMode != PK_CLIMB && g_pkMode != PK_BAR) ||
+        (g_pkMode == PK_CLIMB && (g_pkBypass || g_pkTopOpen)) || g_pkPullUpHold > 0 ||
+        g_pkBarJumpHold > 0 || !grip ||
         g_pkEntryHold > 0 || g_pkCornerState != 0) {
         if (g_pkSnapWhy2[hand][0] == 'o')   // keep a more specific reason set above
             g_pkSnapWhy2[hand] = !g_pkSnapOn ? "off"
                                : g_pkCornerState != 0 ? "corner"
                                : g_pkEntryHold > 0 ? "entry"
+                               : g_pkPullUpHold > 0 ? "pullup"
+                               : g_pkBarJumpHold > 0 ? "barjump"
                                : (grip ? "nomode" : "nogrip");
         // ⚠️ g_pkEntryHold is in here, not just at the call site that decides who owns the hand.
         // Through a corner the player never lets go, so there is no grip edge to re-latch on -
@@ -4205,8 +4344,37 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
             // A ledge is one edge. Both hands hang off it at the same depth, whatever the
             // animation that put them there did.
             const bool perHand = (g_pkMode == PK_CLIMB) && g_pkEntryOffsetHOk[hand];
-            const MEVR_Vec3 mine = perHand ? g_pkEntryOffsetH[hand] : g_pkEntryOffset;
-            const bool haveMine = perHand || g_pkEntryOffsetValid;
+            MEVR_Vec3 mine = perHand ? g_pkEntryOffsetH[hand] : g_pkEntryOffset;
+            bool haveMine = perHand || g_pkEntryOffsetValid;
+            // ---- ⚠️ A BAR DOES NOT NEED THE MEASUREMENT, AND MUST NOT USE IT ----
+            //
+            // Every other surface measures where the game plants a hand because it has no better
+            // way of knowing where the hold is: the ledge's own point lags the pawn by up to 125
+            // UU, and a pipe has no position field at all. A bar has SwingLocation, which the run
+            // of 2026-09-01 shows sliding cleanly ALONG BarDirection - X from -7920 to -7882 with
+            // Y and Z fixed - exactly the way MoveLedgeLocation tracks a ledge. The bar line is
+            // the best-known hold in the game.
+            //
+            // The measurement, meanwhile, is describing something else entirely. Four bar entries
+            // read the hand at 57, 67, 79 and 134 UU from that line, both hands agreeing to a
+            // tenth each time. A hand on a bar does not sit at four different distances; those
+            // are four different phases of a swing, and the 1P arm animation is authored relative
+            // to the camera, so its world-space hands travel the whole 1.2 m arc with the body.
+            //
+            // Worse, the 60 UU sanity bound - a LEDGE constant, where a planted hand reads 10 to
+            // 15 - accepts only the shallowest of those readings and rejects the rest. So the one
+            // sample that survived was systematically the least representative, and the anchor
+            // took its offset from it. That is the "sticks my hands higher than I can reach"
+            // report: an anchor placed from a sample caught at one arbitrary point in a swing,
+            // then held fixed while the player swung away from it.
+            //
+            // So on a bar the planted pose IS the bar, plus the small amount a closed hand hangs
+            // below the thing it is gripping. Nothing measured, because nothing needs to be.
+            if (g_pkMode == PK_BAR) {
+                if (!g_pkBarLineOk) haveMine = false;
+                else if (g_pkBarOffsetOk) { mine = g_pkBarOffset; haveMine = true; }
+                else { mine = { 0.0f, 0.0f, -g_pkBarWrap }; haveMine = true; }
+            }
             float dist = raw;
             const char* against = "line";
             if (haveMine) {
@@ -4222,7 +4390,7 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
             // ended with "it did not snap" and no number to size it from.
             Log("[pk] %s grip closed %.1f UU from the %s's %s (raw %.1f from the line,"
                 " radius %.0f) - %s",
-                hand ? "RIGHT" : "LEFT", dist, g_pkMode == PK_CLIMB ? "pipe" : "ledge",
+                hand ? "RIGHT" : "LEFT", dist, PkSurfaceName(),
                 against, raw, g_pkSnapRadius * g_pkUUPerMetre,
                 dist <= g_pkSnapRadius * g_pkUUPerMetre ? "ANCHORED" : "too far, hand stays free");
 
@@ -4522,6 +4690,13 @@ static bool PkClimbLine(float* point)
 // is the same arithmetic once it has these two.
 static bool PkHoldLine(float* point, float* axis)
 {
+    // PK.46: and the bar, which is the only one of the three that simply says where it is.
+    if (g_pkMode == PK_BAR) {
+        if (!g_pkBarLineOk) return false;
+        point[0] = g_pkBarLoc[0]; point[1] = g_pkBarLoc[1]; point[2] = g_pkBarLoc[2];
+        axis[0] = g_pkBarAxis[0]; axis[1] = g_pkBarAxis[1]; axis[2] = g_pkBarAxis[2];
+        return true;
+    }
     if (g_pkMode == PK_CLIMB) {
         if (!PkClimbLine(point)) return false;
         axis[0] = 0.0f; axis[1] = 0.0f; axis[2] = 1.0f;
@@ -5620,6 +5795,716 @@ static void ParkourDirectBodyTick()
     havePrev = true;
 }
 
+
+// ================================================================ PK.46: the horizontal bar
+//
+// The bar is the one parkour surface where the game already does the hard part properly, and
+// the run of 2026-08-28 proves it. Forty consecutive samples of TdMove_Swing::SwingAngle:
+//
+//   -1.000 -0.940 -0.565 -0.115 +0.242 ... peak +1.188 ... peak -0.755 ... peak +0.493
+//
+// Peaks 1.188, 0.755, 0.493 - a damping ratio of 0.64 and 0.65, which is the same number twice.
+// Half-period 1.08 s then 1.00 s, so a full period near 2.1 s. SwingPendulumLength reads 120.0
+// UU, and a rigid pendulum of 1.2 m has a period of 2*pi*sqrt(1.2/9.81) = 2.20 s.
+//
+// That is not a curve someone tuned to look like a swing. It is a real damped pendulum with a
+// length the game will tell us, an angle the game will tell us, and an angular velocity beside
+// it. Nothing here needs to simulate anything - which is the whole design of this rung, and the
+// player's own instruction: "maybe this time it should simulate stick pushes instead of one to
+// one movements, because the stick pushes simulate true body swinging speed".
+//
+// So: the mod owns the HANDS and the GESTURE, and the game keeps the physics.
+//
+// ---- what a bar has that a ledge and a pipe did not ----
+//
+// Both of the other surfaces had to have their line derived. The ledge's axis comes from the
+// pawn's yaw because MoveLedgeNormal reads (0,0,0), and its sign was wrong twice; the pipe has no
+// position field at all, so its line is the pawn's own X/Y. The bar just says where it is:
+// SwingLocation at +0x01B8 and BarDirection at +0x01AC, both structs, both on the move.
+//
+// ⚠️ Which means the reads are unverified in a way the others no longer are. The offsets come
+// from the class dump and are certainly the right fields; what no run has yet shown is a LIVE
+// value from either, because the only logged swing predates both entries being in the probe
+// table. Every one of them is therefore sanity-checked and fails CLOSED into "no bar line" -
+// which costs the ghost and the anchors and nothing else, exactly as an unreadable pipe extent
+// costs the climb guard and nothing else.
+// Read everything the swing knows about itself. Runs from the parkour tick, like PkReadLedge.
+static void PkReadSwing()
+{
+    g_pkSwingOk = false;
+    g_pkBarLineOk = false;
+    if (g_pkMode != PK_BAR || !g_playerPawn || g_offMoveState < 0 || g_offMoves < 0) {
+        // ⚠️ PK.49: armed on the way OUT, because the speed worth measuring only exists once the
+        // bar has been left - and this is the frame that knows what the swing had built.
+        // ⚠️ NOTHING IS RESTORED HERE, DELIBERATELY. The move object is no longer
+        // TdMove_Swing by the time this runs, so the write had nowhere to land - and clearing
+        // the latch here is what let the boost compound. The field is re-asserted from the
+        // session's true original on every bar instead, which is correct whether or not anything
+        // put it back.
+        if (g_pkSwingPeak > 0.0f) {
+            g_pkLaunchPeak = g_pkSwingPeak;
+            g_pkLaunchAt = g_pkSwingAngle;
+            g_pkLaunchSpeed = 0.0f;
+            g_pkLaunchWatch = 45;
+            g_pkSwingPeak = 0.0f;
+        }
+        g_pkBarWhy = "not on a bar";
+        return;
+    }
+    uint8_t st = 0xFF;
+    if (!SafeRead(g_playerPawn + g_offMoveState, &st, 1)) { g_pkBarWhy = "no move state"; return; }
+    char cls[48];
+    uintptr_t obj = 0;
+    if (!ReadMoveClassName(g_playerPawn, (int)st, cls, sizeof(cls), &obj) || !obj) {
+        g_pkBarWhy = "no move object";
+        return;
+    }
+    if (strcmp(cls, "TdMove_Swing") != 0) { g_pkBarWhy = "move is not TdMove_Swing"; return; }
+
+    if (g_offSwingAngle >= 0) SafeRead(obj + g_offSwingAngle, &g_pkSwingAngle, sizeof(float));
+    if (g_offSwingVel   >= 0) SafeRead(obj + g_offSwingVel,   &g_pkSwingVel,   sizeof(float));
+    if (g_offSwingLen   >= 0) SafeRead(obj + g_offSwingLen,   &g_pkSwingLen,   sizeof(float));
+    if (g_offExitVel    >= 0) SafeRead(obj + g_offExitVel,    &g_pkExitVel,    sizeof(float));
+    // ---- PK.51: the game's own exit-speed knob, turned up ----
+    //
+    // ⚠️ THIS IS A CHEAT AND IT IS LABELLED AS ONE. Everything else on the bar reproduces what
+    // the game does; this changes what the game does. It earns its place because the alternative
+    // - the mod computing a launch velocity and writing it - would put this file back in the
+    // business of simulating physics it has spent the whole rung avoiding, on the one surface
+    // where the game's own pendulum is measurably correct.
+    //
+    // ExitVelocityModifier is a float on TdMove_Swing that reads 600.00 on every sample of every
+    // swing. The game already multiplies its launch by it; scaling it is asking for a harder
+    // throw in the game's own terms, and everything downstream - direction, arc, the SwingJump
+    // animation, where the player lands - stays the game's.
+    //
+    // The original is captured the first time it is seen and put back when the bar is left, so a
+    // boosted value cannot escape onto another swing or outlive the session. Default 1.0, which
+    // writes nothing at all: PK.50 may well have been the whole problem, and a cheat left on by
+    // default would hide whether it was.
+    // ---- ⚠️ THE ORIGINAL IS LATCHED ONCE PER SESSION AND NEVER RE-READ ----
+    //
+    // The first version re-captured it per bar, and the restore that was supposed to make that
+    // safe could not run: by the time the mode has left PK_BAR the move object is no longer
+    // TdMove_Swing, so the write-back was skipped while the saved flag was cleared anyway. Every
+    // subsequent entry then took its "original" from the value we had already multiplied.
+    //
+    //     600 -> 900 -> 1350 -> 2025 -> 3038 -> 4556 -> 6834
+    //
+    // Seven swings, and the player was launched eleven times harder than asked. "The first few
+    // times were ok" is exactly the shape of a compounding error: 1.5 is fine, 2.25 is generous,
+    // and by 11.4 you are leaving the level.
+    //
+    // A remembered value that can be re-derived from a value we have written is not a backup, it
+    // is a feedback loop. This one is taken from the first swing of the session, before anything
+    // has been written, and is never assigned again - so the field is always exactly
+    // (true original x boost), whatever happens in between, and the arithmetic cannot compound
+    // because it never reads its own output.
+    if (g_offExitVel >= 0) {
+        if (!g_pkExitSaved && g_pkExitVel > 1.0f && std::isfinite(g_pkExitVel)) {
+            g_pkExitOrig = g_pkExitVel;
+            g_pkExitSaved = true;
+            Log("[bar] PK.51: the bar's own ExitVelocityModifier is %.0f - latched for the"
+                " session, and never read back from a value we have written", g_pkExitOrig);
+        }
+    }
+    if (g_offExitVel >= 0 && g_pkExitSaved) {
+        // At boost 1.0 this writes the original back, so turning the cheat off in the ini and
+        // reloading actually turns it off rather than leaving the last scaled value in place.
+        const float want = g_pkExitOrig * g_pkExitBoost;
+        if (fabsf(g_pkExitVel - want) > 0.5f && std::isfinite(want)) {
+            WriteProcessMemory(GetCurrentProcess(), (LPVOID)(obj + g_offExitVel),
+                               &want, sizeof(want), nullptr);
+            g_pkExitVel = want;
+            Log("[bar] PK.51: ExitVelocityModifier %.0f -> %.0f (original %.0f x boost %.2f)",
+                g_pkExitVel, want, g_pkExitOrig, g_pkExitBoost);
+        }
+    }
+    // The running peak of this swing, so the launch can be judged against what preceded it
+    // rather than against the one frame it happened on.
+    if (fabsf(g_pkSwingAngle) > g_pkSwingPeak) g_pkSwingPeak = fabsf(g_pkSwingAngle);
+    g_pkSwingOk = g_offSwingAngle >= 0 && std::isfinite(g_pkSwingAngle);
+
+    // ---- the bar's line, with both halves checked ----
+    //
+    // ⚠️ THE WORLD ORIGIN IS NOT A BAR, and this file has already lost a run to the ledge
+    // version of that: MoveLedgeLocation reads (0,0,0) whenever the game has not filled it in,
+    // and treating that as a real point put the hold half a mile away. The same guard, and a
+    // second one the ledge did not need - BarDirection is a direction, so it has to be unit
+    // length, and a struct read at a wrong offset almost never is.
+    if (g_offSwingLoc < 0 || g_offBarDir < 0) { g_pkBarWhy = "no SwingLocation/BarDirection"; return; }
+    float loc[3] = { 0, 0, 0 }, dir[3] = { 0, 0, 0 };
+    if (!SafeRead(obj + g_offSwingLoc, loc, sizeof(loc)) ||
+        !SafeRead(obj + g_offBarDir, dir, sizeof(dir))) {
+        g_pkBarWhy = "bar line unreadable";
+        return;
+    }
+    if (!std::isfinite(loc[0]) || !std::isfinite(loc[1]) || !std::isfinite(loc[2]) ||
+        (fabsf(loc[0]) < 1.0f && fabsf(loc[1]) < 1.0f && fabsf(loc[2]) < 1.0f)) {
+        g_pkBarWhy = "SwingLocation is the origin";
+        return;
+    }
+    const float dl = sqrtf(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
+    if (!std::isfinite(dl) || dl < 0.9f || dl > 1.1f) { g_pkBarWhy = "BarDirection is not unit"; return; }
+
+    memcpy(g_pkBarLoc, loc, sizeof(loc));
+    g_pkBarAxis[0] = dir[0] / dl; g_pkBarAxis[1] = dir[1] / dl; g_pkBarAxis[2] = dir[2] / dl;
+    g_pkBarLineOk = true;
+    g_pkBarWhy = "bar line good";
+
+    // ---- ⚠️ AT THE BOTTOM OF THE SWING, WHERE THE ANIMATION IS DISPLACING NOTHING ----
+    //
+    // Anywhere else on the arc this reads the swing rather than the hold: 63 UU at rest against
+    // 116 UU at 0.93 rad, on the same bar in the same second. So it is only sampled near the
+    // bottom, and the smallest |angle| seen wins - the pendulum passes through zero twice a
+    // period, so a real swing supplies a good sample within about a second whatever it is doing.
+    if (fabsf(g_pkSwingAngle) < 0.15f && g_pkGameHandValid[0] && g_pkGameHandValid[1] &&
+        (!g_pkBarOffsetOk || fabsf(g_pkSwingAngle) < g_pkBarOffsetAt)) {
+        MEVR_Vec3 sum{};
+        for (int h = 0; h < 2; ++h) {
+            const MEVR_Vec3& hw = g_pkGameHandWorld[h];
+            const float vx = hw.x - g_pkBarLoc[0], vy = hw.y - g_pkBarLoc[1], vz = hw.z - g_pkBarLoc[2];
+            const float t = vx * g_pkBarAxis[0] + vy * g_pkBarAxis[1] + vz * g_pkBarAxis[2];
+            sum.x += vx - g_pkBarAxis[0] * t;
+            sum.y += vy - g_pkBarAxis[1] * t;
+            sum.z += vz - g_pkBarAxis[2] * t;
+        }
+        const MEVR_Vec3 off = { sum.x * 0.5f, sum.y * 0.5f, sum.z * 0.5f };
+        const float mag = sqrtf(off.x * off.x + off.y * off.y + off.z * off.z);
+        // A bound an order of magnitude looser than the ledge's, because the honest answer here
+        // IS large - and still tight enough to reject a read that has gone wrong entirely.
+        if (mag < 200.0f) {
+            const bool first = !g_pkBarOffsetOk;
+            g_pkBarOffset = off;
+            g_pkBarOffsetOk = true;
+            g_pkBarOffsetAt = fabsf(g_pkSwingAngle);
+            if (first)
+                Log("[pk] PK.46: the bar's resting hand offset is (%.1f %.1f %.1f), %.0f UU below"
+                    " the line, taken at %.3f rad - that is where a hand can actually be reached",
+                    off.x, off.y, off.z, mag, g_pkSwingAngle);
+        }
+    }
+}
+
+// ================================================================ PK.47: pumping the swing
+//
+// The player's instruction, and the reason it is the right design: "swinging forward is like you
+// are pushing the stick back and vice versa... it should simulate stick pushes instead of one to
+// one movements, because the stick pushes simulate true body swinging speed".
+//
+// A one-to-one mapping would have the mod deciding where the body is, on the one surface where
+// the game is already running a correct damped pendulum with a measured 2.1 s period. The stick
+// is the input that pendulum was built to take, so the gesture drives the stick and the game
+// keeps producing real swing speed, real momentum and a real launch.
+//
+// So this is a continuous stick, not a trigger like PK.44's pull-up: the player pumps fore and
+// aft, and the deflection follows how far they are pushing. Both hands, anchored - one hand
+// moving is not a swing, and a hand that is not on the bar is not pushing off it.
+//
+// ⚠️ INVERTED, because the hands are the fixed thing. This is the same relationship the ledge
+// servo runs on - "pull the hands LEFT and the body goes RIGHT" - and the same one the original
+// bar measurement confirmed, "where hands back meant feet forward". The sign is a setting anyway,
+// because a sign in this file has been wrong twice and a run spent on one is a run wasted.
+static bool  g_pkSwingPump = true;          // ParkourSwingPump in mevr.ini
+// ⚠️ Sized from the run, not guessed. With the follower fixed, the 45 anchored samples of
+// 2026-09-01 peaked at 0.311 m of raw fore/aft travel, and half of that is a comfortable pump -
+// so full deflection at 0.15 and a deadband low enough that an ordinary push clears it at once.
+static float g_pkPumpFull = 0.15f;          // metres of fore/aft push for full stick
+static float g_pkPumpDead = 0.03f;          // ...and the deadband under it
+static float g_pkPumpSign = -1.0f;          // ParkourSwingPumpSign: -1 inverts, +1 follows
+static float g_pkPumpStick = 0.0f;          // what the pad is asked for on Y this frame
+static float g_pkPumpPush = 0.0f;           // the measured fore/aft push, metres, for the overlay
+static float g_pkPumpBase[2] = { 0.0f, 0.0f };
+static bool  g_pkPumpBaseOk = false;
+static const char* g_pkPumpWhy = "not on a bar";
+
+// Fore/aft of one hand against the levelled head forward - the same projection PkLateralOf does
+// on the right axis, on the other axis. Head-relative, so it means "in front of me" whichever way
+// the player has turned, and turning on the spot does not read as a push.
+static float PkForeAftOf(const ArmSwingHand& h)
+{
+    return h.rel.x * g_headForward.x + h.rel.z * g_headForward.z;
+}
+
+// ---- ⚠️ THE ONE NUMBER THAT DECIDES WHETHER A BAR CAN BE MEASURED AT ALL ----
+//
+// Perpendicular distance from the game's OWN composed hand to the bar line, live. The four entry
+// samples that read 57, 67, 79 and 134 UU are four snapshots of this, each caught at whatever
+// phase the swing happened to be in when a 30-frame window closed.
+//
+// If this tracks SwingAngle - largest at the extremes, smallest at the bottom - then the 1P arm
+// animation is authored camera-relative, its world hands ride the whole 1.2 m arc, and no single
+// measured offset can ever describe them. That is the assumption the fix above is built on, and
+// this is what confirms or kills it. If instead it holds steady near some value, the entry
+// measurement was salvageable and only its 60 UU ledge bound was wrong.
+static float PkGameHandToBar(int hand)
+{
+    if (!g_pkBarLineOk || hand < 0 || hand > 1 || !g_pkGameHandValid[hand]) return -1.0f;
+    const MEVR_Vec3& h = g_pkGameHandWorld[hand];
+    const float vx = h.x - g_pkBarLoc[0], vy = h.y - g_pkBarLoc[1], vz = h.z - g_pkBarLoc[2];
+    const float t = vx * g_pkBarAxis[0] + vy * g_pkBarAxis[1] + vz * g_pkBarAxis[2];
+    const float ex = vx - g_pkBarAxis[0] * t;
+    const float ey = vy - g_pkBarAxis[1] * t;
+    const float ez = vz - g_pkBarAxis[2] * t;
+    return sqrtf(ex * ex + ey * ey + ez * ez);
+}
+
+static void PkSwingPumpTick()
+{
+    // PK.49's launch watch. Above everything, for the reason every other assert in this file is:
+    // the thing being measured happens after the mode it belongs to has ended.
+    if (g_pkLaunchWatch > 0) {
+        --g_pkLaunchWatch;
+        float v[3];
+        if (g_offVelocity >= 0 && g_playerPawn &&
+            SafeRead(g_playerPawn + g_offVelocity, v, sizeof(v))) {
+            const float sp = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            if (sp > g_pkLaunchSpeed) g_pkLaunchSpeed = sp;
+        }
+        if (g_pkLaunchWatch == 0) {
+            // What the pendulum SHOULD have been doing at that angle, from its own length and
+            // amplitude - so the game's answer can be compared against the physics rather than
+            // against an impression. v = sqrt(2 g L (cos angle - cos peak)), L in metres.
+            const float L = g_pkSwingLen > 1.0f ? g_pkSwingLen / 100.0f : 1.2f;
+            const float c = cosf(g_pkLaunchAt) - cosf(g_pkLaunchPeak);
+            const float want = c > 0.0f ? sqrtf(2.0f * 9.81f * L * c) * 100.0f : 0.0f;
+            Log("*** [bar] PK.49: launched from a swing that peaked at %.3f rad, released at"
+                " %.3f - fastest afterwards %.0f UU/s against %.0f the pendulum was carrying."
+                " ExitVelocityModifier %.2f",
+                g_pkLaunchPeak, g_pkLaunchAt, g_pkLaunchSpeed, want, g_pkExitVel);
+        }
+    }
+
+    g_pkPumpStick = 0.0f;
+    const bool eligible = g_pkSwingPump && g_pkMode == PK_BAR &&
+                          g_pkHandAnchored[0] && g_pkHandAnchored[1] &&
+                          g_swingL.tracked && g_swingR.tracked;
+    if (!eligible) {
+        g_pkPumpBaseOk = false;
+        g_pkPumpPush = 0.0f;
+        g_pkPumpWhy = !g_pkSwingPump ? "off"
+                    : g_pkMode != PK_BAR ? "not on a bar"
+                    : "need both hands";
+        return;
+    }
+
+    const float f = 0.5f * (PkForeAftOf(g_swingL) + PkForeAftOf(g_swingR));
+    if (!g_pkPumpBaseOk) {
+        g_pkPumpBase[0] = f;
+        g_pkPumpBaseOk = true;
+        g_pkPumpWhy = "ready";
+        return;
+    }
+    // ---- ⚠️ THE NEUTRAL DRIFTS, AND THE FIRST VERSION DRIFTED AT THE SPEED OF THE PUMP ----
+    //
+    // 0.01 per frame at ~70 fps is a time constant of about 1.4 s. The pendulum's period is 2.1 s.
+    // So the "slow" follower was chasing the gesture at very nearly the gesture's own rate and
+    // cancelling most of it: over 45 logged frames with both hands anchored, push had a median of
+    // 0.077 m against a 0.05 m deadband, so the stick read 0.00 on 1038 of 1050 samples. The
+    // comment claimed a real pump "passes through it untouched"; the measurement says it was
+    // being eaten. Reported as "moving them forwards or backwards does not move the character",
+    // which is exactly what a deadband nothing can cross looks like.
+    //
+    // 0.0005 is a ~30 s time constant - slow against any pump, still fast enough to learn a
+    // player who hangs habitually forward.
+    g_pkPumpBase[0] += (f - g_pkPumpBase[0]) * 0.0005f;
+    g_pkPumpPush = f - g_pkPumpBase[0];
+
+    float mag = fabsf(g_pkPumpPush);
+    if (mag <= g_pkPumpDead) { g_pkPumpWhy = "centred"; return; }
+    const float span = g_pkPumpFull - g_pkPumpDead;
+    float unit = span > 1e-3f ? (mag - g_pkPumpDead) / span : 0.0f;
+    if (unit > 1.0f) unit = 1.0f;
+    g_pkPumpStick = g_pkPumpSign * (g_pkPumpPush < 0.0f ? -unit : unit);
+    g_pkPumpWhy = g_pkPumpStick > 0.0f ? "pushing +Y" : "pushing -Y";
+}
+
+// ================================================================ PK.52: along the bar
+//
+// Moving left and right on a bar, the way a ledge shimmies.
+//
+// ---- ⚠️ THE BOUNDS ARE NOT OURS TO FIND, AND THAT IS THE ANSWER ----
+//
+// "Do we have a way to determine the bounds of the pipe?" Nothing readable gives them: this
+// level places zero TdSwingVolume instances, and the move carries a location and a direction but
+// no extent. Deriving them would mean the same guessing that cost the pipe four runs.
+//
+// It also is not necessary, and the ledge already proved why. Its whole end-of-ledge machinery is
+// built on asking rather than knowing: push the stick, watch MoveLedgeLocation advance or not,
+// and the game's refusal IS the boundary. A bar answers the same question even more directly -
+// SwingLocation slides along BarDirection as the player moves, measured travelling 38 UU in one
+// logged run - so pushing the stick and watching that number is a complete substitute for an
+// extent nobody can read. When it stops advancing, the bar has stopped.
+//
+// So this asks, and it reports what came back. The game clamps its own bar; we do not need to
+// know where the ends are to avoid falling off one.
+//
+// ---- and it is head-relative, like the ledge, for a reason that has already cost a day ----
+//
+// The obvious alternative is to project the hand's motion onto BarDirection, which unlike the
+// pawn's yaw is a real measured vector that varies per bar. It would need the room-to-world
+// bridge, and every version of that in this file has been wrong in a different way. The ledge's
+// shimmy runs on head-relative lateral and works. Same input, same frame, nothing new to get
+// backwards.
+static bool  g_pkBarShimmyOn = true;        // ParkourBarShimmy in mevr.ini
+static float g_pkBarShimmyFull = 0.25f;     // metres of lateral hand travel for full stick
+static float g_pkBarShimmyDead = 0.04f;
+static float g_pkBarShimmy = 0.0f;          // what the pad is asked for on X
+static float g_pkBarShimmyLat[2] = { 0.0f, 0.0f };   // lateral at the moment each hand anchored
+static bool  g_pkBarShimmyRef[2] = { false, false };
+static float g_pkBarShimmyPush = 0.0f;      // live lateral offset, for the overlay
+static float g_pkBarTravel = 0.0f;          // how far SwingLocation has moved along the bar
+static float g_pkBarTravelPrev[3] = { 0, 0, 0 };
+static bool  g_pkBarTravelOk = false;
+static const char* g_pkBarShimmyWhy = "not on a bar";
+
+static void PkBarShimmyTick()
+{
+    g_pkBarShimmy = 0.0f;
+    if (!g_pkBarShimmyOn || g_pkMode != PK_BAR) {
+        g_pkBarShimmyRef[0] = g_pkBarShimmyRef[1] = false;
+        g_pkBarShimmyPush = 0.0f;
+        g_pkBarTravelOk = false;
+        g_pkBarTravel = 0.0f;
+        g_pkBarShimmyWhy = g_pkBarShimmyOn ? "not on a bar" : "off";
+        return;
+    }
+
+    // ---- the game's own verdict on where the bar ends ----
+    //
+    // Accumulated along BarDirection, so a swing moving the point perpendicular to the bar does
+    // not read as travel. This is the number that says whether an asked-for shimmy was taken.
+    if (g_pkBarLineOk) {
+        if (g_pkBarTravelOk) {
+            const float dx = g_pkBarLoc[0] - g_pkBarTravelPrev[0];
+            const float dy = g_pkBarLoc[1] - g_pkBarTravelPrev[1];
+            const float dz = g_pkBarLoc[2] - g_pkBarTravelPrev[2];
+            const float along = dx * g_pkBarAxis[0] + dy * g_pkBarAxis[1] + dz * g_pkBarAxis[2];
+            if (fabsf(along) < 50.0f) g_pkBarTravel += along;   // a jump that size is a new bar
+        }
+        memcpy(g_pkBarTravelPrev, g_pkBarLoc, sizeof(g_pkBarTravelPrev));
+        g_pkBarTravelOk = true;
+    }
+
+    // The most recently anchored hand drives, exactly as the ledge's anchor selection does - two
+    // hands pulling different ways is not a direction anybody asked for.
+    int drive = -1;
+    for (int h = 0; h < 2; ++h) {
+        const bool on = g_pkHandAnchored[h] && (h ? g_swingR : g_swingL).tracked;
+        if (!on) { g_pkBarShimmyRef[h] = false; continue; }
+        const float lat = PkLateralOf(h ? g_swingR : g_swingL);
+        if (!g_pkBarShimmyRef[h]) {          // latch where the hand was when it took hold
+            g_pkBarShimmyLat[h] = lat;
+            g_pkBarShimmyRef[h] = true;
+        }
+        if (drive < 0) drive = h;
+    }
+    if (drive < 0) {
+        g_pkBarShimmyPush = 0.0f;
+        g_pkBarShimmyWhy = "no hand on the bar";
+        return;
+    }
+
+    const float lat = PkLateralOf(drive ? g_swingR : g_swingL);
+    g_pkBarShimmyPush = lat - g_pkBarShimmyLat[drive];
+    const float mag = fabsf(g_pkBarShimmyPush);
+    if (mag <= g_pkBarShimmyDead) { g_pkBarShimmyWhy = "centred"; return; }
+    const float span = g_pkBarShimmyFull - g_pkBarShimmyDead;
+    float unit = span > 1e-3f ? (mag - g_pkBarShimmyDead) / span : 0.0f;
+    if (unit > 1.0f) unit = 1.0f;
+    // ⚠️ Inverted, the same way everything else anchored in this file is: the hands are the fixed
+    // thing, so pulling them right carries the body left.
+    g_pkBarShimmy = (g_pkBarShimmyPush > 0.0f ? -unit : unit) * g_pkShimmyCap;
+    g_pkBarShimmyWhy = g_pkBarShimmy > 0.0f ? "moving +X" : "moving -X";
+}
+
+// ================================================================ PK.48: swipe off a pipe
+//
+// Jumping sideways off a pipe with a hand instead of a stick. Swipe right and let go, and you go
+// left - the anchored-hand inversion this file runs on everywhere else, and the one the player
+// asked for by name.
+//
+// With one hand holding, that hand decides. With both holding, both must have swiped the same way
+// before the release, so a hand that happens to move while the other one is doing the work cannot
+// launch anybody. Rejecting a disagreement is deliberate: the alternative is picking a winner,
+// and there is no reading of "the hands went opposite ways" that means a confident sideways jump.
+//
+// ---- ⚠️ THE DIRECTION PROBLEM THE PLAYER SAW COMING, AND WHAT IS AND IS NOT SOLVED ----
+//
+// "I can foresee trouble if you are looking one way and swipe to jump the other way. Normally
+// jump direction is where you are looking. In this case I want the direction implied by the swipe
+// to take priority."
+//
+// Right, and the fix is to assert a stick DIRECTION rather than a bare jump. A bare jump takes
+// its heading from where the camera points, so the swipe would be ignored outright. The left
+// stick is interpreted in the controller's own yaw frame, and this mod writes that yaw from the
+// head - so LX is "the player's own right", the same frame the swipe was measured in. Swipe
+// right, assert LX left, and the jump goes left whichever way the player is facing. The swipe
+// wins, which is what was asked for.
+//
+// ⚠️ What that does NOT fix is looking a long way off the pipe. The stick is still read in the
+// camera's frame, so with the head turned 90 degrees from the wall the player's "left" points
+// along the wall or into it rather than off it, and the jump goes somewhere useless. Resolving
+// the swipe onto the pawn's own left/right instead would fix it, and needs the pawn's right-axis
+// SIGN - which this file has had wrong once already and scores rather than picks. So the yaw
+// difference is logged at every firing instead of guessed at: if the useless jumps correlate with
+// a large one, that is the fix, and the number to build it from is already in the log.
+static bool  g_pkSwipeJump = true;          // ParkourSwipeJump in mevr.ini
+static float g_pkSwipeSpeed = 1.2f;         // m/s of lateral hand speed that counts as a swipe
+static float g_pkSwipeSign = 1.0f;          // ParkourSwipeSign: flips which way the wall axis runs
+static const long kPkSwipeWindow = 30;      // frames a swipe stays live, waiting for the release
+static const long kPkSwipeAssert = 12;      // frames the jump and the stick are then held
+static const float kPkSwipeStick = 0.97f;   // the handover's measured deflection, again
+static int   g_pkSwipeDir[2] = { 0, 0 };    // -1 left, +1 right, in the player's own frame
+static long  g_pkSwipeLive[2] = { 0, 0 };
+static bool  g_pkSwipePrevGrip[2] = { false, false };
+static long  g_pkSwipeHold = 0;             // frames left asserting
+static float g_pkSwipeStick = 0.0f;         // ...and what LX is being asked for
+static long  g_pkSwipeJumps = 0;
+static float g_pkSwipeVel[2] = { 0.0f, 0.0f };      // live lateral speed, for the overlay
+// ⚠️ The speed AT THE LATCH, kept because the live one is zeroed the instant the hand lets go -
+// which is the instant before the firing log runs, so every single line read "0.00 m/s". A
+// diagnostic that reports a value already cleared is worse than none: it looks like a
+// measurement of zero rather than an absence of one.
+static float g_pkSwipePeak[2] = { 0.0f, 0.0f };
+static float g_pkSwipePerp[2] = { 0.0f, 0.0f };   // the across-the-wall half, which must lose
+// The room-to-world angle, degrees. It is a property of the recentre, not of where the player is
+// looking, so it should sit still while the head turns - and a value that drifts is the tell that
+// something in the chain is still head-dependent.
+static float g_pkRoomToWorld = 0.0f;
+// Frames after the assert during which a refused jump still will not be turned into a drop.
+static long  g_pkSwipeGrace = 0;
+static const long kPkSwipeGrace = 45;
+static const char* g_pkSwipeWhy = "not on a pipe";
+// ---- ⚠️ WHERE DID THE PLAYER ACTUALLY GO? ----
+//
+// The whole design rests on one unmeasured assumption: that a pipe jump takes its direction from
+// the camera yaw COMBINED with the stick, the way 3D movement normally composes the two. If that
+// holds, asserting the stick sideways is already identical to "turn to face that way and jump",
+// and nothing needs to touch the view.
+//
+// If instead the jump reads the camera yaw ALONE, the stick is inert, every swipe launches the
+// player wherever they happened to be looking, and the only remaining lever is writing the
+// controller yaw - which costs a view swing, because ApplyYawFix pins the rendered view to that
+// same yaw while a wall has the animation locks off.
+//
+// So the pawn's own velocity is sampled for a few frames after every firing and compared, in
+// degrees, against the direction the swipe asked for. Agreement settles it. A jump that
+// consistently follows the head instead of the swipe settles it the other way, and says so with
+// a number rather than an impression.
+static long  g_pkSwipeWatch = 0;            // frames left of the post-jump velocity sample
+static float g_pkSwipeWant = 0.0f;          // the heading the swipe asked for, degrees
+static float g_pkSwipePawnYaw = 0.0f;       // ...and the pawn's own facing when it fired
+static float g_pkSwipeBestSpeed = 0.0f;     // fastest horizontal speed seen since firing
+static float g_pkSwipeBestDir = 0.0f;       // ...and the heading at that moment
+
+static void PkSwipeJumpTick()
+{
+    // ⚠️ First and unconditional, like every other assert in this file. A sideways jump ENDS the
+    // climb, so the mode has already changed while the button still needs holding.
+    if (g_pkSwipeHold > 0) --g_pkSwipeHold;
+    if (g_pkSwipeHold == 0) g_pkSwipeStick = 0.0f;
+
+    // ⚠️ ABOVE the eligibility gate, for that same reason. The velocity worth measuring only
+    // exists once the player has left the pipe, which is the moment this function would
+    // otherwise have stopped running.
+    if (g_pkSwipeWatch > 0) {
+        --g_pkSwipeWatch;
+        float v[3];
+        if (g_offVelocity >= 0 && g_playerPawn &&
+            SafeRead(g_playerPawn + g_offVelocity, v, sizeof(v))) {
+            const float sp = sqrtf(v[0] * v[0] + v[1] * v[1]);
+            if (sp > g_pkSwipeBestSpeed) {
+                g_pkSwipeBestSpeed = sp;
+                g_pkSwipeBestDir = atan2f(v[1], v[0]) * (180.0f / 3.14159265f);
+            }
+        }
+        if (g_pkSwipeWatch == 0 && g_pkSwipeBestSpeed > 1.0f) {
+            float err = g_pkSwipeBestDir - g_pkSwipeWant;
+            while (err > 180.0f) err -= 360.0f;
+            while (err < -180.0f) err += 360.0f;
+            // ⚠️ THE FIRST VERSION OF THIS TEST WAS WRONG, AND SAID SO FOUR TIMES.
+            //
+            // It compared against a heading derived from the HEAD, as though the jump could go
+            // anywhere. It cannot: all five firings landed on exactly 0 or 180 degrees against a
+            // pawn yaw of 90, which is the pipe's own left and right and nothing in between. So
+            // "off by 106 degrees" was not the stick failing to steer, it was the test asking for
+            // a heading the game never offers. Judged against the two headings that exist, the
+            // stick steered every one of the five correctly.
+            const float side = g_pkSwipeStick < 0.0f ? -90.0f : 90.0f;
+            float want2 = g_pkSwipeWant;
+            (void)want2;
+            Log("*** [pk] PK.48: the jump went %.0f deg at %.0f UU/s | pawn %.0f, so its own"
+                " left/right are %.0f and %.0f | the swipe asked for the %s one - %s",
+                g_pkSwipeBestDir, g_pkSwipeBestSpeed, g_pkSwipePawnYaw,
+                g_pkSwipePawnYaw - 90.0f, g_pkSwipePawnYaw + 90.0f,
+                side < 0.0f ? "first" : "second",
+                fabsf(err) < 45.0f ? "and went there"
+                                   : "CHECK: it went to the other one, so the sign is inverted");
+        }
+    }
+
+    const bool eligible = g_pkSwipeJump && g_pkMode == PK_CLIMB && !g_pkBypass && !g_pkTopOpen;
+    if (!eligible) {
+        g_pkSwipeDir[0] = g_pkSwipeDir[1] = 0;
+        g_pkSwipeLive[0] = g_pkSwipeLive[1] = 0;
+        g_pkSwipePrevGrip[0] = g_pkSwipePrevGrip[1] = false;
+        g_pkSwipeVel[0] = g_pkSwipeVel[1] = 0.0f;
+        g_pkSwipeWhy = !g_pkSwipeJump ? "off"
+                     : g_pkMode != PK_CLIMB ? "not on a pipe"
+                     : "the game has the pipe";
+        return;
+    }
+
+    for (int h = 0; h < 2; ++h) {
+        const ArmSwingHand& hd = h ? g_swingR : g_swingL;
+        const bool grip = g_gripValue[h] > 0.5f;
+        // ⚠️ ANCHORED, not merely gripping. A hand waving in open air beside a pipe is not
+        // pushing off anything, and PK.45 has just finished teaching the rest of this file that
+        // a refused grip is a fist rather than a hold.
+        const bool holding = grip && g_pkHandAnchored[h];
+        if (g_pkSwipeLive[h] > 0) --g_pkSwipeLive[h];
+
+        if (holding && hd.tracked) {
+            // ---- ⚠️ MEASURED AGAINST THE WALL, NOT AGAINST THE HEAD ----
+            //
+            // The first version projected onto g_headRight, and the report is exactly what that
+            // produces: "if I'm facing the bar and swipe right it works as expected. But let's
+            // say I turn left first... it still is working if I swipe to my right, which when
+            // facing left is basically punching the wall."
+            //
+            // Right, because the JUMP is a fact about the pipe and the SWIPE was a fact about the
+            // head, and turning slid the two apart. The run settles what the jump can do: five
+            // firings, every one landing at exactly 0 or 180 degrees against a pawn yaw of 90,
+            // at 412 UU/s each time. The game only offers two directions off a pipe - its own
+            // left and its own right - and it took the one the asserted stick asked for on all
+            // five. So the swipe has to be read on that same axis, and then swiping along the
+            // wall works whichever way the player has turned, while swiping into it does nothing.
+            //
+            // ⚠️ The sign is derived from those five, not from a trig convention this file has
+            // had backwards before: pawn yaw 90 with LX negative produced a jump at 0 degrees, so
+            // the stick-negative direction is (sin yaw, -cos yaw). ParkourSwipeSign flips it if
+            // that generalises worse than five samples suggest.
+            // ---- ⚠️ THE WALL AXIS WAS BUILT ON A CONSTANT. ALL OF IT COMES OUT. ----
+            //
+            // PkPawnYaw returns 90.0 on every sample of every pipe in every run in this log. It
+            // is not the wall's orientation - the climb move pins it - so it carries no
+            // information about which way the wall runs. Two successive coordinate transforms
+            // were built on top of it, one bridging room to world through a head yaw that turned
+            // out not to be absolute, then another through the rendered camera basis. Both were
+            // arithmetic on a number that never varied, which is why each one failed in a new
+            // direction and why the player kept seeing the same behaviour.
+            //
+            // What the game actually offers off a pipe is two outcomes, its own left and its own
+            // right, and the stick sign picks between them. That needs no world frame at all -
+            // only "did the hand go the player's left or the player's right", which is the head
+            // basis, and the head basis is now live rather than frozen. This is what the first
+            // implementation did; it read as direction-fixed because the basis was stale, and
+            // that is fixed upstream.
+            //
+            // A swipe is sideways to the player and a release is toward them, so the shape test
+            // becomes lat against fwd - the same two numbers, in the one frame that was never in
+            // doubt.
+            const float lat = hd.vel.x * g_headRight.x + hd.vel.z * g_headRight.z;
+            const float fwd = hd.vel.x * g_headForward.x + hd.vel.z * g_headForward.z;
+            g_pkSwipeVel[h] = lat * g_pkSwipeSign;
+            g_pkSwipePerp[h] = fwd;
+            if (fabsf(lat) >= g_pkSwipeSpeed && (g_frames % 3) == 0)
+                Log("[pk] PK.48 swipe %s: RAW vel (%+.2f %+.2f %+.2f) | basis R(%+.2f %+.2f)"
+                    " age %ld | lat %+.2f fwd %+.2f -> %s",
+                    h ? "R" : "L", hd.vel.x, hd.vel.y, hd.vel.z,
+                    g_headRight.x, g_headRight.z, g_headAxesAge, lat, fwd,
+                    fabsf(lat) >= g_pkSwipeSpeed ? "taken" : "under the threshold");
+
+            // ---- ⚠️ NO SHAPE TEST. IT WAS REJECTING HALF THE PLAYER'S SWIPES. ----
+            //
+            // The player is right, and said so with the build that proved it: "if I'm facing the
+            // bar and swipe right it works as expected". Facing the wall, swipe right, jump left
+            // - that worked, and every later build broke it while I argued the game could not do
+            // it. It can. What the game refuses is a lateral jump taken while looking a long way
+            // OFF the wall, which is a different sentence and not the one the player was saying.
+            //
+            // The regression is this test. It was added to explain twelve firings that all read
+            // "swiped left", on the theory that the peak sample was a pull-back rather than a
+            // swipe. That theory was wrong - the cause was the levelled head basis freezing
+            // whenever the player looked up at their own hands, which is fixed at the source now.
+            // The filter stayed behind and went on rejecting gestures for a fault that no longer
+            // existed: six accepted against six refused in the last run.
+            //
+            // And it was never a sound test anyway. A hand swiping sideways above the head
+            // travels an ARC, so it moves backwards as well - fwd legitimately exceeding lat is
+            // what a real swipe on a bar looks like, not what a release looks like. Requiring
+            // otherwise asks the player to swipe in a way an arm on a pipe cannot.
+            //
+            // So it is the speed threshold and the peak latch, which is what worked. fwd is still
+            // logged, because if pull-backs ever do become a problem the number to build a test
+            // from should come from a run rather than from a theory.
+            const float sp = fabsf(g_pkSwipeVel[h]);
+            if (sp >= g_pkSwipeSpeed &&
+                (g_pkSwipeLive[h] == 0 || sp > g_pkSwipePeak[h])) {
+                g_pkSwipeDir[h] = g_pkSwipeVel[h] > 0.0f ? 1 : -1;
+                g_pkSwipePeak[h] = sp;
+                g_pkSwipeLive[h] = kPkSwipeWindow;
+            } else if (sp >= g_pkSwipeSpeed) {
+                g_pkSwipeLive[h] = kPkSwipeWindow;       // still swiping: keep the window open
+            }
+        } else {
+            g_pkSwipeVel[h] = 0.0f;
+        }
+
+        // ---- the release is the trigger, and only while the swipe is still live ----
+        if (g_pkSwipePrevGrip[h] && !grip && g_pkSwipeLive[h] > 0 && g_pkSwipeHold == 0) {
+            const int o = 1 - h;
+            const bool otherHolding = g_gripValue[o] > 0.5f && g_pkHandAnchored[o];
+            if (otherHolding && (g_pkSwipeLive[o] == 0 || g_pkSwipeDir[o] != g_pkSwipeDir[h])) {
+                g_pkSwipeWhy = "both hands on, and they disagree";
+                Log("[pk] PK.48: %s hand released after a swipe %s, but the %s hand is still on"
+                    " the pipe and has not swiped the same way - no jump",
+                    h ? "RIGHT" : "LEFT", g_pkSwipeDir[h] > 0 ? "right" : "left",
+                    o ? "RIGHT" : "LEFT");
+            } else {
+                // Inverted: the hands are the anchored thing, so swiping them right carries the
+                // body left. Same relationship as the ledge servo and the bar's pump.
+                g_pkSwipeStick = (g_pkSwipeDir[h] > 0 ? -1.0f : 1.0f) * kPkSwipeStick;
+                g_pkSwipeHold = kPkSwipeAssert;
+                g_pkSwipeGrace = kPkSwipeGrace;
+                ++g_pkSwipeJumps;
+                g_pkSwipeWhy = g_pkSwipeStick < 0.0f ? "JUMPING left" : "JUMPING right";
+
+                // ⚠️ The yaw difference, because it is the one number that says whether the
+                // camera-frame stick was the right call for this jump. See the note above.
+                float pawnYaw = 0.0f;
+                const bool haveYaw = PkPawnYaw(&pawnYaw);
+                // Declared locally, the way the climb telemetry does it - these live with the
+                // pawn globals far below and nothing up here has any other use for them.
+                extern int32_t g_lastHeadYawPub;
+                const float headYaw = (float)g_lastHeadYawPub * (360.0f / 65536.0f);
+                Log("*** [pk] PK.48: %s hand swiped %s at %.2f m/s and let go - jumping %s."
+                    " Jump #%ld | other hand %s | head %.0f deg pawn %.0f deg, off by %.0f",
+                    h ? "RIGHT" : "LEFT", g_pkSwipeDir[h] > 0 ? "right" : "left",
+                    g_pkSwipePeak[h], g_pkSwipeStick < 0.0f ? "LEFT" : "RIGHT",
+                    g_pkSwipeJumps, otherHolding ? "agreed" : "was off the pipe",
+                    headYaw, haveYaw ? pawnYaw : 0.0f,
+                    haveYaw ? fabsf(PkYawDelta(headYaw, pawnYaw)) : -1.0f);
+                // The heading the swipe asked for, in the game's own yaw sense: the head's
+                // facing turned 90 degrees toward the side the body should go.
+                g_pkSwipePawnYaw = haveYaw ? pawnYaw : headYaw;
+                g_pkSwipeWant = g_pkSwipePawnYaw + (g_pkSwipeStick < 0.0f ? -90.0f : 90.0f);
+                while (g_pkSwipeWant > 180.0f) g_pkSwipeWant -= 360.0f;
+                while (g_pkSwipeWant < -180.0f) g_pkSwipeWant += 360.0f;
+                g_pkSwipeWatch = 45;
+                g_pkSwipeBestSpeed = 0.0f;
+                g_pkSwipeBestDir = 0.0f;
+                g_pkSwipeLive[0] = g_pkSwipeLive[1] = 0;
+                g_pkSwipeDir[0] = g_pkSwipeDir[1] = 0;
+            }
+        }
+        g_pkSwipePrevGrip[h] = grip;
+    }
+
+    if (g_pkSwipeHold == 0 && g_pkSwipeWhy[0] == 'J') g_pkSwipeWhy = "ready";
+}
+
 // ================================================================ PK.44: push down to get up
 //
 // Hanging from a ledge, the one thing left that still needed the stick was getting ON to it. The
@@ -5657,7 +6542,10 @@ static float g_pkPullUpBase[2] = { 0.0f, 0.0f };
 static float g_pkPullUpFell[2] = { 0.0f, 0.0f };   // live drop per hand, for the overlay
 static bool  g_pkPullUpBaseOk = false;
 static bool  g_pkPullUpArmed = true;        // cleared on firing, restored by the hysteresis
-static long  g_pkPullUpHold = 0;            // frames of stick-up left to assert
+long         g_pkPullUpHold = 0;            // frames of stick-up left to assert (PK.44)
+// PK.50: frames left of standing the hands down so a bar's SwingJump animation can run.
+long         g_pkBarJumpHold = 0;
+static const long kPkBarJumpHold = 20;
 static long  g_pkPullUps = 0;
 static const char* g_pkPullUpWhy = "off the wall";
 
@@ -5734,8 +6622,9 @@ static void PkPullUpTick()
 static void PkLetGoTick()
 {
     if (g_pkHoldDrop > 0) --g_pkHoldDrop;
+    if (g_pkBarJumpHold > 0) --g_pkBarJumpHold;     // PK.50, and it outlives the bar by design
 
-    if (!g_parkour || (g_pkMode != PK_LEDGE && g_pkMode != PK_CLIMB)) {
+    if (!g_parkour || (g_pkMode != PK_LEDGE && g_pkMode != PK_CLIMB && g_pkMode != PK_BAR)) {
         g_pkHoldGripped = false;
         g_pkHoldEmpty = 0;
         g_pkHoldWhy = "no hold";
@@ -5754,6 +6643,29 @@ static void PkLetGoTick()
         (g_pkMode == PK_CLIMB && (g_pkBypass || g_pkTopOpen))) {
         g_pkHoldEmpty = 0;
         g_pkHoldWhy = "the game has the hands";
+        return;
+    }
+    // ---- ⚠️ PK.48 AND PK.42 FIRE ON THE SAME EVENT ----
+    //
+    // A swipe jump is triggered by letting go, and letting go is exactly what PK.42 watches for.
+    // Left alone, a sideways jump would be followed twelve frames later by an asserted crouch -
+    // which in mid air is a landing roll nobody asked for, and on the ground a slide. The release
+    // has already been spent on a jump; it cannot also mean "fall off".
+    // ---- ⚠️ AND FOR LONGER THAN THE ASSERT, BECAUSE A REFUSED JUMP IS THE DANGEROUS CASE ----
+    //
+    // The suppression matched the assert exactly - 12 frames each - so the empty count simply
+    // restarted the moment the assert ended and reached its own 12 twelve frames later. Marker 1
+    // of the 2026-09-01 run is that sequence: swipe, jump asserted, no jump, "nothing on the pipe
+    // for 12 frames - asserting crouch", Climb -> Falling. The player asked to jump left, the
+    // game declined, and this dropped them straight down for asking.
+    //
+    // When the jump IS taken the mode leaves the pipe within a frame or two and none of this
+    // matters. The window only ever runs its course when the jump was refused, which is exactly
+    // when the player needs a moment to grab back on rather than a crouch.
+    if (g_pkSwipeHold > 0 || g_pkSwipeGrace > 0) {
+        if (g_pkSwipeGrace > 0) --g_pkSwipeGrace;
+        g_pkHoldEmpty = 0;
+        g_pkHoldWhy = g_pkSwipeHold > 0 ? "swipe jump" : "swipe declined - hold on";
         return;
     }
 
@@ -5789,7 +6701,7 @@ static void PkLetGoTick()
         g_pkHoldGripped = true;
         Log("[pk] PK.42: first hand on this %s - the grace period is over, and letting go"
             " with both now drops the player",
-            g_pkMode == PK_CLIMB ? "pipe" : "ledge");
+            PkSurfaceName());
     }
     if (anchored || gripping) {
         g_pkHoldEmpty = 0;
@@ -5811,7 +6723,75 @@ static void PkLetGoTick()
     // ⚠️ ==, not >=. One firing per release: the assert is a fixed number of frames and
     // re-arming it every frame afterwards would hold the crouch down for as long as the player
     // stayed off the ledge, which on the ground is a slide.
+    // ---- ⚠️ A BAR LAUNCHES ON THE RELEASE, AND A DEBOUNCE IS A THIRD OF THE ARC ----
+    //
+    // The pump works - the run reached |angle| 1.362 rad against 1.188 for a free decay, with
+    // the stick flipping in phase through the bottom of every swing. What did not work was
+    // getting anywhere with it: "couldn't generate enough momentum to jump far enough".
+    //
+    // The momentum was there and the release threw it away. g_pkLetGoFrames is 12 frames, which
+    // at this pendulum's 2.1 s period is about 30 degrees of arc - so the jump was asserted a
+    // third of the way past wherever the player let go, by which time the swing has carried them
+    // back and, worse, they are already falling with TdMove_Swing over. On a ledge the debounce
+    // protects hand-over-hand, which is the whole reason it exists. A bar has no hand-over-hand,
+    // and its release IS the launch: the one moment the timing has to be exact.
+    // ---- ⚠️ PK.49: THE TOP OF A SWING IS WHERE IT IS SLOWEST ----
+    //
+    // "I'm exiting way too slow", and the measurement is unambiguous. Eight launches, exit speed
+    // against the angle they were released at:
+    //
+    //   released 0.242 rad -> 867 UU/s        released 0.911 -> 602
+    //   released 0.892     -> 611             released 1.099 -> 570
+    //   released 0.895     -> 636             released 1.103 -> 569
+    //   released 0.940     -> 616             released 1.185 -> 561
+    //
+    // Monotonic, and a 53% spread. It is not the amplitude - seven of those eight peaked at 1.36
+    // and the fastest one peaked at 1.00. It is WHERE ON THE ARC the player let go, and letting
+    // go at the top of the forward swing means letting go at the one point where a pendulum is
+    // momentarily stationary. The stick jump felt better because the press happened to land near
+    // the bottom.
+    //
+    // Firing on the release frame was right for responsiveness and wrong for everything else. So
+    // the release now latches the intent and the launch waits for the fast part of the arc, which
+    // is what a buffered button press was doing by accident. A timeout fires it regardless, since
+    // a swing that has decayed flat has no bottom worth waiting for.
+    // ---- ⚠️ FIRES ON THE RELEASE. THE DEFERRAL WAS MINE AND IT WAS WRONG. ----
+    //
+    // PK.49 held the launch back until the swing reached the bottom of the arc, on the strength
+    // of eight samples where exit speed rose as the release angle fell - 867 UU/s at 0.242 rad
+    // against 561 at 1.185. The player's verdict: it now jumps "way later than I release and
+    // slower", where firing on the release was at least on time.
+    //
+    // The premise was measured against the wrong quantity. "Fastest speed in the 45 frames after
+    // release" counts the fall as well as the launch, so a jump that goes flat and drops hard
+    // scores higher than one that carries. It was never a measure of distance, which is the only
+    // thing the player was asking about, and optimising a launch against it traded away the
+    // timing for nothing that can be shown to exist.
+    //
+    // So the release frame is the launch frame again. Whatever is limiting the distance, it is
+    // not this, and a mechanism that costs responsiveness has to earn it with a number that
+    // means what it claims.
+    if (g_pkMode == PK_BAR && g_pkHoldEmpty == 1) {
+        g_pkHoldDropJump = true;
+        g_pkHoldDrop = kPkDropAssert;
+        g_pkHoldGripped = false;        // one release, one launch - see the loop note below
+        ++g_pkHoldDrops;
+        g_pkHoldWhy = "LAUNCH";
+        Log("*** [pk] PK.46: let go of the bar at %+.3f rad (this swing peaked at %.3f) -"
+            " jumping on the release frame. Launch #%ld",
+            g_pkSwingAngle, g_pkSwingPeak, g_pkHoldDrops);
+        return;
+    }
     if (g_pkHoldEmpty == g_pkLetGoFrames) {
+        // ---- ⚠️ A BAR LETS GO UPWARD ----
+        //
+        // On a ledge and a pipe, releasing means falling, and GBA_Crouch is the game's own
+        // let-go. A bar is the one hold whose release is a MOVE: TdMove_SwingJump exists as its
+        // own EMovement at 73, the whole point of a swing is the launch at the end of it, and
+        // dropping straight down off a bar is what you do when you have failed. So the player's
+        // instruction - "if you let go it's like the jump button is pushed" - is also what the
+        // game is built for, and it is a different button.
+        g_pkHoldDropJump = (g_pkMode == PK_BAR);
         g_pkHoldDrop = kPkDropAssert;
         ++g_pkHoldDrops;
         g_pkHoldWhy = "DROPPING";
@@ -5822,7 +6802,7 @@ static void PkLetGoTick()
         Log("*** [pk] PK.42: nothing on the %s for %ld frames after holding it - asserting crouch"
             " (bRequestDropDown) for %ld to let go. Drop #%ld | grips %.2f/%.2f anchored %c%c"
             " pending %d/%d corner %d entry %ld",
-            g_pkMode == PK_CLIMB ? "pipe" : "ledge", g_pkHoldEmpty, kPkDropAssert, g_pkHoldDrops,
+            PkSurfaceName(), g_pkHoldEmpty, kPkDropAssert, g_pkHoldDrops,
             g_gripValue[0], g_gripValue[1],
             g_pkHandAnchored[0] ? '+' : '-', g_pkHandAnchored[1] ? '+' : '-',
             g_pkHandPending[0], g_pkHandPending[1], g_pkCornerState, g_pkEntryHold);
@@ -5846,6 +6826,7 @@ static void ParkourTick(XrTime when)
     // Neither depends on a grip. Both have their own gates and are safe to call whenever there
     // is a pawn.
     PkReadLedge();
+    PkReadSwing();      // PK.46: the bar, read the same way and just as unconditionally
     PkReadCorner();
     PkWatchLedgeOffset();
     PkClimbCameraCollision(g_pkMode == PK_CLIMB && !g_pkBypass);
@@ -5868,16 +6849,16 @@ static void ParkourTick(XrTime when)
     if (g_pkMode != prevMode) {
         if (g_pkMode == PK_NONE || prevMode == PK_NONE)
             Log("[pk] mode %d -> %d at t=%.2fs", prevMode, g_pkMode, LogSecs());
-        if (g_pkMode == PK_LEDGE || g_pkMode == PK_CLIMB) {
+        if (g_pkMode == PK_LEDGE || g_pkMode == PK_CLIMB || g_pkMode == PK_BAR) {
             g_pkEntryHold = 30;
             g_pkEntryOffsetValid = false;
             g_pkEntryOffsetHOk[0] = g_pkEntryOffsetHOk[1] = false;
             g_pkGapBaselineOk = false;
             g_pkGapBaselineOkPub = false;
-            PkBeginHold(g_pkMode == PK_CLIMB ? "a pipe" : "a ledge");   // PK.42
+            PkBeginHold(PkSurfaceName());   // PK.42
             Log("[pk] %s entered - the game keeps both hands for %ld frames while the"
                 " hand offset is measured off its own planted pose",
-                g_pkMode == PK_CLIMB ? "pipe" : "ledge", g_pkEntryHold);
+                PkSurfaceName(), g_pkEntryHold);
         }
         // ⚠️ Direct drive is never TOLD it is over. ParkourDirectBodyTick is called below the
         // "not on a wall" early return, so the frame the mode leaves the ledge is the last frame
@@ -5907,6 +6888,9 @@ static void ParkourTick(XrTime when)
     // button at the instant the game was acting on it.
     PkLetGoTick();
     PkPullUpTick();     // PK.44 - above the return for the same reason, see its own note
+    PkSwingPumpTick();  // PK.47
+    PkSwipeJumpTick();  // PK.48
+    PkBarShimmyTick();  // PK.52
 
     if (g_pkMode == PK_NONE) {
         g_pkBlock = "not on a wall"; g_pkAnchor = PK_HAND_NONE; PkZeroLead();
@@ -5930,6 +6914,36 @@ static void ParkourTick(XrTime when)
     // What this needs to answer: does the pawn's X/Y really stay fixed while climbing - the whole
     // PkClimbLine assumption rests on it - how fast the game climbs for a given stick, and whether
     // the entry measurement lands at all on a surface with no MoveLedgeLocation to measure from.
+    // ---- ⚠️ PK.47: THE ONE THING THIS BUILD CANNOT ANSWER WITHOUT A RUN ----
+    //
+    // The pump asserts the stick because that is what the player asked for and because the game
+    // is already running a real pendulum that a stick is the natural input to. What no log has
+    // ever shown is the stick and SwingAngle ON THE SAME LINE, so "does pushing the stick add
+    // energy to the swing, and on which axis" is still a hypothesis - the only logged swing, of
+    // 2026-08-28, is forty samples of a pendulum decaying freely while the player held still.
+    //
+    // Every column needed to settle it, every frame of every swing. If ANGLE's peaks grow while
+    // STICK is non-zero and in phase, the stick pumps and PK.47 is finished. If they keep
+    // decaying at the measured 0.64 per half-period regardless, the stick is not the channel and
+    // SwingVelocity - a writable float sitting right there - is the next thing to try.
+    if (g_pkMode == PK_BAR && (g_frames % 4) == 0) {
+        // ⚠️ [bar], not [swing]. [swing] is the ARM-SWING locomotion tag and has been since
+        // AS.0 - 2260 of its lines were already in the run this rung was diagnosed from, and
+        // finding these among them needed a format string rather than the tag that is supposed
+        // to do that job.
+        Log("[bar] angle %+.3f rad vel %+.3f len %.0f peak %.3f exitmod %.2f"
+            " | push %+.3f m -> stick %+.2f (%s)"
+            " | grips %c%c anchored %c%c | hand-to-line %.0f/%.0f UU | bar %s"
+            " (%.0f %.0f %.0f) axis (%.2f %.2f %.2f)",
+            g_pkSwingAngle, g_pkSwingVel, g_pkSwingLen, g_pkSwingPeak, g_pkExitVel,
+            g_pkPumpPush, g_pkPumpStick, g_pkPumpWhy,
+            g_gripValue[0] > 0.5f ? 'G' : '-', g_gripValue[1] > 0.5f ? 'G' : '-',
+            g_pkHandAnchored[0] ? '+' : '-', g_pkHandAnchored[1] ? '+' : '-',
+            PkGameHandToBar(0), PkGameHandToBar(1),
+            g_pkBarWhy, g_pkBarLoc[0], g_pkBarLoc[1], g_pkBarLoc[2],
+            g_pkBarAxis[0], g_pkBarAxis[1], g_pkBarAxis[2]);
+    }
+
     if (g_pkMode == PK_CLIMB && (g_frames % 6) == 0) {
         // ⚠️ Per ENTRY, not per run. It was a plain static, so "drift from entry" was measured
         // from the first pipe ever touched - and reported Y+96.0 across two different pipes,
@@ -6034,8 +7048,20 @@ static void ParkourTick(XrTime when)
     //
     // So it retries. The window costs nothing when it succeeds and is the only way back when it
     // does not.
-    if ((g_pkMode == PK_LEDGE || g_pkMode == PK_CLIMB) && g_pkEntryHold == 0 &&
-        !g_pkEntryOffsetValid && g_pkCornerState == 0) {
+    // ---- ⚠️ AND NOT ON A BAR, WHICH CAN NEVER SATISFY IT ----
+    //
+    // Reported as the arms staying stuck up in the grabbing pose on a bar instead of snapping to
+    // the controllers the way they do on a ledge or a pipe. This retry is why. It re-opens the
+    // 30-frame entry window every 120 frames until g_pkEntryOffsetValid comes true - and on a
+    // bar it never can: the honest hand-to-line reading there is 63 to 135 UU, the sanity bound
+    // is 60, so every measurement is correctly rejected and the flag stays false forever. The
+    // window then owns the hands a quarter of the time, permanently, and PK.46 does not even
+    // want the number it is chasing - a bar takes its planted pose from g_pkBarOffset, measured
+    // at the bottom of the swing, for reasons written out where that happens.
+    //
+    // A retry for a measurement nothing uses is a retry that can only cost hands.
+    if ((g_pkMode == PK_LEDGE || g_pkMode == PK_CLIMB) &&
+        g_pkEntryHold == 0 && !g_pkEntryOffsetValid && g_pkCornerState == 0) {
         static long retryAt = 0;
         if (g_frames > retryAt) {
             retryAt = g_frames + 120;
@@ -6830,6 +7856,15 @@ static bool XrSyncInput(XrTime when)
     // the gesture reads them wrong.
     if (g_pkShimmy != 0.0f && sweep <= 0.0f && fabsf(mx) < 0.15f)
         s.Gamepad.sThumbLX = axis(g_pkShimmy);
+    // PK.52: the bar's own shimmy, on the same axis and the same terms. It cannot collide with
+    // the ledge's - g_pkShimmy is only ever set in PK_LEDGE and this only in PK_BAR.
+    if (g_pkBarShimmy != 0.0f && sweep <= 0.0f && fabsf(mx) < 0.15f)
+        s.Gamepad.sThumbLX = axis(g_pkBarShimmy);
+    // PK.48: the swipe's direction, and it OUTRANKS the shimmy rather than sharing the axis with
+    // it. Both want X; a sideways jump ends the climb the shimmy was steering, so for the twelve
+    // frames it is asserted there is nothing left for the shimmy to be steering towards.
+    if (g_pkSwipeHold > 0 && sweep <= 0.0f && fabsf(mx) < 0.15f)
+        s.Gamepad.sThumbLX = axis(g_pkSwipeStick);
     // ---- PK.44: and the pull-up owns Y, on the same terms ----
     //
     // Precedence, not a sum, for the reason directly above - and the physical stick wins the
@@ -6838,6 +7873,10 @@ static bool XrSyncInput(XrTime when)
     // cannot be running while the mode is PK_LEDGE.
     if (g_pkPullUpHold > 0 && sweep <= 0.0f && fabsf(my) < 0.15f)
         s.Gamepad.sThumbLY = axis(kPkPullUpStick);
+    // PK.47: the bar's pump, same rule again - precedence over the physical stick, and the
+    // physical stick wins the moment it is touched.
+    if (g_pkPumpStick != 0.0f && sweep <= 0.0f && fabsf(my) < 0.15f)
+        s.Gamepad.sThumbLY = axis(g_pkPumpStick);
     // ---- ⚠️ PK.34: THE DISMOUNT NEEDS THE GAME TO CLIMB, NOT TO BE PUT THERE ----
     //
     // Opening the ceiling was necessary and not sufficient: "at the point at the top where it
@@ -6897,7 +7936,7 @@ static bool XrSyncInput(XrTime when)
     // PK.42: the same button, for the opposite reason. AS.3 refuses to press it on a ledge
     // because it lets go; this presses it BECAUSE it lets go, once the player has stopped
     // holding a hold they were holding. Full, for the reason directly above.
-    if (g_pkHoldDrop > 0) s.Gamepad.bLeftTrigger = 0xFF;
+    if (g_pkHoldDrop > 0 && !g_pkHoldDropJump) s.Gamepad.bLeftTrigger = 0xFF;
     s.Gamepad.bRightTrigger = (BYTE)(flt(g_aRTrig) * 255.0f);
 
     WORD b = 0;
@@ -6942,7 +7981,30 @@ static bool XrSyncInput(XrTime when)
     // it is the one a player reaches for when a gap is closing. The stick joins on the same
     // terms - three paths to one button, none of them the owner.
     if (swingJump) b |= MEVR_PAD_LSHOULDER;
+    // PK.46: letting go of a bar. Same button, different reason - and gated on g_pkHoldDropJump
+    // rather than on the mode, because by the time the game acts on it the swing has already
+    // ended and the mode is no longer PK_BAR.
+    if (g_pkHoldDrop > 0 && g_pkHoldDropJump) b |= MEVR_PAD_LSHOULDER;
+    if (g_pkSwipeHold > 0) b |= MEVR_PAD_LSHOULDER;      // PK.48
     if (stickJump) b |= MEVR_PAD_LSHOULDER;
+    // ---- ⚠️ PK.50: A SWING JUMP NEEDS ITS ARMS, WHOEVER ASKED FOR IT ----
+    //
+    // Three marked tests settle this. Swinging by hand and releasing failed; swinging by hand and
+    // pressing jump failed; swinging with the STICK and pressing jump worked. The one thing the
+    // successful run had that the other two did not is the mod not holding the arms - it read
+    // "grips -- anchored --" throughout, against "grips GG anchored ++" for both failures.
+    //
+    // It is not the stick. Test 2 had the pump asserting a full forward deflection at the moment
+    // of the jump and failed anyway, which rules that out on its own.
+    //
+    // It is PK.34's rule for the third time: SwingJump is an animation, and an animation that
+    // moves the arms cannot run while the arms are pinned to world points. The pull-up needed
+    // exactly this and was fixed exactly this way.
+    //
+    // ⚠️ Latched from the BUTTON rather than from our own launch, because the player can ask for
+    // this jump without the mod knowing - test 2 was a physical press with the hands still
+    // anchored, and a stand-down keyed only to PK.46's launch would have missed it entirely.
+    if (g_pkMode == PK_BAR && (b & MEVR_PAD_LSHOULDER)) g_pkBarJumpHold = kPkBarJumpHold;
     if (stickTurn) b |= MEVR_PAD_RSHOULDER;
     s.Gamepad.wButtons = b;
 
@@ -15151,7 +16213,7 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13HandPoseSnapshot& 
     // So this deliberately does NOT stand the arm down for an ANCHORED hand. It does for a
     // PENDING one: those few frames exist precisely so the game can pose the hand without us
     // steering it, and capturing a position we wrote ourselves would anchor to our own guess.
-    if (g_parkour && (g_pkMode == PK_LEDGE || g_pkMode == PK_CLIMB) &&
+    if (g_parkour && (g_pkMode == PK_LEDGE || g_pkMode == PK_CLIMB || g_pkMode == PK_BAR) &&
         (g_pkEntryHold > 0 || g_pkCornerState != 0 ||
          g_pkHandPending[leftHand ? 0 : 1] > 0)) {
         if (outMovement) {
@@ -15181,7 +16243,19 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13HandPoseSnapshot& 
     if (g_offMoveState < 0 || !SafeRead(pawn + g_offMoveState, &movement, 1) ||
         !(movement == 1 || movement == 2 || movement == 11 || movement == 15 ||
           movement == 16 || movement == 24 || movement == 29 || movement == 30 ||
-          (g_parkour && (movement == 3 || movement == 21)) ||
+          // ---- ⚠️ AND 60 IS Swing, WHICH IS THIS EXACT BUG FOR THE THIRD TIME ----
+          //
+          // The note above describes 21 being missing and making "every pipe fix invisible".
+          // 60 was missing for the same reason and cost the same thing: on a bar the mod never
+          // took the hands, so PK.43's ghost, PK.46's anchor and PK.47's pump were all computed
+          // against hand targets that were never written. The player reported it precisely -
+          // "the real arms are stuck upwards in the grabbing position" - and I went looking at
+          // the retry window and the offset instead of at the one list that decides whether any
+          // of it reaches the screen.
+          //
+          // A new parkour surface has to be added HERE as well as to the mode enum. Nothing else
+          // in the file makes that necessary and this is the second time it has been forgotten.
+          (g_parkour && (movement == 3 || movement == 21 || movement == 60)) ||
           (movement == 9 && g_vaultHandsAreOurs))) {
         if (outMovement) *outMovement = movement;
         return P13_MOVEMENT;
@@ -17067,6 +18141,52 @@ static void PkCaptureGhostHand(const DetachedRigFrame& rig, int hand)
             seg[n++] = { a, b };
     }
 
+    // ---- ⚠️ ON A BAR THE CAPTURED POSE IS IN THE RIGHT SHAPE AND THE WRONG PLACE ----
+    //
+    // Reported as "the point it sticks my hands is higher than I can reach", about these bones
+    // rather than about the anchor. Both had the same cause and only the anchor was fixed.
+    //
+    // A ledge and a pipe hold the body still against the hold, so the pose the game composes at
+    // the end of the entry window is where the hands genuinely are, and freezing it is honest.
+    // A bar does not: the 1P arm animation is authored camera-relative, so its world-space hands
+    // ride the whole 1.2 m arc with the body. The four bar entries of 2026-09-01 caught them at
+    // 57, 67, 79 and 134 UU from the bar line - four snapshots of a swing, and whichever one the
+    // window happened to close on became a ghost hanging in mid air at that phase. Catch it near
+    // an extreme and the marker sits most of a metre above the bar it is supposed to be marking.
+    //
+    // The SHAPE is still right - it is a hand closed around a bar, nineteen finger bones of it.
+    // Only the placement is wrong, so only the placement is corrected: slide the whole set so the
+    // palm sits on the bar line, keeping where it fell ALONG the bar, which is the one axis the
+    // player actually chose. Rigid, so the grip shape survives intact.
+    //
+    // ⚠️ The pose keeps whatever tilt it was captured with - a rigid shift cannot fix an
+    // orientation. A ghost caught at an extreme will sit on the bar at a slight angle. That is
+    // visible and harmless, where being a metre out of reach was neither.
+    if (g_pkMode == PK_BAR && g_pkBarLineOk && n > 0) {
+        const float vx = palm.x - g_pkBarLoc[0];
+        const float vy = palm.y - g_pkBarLoc[1];
+        const float vz = palm.z - g_pkBarLoc[2];
+        const float t = vx * g_pkBarAxis[0] + vy * g_pkBarAxis[1] + vz * g_pkBarAxis[2];
+        // The SAME offset the anchor uses. A ghost that marks one place while the grip anchors
+        // to another is worse than no ghost - it is an instruction to reach somewhere that will
+        // not take.
+        const MEVR_Vec3 off = g_pkBarOffsetOk ? g_pkBarOffset
+                                              : MEVR_Vec3{ 0.0f, 0.0f, -g_pkBarWrap };
+        const MEVR_Vec3 want = {
+            g_pkBarLoc[0] + g_pkBarAxis[0] * t + off.x,
+            g_pkBarLoc[1] + g_pkBarAxis[1] * t + off.y,
+            g_pkBarLoc[2] + g_pkBarAxis[2] * t + off.z };
+        const float dx = want.x - palm.x, dy = want.y - palm.y, dz = want.z - palm.z;
+        Log("[pk] PK.43: %s hand was %.0f UU off the bar line when the window closed - the ghost"
+            " is slid onto the bar, keeping where it sat along it",
+            hand ? "RIGHT" : "LEFT", sqrtf(dx * dx + dy * dy + dz * dz));
+        for (int i = 0; i < n; ++i) {
+            seg[i].a.x += dx; seg[i].a.y += dy; seg[i].a.z += dz;
+            seg[i].b.x += dx; seg[i].b.y += dy; seg[i].b.z += dz;
+        }
+        palm = want;
+    }
+
     // ⚠️ Zero the count before touching the points, publish it after. See the declaration.
     InterlockedExchange(&g_pkGhostSegs[hand], 0);
     memcpy(g_pkGhostSeg[hand], seg, sizeof(PkGhostSeg) * (size_t)n);
@@ -17075,7 +18195,7 @@ static void PkCaptureGhostHand(const DetachedRigFrame& rig, int hand)
     ++g_pkGhostCaptures;
     Log("[pk] PK.43: %s hand ghosted at (%.0f %.0f %.0f) from %d bone segments - it stays until"
         " the %s is actually held", hand ? "RIGHT" : "LEFT", palm.x, palm.y, palm.z, n,
-        g_pkMode == PK_CLIMB ? "pipe" : "ledge");
+        PkSurfaceName());
 }
 
 static bool ShoulderWorldPosition(const DetachedRigFrame& rig, int boneIndex,
@@ -17301,7 +18421,7 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
             }
         }
     }
-    const bool onHold = g_pkMode == PK_LEDGE || g_pkMode == PK_CLIMB;
+    const bool onHold = g_pkMode == PK_LEDGE || g_pkMode == PK_CLIMB || g_pkMode == PK_BAR;
     g_pkGameOwnsHand[0] = g_parkour && onHold && !leftEligible;
     g_pkGameOwnsHand[1] = g_parkour && onHold && !rightEligible;
 
@@ -17365,7 +18485,22 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
                     // was: a hand really is at that spot, and refusing to DRAW it because its
                     // offset was implausible confused "do not anchor to this" with "do not show
                     // this".
-                    if (g_pkEntryHold <= 1 && !g_pkGhostTaken[hand]) {
+                    // ---- ⚠️ THREE CHANCES, NOT ONE ----
+                    //
+                    // "Sometimes the skeleton arms did not show up", and the marked entry is the
+                    // proof: the window opened, the resting offset was measured, and no PK.43
+                    // line was ever printed. The capture only ever fired on the single frame
+                    // where g_pkEntryHold == 1, and it needs three separate things to hold on
+                    // THAT frame - the pose path running, the hold line readable, and all three
+                    // arm bones resolving. Miss any of them and the ghost is lost for that hold.
+                    //
+                    // On a ledge or a pipe the retry window comes round again and gives it
+                    // another go. A bar has no retry - deliberately, because the offset it chases
+                    // can never validate there - so the one frame was the only frame.
+                    //
+                    // Two frames earlier out of thirty is well inside the settled pose the window
+                    // exists to produce, so widening costs nothing and removes the whole class.
+                    if (g_pkEntryHold <= 3 && !g_pkGhostTaken[hand]) {
                         g_pkGhostTaken[hand] = true;
                         PkCaptureGhostHand(rig, hand);
                     }
@@ -17381,13 +18516,13 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
                             g_pkEntryOffsetValid = true;
                             Log("[pk] hand-to-%s offset settled off the %s hand:"
                                 " (%.1f %.1f %.1f), %.1f UU - used for both",
-                                g_pkMode == PK_CLIMB ? "pipe" : "ledge",
+                                PkSurfaceName(),
                                 hand ? "RIGHT" : "LEFT", off.x, off.y, off.z, mag);
                         }
                     } else if (g_pkEntryHold <= 1) {
                         Log("[pk] %s hand reads %.1f UU off the %s at entry - not a hand on it,"
                             " ignored", hand ? "RIGHT" : "LEFT", mag,
-                            g_pkMode == PK_CLIMB ? "pipe" : "ledge");
+                            PkSurfaceName());
                     }
                 }
             }
@@ -22544,6 +23679,15 @@ static MoveProbeProp g_moveProbe[] = {
     { "TdMove_Swing", nullptr, false, "SwingLocation" },
     { "TdMove_Swing", nullptr, false, "BarDirection" },
     { "TdMove_Swing", nullptr, false, "SwingAngleTimingOffset" },
+    // PK.46: the pendulum's own length, which turns SwingAngle into a period and confirmed the
+    // 2026-08-28 trace really is a rigid pendulum. Dumped by the class walk at +0x01C4 and never
+    // asked for by name until now.
+    { "TdMove_Swing", nullptr, false, "SwingPendulumLength" },
+    { "TdMove_Swing", nullptr, false, "SwingDirection" },
+    // PK.49: the prime suspect for "I can't jump far enough". If the launch speed comes from a
+    // stored modifier rather than from how fast the pendulum is actually moving, then pumping
+    // cannot help however well it works - and it works: 1.000 rad unpumped against 1.364 pumped.
+    { "TdMove_Swing", nullptr, false, "ExitVelocityModifier" },
     // TdMove_Climb carries only animation and sound config - no ClimbState, no ClimbSpeed, no
     // position. Run 4 dumped the whole class and there is nothing live on it, which is why the
     // pipe has produced zero value lines across four runs. The state has to be on the climbable
@@ -23503,6 +24647,14 @@ static void ResolveMoveProbeProps()
         p.off = LookupProp(p.cls, p.prop, false);
         // PK.40: this one is read at runtime by the dismount handover, not just printed.
         if (strcmp(p.prop, "ClimbState") == 0 && p.off >= 0) g_offClimbState = p.off;
+        // PK.46: the bar reads all of these live. Same mechanism, same reason - the probe table
+        // is the only thing that resolves them, and a name typed twice is a name that can drift.
+        if (strcmp(p.prop, "SwingAngle") == 0 && p.off >= 0) g_offSwingAngle = p.off;
+        if (strcmp(p.prop, "SwingVelocity") == 0 && p.off >= 0) g_offSwingVel = p.off;
+        if (strcmp(p.prop, "SwingLocation") == 0 && p.off >= 0) g_offSwingLoc = p.off;
+        if (strcmp(p.prop, "BarDirection") == 0 && p.off >= 0) g_offBarDir = p.off;
+        if (strcmp(p.prop, "SwingPendulumLength") == 0 && p.off >= 0) g_offSwingLen = p.off;
+        if (strcmp(p.prop, "ExitVelocityModifier") == 0 && p.off >= 0) g_offExitVel = p.off;
         strcpy_s(p.kind, "?");
         if (p.off < 0) {
             // Second opinion from the GObjects owner pass, which reaches properties the
@@ -24224,6 +25376,39 @@ static void DrawOverlay(IDirect3DDevice9* dev)
         // still moved the camera was the whole bug, so whether the mod agrees the hand is out of
         // reach belongs on screen beside the pose. PUSH is each hand's live drop toward the
         // pull-up, which is the only way to tune the threshold without guessing.
+        // PK.46/47. ANGLE and VEL are the game's own pendulum; PUSH and STICK are what the
+        // gesture is asking of it. Watching all four at once is the only way to see whether the
+        // stick is actually pumping the swing, which is this rung's open question.
+        if (g_pkMode == PK_BAR)
+            OverlayRow(lines, &nl, "SWING %+.2f rad v%+.2f L%.0f | PUSH %+.2f STK %+.2f %s",
+                       g_pkSwingAngle, g_pkSwingVel, g_pkSwingLen,
+                       g_pkPumpPush, g_pkPumpStick, g_pkPumpWhy);
+        if (g_pkMode == PK_BAR)
+            OverlayRow(lines, &nl, "BAR %s", g_pkBarWhy);
+        // PK.52. TRAVEL is the game's own answer about where the bar ends: ask with the stick,
+        // and if this stops advancing there is no more bar in that direction.
+        if (g_pkMode == PK_BAR)
+            OverlayRow(lines, &nl, "SHIMMY %s  PUSH %+.2f of %.2f m  STK %+.2f  TRAVEL %+.0f UU",
+                       g_pkBarShimmyWhy, g_pkBarShimmyPush, g_pkBarShimmyFull,
+                       g_pkBarShimmy, g_pkBarTravel);
+        // PK.48. VEL is each hand's live lateral speed against the threshold, LIVE counts down
+        // the window a release has to land inside, and DIR is what each hand has committed to -
+        // which is the only way to see WHY a swipe that felt right did not fire.
+        // ⚠️ AGE is the one that invalidates the rest of this row. The levelled head basis stops
+        // updating whenever the player looks far enough up or down, and looking up at your own
+        // hands is the normal posture on a pipe - so a large age means every projected number
+        // here is measured against a facing the player may no longer have.
+        if (g_pkMode == PK_CLIMB || g_pkMode == PK_BAR)
+            OverlayRow(lines, &nl, "HEADAXES age %ld%s", g_headAxesAge,
+                       g_headAxesAge > 30 ? "  STALE - projections suspect" : "");
+        if (g_pkMode == PK_CLIMB)
+            OverlayRow(lines, &nl, "SWIPE %s  VEL %+.1f/%+.1f of %.1f  LIVE %ld/%ld"
+                       "  DIR %c%c  JUMPS %ld",
+                       g_pkSwipeWhy, g_pkSwipeVel[0], g_pkSwipeVel[1], g_pkSwipeSpeed,
+                       g_pkSwipeLive[0], g_pkSwipeLive[1],
+                       g_pkSwipeDir[0] < 0 ? 'L' : g_pkSwipeDir[0] > 0 ? 'R' : '-',
+                       g_pkSwipeDir[1] < 0 ? 'L' : g_pkSwipeDir[1] > 0 ? 'R' : '-',
+                       g_pkSwipeJumps);
         if (g_pkMode == PK_LEDGE)
             OverlayRow(lines, &nl, "PULLUP %s  PUSH %.2f/%.2f of %.2f m  FAR %c%c  DONE %ld",
                        g_pkPullUpWhy, g_pkPullUpFell[0], g_pkPullUpFell[1], g_pkPullUpDrop,
@@ -24634,7 +25819,7 @@ static void PkGhostReleaseState()
 static bool PkGhostShowing()
 {
     if (!g_pkGhost || !g_parkour) return false;
-    if (g_pkMode != PK_LEDGE && g_pkMode != PK_CLIMB) return false;
+    if (g_pkMode != PK_LEDGE && g_pkMode != PK_CLIMB && g_pkMode != PK_BAR) return false;
     if (g_pkHoldGripped) return false;
     if (g_pkEntryHold > 0 || g_pkCornerState != 0 || g_pkTopOpen) return false;
     return g_pkGhostSegs[0] > 0 || g_pkGhostSegs[1] > 0;
@@ -26265,6 +27450,83 @@ static void LoadSettings()
                 Log("[cfg]   ParkourLetGoFrames = %ld  (empty frames before PK.42 drops you)", fr);
                 applied++;
             } else { Log("[cfg]   ParkourLetGoFrames '%s' out of range 4..120 - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourSwipeJump") == 0) {
+            if (SettingBool(val, &b)) {
+                g_pkSwipeJump = b;
+                Log("[cfg]   ParkourSwipeJump = %s%s", b ? "on" : "off",
+                    b ? "  (PK.48: on a pipe, swipe a holding hand sideways and let go to jump"
+                        " the other way - both hands must agree if both are on)"
+                      : "  (letting go of a pipe just drops you)");
+                applied++;
+            } else { Log("[cfg]   ParkourSwipeJump '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourSwipeSpeed") == 0) {
+            const float sp = (float)atof(val);
+            if (sp >= 0.3f && sp <= 5.0f) {
+                g_pkSwipeSpeed = sp;
+                Log("[cfg]   ParkourSwipeSpeed = %.2f m/s  (lateral hand speed that counts)", sp);
+                applied++;
+            } else { Log("[cfg]   ParkourSwipeSpeed '%s' out of range 0.3..5.0 - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourBarWrap") == 0) {
+            const float w = (float)atof(val);
+            if (w >= 0.0f && w <= 40.0f) {
+                g_pkBarWrap = w;
+                Log("[cfg]   ParkourBarWrap = %.1f UU  (how far below the bar a closed hand sits)", w);
+                applied++;
+            } else { Log("[cfg]   ParkourBarWrap '%s' out of range 0..40 - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourBarShimmy") == 0) {
+            if (SettingBool(val, &b)) {
+                g_pkBarShimmyOn = b;
+                Log("[cfg]   ParkourBarShimmy = %s%s", b ? "on" : "off",
+                    b ? "  (PK.52: move your anchored hand sideways to travel along the bar -"
+                        " the game owns where the bar ends, and refuses when you reach one)"
+                      : "  (no sideways movement on a bar)");
+                applied++;
+            } else { Log("[cfg]   ParkourBarShimmy '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourBarShimmyFull") == 0) {
+            const float bf = (float)atof(val);
+            if (bf >= 0.05f && bf <= 1.0f) {
+                g_pkBarShimmyFull = bf;
+                Log("[cfg]   ParkourBarShimmyFull = %.2f m  (hand travel for full stick)", bf);
+                applied++;
+            } else { Log("[cfg]   ParkourBarShimmyFull '%s' out of range 0.05..1.0 - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourSwingExitBoost") == 0) {
+            const float eb = (float)atof(val);
+            if (eb >= 0.5f && eb <= 4.0f) {
+                g_pkExitBoost = eb;
+                Log("[cfg]   ParkourSwingExitBoost = %.2f%s", eb,
+                    eb == 1.0f ? "  (off - the game's own launch speed, untouched)"
+                               : "  (PK.51: scales TdMove_Swing::ExitVelocityModifier, which"
+                                 " reads 600 - a cheat, and the only one on this surface)");
+                applied++;
+            } else { Log("[cfg]   ParkourSwingExitBoost '%s' out of range 0.5..4.0 - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourSwingPump") == 0) {
+            if (SettingBool(val, &b)) {
+                g_pkSwingPump = b;
+                Log("[cfg]   ParkourSwingPump = %s%s", b ? "on" : "off",
+                    b ? "  (PK.47: hanging from a bar with both hands, pumping fore and aft"
+                        " drives the stick the game's own pendulum takes as input)"
+                      : "  (the stick is the only way to pump a swing)");
+                applied++;
+            } else { Log("[cfg]   ParkourSwingPump '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourSwingPumpFull") == 0) {
+            const float f = (float)atof(val);
+            if (f >= 0.08f && f <= 1.00f) {
+                g_pkPumpFull = f;
+                Log("[cfg]   ParkourSwingPumpFull = %.2f m  (push for full stick deflection)", f);
+                applied++;
+            } else { Log("[cfg]   ParkourSwingPumpFull '%s' out of range 0.08..1.00 - ignored", val); rejected++; }
+        } else if (_stricmp(key, "ParkourSwingPumpSign") == 0) {
+            const float s2 = (float)atof(val);
+            // ⚠️ A SETTING, not a constant. The hands are the anchored thing, so pushing them one
+            // way carries the body the other - but the sign of that relationship has been wrong
+            // twice in this file already, and spending a run on it is worse than spending a line.
+            if (s2 == 1.0f || s2 == -1.0f) {
+                g_pkPumpSign = s2;
+                Log("[cfg]   ParkourSwingPumpSign = %+.0f  (%s)", s2,
+                    s2 < 0.0f ? "hands forward pushes the stick back - the anchored-hand inversion"
+                              : "hands forward pushes the stick forward");
+                applied++;
+            } else { Log("[cfg]   ParkourSwingPumpSign '%s' must be 1 or -1 - ignored", val); rejected++; }
         } else if (_stricmp(key, "ParkourPullUp") == 0) {
             if (SettingBool(val, &b)) {
                 g_pkPullUp = b;
