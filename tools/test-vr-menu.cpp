@@ -8,6 +8,30 @@ static std::string ReadTestFile(const wchar_t* path) {
     std::ifstream stream(path,std::ios::binary);
     return std::string(std::istreambuf_iterator<char>(stream),{});
 }
+static void ResolutionTests() {
+    // No real headset cache is configured in this harness, so auto cannot touch
+    // the user's engine INI. Exercise first-run fallback and parser transitions.
+    assert(!g_headsetCachePath[0]);
+    assert(MenuAtomicWrite("Resolution = off\n"));
+    LoadSettings();VrMenuInitializeSettings();
+    assert(!g_resAuto&&!g_forceResW&&!g_forceResH&&g_menuResolution=="off");
+    assert(MenuAtomicWrite("Resolution = auto\n"));
+    LoadSettings();VrMenuInitializeSettings();
+    assert(g_resAuto&&!g_forceResW&&!g_forceResH&&g_menuResolution=="auto");
+    assert(MenuAtomicWrite("Resolution = 2560x1440\n"));
+    LoadSettings();VrMenuInitializeSettings();
+    assert(!g_resAuto&&g_forceResW==2560&&g_forceResH==1440&&g_menuResolution=="2560x1440");
+    assert(SaveMenuSettings());LoadSettings();
+    assert(!g_resAuto&&g_forceResW==2560&&g_forceResH==1440);
+    assert(MenuAtomicWrite("; Resolution omitted\n"));
+    LoadSettings();VrMenuInitializeSettings();
+    assert(g_resAuto&&!g_forceResW&&!g_forceResH&&g_menuResolution=="auto");
+    assert(DeleteFileW(g_settingsPath)); // only the harness INI beside its test log
+    g_resAuto=false;g_forceResW=2560;g_forceResH=1440;
+    LoadSettings();VrMenuInitializeSettings();
+    assert(g_resAuto&&!g_forceResW&&!g_forceResH&&g_menuResolution=="auto");
+    puts("PASS resolution auto default without INI/key/cache, explicit off/custom, and save/reload");
+}
 static void InputTests() {
     using namespace mevr;
     MenuInputState s;MenuInput in;in.y=true;
@@ -95,8 +119,10 @@ static void IniTests() {
         g_fpsCap=cap;assert(SaveMenuSettings());LoadSettings();VrMenuInitializeSettings();assert(g_fpsCap==cap);
     }
     MenuRestoreDefaults();assert(ReadTestFile(g_settingsPath)==kVrShippedDefaults);
+    assert(g_menuResolution=="auto"&&g_menuRestart);
     assert(g_motionHands&&g_menuArm&&g_armSwing&&g_armSwingJump&&g_gripToGrip&&g_stickJumpTurn);
     LoadSettings();VrMenuInitializeSettings();assert(g_fpsCap==72&&g_motionHands&&g_menuArm&&!g_debug);
+    assert(g_resAuto&&g_menuResolution=="auto");
     assert(g_armSwing&&g_armSwingJump&&g_gripToGrip&&g_stickJumpTurn);
     // Existing explicit opt-outs survive save/reload despite the enabled defaults.
     MenuActivate(MArm,-1);MenuActivate(MHands,-1);
@@ -187,8 +213,9 @@ int wmain(int argc,wchar_t** argv) {
     LARGE_INTEGER frequency;QueryPerformanceFrequency(&frequency);g_qpcFreq=(double)frequency.QuadPart;
     swprintf_s(g_settingsPath,L"%s\\mevr.ini",argv[1]);swprintf_s(g_logPath,L"%s\\mevr.log",argv[1]);
     VrMenuInitializeSettings();
+    assert(g_resAuto&&g_menuResolution=="auto");
     assert(g_motionHands&&g_menuArm&&g_armSwing&&g_armSwingJump&&g_gripToGrip&&g_stickJumpTurn);
-    InputTests();IniTests();MetadataTests();PauseTests();
+    ResolutionTests();InputTests();IniTests();MetadataTests();PauseTests();
     for(int page=0;page<9;++page)WritePreview(argv[1],page);
     puts("PASS all 9 production menu page previews rendered");
     return 0;

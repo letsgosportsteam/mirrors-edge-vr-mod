@@ -390,7 +390,7 @@ static void Log(_Printf_format_string_ const char* fmt, ...)
 // before the engine's config pass - is a race with a corrupted-looking resolution as its
 // failure mode. One late launch is the better trade.
 static wchar_t g_headsetCachePath[MAX_PATH] = L"";
-static bool    g_resAuto  = false;                 // ini Resolution = auto
+static bool    g_resAuto  = true;                  // default: follow the cached headset size
 // The CACHED per-eye size this run was actually built from, so InitXR can say whether the
 // runtime still agrees with it. Zero means auto had nothing to go on yet.
 static UINT    g_autoEyeW = 0, g_autoEyeH = 0;
@@ -27527,7 +27527,7 @@ static void LoadGunCalibration()
     }
 }
 
-static void LoadSettings()
+static void LoadSettingsFile()
 {
     // A small dedicated file lets live calibration persist without rewriting the
     // user's commented mevr.ini. The log directory is already created at startup.
@@ -27995,40 +27995,16 @@ static void LoadSettings()
             // away from silently, and the run would look like the setting did nothing.
             unsigned resW = 0, resH = 0;
             if (SettingBool(val, &b) && !b) {
+                g_resAuto = false;
                 g_forceResW = g_forceResH = 0;
                 Log("[cfg]   Resolution = off  (the game's own menu list is the limit)");
                 applied++;
             } else if (_stricmp(val, "auto") == 0) {
                 g_resAuto = true;
                 applied++;
-                // Read from the file the last run with a headset left behind. Everything this
-                // does has to be finished before the engine's config pass, and that pass has
-                // not happened yet only because this is DllMain - see the note at the cache.
-                if (ReadHeadsetCache(&g_autoEyeW, &g_autoEyeH)) {
-                    // Full per-eye width, and the height that width's 16:9 partner rather than
-                    // the runtime's own - the engine renders 16:9 regardless and letterboxes
-                    // the remainder into a smaller target, which costs stereo, not pixels.
-                    g_forceResW = g_autoEyeW * 2;
-                    g_forceResH = (g_forceResW * 9) / 16;
-                    Log("[cfg]   Resolution = auto -> %ux%u  (headset last wanted %ux%u an eye)",
-                        g_forceResW, g_forceResH, g_autoEyeW, g_autoEyeH);
-                    char what[256] = "";
-                    const bool ok = SyncEngineResolution(g_forceResW, g_forceResH,
-                                                         what, sizeof(what));
-                    Log("[cfg]   Resolution: %s", what);
-                    if (!ok) {
-                        // The mode would be offered and never asked for. Saying nothing here
-                        // is how this ends up looking like the injection failed.
-                        Log("[cfg]   Resolution: *** the engine will keep asking for its own"
-                            " size. Set ResX/ResY by hand, or use Resolution = %ux%u.",
-                            g_forceResW, g_forceResH);
-                    }
-                } else {
-                    Log("[cfg]   Resolution = auto  (no headset size recorded yet - this run"
-                        " uses the game's own size, and the next one will be correct)");
-                }
             } else if (sscanf_s(val, "%ux%u", &resW, &resH) == 2 &&
                        resW >= 640 && resW <= 16384 && resH >= 480 && resH <= 16384) {
+                g_resAuto = false;
                 g_forceResW = resW; g_forceResH = resH;
                 // Both halves of the trap, stated where it can still be acted on. The engine
                 // renders 16:9 regardless and puts the remainder in a smaller target, which
@@ -28079,6 +28055,36 @@ static void LoadSettings()
     free(buf);
     Log("[cfg] %d applied, %d ignored. Hotkeys still override anything set here.",
         applied, rejected);
+}
+
+static void LoadSettings()
+{
+    // Resolve the final selection before touching the engine INI. Auto also applies
+    // when the file or key is absent; explicit Off/custom sizes must override it.
+    g_resAuto = true;
+    g_forceResW = g_forceResH = g_autoEyeW = g_autoEyeH = 0;
+    LoadSettingsFile();
+    if (!g_resAuto) return;
+    if (!ReadHeadsetCache(&g_autoEyeW, &g_autoEyeH)) {
+        g_forceResW = g_forceResH = 0;
+        Log("[cfg]   Resolution = auto  (no headset size recorded yet - this run"
+            " uses the game's own size, and the next one will be correct)");
+        return;
+    }
+    // DllMain runs this before the engine's config pass. Use full per-eye width
+    // with a 16:9 frame; the engine letterboxes other aspects into a smaller target.
+    g_forceResW = g_autoEyeW * 2;
+    g_forceResH = (g_forceResW * 9) / 16;
+    Log("[cfg]   Resolution = auto -> %ux%u  (headset last wanted %ux%u an eye)",
+        g_forceResW, g_forceResH, g_autoEyeW, g_autoEyeH);
+    char what[256] = "";
+    const bool ok = SyncEngineResolution(g_forceResW, g_forceResH, what, sizeof(what));
+    Log("[cfg]   Resolution: %s", what);
+    if (!ok) {
+        Log("[cfg]   Resolution: *** the engine will keep asking for its own"
+            " size. Set ResX/ResY by hand, or use Resolution = %ux%u.",
+            g_forceResW, g_forceResH);
+    }
 }
 
 #include "vr_menu.inl"

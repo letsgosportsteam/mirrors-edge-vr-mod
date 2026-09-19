@@ -11,6 +11,8 @@ INSTALLATION
 2. Connect the headset through Virtual Desktop with VDXR selected as the
    OpenXR runtime, then launch the game normally.
 3. Load a level for stereo gameplay. Hold Y for one second for VR settings.
+4. Resolution defaults to Auto. Quit and relaunch after the first connected
+   run so the recorded headset size takes effect.
 
 Back up your mevr.ini before an update if you want to keep your settings.
 To uninstall, remove the three mod files. The mod does not replace game assets;
@@ -99,11 +101,13 @@ Calibration and menu:     Recenter, gun alignment, panel size, restore defaults
 Turn off the game's vertical sync. The default cap is 72 FPS. Pick a stable
 cap matching or evenly dividing headset refresh, such as 60 FPS at 120 Hz.
 
-Resolution defaults to Off, using the game's chosen resolution. Auto sizes a
-16:9 frame from the headset's requested eye width and needs a restart. The
+Resolution defaults to Auto, sizing a 16:9 frame from the headset's requested
+eye width. Quit and relaunch after the first connected run to apply it. The
 headset size is cached during a run for the next launch; changing the headset
 or Virtual Desktop render scale also needs a restart. Higher resolution costs
 performance. Resolution, lens flares, and D3D9Ex are restart settings.
+Choose Off to use the game's chosen resolution instead. Existing saved Off
+or custom resolution settings are preserved when updating.
 
 Try Comfort's animation pitch/roll locks if camera motion is uncomfortable.
 Release mevr.ini has Debug off. Deleting it can restore the development overlay.

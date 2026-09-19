@@ -25,6 +25,8 @@ On Steam, use **Manage > Browse local files** to find the game folder. Stereo
 starts after a level loads; the startup screen is not a stereo gameplay view.
 
 **Hold Y for one second to open VR settings.** Changes save automatically.
+Resolution defaults to **Auto**: launch once with the headset connected, then
+quit and relaunch so the recorded headset size takes effect.
 When updating, back up your existing `mevr.ini` if you want to keep your settings.
 
 To uninstall, remove the three mod files. The mod does not replace game assets;
@@ -151,11 +153,13 @@ Turn off the game's vertical sync. The default frame cap is **72 FPS**; choose a
 cap your PC can hold that matches the headset refresh or divides it evenly.
 For example, 60 FPS fits a 120 Hz headset. Unlimited is also available.
 
-Resolution defaults to **Off**, leaving the game's chosen resolution in use.
-Choose **Auto** for a 16:9 render size based on the headset's requested eye width,
-then restart. The headset size is cached during a run and used on the next launch;
+Resolution defaults to **Auto**, using a 16:9 render size based on the headset's
+requested eye width. The first run records that size; quit and relaunch to apply
+it. The headset size is cached during a run and used on the next launch;
 changing headsets or Virtual Desktop render scale also needs a restart. Higher
 resolution costs performance. Resolution, lens flares, and D3D9Ex are restart settings.
+Choose **Off** to use the game's chosen resolution instead. Existing saved Off
+or custom resolution settings are preserved when updating.
 
 The game retains its camera animations by default. If landing dips or wall-run
 roll are uncomfortable, try the pitch and roll locks under **Comfort**.

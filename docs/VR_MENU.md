@@ -32,7 +32,7 @@ up/down to jump/quick-turn; gamepad mode still suspends motion features.
   setting applies with either controller type and with hand tracking off.
   Parkour's own camera behavior stays with parkour.
 - **Graphics and performance:** 30, 36, 60, **72 default**, 90, 120, 144, Unlimited;
-  resolution; lens flares; FPS display; native game UI size and vertical position.
+  resolution (**Auto default**); lens flares; FPS display; native game UI size and vertical position.
   Native UI defaults to 65% size, centered in each eye. Numeric INI caps 20–1000 remain supported.
 - **Controllers and turning:** Auto, Quest, or Gamepad input; Smooth or Snap turning;
   smooth speed from 25–200% (100% preserves the existing game speed); snap angle
@@ -52,6 +52,12 @@ to keep Quest input from switching it back. While Gamepad is active, motion hand
 features are suspended; their preferences are remembered for switching back to
 Quest. Headset tracking remains active. A disconnected gamepad falls back to Quest.
 Snap turning and the smooth-speed multiplier only apply during active gameplay.
+
+As of 2026-09-19, Resolution defaults to Auto in the shipped INI, compiled
+fallback, and Restore Defaults. The startup loader applies the final resolution
+selection after parsing, so an absent file/key still uses the headset cache,
+while explicit Off/custom settings disable Auto. Without a cache, the first run
+uses the game's size and records the headset recommendation for the next launch.
 
 ## Persistence and presentation
 

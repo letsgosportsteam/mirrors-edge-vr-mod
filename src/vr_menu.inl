@@ -11,7 +11,7 @@ static bool g_showReticle=false;
 static int g_menuHudOffset=-1,g_menuReticleOffset=-1;
 static uint32_t g_menuReticleMask=0;
 static float g_menuSize = 1.1f, g_menuDistance = 1.5f;
-static std::string g_menuResolution = "off";
+static std::string g_menuResolution = "auto";
 static char g_menuStatus[96] = "HOLD Y FOR ONE SECOND TO OPEN";
 static int g_menuPage = 0, g_menuRow = 0, g_menuGunHand = 1;
 static uint64_t g_menuPulseUntil = 0, g_menuPauseDeadline = 0, g_menuYUntil = 0;
@@ -348,7 +348,7 @@ static void MenuRestoreDefaults() {
     g_motionHands=true;g_menuArm=true;g_menuGuns=g_menuMelee=g_menuParkour=true;
     g_armSwingCrouch=g_balanceRoll=true;
     MenuAnimPreference(0)=MenuAnimPreference(1)=MenuAnimPreference(2)=true;
-    g_fpsCap=72;g_menuResolution="off";g_menuLens=false;g_menuEx=true;g_fastCapture=true;
+    g_fpsCap=72;g_menuResolution="auto";g_menuLens=false;g_menuEx=true;g_fastCapture=true;
     g_debug=false;g_overlay=true;g_motionHandsDebug=g_armSwingDebug=g_parkourDebug=false;
     g_menuSize=1.1f;g_menuDistance=1.5f;g_menuFps=false;
     g_controllerMode=0;g_snapTurning=false;g_smoothTurnSpeed=1;g_snapTurnAngle=45;

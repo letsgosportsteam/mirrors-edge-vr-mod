@@ -499,7 +499,7 @@ FastCapture = on
 ; off also repairs TdEngine.ini on its own: the engine finds the size is not a real display
 ; mode any more, snaps to the nearest and writes that back. MaxMultisamples is NOT restored -
 ; that one is yours.
-Resolution = off
+Resolution = auto
 
 
 ; ---------------------------------------------------------------- the half-res hunt (diagnostics)
