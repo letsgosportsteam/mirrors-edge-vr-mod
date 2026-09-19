@@ -1,271 +1,224 @@
 # Mirror's Edge VR
 
-A VR mod for *Mirror's Edge* (2008, Unreal Engine 3.536). It is a `d3d9.dll` proxy: it
-forwards every Direct3D 9 export to the real system library, and along the way renders the
-game in stereo to an OpenXR headset with 6-DOF head tracking.
+A VR mod for *Mirror's Edge* (2008), with native stereo rendering, 6-DOF head
+tracking, motion controllers, and optional tracked hands, pistols, and parkour.
 
-> **Pre-alpha.** This is an early build shared to gather reports, not a finished mod. The
-> HUD is broken in VR (see [Known issues](#known-issues)), and it has been tested on very
-> few machines. Expect crashes.
+> **Alpha.** Hardware coverage is limited, and motion interactions are still experimental.
 
----
+**[Download the latest release](https://github.com/letsgosportsteam/mirrors-edge-vr-mod/releases/latest)**
 
-## Install — three files into one folder
+## Installation
 
-**That is the whole installation.** No installer, no patcher, and no game file is modified.
+1. Download and extract the release ZIP.
+2. Copy these three files into the game's `Binaries` folder, beside `MirrorsEdge.exe`:
 
-1. **Check [Requirements](#requirements) first** — you need **Virtual Desktop**. SteamVR and
-   Meta Link cannot run this at all. Ten seconds now saves a wasted download.
-2. Download **`mevr-<version>.zip`** from
-   [Releases](https://github.com/letsgosportsteam/mirrors-edge-vr-mod/releases).
-3. Unzip it, and copy these three files into the game's `Binaries` folder, beside
-   `MirrorsEdge.exe`:
-
-   ```
+   ```text
    d3d9.dll
    openxr_loader.dll
    mevr.ini
    ```
 
-4. Start the Virtual Desktop stream, **then** launch the game normally.
+3. Connect your headset through Virtual Desktop, with **VDXR** selected as the
+   OpenXR runtime, then launch the game normally.
 
-To find `Binaries` on Steam: right-click the game → **Manage** → **Browse local files**, then
-open `Binaries`.
+On Steam, use **Manage > Browse local files** to find the game folder. Stereo
+starts after a level loads; the startup screen is not a stereo gameplay view.
 
-Stereo arms itself a few seconds into the first loaded level — not at the menu. If it gives up,
-it says so in the log and tells you to press **F6**.
+**Hold Y for one second to open VR settings.** Changes save automatically.
+When updating, back up your existing `mevr.ini` if you want to keep your settings.
 
-**To uninstall:** delete those three files. Nothing else was touched.
-
-> ⚠️ **Do not put anything in `TdGame\Config`.** Mirror's Edge hash-checks the files in that
-> folder and refuses to start when they are edited. Nothing this mod needs goes near it.
-
-## What works today
-
-- **Native stereo rendering.** Both eyes are rendered by the engine with their own projection,
-  per frame. This is not reprojection or a flat image on a floating screen.
-- **6-DOF head tracking**, sampled inside the frame it is drawn for.
-- **Touch controllers**, synthesised as an Xbox pad, so the game's own gamepad layout applies
-  1:1 — or play with keyboard and mouse.
-
-> ### 🎯 PAGE UP recentres the view — at any time
->
-> A headset put on even slightly crooked leaves the world tilted, and it is the first thing
-> that will bother you. **PAGE UP** puts the view back where you are facing, instantly, as
-> often as you like. It works during play, in menus, and whether or not anything else is
-> switched on.
+To uninstall, remove the three mod files. The mod does not replace game assets;
+automatic resolution can update the game's user settings. Do not edit the
+installation's `TdGame\Config` files: the game checks their integrity.
 
 ## Requirements
 
-> ### ⚠️ You must play through Virtual Desktop. There is no alternative.
->
-> Mirror's Edge is a **32-bit** process, and almost nothing ships a 32-bit OpenXR runtime any
-> more. This was measured, not assumed:
->
-> - **VirtualDesktopXR (VDXR)** — works. The only one that does.
-> - **SteamVR** — ships no 32-bit runtime at all. Index, Vive and every SteamVR-native headset
->   are out of reach for now.
-> - **Meta / Oculus native (Link, Air Link)** — its 32-bit runtime crashes in `xrCreateSession`.
->
-> So: a Quest or Pico, **[Virtual Desktop](https://www.vrdesktop.net/)**, with **VDXR set as
-> your OpenXR runtime**, and the stream **already running before you launch the game**.
-
 | | |
 |---|---|
-| Game | *Mirror's Edge* (2008), any store. The 32-bit original — **not** *Catalyst*. |
-| Headset | A standalone headset streamed over Virtual Desktop, as above. Touch-style controllers; the mod suggests the `oculus/touch_controller` interaction profile, which is what a Quest reports through Virtual Desktop. |
-| Runtime | [Microsoft Visual C++ 2015–2022 Redistributable — **x86**](https://aka.ms/vs/17/release/vc_redist.x86.exe). The x64 one you probably already have **does not** satisfy it; the game is a 32-bit process. |
+| Game | *Mirror's Edge* (2008) for Windows, the original game rather than *Catalyst*. |
+| Headset | A headset supported by [Virtual Desktop](https://www.vrdesktop.net/), connected through **VDXR**. Motion input uses the Touch controller layout. |
+| Runtime | [Microsoft Visual C++ 2015–2022 Redistributable **x86**](https://aka.ms/vs/17/release/vc_redist.x86.exe), required to run the mod. The x64 package alone is insufficient. |
 | OS | Windows 10 or 11. |
+| Input | Touch motion controllers, a standard XInput gamepad, or keyboard and mouse. |
 
-If the x86 redistributable is missing, Windows silently declines to load the mod and the game
-starts up flat with no error at all. It is the single most likely reason for "nothing happened".
+**This build supports Virtual Desktop with VDXR.** SteamVR and Meta Link/Air Link
+are not supported by this mod's current 32-bit OpenXR path.
 
-If Virtual Desktop is not streaming when the game starts, the log says so in as many words:
-`no OpenXR instance. Is the headset connected and Virtual Desktop streaming?`
+If the game starts flat with no mod log, check that the x86 redistributable is
+installed. If OpenXR cannot start, check that Virtual Desktop is already streaming.
 
-## Set these before you play
+## Features
 
-Three to change before you start, and one to keep in your back pocket.
+| Feature | Current support |
+|---|---|
+| Stereo and head tracking | Separate eye views with positional and rotational tracking. |
+| Controllers and turning | Touch input, automatic switching to an XInput gamepad, smooth or snap turning. |
+| VR settings | In-headset panel, automatic saving, recentering, and restore defaults. |
+| Game UI | Recognized HUD, menus, and tutorial prompts rendered in both eyes; adjustable size and height. |
+| Motion hands | Optional controller-driven hands, with the game taking over during supported animations. |
+| Pistols | Colt1911 and Glock18c follow either hand, with controller aiming, grip pickup/drop/throw, and per-hand calibration. |
+| Melee and movement | Optional punch/disarm gestures, arm-swing running, hands-up jumping, and physical crouching. |
+| Motion parkour | Grip interactions on ledges, pipes, and horizontal bars. |
+| Graphics and comfort | Headset-based resolution option, frame cap, camera animation locks, lens-flare and reticle controls. |
 
-**Set the game's resolution as high as it goes, and keep it 16:9.** The mod does not take its
-resolution from the headset yet — it splits the game's own frame down the middle, one half per
-eye, so the game's resolution *is* your per-eye resolution. Keep the aspect at 16:9: anything
-else is letterboxed, and the eye crop then has to assume the black bars are centred.
-
-**A resolution change only takes effect after restarting the game**, so set it before you get
-comfortable rather than partway through a session.
-
-**Turn vertical sync off.** It paces the game to your flat monitor, which fights the frame cap
-the mod uses to pace the headset.
-
-**Set `FrameCap` in `mevr.ini` to a rate that divides your headset's refresh exactly** — 60 for
-a 120 Hz headset, 72 for 144 Hz. Usually that means half. What matters is not the number but
-the division: a frame held for two display periods *every* time looks smoother than a faster
-rate held for two, then three. Uneven pacing shows up as judder, most obviously when you look
-up and down.
-
-**If you feel motion sick, try `LockAnimPitch` and `LockAnimRoll`.** Both ship off, so the
-game's own camera animations — wall-run roll, landing dips, vaults — play as it intended.
-Turning them on stops those animations moving your view on those axes, which may help a lot.
-Worth reaching for if the first session is uncomfortable, rather than something to change
-before you have played.
-
-Leave `LockAnimYaw` off either way: an animation that turns the player is carrying them
-somewhere, and cancelling it leaves your body facing one way and your view another.
+**Motion hands and arm-swing locomotion default to Off.** Enable **Hand tracking**
+under **Hands and movement** to use controller-driven hands; Guns, Melee, and
+Motion parkour have their own switches. Here, “hand tracking” means tracking the
+controllers, not playing with bare hands.
 
 ## Controls
 
-Keyboard and mouse work exactly as they always did. Motion controllers are synthesised as an
-Xbox pad, so **the game's own default gamepad layout applies 1:1** — the mod remaps nothing, and
-the in-game control list is accurate.
+These are the default game bindings with Touch controllers. Enabling Hand tracking
+changes the grips and right-stick vertical input as shown below. Keyboard/mouse
+and standard gamepads retain the game's normal bindings, with the gamepad's Y
+hold reserved for VR settings.
 
-Two are worth knowing before you start, because neither is where a VR player would look:
+### Left controller
 
-| | |
+| Input | Action |
 |---|---|
-| **Left grip** | **Jump.** The game puts jump on the left shoulder so both thumbs stay on the sticks; on a controller held in the fist, that lands on the grip. |
-| **Left stick click** | **Back / in-game menu — you need this for the tutorial.** Press the left thumbstick in. It was the one live binding no physical control could otherwise reach, so the mod puts it here. |
+| Thumbstick | Move / strafe. |
+| Thumbstick click | Back / in-game menu, including the tutorial menu. |
+| Trigger | Crouch / slide. With a tracked pistol in the left hand, fires that pistol instead. |
+| Grip | Jump with Hand tracking off; close the hand / grip with Hand tracking on. |
+| X | Reaction Time. |
+| Y | Weapon action on a short press; **hold one second to open or close VR settings**. |
+| Menu | Native pause menu. |
 
-Three keyboard keys stay live even though the mod is otherwise invisible:
+### Right controller
 
-| Key | |
+| Input | Action |
 |---|---|
-| **PAGE UP** | Recentre the view. Use it whenever the headset was put on at an angle. |
-| **PAUSE** (hold) | Quit cleanly, so the engine writes your save. |
-| **F6** | Rescan for the view matrix, if stereo never came on. |
+| Thumbstick left/right | Turn; choose Smooth or Snap in VR settings. |
+| Thumbstick up/down | With Hand tracking on: **up to jump, down to quick-turn**. Otherwise, the game's look axis. |
+| Thumbstick click | Weapon zoom, where supported by the game. |
+| Trigger | Attack / fire; a tracked pistol uses the trigger on its holding hand. |
+| Grip | Quick-turn / look behind with Hand tracking off; close the hand / grip with Hand tracking on. |
+| A | Use / interact. |
+| B | Look at the game's point of interest. |
 
-The in-game menus do not display correctly in the headset yet. Until that is fixed, glance at
-the flat monitor to read them — the game is still rendering there normally.
+Center the right stick between snap turns or repeated jump/quick-turn inputs.
+With a tracked pistol in the left hand, the right trigger no longer fires it.
 
-## Configuration
+### Motion interactions
 
-`mevr.ini` sits beside `d3d9.dll`. It is read from `%LOCALAPPDATA%\MirrorsEdgeVR\` too, if
-you would rather not put files in the game folder; beside the DLL wins if both exist.
+These require Hand tracking and the relevant feature enabled in **Hands and movement**.
 
-Every line is echoed to the log at startup — applied, or rejected with the reason — so a
-misspelt key is never silent. The file can only move settings the hotkeys could already
-move; deleting it is always safe. See the comments in the file itself for each setting.
-
-The settings that matter most for a first session — `FrameCap` and the animation locks — are
-covered under [Set these before you play](#set-these-before-you-play).
-
-Setting `Debug = on` restores the development overlay and roughly twenty diagnostic hotkeys.
-Useful when investigating a bug, unpleasant to play with.
-
-## Known issues
-
-- **The HUD and in-game menus are split across the eyes and unreadable in the headset.** They
-  arrive through the same 2D path as the game's full-screen post passes, and every filter
-  tried so far separates the examples rather than the categories. The fix is to give the
-  overlay its own render target and submit it as a second composition layer — substantial
-  work, not a tweak. **Workaround: glance at the flat monitor**, which still shows the game
-  normally.
-- **Resolution is not taken from the headset.** The game's own frame is split per eye, so
-  your in-game resolution sets your per-eye resolution. See
-  [Set these before you play](#set-these-before-you-play).
-- No weapon or hand anchoring; this is a stereo-camera mod, not a full VR conversion.
-- Camera animations still move the view unless locked per axis in `mevr.ini`.
-- Deleting `mevr.ini` entirely restores the compiled default of `Debug = on`, i.e. the
-  development overlay comes back. Edit the file rather than deleting it.
-
-## Planned
-
-Roughly in the order they matter. Nothing here is a promise of a date.
-
-**Toward alpha**
-
-- A proper **VR settings menu**, instead of editing an ini by hand
-- A **real fix for the in-game pop-up menus** — the second composition layer described above
-- **Reposition the in-game UI** so it is readable at a comfortable distance in the headset
-- **Full headset resolution**, rather than splitting the game's own frame per eye
-- **Effects that render in one eye only** — currently they break the stereo
-- **Misaligned sprites** (birds and similar) sitting at the wrong depth
-- **Misaligned reflections**
-- **Correct head-tracking yaw during in-game cinematics**
-- **Stutter during the flat video cutscenes**
-- **Snap turn**
-- Possibly **basic hand tracking**, if it lands in time
-
-**Toward beta**
-
-- **Hand tracking**, in stages:
-
-| Stage | |
+| Action | Gesture |
 |---|---|
-| **Basic** | Hands are tracked, but the game takes control back during animations and gun use |
-| **Guns** | Basic, plus hand tracking for weapons |
-| **Advanced** | Parkour mechanics actually performed with the hands |
+| Pick up a pistol | Look at an eligible pistol within 2 m, then squeeze either grip. A blue box marks the selected pistol. |
+| Drop / throw | Release the holding grip; move the controller as you release to throw. A pistol acquired with the weapon button needs an initial grip squeeze to arm release-to-drop. |
+| Punch | While unarmed, hold a grip and thrust that fist forward. Retract before the next punch. |
+| Disarm | Extend both hands forward and squeeze both grips together while the game's normal disarm conditions are met. |
+| Run | Swing your arms with Arm swing locomotion enabled. The movement stick remains available. |
+| Jump | Raise both hands above your head with Arm swing locomotion enabled. |
+| Crouch / slide | Lower your head with Physical crouching enabled under Comfort; this also requires arm swing. Recenter while standing. |
+| Climb / shimmy | Grip a ledge or pipe and move hand over hand. Push down while gripping to pull up from a ledge. |
+| Swing / release | Grip a horizontal bar with both hands and pump forward/back. Release both grips to leave the bar. |
 
-The implementation plan for the first stage is in
-[`PHASE1_MOTION_CONTROLS.md`](PHASE1_MOTION_CONTROLS.md).
+The game still owns contextual animations and decides whether attacks, pickups,
+and disarms are allowed. Other weapon types retain their native handling.
+
+### VR settings and shortcuts
+
+| Input | Action |
+|---|---|
+| Hold Y for one second | Open or close VR settings, on Touch or an XInput gamepad. |
+| Either stick up/down | Select a settings row. |
+| Either stick left/right | Change its value. |
+| A or right trigger | Confirm. |
+| B | Back; closes the panel from its main page. |
+| Page Up | Recenter the view. Also available under Calibration and menu. |
+| Hold Pause on the keyboard | Exit the game cleanly. |
+| F6 | Rescan if stereo fails to start after loading a level. |
+
+Release controls and center the sticks when leaving VR settings to resume gameplay.
+**Controllers and turning > Auto** selects the active controller from fresh input.
+Gamepad mode suspends motion features while keeping their preferences and headset tracking.
+
+## Settings
+
+Start with the in-headset panel. The main options are:
+
+- **Hands and movement:** controller hand tracking, arm swing, guns, melee, and parkour.
+- **Comfort:** physical crouching, head-tilt balance, animation locks, and reticle visibility.
+- **Graphics and performance:** frame cap, resolution, lens flares, FPS display, and game UI size/height.
+- **Controllers and turning:** input source, turning mode, smooth speed, and snap angle.
+- **Calibration and menu:** recentering, left/right gun alignment, panel size/distance, and restore defaults.
+
+Turn off the game's vertical sync. The default frame cap is **72 FPS**; choose a
+cap your PC can hold that matches the headset refresh or divides it evenly.
+For example, 60 FPS fits a 120 Hz headset. Unlimited is also available.
+
+Resolution defaults to **Off**, leaving the game's chosen resolution in use.
+Choose **Auto** for a 16:9 render size based on the headset's requested eye width,
+then restart. The headset size is cached during a run and used on the next launch;
+changing headsets or Virtual Desktop render scale also needs a restart. Higher
+resolution costs performance. Resolution, lens flares, and D3D9Ex are restart settings.
+
+The game retains its camera animations by default. If landing dips or wall-run
+roll are uncomfortable, try the pitch and roll locks under **Comfort**.
+
+Settings live in `mevr.ini` beside the DLL. An existing
+`%LOCALAPPDATA%\MirrorsEdgeVR\mevr.ini` is also supported; the file beside the DLL
+takes priority. See [mevr.ini.example](mevr.ini.example) for advanced options.
+Release packages use **Debug = off**; the development example and compiled fallback
+use **Debug = on**, so deleting the INI can bring back the diagnostic overlay.
+
+## Known limitations
+
+- Motion hands, gestures, and parkour are experimental. The game takes control of
+  the arms during many animations; tracked gun support is limited to the two pistols above.
+- Stereo fixes for effects, UI, and glass target the rendering paths observed so
+  far. Unseen materials or scenes may still need work. Glass reflections still
+  use one game-rendered reflection image shared between the eyes.
+- Recent tutorial-placement, reticle, and pipe-exit fixes have automated coverage
+  but still need broader headset testing. See the [development notes](docs/README.md)
+  for what was tested and what remains unverified.
+- Performance varies by scene and render resolution; there is no guaranteed frame rate.
 
 ## Reporting a bug
 
-Open an [issue](https://github.com/letsgosportsteam/mirrors-edge-vr-mod/issues) and attach
-`%LOCALAPPDATA%\MirrorsEdgeVR\mevr.log`. That log is the entire diagnostic channel: it names
-the version, the headset runtime, which `mevr.ini` it read, and what the startup sequence
-was waiting for. A report without it is usually unactionable.
-
-Say which headset and which OpenXR runtime, and whether the game reached a loaded level.
-
----
+[Open an issue](https://github.com/letsgosportsteam/mirrors-edge-vr-mod/issues) and attach
+`%LOCALAPPDATA%\MirrorsEdgeVR\mevr.log`. Include the mod version, headset, runtime,
+controller type, enabled motion features, and the level or action that reproduces it.
 
 ## Building
 
-Windows, Visual Studio 2019 or later with the C++ x86 toolset, and the
-[OpenXR.Loader NuGet package](https://www.nuget.org/packages/OpenXR.Loader) unpacked
-somewhere (it must contain `include\` and `native\Win32\release\{lib,bin}`).
+Requires Windows, Visual Studio with the C++ x86 toolset, and the
+[OpenXR.Loader NuGet package](https://www.nuget.org/packages/OpenXR.Loader)
+with `include\` and `native\Win32\release\{lib,bin}` available.
 
-Nothing in this repository hardcodes a path. Point the build at your SDK and a **disposable**
-copy of the game:
-
-```powershell
-Copy-Item src\paths.local.ps1.example src\paths.local.ps1   # then edit it
-```
-
-Or set `MEVR_OPENXR_SDK` and `MEVR_GAME_BIN` in the environment, which is what CI does.
+Copy `src\paths.local.ps1.example` to `src\paths.local.ps1` and set your local SDK
+and game paths, or set `MEVR_OPENXR_SDK` and `MEVR_GAME_BIN` in the environment.
+Use a separate development copy of the game for installation tests.
 
 ```powershell
-.\src\build.ps1              # build d3d9.dll
-.\src\build.ps1 -Install     # build, then copy it to the configured game folder
-.\src\build.ps1 -Package     # build, then stage a release zip in dist\
+.\src\build.ps1              # build x86 d3d9.dll and run static analysis
+.\src\build.ps1 -Install     # also install to the configured game folder
+.\src\build.ps1 -Package     # create a release ZIP in dist; requires a clean commit
+.\tools\check-clean.ps1      # check for personal or machine-local information
 ```
 
-If PowerShell refuses with *"is not digitally signed"*, the machine's execution policy is
-`AllSigned`. These scripts are locally created and carry no zone mark, so `RemoteSigned` is
-enough — `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned` (no admin
-needed, and it still blocks unsigned scripts you download). For a one-off,
-`powershell -ExecutionPolicy Bypass -File .\src\build.ps1` changes nothing persistently.
+## Development notes
 
-`-Install` writes to `$GameBin`. Point that at a copy of the game you don't mind breaking;
-testing this means crashing it repeatedly.
-
-The build is x86 only — the game is a 32-bit process — and runs `/analyze` over `d3d9.cpp`
-before the real compile, failing on format-string defects and on any static function that is
-defined but never called. Both have cost real debugging time on this project and neither is
-caught by `/W4`.
-
-### Repository layout
-
-| | |
+| Location | Contents |
 |---|---|
-| `src/d3d9.cpp` | The whole mod, one file. Heavily commented with *why*, including the wrong turns. |
-| `ENGINE_NOTES.md` | Everything measured about this build of UE3 — offsets, the object model, the view matrix, frame delivery. The most valuable file here for anyone modding this engine. |
-| `FEASIBILITY.md` | The original assessment. |
-| `third_party/minhook/` | Vendored [MinHook](https://github.com/TsudaKageyu/minhook), BSD-2. |
-| `reference/` | The working VR shim from the Singularity mod, kept for study. Not compiled. |
-| `tools/check-clean.ps1` | Refuses to push anything containing a machine-local or personal path. |
+| [AGENTS.md](AGENTS.md) | Starting point for coding agents and documentation routing. |
+| [ENGINE_NOTES.md](ENGINE_NOTES.md) | Measured engine internals, offsets, input bindings, and rendering behavior. |
+| [FEASIBILITY.md](FEASIBILITY.md) | Original assessment, preserved as historical context. |
+| [docs/README.md](docs/README.md) | Topic index for feature plans, investigations, fixes, and validation notes. |
+| `src/` | The D3D9/OpenXR shim and its feature modules. |
+| `tools/` | Regression harnesses, diagnostics, and publication checks. |
+| `reference/` | Reference material from the Singularity shim; not compiled. |
 
-Development proceeds in "rungs" — each one a single question the game has to answer in a
-headset before the next is attempted. The commit history is the ladder, and the notes record
-what each rung actually measured rather than what was expected.
+Development notes record earlier experiments as well as current behavior. Check
+the dates and newer follow-ups before treating an old result as a current limitation.
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE). Third-party components and their notices are listed in
-[THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt); that file ships inside the release zip
-too, because both licences involved require their notice to accompany binary redistributions.
+MIT — see [LICENSE](LICENSE) and [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).
 
-*Mirror's Edge* is a trademark of Electronic Arts Inc. This project is not affiliated with or
-endorsed by EA or DICE, contains no game code or assets, and does nothing without a legally
-obtained copy of the game.
+*Mirror's Edge* is a trademark of Electronic Arts Inc. This project is not affiliated
+with or endorsed by EA or DICE. It contains no game code or assets and requires a
+legally obtained copy of the game.
