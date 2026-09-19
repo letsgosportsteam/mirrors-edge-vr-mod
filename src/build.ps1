@@ -1,12 +1,15 @@
-﻿# Builds the VR shim as x86, and optionally installs it beside the game exe.
+# Builds the VR shim as x86, and optionally installs it beside the game exe.
 # Compiles MinHook's C sources alongside the C++ shim (no separate lib step needed).
 #
 # Everything machine-specific lives in `paths.local.ps1` (gitignored) or in the
 # MEVR_OPENXR_SDK / MEVR_GAME_BIN environment variables. This script contains no paths.
 
-param([switch]$Install, [switch]$Package)
+param([switch]$Install, [switch]$Package, [switch]$Reproducible)
 
 $ErrorActionPreference = "Stop"
+if ($Package) {
+    throw 'Release packaging must preserve the tested files. Use tools/package-tested-build.ps1 with the approved test Binaries directory. No build was started.'
+}
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Resolve-Path (Join-Path $here "..")
 
@@ -68,7 +71,6 @@ try {
     # Embed the same defaults that ship in the package for the menu's Restore Defaults.
     $defaultIni = [System.IO.File]::ReadAllText((Join-Path $root 'mevr.ini.example'))
     $releaseEdits = @(
-        @{ Rx = '(?m)^Debug = on\s*$'; To = 'Debug = off' }
         @{ Rx = '(?m)^; Rename this file to  mevr\.ini  and leave it beside d3d9\.dll.*$';
            To = '; This IS mevr.ini. Keep it beside d3d9.dll in the game''s Binaries folder.' }
     )
@@ -90,6 +92,23 @@ try {
     }
     $defaultHeader += ';'
     [System.IO.File]::WriteAllText((Join-Path $here 'vr_defaults.inl'), $defaultHeader, (New-Object System.Text.UTF8Encoding($false)))
+    # The installed candidate and independent release rebuild use this exact
+    # generated INI, including comments and line endings.
+    [System.IO.File]::WriteAllText((Join-Path $here 'mevr.ini'), $defaultIni, [Text.UTF8Encoding]::new($false))
+    $identityInputs = @(
+        Get-ChildItem -LiteralPath $here -File | Where-Object {
+            $_.Extension -in @('.cpp','.inl','.h','.def') -and $_.Name -ne 'build_identity.inl'
+        }
+        Get-Item -LiteralPath (Join-Path $here 'build.ps1')
+        Get-ChildItem -LiteralPath $mh -Recurse -File | Where-Object { $_.Extension -in @('.c','.h') }
+    ) | Sort-Object FullName
+    $identityText = ($identityInputs | ForEach-Object {
+        $_.FullName.Substring($root.Path.Length).Replace('\','/') + ':' + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+    }) -join "`n"
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $buildId = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($identityText))).Replace('-','') }
+    finally { $sha.Dispose() }
+    [IO.File]::WriteAllText((Join-Path $here 'build_identity.inl'),('static const char kMevrBuildId[] = "' + $buildId + '";'),[Text.UTF8Encoding]::new($false))
     $mhSrc = ""
     if ($needsMinHook) {
         $mhSrc = @(
@@ -144,12 +163,20 @@ try {
         throw "a static function is defined but never called - almost certainly a missing call site"
     }
 
-    $cmd = "`"$vcvars`" x86 && cl /nologo /LD /EHsc /W3 /w34505 /Zi /MD /std:c++17 " +
+    $debugFlags = if ($Reproducible) { '/Z7 /Brepro' } else { '/Zi' }
+    $linkFlags = if ($Reproducible) { '/DEBUG:FULL /INCREMENTAL:NO /Brepro /PDBALTPATH:d3d9.pdb' } else { '' }
+    if ($Reproducible) {
+        # Full compilation below rebuilds every object. Remove the old symbol
+        # database so the linker cannot retain its previous page layout.
+        $oldPdb = Join-Path $here 'd3d9.pdb'
+        if (Test-Path -LiteralPath $oldPdb) { Remove-Item -LiteralPath $oldPdb }
+    }
+    $cmd = "`"$vcvars`" x86 && cl /nologo /LD /EHsc /W3 /w34505 $debugFlags /MD /std:c++17 " +
            "$incArgs " +
            "/Fe:d3d9.dll d3d9.cpp $mhSrc " +
            # advapi32: Resolution = auto resolves the real Documents folder from the registry
            # rather than assuming %USERPROFILE%\Documents, which OneDrive redirection breaks.
-           "/link /DEF:d3d9.def $xrLib user32.lib shell32.lib psapi.lib advapi32.lib"
+           "/link /DEF:d3d9.def $linkFlags $xrLib user32.lib shell32.lib psapi.lib advapi32.lib"
     cmd /c $cmd
     if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
     Write-Host ""
@@ -185,99 +212,6 @@ try {
         }
     }
 
-    # ---- -Package: stage the release zip ----
-    #
-    # Everything a user needs and nothing else. The two rules this enforces, because both
-    # failures are silent and both reach the user before anyone notices:
-    #
-    #   1. A zip must correspond to a COMMIT. Otherwise the version in the log names a tree
-    #      nobody can check out, and the first question a bug report has to answer - "which
-    #      build is this" - has no answer.
-    #   2. The shipped mevr.ini must actually say Debug=off. The compiled default is ON, so a
-    #      failed substitution does not produce a broken build; it produces a working build
-    #      with a diagnostic overlay across the player's face.
-    if ($Package) {
-        if (-not $needsOpenXr) { throw "packaging a build with no OpenXR is not a release" }
-
-        # ---- the version, read from the source ----
-        # Same principle as $needsOpenXr above: the DLL logs this string, so parsing it here
-        # means the zip cannot be named after a version the binary does not report.
-        $verLine = Select-String -LiteralPath (Join-Path $here "d3d9.cpp") `
-                                 -Pattern '^\s*#define\s+MEVR_VERSION\s+"([^"]+)"'
-        if (-not $verLine) { throw "no MEVR_VERSION #define found in d3d9.cpp" }
-        $version = $verLine.Matches[0].Groups[1].Value
-
-        # ---- refuse to package a dirty or unknown tree ----
-        $dirty = git -C $root status --porcelain
-        if ($LASTEXITCODE -ne 0) { throw "not a git repository - cannot identify this build" }
-        if ($dirty) {
-            $dirty | ForEach-Object { Write-Host "  $_" }
-            throw "working tree is dirty. Commit or stash before packaging - a release zip " +
-                  "that does not correspond to a commit cannot be reproduced or bisected."
-        }
-        $sha = (git -C $root rev-parse --short HEAD).Trim()
-
-        & (Join-Path $root "tools\check-clean.ps1")
-        if ($LASTEXITCODE -ne 0) { throw "check-clean failed - not packaging" }
-
-        # ---- the DLL must be 32-bit ----
-        # The game is a 32-bit process, so an x64 d3d9.dll is not loaded at all - which looks
-        # exactly like the mod doing nothing. Read the PE machine field rather than trusting
-        # that vcvarsall was invoked with x86 twenty lines up.
-        $dllPath = Join-Path $here "d3d9.dll"
-        $fs = [System.IO.File]::OpenRead($dllPath)
-        try {
-            $br = New-Object System.IO.BinaryReader($fs)
-            $fs.Position = 0x3C
-            $fs.Position = $br.ReadInt32() + 4      # e_lfanew -> COFF header, past "PE\0\0"
-            $machine = $br.ReadUInt16()
-        } finally { $fs.Dispose() }
-        if ($machine -ne 0x014C) {
-            throw ("d3d9.dll is not x86 (PE machine 0x{0:X4}, expected 0x014C)" -f $machine)
-        }
-
-        if ($version -notmatch '^\d+\.\d+\.\d+-alpha(?:\.\d+)?$') { throw 'unexpected alpha version format' }
-        $dist  = [System.IO.Path]::GetFullPath((Join-Path $root "dist"))
-        $stage = [System.IO.Path]::GetFullPath((Join-Path $dist "mevr-$version"))
-        if ([System.IO.Path]::GetDirectoryName($stage) -ne $dist) { throw 'release stage escaped dist' }
-        if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
-        New-Item -ItemType Directory -Force -Path $stage | Out-Null
-
-        Copy-Item $dllPath $stage
-        Copy-Item (Join-Path $binDir "openxr_loader.dll") $stage
-
-        # ---- mevr.ini, derived from the example rather than kept as a second copy ----
-        #
-        # One source of truth for the settings and their documentation, with exactly two
-        # deliberate release deltas. Each MUST match, or the build stops: a silently skipped
-        # substitution here ships the wrong default, and nothing downstream would catch it.
-        $iniText = $defaultIni
-        # NOT Set-Content -Encoding utf8, which on Windows PowerShell 5.1 writes a BOM. The
-        # parser skips spaces and tabs before testing for ';', and a BOM is neither - so the
-        # file's own first comment would be reported as a rejected line in every release, and
-        # a setting on line 1 would be dropped outright. LoadSettings tolerates a BOM now; this
-        # side simply never produces one.
-        [System.IO.File]::WriteAllText((Join-Path $stage "mevr.ini"), $iniText,
-                                       (New-Object System.Text.UTF8Encoding($false)))
-
-        $zip = Join-Path $dist "mevr-$version.zip"
-        if (Test-Path $zip) { Remove-Item $zip -Force }
-        Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip
-        & (Join-Path $root 'tools/check-package.ps1') -ZipPath $zip
-        if ($LASTEXITCODE -ne 0) { throw 'release archive verification failed' }
-
-        # The PDB is a SEPARATE release asset, never inside the zip. It is wanted only to turn
-        # a crash address in somebody's log into a line number, and putting it in the zip
-        # invites users to copy it into Binaries where it does nothing.
-        Copy-Item (Join-Path $here "d3d9.pdb") (Join-Path $dist "d3d9-$version.pdb") -Force
-
-        Write-Host ""
-        Write-Host "Packaged $version ($sha)" -ForegroundColor Green
-        Write-Host "  $zip"
-        Write-Host "  $(Join-Path $dist "d3d9-$version.pdb")  (separate release asset, not in the zip)"
-        Write-Host ""
-        Write-Host "  Upload the ZIP and PDB as GitHub release assets for v$version."
-    }
 } finally {
     Pop-Location
 }

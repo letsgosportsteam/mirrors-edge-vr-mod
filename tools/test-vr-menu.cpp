@@ -37,7 +37,64 @@ static void WriteEffectiveSettings(const wchar_t* input) {
     assert(MenuAtomicWrite(mevr::updateIni(ReadTestFile(g_settingsPath),extra)));
     puts("PASS effective settings snapshot written without launching the game");
 }
+static UINT STDMETHODCALLTYPE TestModeCount(IDirect3D9*, UINT, D3DFORMAT fmt) {
+    return fmt == D3DFMT_X8R8G8B8 ? 2 : 0;
+}
+static HRESULT STDMETHODCALLTYPE TestEnumMode(IDirect3D9*, UINT, D3DFORMAT fmt, UINT index,
+                                               D3DDISPLAYMODE* mode) {
+    if (!mode || fmt != D3DFMT_X8R8G8B8 || index >= 2) return D3DERR_INVALIDCALL;
+    *mode = {index ? 1920u : 1600u, index ? 1080u : 1200u, 60, fmt};
+    return D3D_OK;
+}
+static void AutoModeTests() {
+    g_origGetAdapterModeCount=TestModeCount;g_origEnumAdapterModes=TestEnumMode;
+    g_resAuto=true;g_forceResW=4224;g_forceResH=2376;
+    D3DDISPLAYMODE mode{};
+    assert(Hook_GetAdapterModeCount(nullptr,0,D3DFMT_X8R8G8B8)==1);
+    assert(SUCCEEDED(Hook_EnumAdapterModes(nullptr,0,D3DFMT_X8R8G8B8,0,&mode)));
+    assert(mode.Width==4224&&mode.Height==2376&&mode.RefreshRate==60);
+    assert(FAILED(Hook_EnumAdapterModes(nullptr,0,D3DFMT_X8R8G8B8,1,&mode)));
+    assert(FAILED(Hook_EnumAdapterModes(nullptr,0,D3DFMT_X8R8G8B8,0,nullptr)));
+    assert(Hook_GetAdapterModeCount(nullptr,0,D3DFMT_UNKNOWN)==0);
+    g_resAuto=false;
+    assert(Hook_GetAdapterModeCount(nullptr,0,D3DFMT_X8R8G8B8)==3);
+    assert(SUCCEEDED(Hook_EnumAdapterModes(nullptr,0,D3DFMT_X8R8G8B8,0,&mode))&&mode.Width==1600);
+    assert(SUCCEEDED(Hook_EnumAdapterModes(nullptr,0,D3DFMT_X8R8G8B8,2,&mode))&&mode.Width==4224);
+    g_forceResW=g_forceResH=0;
+    assert(Hook_GetAdapterModeCount(nullptr,0,D3DFMT_X8R8G8B8)==2);
+    g_resAuto=true; // no cache on the first launch still offers the native list
+    assert(Hook_GetAdapterModeCount(nullptr,0,D3DFMT_X8R8G8B8)==2);
+    g_origGetAdapterModeCount=nullptr;g_origEnumAdapterModes=nullptr;g_modeInjectCount=0;
+}
+static void MotionSamplingGateTests() {
+    g_armSwing=false;g_armSwingDebug=false;g_motionHands=true;g_motionPunch=true;g_gripToGrip=true;
+    g_swingL.havePrev=g_swingR.havePrev=true;
+    ArmSwingSample(1000000000LL,false);
+    assert(!g_swingL.havePrev&&!g_swingR.havePrev); // punch sampling survives locomotion Off
+    g_motionPunch=false;g_armSwing=true;
+    g_swingL.havePrev=g_swingR.havePrev=true;
+    ArmSwingSample(1000000000LL,false);
+    assert(!g_swingL.havePrev&&!g_swingR.havePrev); // normal sampling survives logging Off
+    g_motionPunch=true;
+    g_padEnabled=true;g_sweepActive=false;g_pkMode=PK_NONE;g_moveInputBlocked=false;
+    g_gripValue[0]=g_gripValue[1]=0;g_swingHeadVert=0;g_swingJumpGraceUntil=0;
+    g_swingAltValid=true;g_swingAltSmooth=-0.5f;
+    g_swingL.tracked=g_swingR.tracked=true;
+    g_swingDt=1.0f/72;g_swingNow=g_swingFull=2.0f;
+    float result=0;
+    for(int i=0;i<144;++i) {
+        const XrTime when=2000000000LL+i*13888889LL;
+        g_swingHandLoud[0]=g_swingHandLoud[1]=when;
+        result=ArmSwingDeflection(when,0,0);
+    }
+    assert(result==1.0f); // sustained opposed swings drive forward with debug Off
+    assert(ArmSwingDeflection(4100000000LL,0,-1)==0); // stick-back emergency stop
+    g_gripValue[0]=1;
+    assert(ArmSwingDeflection(4200000000LL,0,0)==0); // a punch must not drive locomotion
+    g_gripValue[0]=0;
+}
 static void ResolutionTests() {
+    AutoModeTests();MotionSamplingGateTests();
     // No real headset cache is configured in this harness, so auto cannot touch
     // the user's engine INI. Exercise first-run fallback and parser transitions.
     assert(!g_headsetCachePath[0]);
@@ -151,6 +208,7 @@ static void IniTests() {
     assert(g_menuResolution=="auto"&&g_menuRestart);
     assert(g_motionHands&&g_menuArm&&g_armSwing&&g_armSwingJump&&g_gripToGrip&&g_stickJumpTurn);
     LoadSettings();VrMenuInitializeSettings();assert(g_fpsCap==72&&g_motionHands&&g_menuArm&&!g_debug);
+    assert(g_motionHandsDebug&&g_armSwingDebug&&g_parkourDebug);
     assert(g_resAuto&&g_menuResolution=="auto");
     assert(g_armSwing&&g_armSwingJump&&g_gripToGrip&&g_stickJumpTurn);
     // Existing explicit opt-outs survive save/reload despite the enabled defaults.
@@ -240,6 +298,23 @@ static void WritePreview(const wchar_t* directory,int page) {
     FILE* out=nullptr;_wfopen_s(&out,path,L"wb");assert(out);
     fwrite(&file,sizeof(file),1,out);fwrite(&info,sizeof(info),1,out);fwrite(g_menuPixels.data(),4,g_menuPixels.size(),out);fclose(out);
 }
+static void SmokeCaptureTests() {
+    size_t vb=0,ib=0;
+    assert(SmokeCaptureSizes(D3DPT_TRIANGLELIST,4,8,4,D3DFMT_INDEX16,32,&vb,&ib));
+    assert(vb==384 && ib==24); // include the minimum-index offset in the UP buffer
+    assert(SmokeCaptureSizes(D3DPT_TRIANGLELIST,0,8,4,D3DFMT_INDEX32,32,&vb,&ib));
+    assert(vb==256 && ib==48);
+    assert(!SmokeCaptureSizes(D3DPT_TRIANGLELIST,UINT_MAX,1,4,D3DFMT_INDEX16,32,&vb,&ib));
+    assert(!SmokeCaptureSizes(D3DPT_TRIANGLELIST,0,8,UINT_MAX,D3DFMT_INDEX32,32,&vb,&ib));
+    assert(!SmokeCaptureSizes(D3DPT_TRIANGLELIST,0,8,4,D3DFMT_INDEX16,257,&vb,&ib));
+    assert(!SmokeCaptureSizes(D3DPT_TRIANGLELIST,0,8,4,D3DFMT_UNKNOWN,32,&vb,&ib));
+    assert(!SmokeCaptureSizes(D3DPT_TRIANGLESTRIP,0,8,4,D3DFMT_INDEX16,32,&vb,&ib));
+    assert(!SmokeCaptureSizes(D3DPT_TRIANGLELIST,0,0,4,D3DFMT_INDEX16,32,&vb,&ib));
+    // Outside an explicit capture, even the device/input pointers are untouched.
+    g_effectCaptureUntil=0;
+    CaptureSmokeIndexedUP(nullptr,D3DPT_TRIANGLELIST,0,8,4,nullptr,D3DFMT_INDEX16,nullptr,32);
+    puts("PASS smoke capture buffer bounds and inactive capture gate");
+}
 int wmain(int argc,wchar_t** argv) {
     const bool snapshot=argc==4&&!wcscmp(argv[1],L"--snapshot");
     assert(argc==2||snapshot);InitializeCriticalSection(&g_padLock);g_padLockReady=true;
@@ -250,7 +325,7 @@ int wmain(int argc,wchar_t** argv) {
     VrMenuInitializeSettings();
     assert(g_resAuto&&g_menuResolution=="auto");
     assert(g_motionHands&&g_menuArm&&g_armSwing&&g_armSwingJump&&g_gripToGrip&&g_stickJumpTurn);
-    ResolutionTests();InputTests();IniTests();MetadataTests();PauseTests();
+    ResolutionTests();InputTests();IniTests();MetadataTests();PauseTests();SmokeCaptureTests();
     for(int page=0;page<9;++page)WritePreview(argv[1],page);
     puts("PASS all 9 production menu page previews rendered");
     return 0;

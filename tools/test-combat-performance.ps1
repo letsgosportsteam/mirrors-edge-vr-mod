@@ -31,18 +31,22 @@ static DWORD mainThread=0;
 static HANDLE allowMetadata=nullptr,enteredMetadata=nullptr;
 static volatile LONG lookupCount=0,propertyPasses=0;
 static int creates=0,hookCreates=0,gameCalls=0;
-static bool failThread=false,badLayout=false;
-static double NowMs() { return (double)GetTickCount64(); }
+static bool failThread=false,badLayout=false,missingOnce=false,missingAlways=false;
+static uintptr_t g_playerPawn=0x2000;
+static double clockMs=0;
+static double NowMs() { return clockMs; }
 static void Log(const char*,...) {}
 static bool LooksLikePlayerPawn(uintptr_t p) { return p==0x2000; }
 static bool ReadMoveClassName(uintptr_t,int,char*,size_t,uintptr_t* out) { *out=0x3000; return true; }
 static void DumpVtableSlots(uintptr_t,const char*,uintptr_t,const char*,int) { g_peSlot=61; }
 static int DeriveUFunctionFuncOffset(uintptr_t* script) { *script=0x1000; return 172; }
-static uintptr_t PkFindFunction(const char*,const char*) {
+static uintptr_t PkFindFunction(const char* name,const char*) {
     assert(GetCurrentThreadId()!=mainThread);
     SetEvent(enteredMetadata);
     assert(WaitForSingleObject(allowMetadata,10000)==WAIT_OBJECT_0);
-    return 0x4000+0x100*InterlockedIncrement(&lookupCount);
+    const LONG call=InterlockedIncrement(&lookupCount);
+    if(!strcmp(name,"GetSocketWorldLocationAndRotation") && (missingAlways || (missingOnce && call<=5))) return 0;
+    return 0x4000+0x100*call;
 }
 struct DetachedPropRequest { const char *owner,*name,*kind; int* offset; };
 static void LookupDetachedPropsBatch(DetachedPropRequest* p,int n) {
@@ -50,7 +54,7 @@ static void LookupDetachedPropsBatch(DetachedPropRequest* p,int n) {
     InterlockedIncrement(&propertyPasses);
     for(int i=0;i<n;++i) *p[i].offset=badLayout ? -1 : 100+i;
 }
-static bool CombatParameter(uintptr_t,const char*,const char*,uint32_t) { return true; }
+static bool CombatParameter(uintptr_t fn,const char*,const char*,uint32_t) { return fn!=0; }
 static bool SafeU32(uintptr_t,uint32_t* out) { *out=0x1000; return true; }
 static bool SafeRead(uintptr_t p,void* out,size_t n) {
     if(p==0x2004 && n==1) { *(uint8_t*)out=1; return true; }
@@ -82,12 +86,18 @@ int main(int argc,char** argv) {
     mainThread=GetCurrentThreadId();
     failThread=argc>1 && !strcmp(argv[1],"thread-failure");
     badLayout=argc>1 && !strcmp(argv[1],"bad-layout");
+    missingOnce=argc>1 && !strcmp(argv[1],"missing-once");
+    missingAlways=argc>1 && !strcmp(argv[1],"missing-always");
     long last=0, reports=0;
     for(long call=1;call<=20670;++call)
         reports+=CombatTraceDiagnosticDue(call,call/2,&last) ? 1 : 0;
     assert(reports==20); // 20,670 getter calls -> 20 diagnostic writes
     allowMetadata=CreateEventW(nullptr,TRUE,FALSE,nullptr);
     enteredMetadata=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    g_playerPawn=0x5000;
+    InitializeCombatHooks(0x2000);
+    assert(creates==0 && hookCreates==0); // not yet the published player pawn
+    g_playerPawn=0x2000;
     InitializeCombatHooks(0x2000);
     assert(creates==1 && !g_combatReady && hookCreates==0 && gameCalls==0);
     if(failThread) {
@@ -106,10 +116,23 @@ int main(int argc,char** argv) {
     while(InterlockedCompareExchange(&g_combatMetadataState,0,0)!=2 && GetTickCount64()<deadline) Sleep(1);
     assert(g_combatMetadataState==2 && lookupCount==5 && propertyPasses==1);
     InitializeCombatHooks(0x2000);
+    const int expectedAttempts=(badLayout||missingAlways) ? 3 : missingOnce ? 2 : 1;
+    for(int attempt=2;attempt<=expectedAttempts;++attempt) {
+        assert(g_combatMetadataState==0 && hookCreates==0 && gameCalls==0);
+        for(int i=0;i<100;++i) InitializeCombatHooks(0x2000);
+        assert(creates==attempt-1); // no busy retry during cooldown
+        clockMs+=2001;
+        InitializeCombatHooks(0x2000);
+        const ULONGLONG retryDeadline=GetTickCount64()+10000;
+        while(InterlockedCompareExchange(&g_combatMetadataState,0,0)!=2 && GetTickCount64()<retryDeadline) Sleep(1);
+        assert(g_combatMetadataState==2 && creates==attempt);
+        InitializeCombatHooks(0x2000);
+    }
+    badLayout=badLayout||missingAlways;
     assert(g_combatReady==!badLayout);
     assert(hookCreates==(badLayout ? 0 : 1) && gameCalls==(badLayout ? 0 : 1));
     for(int i=0;i<100;++i) InitializeCombatHooks(0x2000);
-    assert(creates==1 && lookupCount==5 && propertyPasses==1);
+    assert(creates==expectedAttempts && lookupCount==5*expectedAttempts && propertyPasses==expectedAttempts);
     CloseHandle(allowMetadata); CloseHandle(enteredMetadata);
     puts("combat performance: bounded logging, nonblocking discovery, single setup, game-thread-only hooks/calls passed");
 }
@@ -123,7 +146,7 @@ $exe = Join-Path $out 'combat-performance.exe'
 $obj = Join-Path $out 'combat-performance.obj'
 cmd /c ('"'+$vc+'" x86 >nul && cl /nologo /EHsc /W4 /std:c++17 /Fe:"'+$exe+'" /Fo:"'+$obj+'" "'+$cpp+'"')
 if ($LASTEXITCODE -ne 0) { throw 'combat performance compile failed' }
-foreach ($scenario in @('success','thread-failure','bad-layout')) {
+foreach ($scenario in @('success','thread-failure','bad-layout','missing-once','missing-always')) {
     & $exe $scenario
     if ($LASTEXITCODE -ne 0) { throw "combat performance test failed: $scenario" }
 }

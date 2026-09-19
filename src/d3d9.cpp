@@ -139,7 +139,8 @@ enum {
 // It exists for one reason: mevr.log is the whole diagnostic channel, and a pasted log that
 // cannot say which build produced it turns every bug report into a round trip. Logged in the
 // header, above everything, so it survives truncation from either end.
-#define MEVR_VERSION "0.2.1-alpha"
+#define MEVR_VERSION "0.2.2-alpha"
+#include "build_identity.inl"
 
 // ---------------------------------------------------------------- state
 
@@ -160,7 +161,7 @@ static HMODULE          g_selfModule = nullptr;   // this DLL, for finding mevr.
 //
 // ⚠️ The scan's own countdown and commit live inside the F6 handler and must keep running
 // whatever this is set to - they are the mechanism, not the key.
-static bool             g_debug      = true;
+static bool             g_debug      = false;
 static CRITICAL_SECTION g_lock;
 static bool             g_lockReady  = false;
 static wchar_t          g_logPath[MAX_PATH] = L"";
@@ -724,8 +725,8 @@ static bool InitXR()
                 WriteHeadsetCache(g_recEyeW, g_recEyeH);
                 if (g_resAuto) {
                     if (g_autoEyeW == g_recEyeW && g_autoEyeH == g_recEyeH) {
-                        Log("[res] auto: this run is sized for exactly what the runtime asked"
-                            " for");
+                        Log("[res] auto: cached headset size matches the runtime;"
+                            " see [backbuffer] for the actual engine frame size");
                     } else if (g_autoEyeW) {
                         Log("");
                         Log("*** [res] auto: the runtime now wants %ux%u an eye, this run was"
@@ -878,7 +879,7 @@ static bool VrPollStandardController(MEVR_XINPUT_STATE* state);
 static void VrSelectController(bool connected,const MEVR_XINPUT_STATE& pad,bool questActivity);
 static void VrPublishStandardController(MEVR_XINPUT_STATE state,bool shortY);
 static bool        g_motionHands = true;            // controller-driven hands; can be disabled in VR settings
-static bool        g_motionHandsDebug = false;      // bounded pose-state and position reports
+static bool        g_motionHandsDebug = true;       // Detailed Logging default
 static bool        g_pistolHands = true;            // requires MotionHands and validated combat hooks
 static bool        g_pickupDebug = false;           // INI-only diagnostics; blue pickup indicator is independent
 static bool        g_motionPunch = true;            // requires MotionHands + GripToGrip
@@ -1450,7 +1451,7 @@ static void XrInitActions()
 // Nothing here writes to the pad, so a build carrying it is safe to play normally.
 
 static bool  g_armSwing = true;             // ArmSwing;      NUMPAD * toggles
-static bool  g_armSwingDebug = false;       // ArmSwingDebug; the per-second metric report
+static bool  g_armSwingDebug = true;        // ArmSwingDebug; the per-second metric report
 
 // One physical constant, shared by the discontinuity guard below and by UpdateSixDof, which
 // learnt it the hard way: OpenXR was measured moving the head 1.31 m between adjacent 120 Hz
@@ -1896,11 +1897,11 @@ static inline float SwingLen(const XrVector3f& v)
 
 static void ArmSwingSample(XrTime when, bool actionsSynced)
 {
-    if (!g_armSwing && !g_armSwingDebug) return;
+    if (!g_armSwing && !g_armSwingDebug && !(g_motionPunch && g_motionHands && g_gripToGrip)) return;
 
     if (!g_swingStartupLogged) {
         g_swingStartupLogged = true;
-        Log("*** [swing] arm swing active - metrics only, nothing is written to the pad yet.");
+        Log("*** [swing] controller motion sampling active for locomotion and gestures.");
         Log("[swing]   metric B, vertical head-relative hand speed, chosen by the AS.0"
             " measurement of 2026-08-27 over 22404 samples.");
         Log("[swing]   anchors: deadband %.2f, walk %.2f, full %.2f m/s. Measured on one body -"
@@ -2573,7 +2574,7 @@ enum PkHand { PK_HAND_NONE = -1, PK_HAND_L = 0, PK_HAND_R = 1 };
 // gated behind it was unreachable code. It accumulated four of them: the dense per-frame corner
 // trace, the grab-offset watcher, the pkend line and the CanShimmy comparison. A debug flag with
 // no way to set it is worse than no flag, because the gating reads as deliberate.
-bool  g_parkourDebug = false;               // ParkourDebug in mevr.ini
+bool  g_parkourDebug = true;                // ParkourDebug in mevr.ini
 int   g_pkAnchor = PK_HAND_NONE;            // which hand is holding the world still
 static float g_pkAnchorLat = 0.0f;          // its lateral position when it grabbed, metres
 static float g_pkProgress = 0.0f;           // how far the body has travelled since, metres
@@ -23421,12 +23422,15 @@ static HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMI
     return g_origDrawPrimUP(dev, type, primCount, data, stride);
 }
 
+#include "smoke_capture.inl"
+
 static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type,
                                                     UINT minVertex, UINT numVerts, UINT primCount,
                                                     const void* idx, D3DFORMAT idxFmt,
                                                     const void* verts, UINT stride)
 {
     NoteUpDraw(dev, primCount);
+    CaptureSmokeIndexedUP(dev,type,minVertex,numVerts,primCount,idx,idxFmt,verts,stride);
     SunDrawCapture sunCapture(dev,1,primCount);
     EffectPassCapture passCapture(dev, "IndexedUP", primCount);
     CaptureEffectDraw(dev,primCount,stride,verts,numVerts,"IndexedUP");
@@ -26996,6 +27000,23 @@ static ModeInject g_modeInject[8]{};
 static int        g_modeInjectCount = 0;
 static bool       g_modeInjectLogged = false;
 
+static bool AutoResolutionModeOnly(UINT realCount)
+{
+    return g_resAuto && g_forceResW && g_forceResH && realCount != 0;
+}
+
+static HRESULT ForcedDisplayMode(IDirect3D9* self, UINT adapter, D3DFORMAT fmt,
+                                 UINT realCount, D3DDISPLAYMODE* mode)
+{
+    if (!mode) return D3DERR_INVALIDCALL;
+    D3DDISPLAYMODE cur{};
+    mode->Width = g_forceResW; mode->Height = g_forceResH; mode->Format = fmt;
+    mode->RefreshRate = g_origEnumAdapterModes && realCount &&
+        SUCCEEDED(g_origEnumAdapterModes(self, adapter, fmt, realCount - 1, &cur))
+        ? cur.RefreshRate : 60;
+    return D3D_OK;
+}
+
 // realCount is passed in rather than re-queried: the caller already has it, and asking the
 // runtime again inside the decision would recurse through nothing useful.
 static bool AppendForcedMode(IDirect3D9* self, UINT adapter, D3DFORMAT fmt, UINT realCount)
@@ -27039,6 +27060,11 @@ static UINT STDMETHODCALLTYPE Hook_GetAdapterModeCount(IDirect3D9* self, UINT ad
         Log("[res] the engine is enumerating display modes - adapter %u format %s -> %u",
             adapter, FormatName(fmt), real);
     }
+    // Auto owns resolution. If the engine regenerates its configuration after
+    // DllMain, appending a mode lets it choose a stale 4:3 default instead. Offer
+    // only the selected Auto mode so its own validation sizes all scene targets
+    // consistently. Changing only CreateDevice's backbuffer would not do that.
+    if (AutoResolutionModeOnly(real)) return 1;
     return real + (AppendForcedMode(self, adapter, fmt, real) ? 1 : 0);
 }
 
@@ -27048,19 +27074,14 @@ static HRESULT STDMETHODCALLTYPE Hook_EnumAdapterModes(IDirect3D9* self, UINT ad
 {
     if (!g_origEnumAdapterModes || !g_origGetAdapterModeCount) return D3DERR_INVALIDCALL;
     const UINT real = g_origGetAdapterModeCount(self, adapter, fmt);
+    if (AutoResolutionModeOnly(real))
+        return index == 0 ? ForcedDisplayMode(self, adapter, fmt, real, mode) : D3DERR_INVALIDCALL;
     if (mode && index == real && AppendForcedMode(self, adapter, fmt, real)) {
         // Appended LAST so every real index keeps the meaning it already had. A caller that
         // walked the list once and remembered index N still gets the mode it saw.
-        mode->Width  = g_forceResW;
-        mode->Height = g_forceResH;
-        mode->Format = fmt;
         // The refresh rate the desktop is running at, so a mode-to-rate match still succeeds.
         // Zero would be legal to the runtime and read as "unknown" by an engine comparing them.
-        D3DDISPLAYMODE cur{};
-        mode->RefreshRate = (g_origEnumAdapterModes && real > 0 &&
-                             SUCCEEDED(g_origEnumAdapterModes(self, adapter, fmt, real - 1, &cur)))
-                            ? cur.RefreshRate : 60;
-        return D3D_OK;
+        return ForcedDisplayMode(self, adapter, fmt, real, mode);
     }
     return g_origEnumAdapterModes(self, adapter, fmt, index, mode);
 }
@@ -27081,6 +27102,11 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT adapte
     Log("*** CreateDevice on IDirect3D9* %p   adapter=%u DeviceType=%d BehaviorFlags=0x%08lX focus=%p",
         (void*)self, adapter, (int)type, (unsigned long)behavior, (void*)focus);
     LogPresentParams("requested", pp);
+    if (pp && g_resAuto && g_forceResW &&
+        (pp->BackBufferWidth != g_forceResW || pp->BackBufferHeight != g_forceResH))
+        Log("*** [res] Auto requested %ux%u but the engine selected %ux%u;"
+            " headset cache agreement does not prove the frame size is correct",
+            g_forceResW, g_forceResH, pp->BackBufferWidth, pp->BackBufferHeight);
     // The earliest moment worth measuring: everything the engine is about to allocate has to
     // fit in what is free RIGHT HERE, and this number is the first candidate for what
     // actually differs between a run that comes up half-res and one that does not.
@@ -27355,8 +27381,8 @@ extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion)
             Log("[patch] *** mode-enumeration patch failed - reverting to pass-through ***");
             g_forceResW = g_forceResH = 0;
         } else if (g_forceResW) {
-            Log("[res] Resolution = %ux%u will be offered to the engine as a display mode",
-                g_forceResW, g_forceResH);
+            Log("[res] Resolution = %ux%u will be offered to the engine %s",
+                g_forceResW, g_forceResH, g_resAuto ? "as its only mode (Auto)" : "as an additional mode");
         }
     }
     return d3d;
@@ -27440,7 +27466,7 @@ static void LogHeader()
     // Built here rather than written as a literal so it cannot drift from the compiler that
     // actually produced the binary - "which build is this" is the first question a bug report
     // has to answer, and a hand-maintained string answers it wrongly eventually.
-    Log("[host] built %s %s with MSC %d", __DATE__, __TIME__, (int)_MSC_VER);
+    Log("[host] source build %s with MSC %d", kMevrBuildId, (int)_MSC_VER);
 }
 
 // ---------------------------------------------------------------- settings
@@ -27939,7 +27965,7 @@ static void LoadSettingsFile()
             if (SettingBool(val, &b)) {
                 g_armSwing = b;
                 Log("[cfg]   ArmSwing = %s%s", b ? "on" : "off",
-                    b ? "  (AS.0: metrics are measured and logged; the pad is NOT driven yet)" : "");
+                    b ? "  (controller motion drives forward locomotion)" : "");
                 applied++;
             } else { Log("[cfg]   ArmSwing '%s' is not a boolean - ignored", val); rejected++; }
         } else if (_stricmp(key, "ArmSwingDebug") == 0) {

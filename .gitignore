@@ -63,3 +63,5 @@ Thumbs.db
 desktop.ini
 # Generated from mevr.ini.example by build.ps1.
 src/vr_defaults.inl
+src/build_identity.inl
+src/mevr.ini

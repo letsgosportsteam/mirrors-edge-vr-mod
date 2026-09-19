@@ -14,6 +14,13 @@ read the root [AGENTS.md](../AGENTS.md). Engine measurements remain in
 
 Release notes: [v0.2.0-alpha](RELEASE_v0.2.0-alpha.md).
 Default-settings correction: [v0.2.1-alpha](RELEASE_v0.2.1-alpha.md).
+Candidate VR approval and publication checks: [v0.2.2-alpha](RELEASE_v0.2.2-alpha.md).
+Release/test comparison and pending fixes: [FOUR_RUNS_2026-09-19.md](FOUR_RUNS_2026-09-19.md).
+Exact-file publication: [RELEASE_WORKFLOW.md](RELEASE_WORKFLOW.md).
+Independent rebuild request and parity audit: [RELEASE_REBUILD_2026-09-19.md](RELEASE_REBUILD_2026-09-19.md).
+Second four-run capture analysis: [RELEASE_PARITY_2026-09-19.md](RELEASE_PARITY_2026-09-19.md).
+Missing-smoke investigation (tabled; also reported in flat mode, GOG/Steam difference unresolved): [SMOKE_RELEASE_2026-09-19.md](SMOKE_RELEASE_2026-09-19.md).
+Steam PhysX freeze reports and optional local capture tools: [STEAM_PHYSX_2026-09-19.md](STEAM_PHYSX_2026-09-19.md).
 
 | Note | Scope |
 |---|---|

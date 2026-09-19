@@ -5,11 +5,11 @@ tracking, motion controllers, and optional tracked hands, pistols, and parkour.
 
 > **Alpha.** Hardware coverage is limited, and motion interactions are still experimental.
 
-**[Download v0.2.1-alpha](https://github.com/letsgosportsteam/mirrors-edge-vr-mod/releases/tag/v0.2.1-alpha)**
+**[Download v0.2.2-alpha](https://github.com/letsgosportsteam/mirrors-edge-vr-mod/releases/tag/v0.2.2-alpha)**
 
 ## Installation
 
-1. Download `mevr-0.2.1-alpha.zip` from the release's **Assets** section and extract it.
+1. Download `mevr-0.2.2-alpha.zip` from the release's **Assets** section and extract it.
 2. Copy these three files into the game's `Binaries` folder, beside `MirrorsEdge.exe`:
 
    ```text
@@ -28,9 +28,16 @@ notices are included as comments in `mevr.ini`.
 On Steam, use **Manage > Browse local files** to find the game folder. Stereo
 starts after a level loads; the startup screen is not a stereo gameplay view.
 
+The release was tested in VR on Steam with the game's **PhysX disabled**. If
+loading a chapter freezes, turn PhysX off in the game's settings. This was also
+reported without the mod; the underlying cause remains unresolved.
+
 **Hold Y for one second to open VR settings.** Changes save automatically.
 Resolution defaults to **Auto**: launch once with the headset connected, then
 quit and relaunch so the recorded headset size takes effect.
+If gameplay stays flat after that, quit and relaunch once. The mod can load
+successfully while the game selects a resolution that prevents stereo; this is
+separate from injection failing. Keep the log if it repeats.
 When updating, back up your existing `mevr.ini` if you want to keep your settings.
 
 To uninstall, remove the three mod files. The mod does not replace game assets;
@@ -165,18 +172,22 @@ resolution costs performance. Resolution, lens flares, and D3D9Ex are restart se
 Choose **Off** to use the game's chosen resolution instead. Existing saved Off
 or custom resolution settings are preserved when updating.
 
+Auto offers the cached headset resolution as the game's only display mode,
+preventing selection of a different aspect ratio. This correction is included
+in v0.2.2-alpha, which was approved after Steam VR testing with PhysX disabled.
+
 The game retains its camera animations by default. If landing dips or wall-run
 roll are uncomfortable, try the pitch and roll locks under **Comfort**.
 
-The v0.2.1-alpha defaults match the installed test configuration, with diagnostic
-logging disabled. This includes the tuned pistol alignment and bar-swing settings;
+The v0.2.2-alpha release keeps the tuned pistol alignment and bar-swing settings,
+with **Debug Overlay off** and **Detailed Logging on**;
 the VR menu can still change your preferences and calibrate either pistol hand.
 
 Settings live in `mevr.ini` beside the DLL. An existing
 `%LOCALAPPDATA%\MirrorsEdgeVR\mevr.ini` is also supported; the file beside the DLL
 takes priority. See [mevr.ini.example](mevr.ini.example) for advanced options.
-Release packages use **Debug = off**; the development example and compiled fallback
-use **Debug = on**, so deleting the INI can bring back the diagnostic overlay.
+The release, example and compiled fallback use **Debug = off**. Detailed Logging
+is separate: hand, arm-swing and parkour logging stay enabled.
 
 ## Known limitations
 
@@ -209,9 +220,14 @@ Use a separate development copy of the game for installation tests.
 ```powershell
 .\src\build.ps1              # build x86 d3d9.dll and run static analysis
 .\src\build.ps1 -Install     # also install to the configured game folder
-.\src\build.ps1 -Package     # create a release ZIP in dist; requires a clean commit
 .\tools\check-clean.ps1      # check for personal or machine-local information
 ```
+
+For independently rebuilt candidates, use
+[`tools/build-reproducible-candidate.ps1`](tools/build-reproducible-candidate.ps1).
+It compiles twice and verifies all three install files match before packaging
+build 2. Test and approve the candidate before publishing; preserve the approved
+archive and settings afterward. See the [release workflow](docs/RELEASE_WORKFLOW.md).
 
 ## Development notes
 

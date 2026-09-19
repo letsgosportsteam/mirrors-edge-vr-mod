@@ -31,8 +31,8 @@
 
 ; ---------------------------------------------------------------- debugging
 
-; On by default. Turn it off for normal play and the mod becomes invisible: no text on the
-; screen, and no hotkey does anything.
+; Off by default: no diagnostic overlay or debug hotkeys. Detailed Logging is
+; separate and remains on through the hand, arm-swing and parkour logging flags.
 ;
 ; Three keys stay live, because none of them is a diagnostic and each one leaves you stuck
 ; if it is missing:
@@ -45,7 +45,7 @@
 ;
 ; Everything else - the overlay, the stereo strength and IPD controls, the animation locks,
 ; the frame cap, the capture and occlusion experiments - is off.
-Debug = on
+Debug = off
 
 ; Hide the previously captured camera-style glow/ring/starburst materials.
 ; Smoke, birds, atmospheric sun haze and bloom remain enabled. Restart to apply.
@@ -113,7 +113,7 @@ PickupDebug = off
 ; Unarmed disarm: extend both hands forward, then squeeze both grips within
 ; 0.25 s. Only attempts a disarm if the game's normal target checks accept it.
 MotionPunch = on
-MotionHandsDebug = off
+MotionHandsDebug = on
 
 
 ; ---------------------------------------------------------------- freeing the two grips
@@ -156,7 +156,7 @@ GripToGrip = on
 ; Hotkey: NUMPAD * toggles ArmSwing.
 
 ArmSwing = on
-ArmSwingDebug = off
+ArmSwingDebug = on
 
 ; The two gestures, independently switchable because they fail differently.
 ;
@@ -357,7 +357,7 @@ ParkourGhostRadius = 0.9
 ; Dense parkour diagnostics: a per-frame trace of every corner, the ledge-offset watcher, and
 ; the CanShimmy-vs-heuristic comparison. A VERY large log - the corner trace alone was a fifth of
 ; one run's lines - so on only while you are chasing something.
-ParkourDebug = off
+ParkourDebug = on
 
 ; One-shot dump of every authored parkour-geometry class in the level, with instance counts and
 ; positions. Off, and it should stay off unless you are asking that question: it walks the whole

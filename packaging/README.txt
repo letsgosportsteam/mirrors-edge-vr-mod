@@ -1,4 +1,4 @@
-MIRROR'S EDGE VR - v0.2.1-alpha
+MIRROR'S EDGE VR - v0.2.2-alpha
 
 Native stereo rendering and 6-DOF head tracking for Mirror's Edge (2008), with
 optional controller-driven hands, pistols, melee, locomotion, and parkour.
@@ -6,9 +6,12 @@ Hardware coverage is limited; motion interactions remain experimental.
 
 INSTALLATION
 
-Download mevr-0.2.1-alpha.zip from the GitHub release's Assets section.
+Download mevr-0.2.2-alpha.zip from the GitHub release's Assets section.
 It contains exactly the three files below; no INI editing is needed. The
 separate .pdb asset is only for debugging. License notices are in mevr.ini.
+Future releases package the exact approved test files without changing settings.
+When notices are not already in that tested INI, LICENSES.txt accompanies the
+release as a separate asset; it does not need to be copied into Binaries.
 
 1. Copy d3d9.dll, openxr_loader.dll, and mevr.ini into the game's Binaries
    folder, beside MirrorsEdge.exe.
@@ -17,6 +20,16 @@ separate .pdb asset is only for debugging. License notices are in mevr.ini.
 3. Load a level for stereo gameplay. Hold Y for one second for VR settings.
 4. Resolution defaults to Auto. Quit and relaunch after the first connected
    run so the recorded headset size takes effect.
+
+If gameplay stays flat afterward, quit and relaunch once. The mod may have
+loaded while the game selected a resolution that prevents stereo. Keep the
+log if this repeats.
+Auto offers only the cached headset display mode. This correction is included
+in v0.2.2-alpha, approved after Steam VR testing with PhysX disabled.
+
+This release was tested in VR on Steam with the game's PhysX disabled. If
+loading a chapter freezes, turn PhysX off in the game's settings. This was also
+reported without the mod; the underlying cause remains unresolved.
 
 Back up your mevr.ini before an update if you want to keep your settings.
 To uninstall, remove the three mod files. The mod does not replace game assets;
@@ -114,9 +127,9 @@ Choose Off to use the game's chosen resolution instead. Existing saved Off
 or custom resolution settings are preserved when updating.
 
 Try Comfort's animation pitch/roll locks if camera motion is uncomfortable.
-The v0.2.1-alpha defaults match the installed test configuration, with diagnostic
-logging disabled, including tuned pistol alignment and bar-swing settings.
-Release mevr.ini has Debug off. Deleting it can restore the development overlay.
+The release retains the tuned pistol alignment and bar-swing settings.
+The v0.2.2-alpha release has Debug Overlay off and Detailed Logging on.
+The example and compiled fallback use these same diagnostic defaults.
 
 Keyboard shortcuts:
   Page Up       Recenter (also available in Calibration and menu)

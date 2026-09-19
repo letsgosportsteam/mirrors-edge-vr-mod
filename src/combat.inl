@@ -281,14 +281,17 @@ static DWORD WINAPI CombatMetadataThread(LPVOID)
 static void InitializeCombatHooks(uintptr_t pawn)
 {
     static bool attempted = false;
+    static int metadataAttempts = 0;
+    static double retryAfter = 0;
     if (attempted || !g_motionHands || (!g_pistolHands && !g_motionPunch) ||
         InterlockedCompareExchange(&g_objModelThreadFinished, 0, 0) != 1 ||
-        !LooksLikePlayerPawn(pawn)) return;
+        pawn != g_playerPawn || !LooksLikePlayerPawn(pawn) || NowMs() < retryAfter) return;
     uintptr_t move = 0; char moveName[64] = ""; uint8_t state = 0;
     if (g_offMoveState < 0 || !SafeRead(pawn + g_offMoveState, &state, 1) ||
         !ReadMoveClassName(pawn, state, moveName, sizeof(moveName), &move) || !move) return;
     const LONG metadata = InterlockedCompareExchange(&g_combatMetadataState, 1, 0);
     if (metadata == 0) {
+        ++metadataAttempts;
         HANDLE thread = CreateThread(nullptr, 0, CombatMetadataThread, nullptr, 0, nullptr);
         if (thread) CloseHandle(thread);
         else {
@@ -298,6 +301,17 @@ static void InitializeCombatHooks(uintptr_t pawn)
         return;
     }
     if (metadata != 2) return; // Interlocked publication keeps partial metadata invisible.
+    // Loading can grow/reallocate GObjects while the background reader walks it.
+    // A missing function is not evidence of an incompatible ABI. Retry discovery
+    // after a delay, with no hooks or game calls until all validation succeeds.
+    if ((!g_combatStartFn || !g_combatPawnStartFn || !g_combatAimFn ||
+         !g_combatSocketFn || !g_combatSpreadFn ||
+         g_combatMesh1p < 0 || g_combatMuzzleName < 0) && metadataAttempts < 3) {
+        retryAfter = NowMs() + 2000.0;
+        InterlockedExchange(&g_combatMetadataState, 0);
+        Log("[combat] incomplete startup metadata; retry %d/3 in two seconds", metadataAttempts + 1);
+        return;
+    }
     attempted = true;
     const double setupStarted = NowMs();
     // Derive the event dispatcher independently of the optional parkour census.

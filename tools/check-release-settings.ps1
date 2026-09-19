@@ -2,7 +2,8 @@
 # Run tools/test-vr-menu.ps1 first. All writes stay in ignored test directories.
 param(
     [Parameter(Mandatory=$true)][string]$ReferenceIni,
-    [Parameter(Mandatory=$true)][string]$CandidateIni
+    [Parameter(Mandatory=$true)][string]$CandidateIni,
+    [string[]]$AllowedDifferences=@()
 )
 $ErrorActionPreference='Stop'
 $root=Split-Path -Parent $PSScriptRoot
@@ -31,16 +32,14 @@ foreach($item in @(@{Name='reference';Path=$ReferenceIni},@{Name='candidate';Pat
     $snapshots[$item.Name]=Read-Settings (Join-Path $folder 'mevr.ini')
 }
 $expected=Read-Settings (Join-Path $root 'mevr.ini.example')
-$debugKeys=@('Debug','MotionHandsDebug','ArmSwingDebug','ParkourDebug','PickupDebug','ParkourGeomCensus','TestStall','TestWideFov')
 $differences=@()
 foreach($key in $expected.Keys) {
     foreach($side in @('reference','candidate')) {
         if(-not $snapshots[$side].ContainsKey($key)) { throw "Snapshot does not cover $key ($side)" }
     }
     $before=$snapshots.reference[$key];$after=$snapshots.candidate[$key]
-    if($key -in $debugKeys) {
-        if($after -notin @('off','0')) { throw "Release diagnostics must be off: $key=$after" }
-        if($before -ne $after) { Write-Host "Allowed diagnostic difference: $key $before -> $after" }
+    if($before -ne $after -and $key -in $AllowedDifferences) {
+        Write-Host "Explicitly allowed setting difference: $key $before -> $after"
     } elseif($before -ne $after) {
         $differences += [pscustomobject]@{Setting=$key;TestBuild=$before;Release=$after}
     }
@@ -49,4 +48,4 @@ if($differences.Count) {
     $differences | Sort-Object Setting | Format-Table -AutoSize | Out-String | Write-Host
     throw 'Release settings differ from the test build'
 }
-Write-Host "PASS all $($expected.Count) effective settings match the test build, except disabled diagnostics."
+Write-Host "PASS all $($expected.Count) effective settings match, except any explicitly listed differences. Byte parity requires check-tested-package.ps1."
