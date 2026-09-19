@@ -139,7 +139,7 @@ enum {
 // It exists for one reason: mevr.log is the whole diagnostic channel, and a pasted log that
 // cannot say which build produced it turns every bug report into a round trip. Logged in the
 // header, above everything, so it survives truncation from either end.
-#define MEVR_VERSION "0.1.0-alpha"
+#define MEVR_VERSION "0.2.0-alpha"
 
 // ---------------------------------------------------------------- state
 

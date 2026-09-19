@@ -36,7 +36,12 @@ game-derived data, logs, and build products out of commits. Respect the existing
 Git identity hooks. Local diagnostic captures live under ignored `.analysis/`;
 notes may reference them, but they are not included in a fresh clone.
 
-When changing player-facing behavior, update `README.md` and the bundled
+When changing player-facing behavior, update `README.md` and the release guide
 `packaging/README.txt` together. Check shipped defaults against `mevr.ini.example`
 and `src/build.ps1`; release packaging turns Debug off. Do not copy private live
 configuration values into public documentation.
+
+The install ZIP contains exactly `d3d9.dll`, `openxr_loader.dll`, and `mevr.ini`.
+`src/build.ps1 -Package` embeds license notices as INI comments and runs
+`tools/check-package.ps1`. Upload the ZIP and PDB as actual GitHub release assets;
+links in release prose alone are not attachments.

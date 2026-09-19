@@ -1,10 +1,14 @@
-MIRROR'S EDGE VR - ALPHA
+MIRROR'S EDGE VR - v0.2.0-alpha
 
 Native stereo rendering and 6-DOF head tracking for Mirror's Edge (2008), with
 optional controller-driven hands, pistols, melee, locomotion, and parkour.
 Hardware coverage is limited; motion interactions remain experimental.
 
 INSTALLATION
+
+Download mevr-0.2.0-alpha.zip from the GitHub release's Assets section.
+It contains exactly the three files below; no INI editing is needed. The
+separate .pdb asset is only for debugging. License notices are in mevr.ini.
 
 1. Copy d3d9.dll, openxr_loader.dll, and mevr.ini into the game's Binaries
    folder, beside MirrorsEdge.exe.
@@ -137,7 +141,7 @@ https://github.com/letsgosportsteam/mirrors-edge-vr-mod
 
 LICENCE
 
-MIT - see LICENSE.txt and THIRD-PARTY-NOTICES.txt.
+MIT - the project and third-party notices are included as comments in mevr.ini.
 Mirror's Edge is a trademark of Electronic Arts Inc. This project is not
 affiliated with or endorsed by EA or DICE, contains no game code or assets,
 and requires a legally obtained copy of the game.

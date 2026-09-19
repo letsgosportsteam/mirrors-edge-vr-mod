@@ -4,7 +4,9 @@ Mirror's Edge VR
 This file lists software by other authors that is compiled into `d3d9.dll` or
 shipped alongside it. It travels WITH THE BINARY, not only with the source:
 both licences below require their notice to accompany redistributions in binary
-form, and the release zip is a binary redistribution.
+form, and the release zip is a binary redistribution. The three-file release
+archive includes these notices, the project licence, and the complete MinHook
+licence as comments in mevr.ini.
 
 The mod's own code is MIT — see LICENSE.
 

@@ -67,8 +67,23 @@ Push-Location $here
 try {
     # Embed the same defaults that ship in the package for the menu's Restore Defaults.
     $defaultIni = [System.IO.File]::ReadAllText((Join-Path $root 'mevr.ini.example'))
-    $defaultIni = [regex]::Replace($defaultIni, '(?m)^Debug = on\s*$', 'Debug = off')
-    $defaultIni = [regex]::Replace($defaultIni, '(?m)^; Rename this file to  mevr\.ini  and leave it beside d3d9\.dll.*$', '; Keep mevr.ini beside d3d9.dll in the game''s Binaries folder.')
+    $releaseEdits = @(
+        @{ Rx = '(?m)^Debug = on\s*$'; To = 'Debug = off' }
+        @{ Rx = '(?m)^; Rename this file to  mevr\.ini  and leave it beside d3d9\.dll.*$';
+           To = '; This IS mevr.ini. Keep it beside d3d9.dll in the game''s Binaries folder.' }
+    )
+    foreach ($edit in $releaseEdits) {
+        if ($defaultIni -notmatch $edit.Rx) { throw 'shipped defaults no longer match mevr.ini.example' }
+        $defaultIni = [regex]::Replace($defaultIni, $edit.Rx, $edit.To)
+    }
+    # Keep the install archive to three files while carrying all redistribution
+    # notices. Comments are ignored by the INI parser and survive Restore Defaults.
+    foreach ($notice in @('LICENSE', 'THIRD-PARTY-NOTICES.txt', 'third_party/minhook/LICENSE.txt')) {
+        $defaultIni += "`r`n; ---- $notice ----`r`n"
+        foreach ($line in ([System.IO.File]::ReadAllText((Join-Path $root $notice)) -split '\r?\n')) {
+            $defaultIni += "; $line`r`n"
+        }
+    }
     $defaultHeader = "static const char kVrShippedDefaults[] =`r`n"
     for ($part = 0; $part -lt $defaultIni.Length; $part += 4096) {
         $defaultHeader += 'R"MEVRDEFAULT(' + $defaultIni.Substring($part, [Math]::Min(4096, $defaultIni.Length - $part)) + ")MEVRDEFAULT`"`r`n"
@@ -221,38 +236,22 @@ try {
             throw ("d3d9.dll is not x86 (PE machine 0x{0:X4}, expected 0x014C)" -f $machine)
         }
 
-        $dist  = Join-Path $root "dist"
-        $stage = Join-Path $dist "mevr-$version"
-        if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+        if ($version -notmatch '^\d+\.\d+\.\d+-alpha(?:\.\d+)?$') { throw 'unexpected alpha version format' }
+        $dist  = [System.IO.Path]::GetFullPath((Join-Path $root "dist"))
+        $stage = [System.IO.Path]::GetFullPath((Join-Path $dist "mevr-$version"))
+        if ([System.IO.Path]::GetDirectoryName($stage) -ne $dist) { throw 'release stage escaped dist' }
+        if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
         New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
         Copy-Item $dllPath $stage
         Copy-Item (Join-Path $binDir "openxr_loader.dll") $stage
-        Copy-Item (Join-Path $root "LICENSE")                  (Join-Path $stage "LICENSE.txt")
-        Copy-Item (Join-Path $root "THIRD-PARTY-NOTICES.txt")   $stage
-        Copy-Item (Join-Path $root "packaging\README.txt")      $stage
 
         # ---- mevr.ini, derived from the example rather than kept as a second copy ----
         #
         # One source of truth for the settings and their documentation, with exactly two
         # deliberate release deltas. Each MUST match, or the build stops: a silently skipped
         # substitution here ships the wrong default, and nothing downstream would catch it.
-        $iniText = Get-Content (Join-Path $root "mevr.ini.example") -Raw
-        $edits = @(
-            @{ What = "the rename instruction";
-               Rx   = '(?m)^; Rename this file to  mevr\.ini  and leave it beside d3d9\.dll.*$';
-               To   = '; This IS mevr.ini. Keep it beside d3d9.dll in the game''s Binaries folder.' }
-            @{ What = "Debug defaulted off for release";
-               Rx   = '(?m)^Debug = on\s*$';
-               To   = 'Debug = off' }
-        )
-        foreach ($e in $edits) {
-            if ($iniText -notmatch $e.Rx) {
-                throw "packaging cannot apply '$($e.What)' - mevr.ini.example no longer matches. " +
-                      "Fix the pattern in build.ps1 rather than shipping the file unedited."
-            }
-            $iniText = [regex]::Replace($iniText, $e.Rx, $e.To)
-        }
+        $iniText = $defaultIni
         # NOT Set-Content -Encoding utf8, which on Windows PowerShell 5.1 writes a BOM. The
         # parser skips spaces and tabs before testing for ';', and a BOM is neither - so the
         # file's own first comment would be reported as a rejected line in every release, and
@@ -264,6 +263,8 @@ try {
         $zip = Join-Path $dist "mevr-$version.zip"
         if (Test-Path $zip) { Remove-Item $zip -Force }
         Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip
+        & (Join-Path $root 'tools/check-package.ps1') -ZipPath $zip
+        if ($LASTEXITCODE -ne 0) { throw 'release archive verification failed' }
 
         # The PDB is a SEPARATE release asset, never inside the zip. It is wanted only to turn
         # a crash address in somebody's log into a line number, and putting it in the zip
@@ -275,7 +276,7 @@ try {
         Write-Host "  $zip"
         Write-Host "  $(Join-Path $dist "d3d9-$version.pdb")  (separate release asset, not in the zip)"
         Write-Host ""
-        Write-Host "  git tag -a v$version -m ""pre-alpha"" && git push origin v$version"
+        Write-Host "  Upload the ZIP and PDB as GitHub release assets for v$version."
     }
 } finally {
     Pop-Location

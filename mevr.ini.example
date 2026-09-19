@@ -1,7 +1,7 @@
 ; Mirror's Edge VR - optional settings
 ;
 ; Rename this file to  mevr.ini  and leave it beside d3d9.dll in the game's Binaries folder.
-; That is the whole installation: d3d9.dll and mevr.ini in the same directory.
+; Install d3d9.dll, openxr_loader.dll and mevr.ini together beside MirrorsEdge.exe.
 ;
 ; It is also read from %LOCALAPPDATA%\MirrorsEdgeVR\ (beside mevr.log) if you would rather not
 ; put files in the game folder. Beside the DLL wins if both exist, and the log names the file

@@ -12,6 +12,8 @@ read the root [AGENTS.md](../AGENTS.md). Engine measurements remain in
 
 ## Settings, controllers, and UI
 
+Release notes: [v0.2.0-alpha](RELEASE_v0.2.0-alpha.md).
+
 | Note | Scope |
 |---|---|
 | [VR_MENU.md](VR_MENU.md) | Settings pages, dependencies, persistence, pause ownership, and menu tests. |

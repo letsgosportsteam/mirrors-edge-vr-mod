@@ -5,11 +5,11 @@ tracking, motion controllers, and optional tracked hands, pistols, and parkour.
 
 > **Alpha.** Hardware coverage is limited, and motion interactions are still experimental.
 
-**[Download the latest release](https://github.com/letsgosportsteam/mirrors-edge-vr-mod/releases/latest)**
+**[Download v0.2.0-alpha](https://github.com/letsgosportsteam/mirrors-edge-vr-mod/releases/tag/v0.2.0-alpha)**
 
 ## Installation
 
-1. Download and extract the release ZIP.
+1. Download `mevr-0.2.0-alpha.zip` from the release's **Assets** section and extract it.
 2. Copy these three files into the game's `Binaries` folder, beside `MirrorsEdge.exe`:
 
    ```text
@@ -20,6 +20,10 @@ tracking, motion controllers, and optional tracked hands, pistols, and parkour.
 
 3. Connect your headset through Virtual Desktop, with **VDXR** selected as the
    OpenXR runtime, then launch the game normally.
+
+The ZIP contains exactly those three files, ready to copy with no INI editing.
+The separate `.pdb` asset is for debugging and is not needed to play. License
+notices are included as comments in `mevr.ini`.
 
 On Steam, use **Manage > Browse local files** to find the game folder. Stereo
 starts after a level loads; the startup screen is not a stereo gameplay view.
