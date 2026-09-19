@@ -5,7 +5,7 @@
 
 static bool g_menuOpen = false, g_menuClosing = false, g_menuOwnsPause = false;
 static bool g_menuPausePending = false, g_menuReady = false, g_menuRestart = false;
-static bool g_menuArm = false, g_menuGuns = true, g_menuMelee = true, g_menuParkour = true;
+static bool g_menuArm = true, g_menuGuns = true, g_menuMelee = true, g_menuParkour = true;
 static bool g_menuFps = false, g_menuEx = true, g_menuLens = false;
 static bool g_showReticle=false;
 static int g_menuHudOffset=-1,g_menuReticleOffset=-1;
@@ -345,7 +345,7 @@ static void MenuOpen(uint64_t now) {
 static void MenuRestoreDefaults() {
     if(!MenuAtomicWrite(kVrShippedDefaults))return;
     // Restart-only and hidden experimental settings take effect next launch.
-    g_motionHands=false;g_menuArm=false;g_menuGuns=g_menuMelee=g_menuParkour=true;
+    g_motionHands=true;g_menuArm=true;g_menuGuns=g_menuMelee=g_menuParkour=true;
     g_armSwingCrouch=g_balanceRoll=true;
     MenuAnimPreference(0)=MenuAnimPreference(1)=MenuAnimPreference(2)=true;
     g_fpsCap=72;g_menuResolution="off";g_menuLens=false;g_menuEx=true;g_fastCapture=true;

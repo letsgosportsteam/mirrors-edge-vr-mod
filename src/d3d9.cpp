@@ -877,7 +877,7 @@ static uint64_t g_artificialTurnUntil=0;
 static bool VrPollStandardController(MEVR_XINPUT_STATE* state);
 static void VrSelectController(bool connected,const MEVR_XINPUT_STATE& pad,bool questActivity);
 static void VrPublishStandardController(MEVR_XINPUT_STATE state,bool shortY);
-static bool        g_motionHands = false;           // incomplete Phase 1 path, opt-in only
+static bool        g_motionHands = true;            // controller-driven hands; can be disabled in VR settings
 static bool        g_motionHandsDebug = false;      // bounded pose-state and position reports
 static bool        g_pistolHands = true;            // requires MotionHands and validated combat hooks
 static bool        g_pickupDebug = false;           // INI-only diagnostics; blue pickup indicator is independent
@@ -920,8 +920,8 @@ static long        g_bonePokeWrites = 0, g_bonePokeReadbacks = 0;
 // them away. GripToGrip therefore implies StickJumpTurn and forces it on at load; the reverse
 // does not hold. If the hand pose later proves worth having by default, this pair collapses into
 // one setting - but that is a decision to make after it has been felt, not before.
-static bool        g_stickJumpTurn = false;         // StickJumpTurn in mevr.ini
-static bool        g_gripToGrip = false;            // GripToGrip in mevr.ini
+static bool        g_stickJumpTurn = true;          // follows the motion-hands default
+static bool        g_gripToGrip = true;             // follows the motion-hands default
 // The live squeeze, 0..1 per hand, published for the hand-pose path that will consume it. Written
 // once per pad build, on the thread that drives Present, and read nowhere else yet.
 static float       g_gripValue[2] = { 0.0f, 0.0f };  // [left, right]
@@ -1449,7 +1449,7 @@ static void XrInitActions()
 //
 // Nothing here writes to the pad, so a build carrying it is safe to play normally.
 
-static bool  g_armSwing = false;            // ArmSwing;      NUMPAD * toggles
+static bool  g_armSwing = true;             // ArmSwing;      NUMPAD * toggles
 static bool  g_armSwingDebug = false;       // ArmSwingDebug; the per-second metric report
 
 // One physical constant, shared by the discontinuity guard below and by UpdateSixDof, which

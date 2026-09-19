@@ -57,8 +57,8 @@ Center the stick between snaps or repeated jump/quick-turn inputs.
 With a tracked left-hand pistol, the right trigger no longer fires it.
 
 Motion features:
-  Enable Hand tracking under Hands and movement. This tracks controllers,
-  not bare hands. Hand tracking and arm swing both default to Off.
+  Hand tracking and arm swing both default to On. Turn either off under
+  Hands and movement if preferred. This tracks controllers, not bare hands.
   Guns, Melee, and Motion parkour have separate switches.
 
   Pickup:  Look at an eligible pistol within 2 m and squeeze either grip.

@@ -61,15 +61,16 @@ installed. If OpenXR cannot start, check that Virtual Desktop is already streami
 | Motion parkour | Grip interactions on ledges, pipes, and horizontal bars. |
 | Graphics and comfort | Headset-based resolution option, frame cap, camera animation locks, lens-flare and reticle controls. |
 
-**Motion hands and arm-swing locomotion default to Off.** Enable **Hand tracking**
-under **Hands and movement** to use controller-driven hands; Guns, Melee, and
+**Motion hands and arm-swing locomotion default to On.** You can turn either off
+under **Hands and movement**; Guns, Melee, and
 Motion parkour have their own switches. Here, “hand tracking” means tracking the
 controllers, not playing with bare hands.
 
 ## Controls
 
-These are the default game bindings with Touch controllers. Enabling Hand tracking
-changes the grips and right-stick vertical input as shown below. Keyboard/mouse
+These are the Touch controller bindings. With the default Hand tracking setting,
+the grips control your hands and right-stick up/down performs jump/quick-turn.
+The tables also show the bindings with Hand tracking off. Keyboard/mouse
 and standard gamepads retain the game's normal bindings, with the gamepad's Y
 hold reserved for VR settings.
 

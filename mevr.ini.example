@@ -77,7 +77,7 @@ SnapTurnAngle = 45
 ; MotionHandsDebug adds bounded pose validity/tracking transitions and a five-second report of
 ; grip/aim positions relative to the headset to mevr.log.
 
-MotionHands = off
+MotionHands = on
 
 ; Pistol hand/aim prototype, active only with MotionHands. Colt1911 and Glock18c
 ; follow the holding hand; shots start at the muzzle along the model's barrel axis.
@@ -141,8 +141,8 @@ MotionHandsDebug = off
 ; Each hand is independent, and both stand down wherever the game poses the hands itself - a
 ; ledge, a pipe, a zipline, a melee - so a squeeze never fights an authored grab.
 
-StickJumpTurn = off
-GripToGrip = off
+StickJumpTurn = on
+GripToGrip = on
 
 
 ; ---------------------------------------------------------------- arm swing locomotion
@@ -155,7 +155,7 @@ GripToGrip = off
 ;
 ; Hotkey: NUMPAD * toggles ArmSwing.
 
-ArmSwing = off
+ArmSwing = on
 ArmSwingDebug = off
 
 ; The two gestures, independently switchable because they fail differently.

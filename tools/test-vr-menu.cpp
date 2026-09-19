@@ -95,7 +95,14 @@ static void IniTests() {
         g_fpsCap=cap;assert(SaveMenuSettings());LoadSettings();VrMenuInitializeSettings();assert(g_fpsCap==cap);
     }
     MenuRestoreDefaults();assert(ReadTestFile(g_settingsPath)==kVrShippedDefaults);
-    LoadSettings();VrMenuInitializeSettings();assert(g_fpsCap==72&&!g_motionHands&&!g_menuArm&&!g_debug);
+    assert(g_motionHands&&g_menuArm&&g_armSwing&&g_armSwingJump&&g_gripToGrip&&g_stickJumpTurn);
+    LoadSettings();VrMenuInitializeSettings();assert(g_fpsCap==72&&g_motionHands&&g_menuArm&&!g_debug);
+    assert(g_armSwing&&g_armSwingJump&&g_gripToGrip&&g_stickJumpTurn);
+    // Existing explicit opt-outs survive save/reload despite the enabled defaults.
+    MenuActivate(MArm,-1);MenuActivate(MHands,-1);
+    LoadSettings();VrMenuInitializeSettings();
+    assert(!g_motionHands&&!g_menuArm&&!g_armSwing&&!g_gripToGrip&&!g_stickJumpTurn);
+    MenuRestoreDefaults();
     assert(!g_showReticle);
     assert(g_gunWristDownDeg[0]==0&&g_gunPositionMm[1][2]==0);
     puts("PASS preferences, all cap roundtrips, gun calibration, atomic failure, comments, defaults");
@@ -179,7 +186,9 @@ int wmain(int argc,wchar_t** argv) {
     assert(argc==2);InitializeCriticalSection(&g_padLock);g_padLockReady=true;
     LARGE_INTEGER frequency;QueryPerformanceFrequency(&frequency);g_qpcFreq=(double)frequency.QuadPart;
     swprintf_s(g_settingsPath,L"%s\\mevr.ini",argv[1]);swprintf_s(g_logPath,L"%s\\mevr.log",argv[1]);
-    VrMenuInitializeSettings();InputTests();IniTests();MetadataTests();PauseTests();
+    VrMenuInitializeSettings();
+    assert(g_motionHands&&g_menuArm&&g_armSwing&&g_armSwingJump&&g_gripToGrip&&g_stickJumpTurn);
+    InputTests();IniTests();MetadataTests();PauseTests();
     for(int page=0;page<9;++page)WritePreview(argv[1],page);
     puts("PASS all 9 production menu page previews rendered");
     return 0;

@@ -17,6 +17,12 @@ Controller gameplay input and gestures remain blocked while the panel is open.
 
 ## Pages
 
+As of 2026-09-19, Hand tracking and Arm swing locomotion default to **On** for
+new configurations and Restore Defaults, including the compiled fallback when
+no INI exists. Explicit Off choices in existing configurations are preserved.
+The enabled hand-tracking default assigns grips to the hands and right-stick
+up/down to jump/quick-turn; gamepad mode still suspends motion features.
+
 - **Hands and movement:** Hand tracking; Arm swing locomotion (includes hands-up
   jump); Guns; Melee; Motion parkour. The child selections are remembered when
   Hand tracking is off. The master also controls grip-to-fist and right-stick
