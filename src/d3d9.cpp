@@ -77,7 +77,11 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cmath>
+#include <cfloat>
 #include <vector>
+#include <string>
+#include <algorithm>
+#include <deque>
 #include <new>
 #include <psapi.h>
 // Rung 10. The build script reads this include to decide whether to compile MinHook's sources,
@@ -170,6 +174,24 @@ static bool  g_devIsEx       = false;   // the device really is D3D9Ex
 // Rung 10, defined below the call sites in the XR setup and the frame loop.
 static void  XrInitActions();
 static bool  XrSyncInput(XrTime when);
+static volatile LONG g_menuBlocksGameplay = 0;
+static wchar_t g_settingsPath[MAX_PATH]{};
+static bool VrMenuInputTick(XrTime when, bool focused, bool y, bool a, bool b,
+                            bool other, float x, float z, bool* shortY);
+static bool VrMenuLayer(XrCompositionLayerQuad* layer);
+static void VrMenuResolveEngine();
+static void PkPipeResolveMetadata();
+static void VrControlsResolveMetadata();
+static void VrControlsTick();
+static float VrTurnAxis(float axis);
+static int VrTakeSnapTurn();
+static void PkPipeGameTick(uintptr_t pawn);
+static bool PkPipeReadVolume(uintptr_t move,uintptr_t* volume,uint32_t* offset);
+static void VrMenuFrameCapTick();
+static void VrMenuReticleTick();
+static bool VrMenuLoadSetting(const char* key, const char* val);
+static void VrMenuInitializeSettings();
+static bool SaveMenuSettings();
 static void  InstallXInputHook();
 void         RecenterSixDof();
 static long  g_frames        = 0;
@@ -844,8 +866,31 @@ static XrSpace     g_sLGripPose = XR_NULL_HANDLE, g_sRGripPose = XR_NULL_HANDLE;
 static XrSpace     g_sLAimPose  = XR_NULL_HANDLE, g_sRAimPose  = XR_NULL_HANDLE;
 static bool        g_actionsReady = false;
 static bool        g_padEnabled = true;            // NUMPAD9 toggles
+static bool g_standardControllerActive=false;
+static DWORD g_standardControllerIndex=0;
+static int g_controllerMode=0; // 0 auto, 1 Quest, 2 standard gamepad
+static bool g_snapTurning=false;
+static float g_smoothTurnSpeed=1.0f,g_snapTurnAngle=45.0f;
+static float g_gameUiScale=.65f,g_gameUiHeight=0.0f;
+static volatile LONG g_pendingSnapYaw=0;
+static uint64_t g_artificialTurnUntil=0;
+static bool VrPollStandardController(MEVR_XINPUT_STATE* state);
+static void VrSelectController(bool connected,const MEVR_XINPUT_STATE& pad,bool questActivity);
+static void VrPublishStandardController(MEVR_XINPUT_STATE state,bool shortY);
 static bool        g_motionHands = false;           // incomplete Phase 1 path, opt-in only
 static bool        g_motionHandsDebug = false;      // bounded pose-state and position reports
+static bool        g_pistolHands = true;            // requires MotionHands and validated combat hooks
+static bool        g_pickupDebug = false;           // INI-only diagnostics; blue pickup indicator is independent
+static bool        g_motionPunch = true;            // requires MotionHands + GripToGrip
+static bool PistolAllowsHandControl(uintptr_t pawn, uintptr_t weapon, uint8_t weaponAnim);
+static void InitializeCombatHooks(uintptr_t pawn);
+static bool MotionPunchTick(XrTime when);
+static int CombatHoldingHand();
+static bool CombatLeftHandGun();
+static void CombatGripTick(XrTime when);
+static void CombatGameplayTick(uintptr_t pawn);
+static void CombatRedirectWeaponBone(uintptr_t mesh, uint32_t bones, int count);
+static void ReportCombatState(uintptr_t pawn);
 // The finger curl, toggled by NUMPAD / - the last unbound key on the pad. Declared up here with
 // the other feature flags because the hotkey reader runs long before the pose code is defined.
 // g_curlTarget is what the key asks for and g_curlNow is where the ramp has got to; F4 replaces
@@ -976,6 +1021,14 @@ static bool FiniteVec(const MEVR_Vec3& v);
 // Live debug calibration in degrees, [left/right][pitch/yaw/roll]. Preserve the values measured
 // in the headset for the wrists. Selection order is Right P/Y/R, then Left P/Y/R.
 static int g_wristCalibrationDeg[2][3] = { { -30, 0, 0 }, { 150, 0, 0 } };
+// Independent gun trim: positive tips the right wrist toward the pinky.
+static int g_gunWristDownDeg[2]{};
+static int g_gunWristRightDeg[2]{};
+static int g_gunPositionMm[2][3]{}; // controller-local forward, right, up
+static wchar_t g_gunCalibrationPath[MAX_PATH] = L"";
+static bool g_gunCalibrationSaveFailed = false;
+static bool PistolCalibrationActive();
+static void SaveGunCalibration();
 // Trim added to each ForeArmRoll helper's twist, in degrees about the forearm axis. P1.4d
 // drives the helper as forearm-swing + measured hand twist + this trim, and run 7 measured the
 // authored helper twist matching the hand's twist at neutral on both sides, so zero is the
@@ -2294,8 +2347,6 @@ extern bool g_pkTopOpen;  // PK.34: the game is climbing the player over the top
 extern long g_pkPullUpHold;
 extern long g_pkBarJumpHold;    // PK.50: ...and while a bar's jump animation needs them
 extern long g_pkTopOpenFrames;      // ...and how far through that handover we are
-extern float g_pkHandoverStick;     // ...and which phase of it the pad should send
-extern const long kPkHandoverFrames;
 struct MEVR_Vec3;
 static void PkSnapHandToLedge(int hand, MEVR_Vec3* target);   // defined with the ledge reads
 static bool g_parkour = true;               // Parkour in mevr.ini
@@ -2443,6 +2494,11 @@ static bool ArmSwingCrouchTick(XrTime when)
 // Returns true while the synthesised jump button should be held down.
 static bool ArmSwingJumpTick(XrTime when)
 {
+    if (g_gripToGrip && (g_gripValue[0] > 0.5f || g_gripValue[1] > 0.5f)) {
+        g_swingJumpAsserted = false;
+        g_swingJumpArmed = false;
+        return false;
+    }
     // ⚠️ Hands 0.25 m above the head IS the resting posture of a player hanging from a ledge, and
     // this asserts GBA_Jump - which on a ledge is GrabPullUp or a jump off it. It would fire
     // continuously, unprompted, over a drop.
@@ -4336,8 +4392,8 @@ static void PkSnapHandToLedge(int hand, MEVR_Vec3* target)
             // grab animation where the left hand is lower than the right, so the anchor points
             // are at different heights", and the capture log is the measurement: LEFT ghosted at
             // Z 8424 and RIGHT at Z 8430 off a ledge at Z 8441 - 17 UU below it against 11. The
-            // file's own figure for a hand resting on a ledge is 10 to 12 UU, so the right hand
-            // is canonical and that animation simply plants the left one lower. Per-hand offsets
+            // file's own figure for a hand resting on a ledge is 10 to 12 UU. The higher hand
+            // is canonical; either hand can be lower in a different animation. Per-hand offsets
             // faithfully reproduce the animation's asymmetry in the anchors, and the player then
             // shimmies along a ledge that is tilted by six centimetres.
             //
@@ -7495,6 +7551,14 @@ static float ArmSwingDeflection(XrTime when, float physX, float physY)
     // ---- collapse: the player has stopped asking ----
     if (!g_armSwing)                       { ArmSwingCollapse("off");        return 0.0f; }
     if (!g_padEnabled)                     { ArmSwingCollapse("pad off");    return 0.0f; }
+    static XrTime gripQuietUntil = 0;
+    if (g_gripToGrip && (g_gripValue[0] > 0.5f || g_gripValue[1] > 0.5f))
+        gripQuietUntil = when + 250000000LL;
+    if (when < gripQuietUntil) {
+        ArmSwingCollapse("grip held");
+        g_swingLastEngagedAt = 0; // require a new locomotion gesture after releasing
+        return 0.0f;
+    }
     if (g_sweepActive)                     { ArmSwingCollapse("sweep");      return 0.0f; }
     if (!g_swingL.tracked && !g_swingR.tracked) { ArmSwingCollapse("no tracked hand"); return 0.0f; }
     // ⚠️ COLLAPSE, not freeze. On a ledge the player is moving their arms deliberately and for a
@@ -7737,11 +7801,14 @@ static bool XrSyncInput(XrTime when)
     //
     // And it runs while the pad is disabled for the same reason: NUMPAD9 is a toggle, and
     // re-enabling must not resume against a position from before it was pressed.
-    ArmSwingSample(when, XR_SUCCEEDED(synced));
 
-    if (XR_FAILED(synced)) return false;
-    // Pose actions share this action set. They remain live when NUMPAD9 disables pad synthesis.
-    if (!g_padEnabled) return true;
+
+    if (synced != XR_SUCCESS || g_xrState != XR_SESSION_STATE_FOCUSED) {
+        bool ignored = false;
+        VrMenuInputTick(when, false, false, false, false, false, 0, 0, &ignored);
+        ArmSwingSample(when, false);
+        return false;
+    }
 
     // Returns whether the action was ACTIVE, which the caller now records. isActive is the
     // runtime saying "this action is bound to a control on a controller that is present" - so
@@ -7779,6 +7846,51 @@ static bool XrSyncInput(XrTime when)
         return false;
     };
 
+    float menuMX=0, menuMY=0, menuLX=0, menuLY=0;
+    vec2(g_aMove, &menuMX, &menuMY); vec2(g_aLook, &menuLX, &menuLY);
+    MEVR_XINPUT_STATE physical{};
+    const bool connected=VrPollStandardController(&physical);
+    const bool questActivity=bl(g_aA)||bl(g_aB)||bl(g_aX)||bl(g_aY)||bl(g_aMenu)||
+        bl(g_aLClick)||bl(g_aRClick)||flt(g_aLTrig)>.3f||flt(g_aRTrig)>.3f||
+        flt(g_aLGrip)>.7f||flt(g_aRGrip)>.7f||fabsf(menuMX)>.3f||fabsf(menuMY)>.3f||fabsf(menuLX)>.3f||fabsf(menuLY)>.3f;
+    VrSelectController(connected,physical,questActivity);
+    if(g_standardControllerActive) {
+        menuMX=physical.Gamepad.sThumbLX/32767.f;menuMY=physical.Gamepad.sThumbLY/32767.f;
+        menuLX=physical.Gamepad.sThumbRX/32767.f;menuLY=physical.Gamepad.sThumbRY/32767.f;
+        const WORD buttons=physical.Gamepad.wButtons;
+        bool shortY=false;
+        const bool other=(buttons&~(MEVR_PAD_Y|MEVR_PAD_A|MEVR_PAD_B))!=0||
+            physical.Gamepad.bLeftTrigger>30||physical.Gamepad.bRightTrigger>30||
+            (fabsf(menuMX)>.2f&&fabsf(menuLX)>.2f)||(fabsf(menuMY)>.2f&&fabsf(menuLY)>.2f);
+        const bool blocked=VrMenuInputTick(when,true,(buttons&MEVR_PAD_Y)!=0,
+            (buttons&MEVR_PAD_A)!=0||physical.Gamepad.bRightTrigger>127,(buttons&MEVR_PAD_B)!=0,other,
+            fabsf(menuLX)>fabsf(menuMX)?menuLX:menuMX,fabsf(menuLY)>fabsf(menuMY)?menuLY:menuMY,&shortY);
+        ArmSwingSample(when,false);g_gripValue[0]=g_gripValue[1]=0;
+        if(blocked)return true;
+        if(!g_padEnabled)return true;
+        ParkourTick(when); // clear motion-owned movement state on device changes
+        VrPublishStandardController(physical,shortY);
+        return true;
+    }
+    const bool menuOther = bl(g_aX) || bl(g_aMenu) || bl(g_aLClick) || bl(g_aRClick) ||
+        flt(g_aLGrip)>.15f || flt(g_aRGrip)>.15f || flt(g_aLTrig)>.15f || flt(g_aRTrig)>.15f ||
+        (fabsf(menuMX)>.2f && fabsf(menuLX)>.2f) || (fabsf(menuMY)>.2f && fabsf(menuLY)>.2f);
+    bool shortY=false;
+    if(VrMenuInputTick(when,true,bl(g_aY),bl(g_aA)||flt(g_aRTrig)>.5f,bl(g_aB),menuOther,
+        fabsf(menuLX)>fabsf(menuMX)?menuLX:menuMX,
+        fabsf(menuLY)>fabsf(menuMY)?menuLY:menuMY,&shortY)) {
+        ArmSwingSample(when,false);
+        MotionPunchTick(when); // blocked eligibility resets punch history
+        return true;
+    }
+    ArmSwingSample(when,true);
+    // Pose actions remain live even when the diagnostic pad switch is off.
+    if (!g_padEnabled) return true;
+    // Gesture gates must see THIS action sync, before arm-swing composes movement.
+    g_gripValue[0] = flt(g_aLGrip);
+    g_gripValue[1] = flt(g_aRGrip);
+    CombatGripTick(when);
+    const bool motionPunch = MotionPunchTick(when);
     float mx, my, lx, ly;
     const bool moveLive = vec2(g_aMove, &mx, &my);
     const bool lookLive = vec2(g_aLook, &lx, &ly);
@@ -7791,7 +7903,7 @@ static bool XrSyncInput(XrTime when)
     };
     s.Gamepad.sThumbLX = axis(mx);
     s.Gamepad.sThumbLY = axis(my);
-    s.Gamepad.sThumbRX = axis(lx);
+    s.Gamepad.sThumbRX = axis(VrTurnAxis(lx));
     g_padSentRX = lx;               // the turn axis - see the climb trace
     s.Gamepad.sThumbRY = axis(ly);
 
@@ -7877,58 +7989,11 @@ static bool XrSyncInput(XrTime when)
     // physical stick wins the moment it is touched.
     if (g_pkPumpStick != 0.0f && sweep <= 0.0f && fabsf(my) < 0.15f)
         s.Gamepad.sThumbLY = axis(g_pkPumpStick);
-    // ---- ⚠️ PK.34: THE DISMOUNT NEEDS THE GAME TO CLIMB, NOT TO BE PUT THERE ----
-    //
-    // Opening the ceiling was necessary and not sufficient: "at the point at the top where it
-    // opened, I didn't actually dismount either by continuing to climb or by pushing the stick
-    // up. I had to push the stick down then back up again to get onto the roof."
-    //
-    // The one successful dismount in that run says why, and every column matters:
-    //
-    //   pawn (-5569 -1632 5563) | stickY +0.97 | grips -- anchored --
-    //   pawn (-5581 -1632 5695) | stickY +0.97 | grips -- anchored --      <- stalls at 5695
-    //   pawn (-5585 -1632 5695) | stickY +0.00 | grips -- anchored --
-    //   pawn (-5599 -1632 5724) | stickY +0.00 | grips -- anchored --      <- the mantle runs
-    //   pawn (-5625 -1632 5762) | stickY +0.00 | grips -- anchored --
-    //
-    // `grips --` on every line: NO HAND WAS GRIPPING, so direct drive was not writing and the
-    // game owned the pawn. It climbed under its own power to 5695 - which is 65 UU BELOW the
-    // volume top, so the trigger was never the top at all - stalled there, and then moved the
-    // pawn itself, 67 UU up and 36 UU back over the lip. That last part is the mantle animation,
-    // and it is the game writing Location.
-    //
-    // Which is exactly what direct drive does every frame. Climbing by hand cannot dismount
-    // because the pawn is placed rather than moved, so the game never stalls at its own trigger;
-    // and even if it fired, our writes would overwrite the animation that carries the player
-    // over the edge. Pushing the stick up did nothing for the same reason - we put the pawn back
-    // each frame. Down-then-up worked because it let go long enough for the game to move.
-    //
-    // So the open ceiling stops being a permission and becomes a HANDOVER: stand our writes down
-    // and hold the climb axis up, and the move that owns this does the whole thing. That is the
-    // ledge's PK.7 argument - "the game then does what only it can" - on the one question a pipe
-    // turns out to have after all.
-    // ---- ⚠️ PK.37: DOWN FIRST, THEN UP - THE SEQUENCE THE PLAYER FOUND BY HAND ----
-    //
-    // Holding the climb axis up does nothing: the pawn freezes at 5661 with ClimbState=0 for the
-    // whole window while g_padSentLY reads +0.97, so the input arrives and the move declines it.
-    // A successful dismount sits at 5695 - 34 UU higher - before anything happens.
-    //
-    // The difference is how the pawn GOT there. In every working case the game climbed it up
-    // from below under its own control; in the handover we place it with direct drive and then
-    // let go, and the move snaps it down to 5661 and refuses to move. The climb evidently tracks
-    // its own position along the ladder, and a pawn teleported up the pipe leaves that tracking
-    // behind - so "climb up" is answered with "you are already at the top of where I think you
-    // are".
-    //
-    // The player found the cure before I understood the cause: "I had to push the stick down
-    // then back up again to get onto the roof." Descending under the game's own power is what
-    // re-synchronises it, and from there a normal climb reaches the trigger and mantles.
-    //
-    // So the handover reproduces that exactly. Down for 30 frames - about 60 UU, enough movement
-    // for the move to re-establish where it is - then up for the rest.
-    if (g_pkTopOpen && fabsf(my) < 0.15f)
-        s.Gamepad.sThumbLY = axis(g_pkHandoverStick);   // PK.38: the phase is decided in the tick
+    // A committed roof exit owns movement; do not feed the old synthetic
+    // down-then-up sequence or a stale hand-derived shimmy into its animation.
+    if (g_pkTopOpen) {s.Gamepad.sThumbLX=0;s.Gamepad.sThumbLY=0;}
     s.Gamepad.bLeftTrigger  = (BYTE)(flt(g_aLTrig) * 255.0f);
+    if (CombatLeftHandGun()) s.Gamepad.bLeftTrigger = 0; // left trigger now fires
     // AS.3: full, and never below what the physical trigger already asked for. GBA_Crouch is
     // a button as far as the game is concerned; a partial press would only risk sitting under
     // whatever threshold it applies.
@@ -7938,12 +8003,14 @@ static bool XrSyncInput(XrTime when)
     // holding a hold they were holding. Full, for the reason directly above.
     if (g_pkHoldDrop > 0 && !g_pkHoldDropJump) s.Gamepad.bLeftTrigger = 0xFF;
     s.Gamepad.bRightTrigger = (BYTE)(flt(g_aRTrig) * 255.0f);
+    if (CombatLeftHandGun()) s.Gamepad.bRightTrigger = (BYTE)(flt(g_aLTrig) * 255.0f);
+    if (motionPunch) s.Gamepad.bRightTrigger = 0xFF;
 
     WORD b = 0;
     if (bl(g_aA)) b |= MEVR_PAD_A;
     if (bl(g_aB)) b |= MEVR_PAD_B;
     if (bl(g_aX)) b |= MEVR_PAD_X;
-    if (bl(g_aY)) b |= MEVR_PAD_Y;
+    if (shortY) b |= MEVR_PAD_Y;
     if (bl(g_aMenu))   b |= MEVR_PAD_START;
     // ---- left stick click is BACK, not LTHUMB ----
     //
@@ -7964,8 +8031,7 @@ static bool XrSyncInput(XrTime when)
     // Read once and keep: the crossover below, the peaks in the window report, and the hand-pose
     // path all want the same number, and calling flt() twice per grip would sample the runtime
     // twice for one frame's answer.
-    g_gripValue[0] = flt(g_aLGrip);
-    g_gripValue[1] = flt(g_aRGrip);
+    // Grip values were sampled above, before gesture and locomotion evaluation.
 
     // Grips are analogue on Touch and shoulder buttons on a pad, so they cross over at a
     // threshold rather than being dropped. Half pressed is deliberate: a grip is squeezed
@@ -8293,9 +8359,10 @@ static bool g_xiHooked = false;
 
 static DWORD WINAPI Hook_XInputGetState(DWORD idx, MEVR_XINPUT_STATE* out)
 {
+    if((g_padEnabled||g_menuBlocksGameplay)&&g_actionsReady&&idx>0)return ERROR_DEVICE_NOT_CONNECTED;
     // Only pad 0. Reporting a controller on every index makes the game think four players are
     // present, and some engines then poll all of them every frame for nothing.
-    if (g_padEnabled && g_actionsReady && idx == 0 && out) {
+    if ((g_padEnabled || g_menuBlocksGameplay) && g_actionsReady && idx == 0 && out) {
         EnterCriticalSection(&g_padLock);
         *out = g_pad;
         LeaveCriticalSection(&g_padLock);
@@ -8309,7 +8376,10 @@ static DWORD WINAPI Hook_XInputGetState(DWORD idx, MEVR_XINPUT_STATE* out)
 
 static DWORD WINAPI Hook_XInputGetCaps(DWORD idx, DWORD flags, MEVR_XINPUT_CAPABILITIES* out)
 {
-    if (g_padEnabled && g_actionsReady && idx == 0 && out) {
+    if((g_padEnabled||g_menuBlocksGameplay)&&g_actionsReady&&idx>0)return ERROR_DEVICE_NOT_CONNECTED;
+    if ((g_padEnabled || g_menuBlocksGameplay) && g_actionsReady && idx == 0 && out) {
+        if(g_standardControllerActive&&g_origXiGetCaps &&
+           g_origXiGetCaps(g_standardControllerIndex,flags,out)==ERROR_SUCCESS)return ERROR_SUCCESS;
         MEVR_XINPUT_CAPABILITIES c{};
         c.Type = 1;        // XINPUT_DEVTYPE_GAMEPAD
         c.SubType = 1;     // XINPUT_DEVSUBTYPE_GAMEPAD
@@ -8869,7 +8939,7 @@ extern int               g_dupOnlyTarget;
 extern bool              g_forceVisible;
 extern int               g_occlusionMode;
 struct RtSeen { IDirect3DSurface9* surf; UINT w, h; D3DFORMAT fmt; long draws; long sceneDraws; };
-extern RtSeen            g_rtSeen[16];
+extern std::deque<RtSeen> g_rtSeen;
 extern int               g_rtSeenCount;
 
 // ---- where the engine actually renders the scene, which is not always the backbuffer ----
@@ -8909,6 +8979,7 @@ long g_c0Uploads = 0, g_c0Pass = 0, g_c0FailW = 0, g_c0FailDir = 0, g_c0Degen = 
 volatile LONG            g_markerBurst = 0;
 // Render thread only: [cam] freeze-probe burst frames remaining after a user marker.
 long                     g_camBurst = 0;
+static long              g_effectCaptureUntil=0;
 
 // The scene's rectangle within the captured backbuffer. Every one of these collapses to the
 // whole backbuffer while g_sceneW/H are unset or equal to it, so every use below is an identity
@@ -8940,6 +9011,7 @@ bool                     g_pitchTargetValid = false;
 bool                     g_pitchFix = true;      // NUMPAD3 toggles, for the A/B
 // The controller's own pitch, sampled INSIDE the frame rather than in Present. See the read site.
 float                    g_liveCtlPitch = 0.0f;
+static uint8_t           g_liveCameraMove = 255;
 float                    g_liveCtlYaw   = 0.0f;
 bool                     g_liveCtlValid = false;
 long                     g_liveCtlFrame = -1;
@@ -9300,7 +9372,7 @@ static void SubmitTestQuad()
         }
     }
 
-    const XrCompositionLayerBaseHeader* layers[1];
+    const XrCompositionLayerBaseHeader* layers[2];
     uint32_t layerCount = 0;
     if (stereoSubmitted) {
         layers[0] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&proj);
@@ -9383,6 +9455,9 @@ static void SubmitTestQuad()
     g_predTime   = fs.predictedDisplayTime;
     g_predPeriod = fs.predictedDisplayPeriod;
 
+    XrCompositionLayerQuad menuLayer{ XR_TYPE_COMPOSITION_LAYER_QUAD };
+    if (fs.shouldRender && VrMenuLayer(&menuLayer))
+        layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&menuLayer);
     XrFrameEndInfo fei{ XR_TYPE_FRAME_END_INFO };
     fei.displayTime          = fs.predictedDisplayTime;
     fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -10129,7 +10204,7 @@ int       g_offMaxSmoothFps = -1;
 // Not a permanent verdict. The game reaches 95-119 in lighter scenes, so a 90 Hz headset mode
 // would be 1:1 almost everywhere and better than either. NUMPAD7 cycles for exactly that kind of
 // test.
-float     g_fpsCap          = 60.0f;    // NUMPAD7 cycles
+float     g_fpsCap          = 72.0f;    // NUMPAD7 cycles
 static int LookupProp(const char* className, const char* propName, bool verbose);
 
 // ---- the half-res fallback: the engine's own "too slow" machinery ----
@@ -10533,6 +10608,9 @@ static DWORD WINAPI ObjectModelThread(LPVOID)
                 ResolveInputGates();
                 DumpClassProperties("TdPlayerController", 60);
                 FindEngineObject();
+                VrMenuResolveEngine();
+                PkPipeResolveMetadata();
+                VrControlsResolveMetadata();
                 FindClientObject();
                 FindWorldInfo();
             }
@@ -11374,9 +11452,28 @@ static void LateReanchorP13Pose(uintptr_t pawn, P13PoseSnapshot* pose)
 void PkVerifyProcessEvent();   // route A rung 3, defined far below with the vtable work
 void PkAskCanShimmy();         // ...and rung 4, the read-only comparison
 
+struct ArmUpdateTiming {
+    double started = NowMs(), gameMs = 0.0;
+    ~ArmUpdateTiming() {
+        const double total = NowMs() - started;
+        const double mod = (std::max)(0.0, total - gameMs);
+        static double modSum = 0.0, gameSum = 0.0, modMax = 0.0, totalMax = 0.0;
+        static long samples = 0;
+        modSum += mod; gameSum += gameMs;
+        modMax = (std::max)(modMax, mod); totalMax = (std::max)(totalMax, total);
+        if (++samples >= 600) {
+            Log("[perf] arm update over %ld calls: mod mean/max %.2f/%.2f ms,"
+                " game mean %.2f ms, total max %.2f ms", samples,
+                modSum / samples, modMax, gameSum / samples, totalMax);
+            samples = 0; modSum = gameSum = modMax = totalMax = 0.0;
+        }
+    }
+};
+
 static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, void* result)
 {
     if (!g_origUpdate1pArms) return;
+    ArmUpdateTiming timing;
     // The preceding frame may have borrowed a dormant controller for the left shoulder. Always
     // put the authored tree and controller bytes back before Mirror's Edge updates parkour,
     // weapon, or root-offset ownership for this tick.
@@ -11386,12 +11483,21 @@ static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, voi
     RestoreWristRotationOverridesBeforeGame(reinterpret_cast<uintptr_t>(self));
     RestoreDetachedArmOverridesBeforeGame(reinterpret_cast<uintptr_t>(self));
     RestoreMotionHandPositionOverridesBeforeGame(reinterpret_cast<uintptr_t>(self));
+    const double gameStarted = NowMs();
     g_origUpdate1pArms(self, edx, stack, result);
+    timing.gameMs = NowMs() - gameStarted;
+    if (g_menuBlocksGameplay || g_standardControllerActive) return;
+    InitializeCombatHooks(reinterpret_cast<uintptr_t>(self));
+    CombatGameplayTick(reinterpret_cast<uintptr_t>(self));
+    PkPipeGameTick(reinterpret_cast<uintptr_t>(self));
 
-    // Route A rung 3. Game thread by construction - Update1pArms is a script native, so it
-    // cannot be running anywhere else.
-    PkVerifyProcessEvent();
-    PkAskCanShimmy();
+    // These are exploratory comparisons only; gameplay does not use their results.
+    // Their full GObjects scans stalled the first ledge grab for 2.7 seconds.
+    extern bool g_geomCensus;
+    if (g_geomCensus) {
+        PkVerifyProcessEvent();
+        PkAskCanShimmy();
+    }
 
     static volatile LONG calls = 0;
     const LONG call = InterlockedIncrement(&calls);
@@ -11405,6 +11511,7 @@ static void __fastcall Hook_Update1pArms(void* self, void* edx, void* stack, voi
     ApplyMotionHandPosition(reinterpret_cast<uintptr_t>(self), pose);
     ApplyDetachedShoulders(reinterpret_cast<uintptr_t>(self), pose);
     ApplyWristRotations(reinterpret_cast<uintptr_t>(self), pose);
+    ReportCombatState(reinterpret_cast<uintptr_t>(self));
     MonitorArmContinuity(reinterpret_cast<uintptr_t>(self), pose);
     // Last, so the finger span it reads has every override this frame already applied to it.
     ProbeFingerBones(reinterpret_cast<uintptr_t>(self));
@@ -11535,7 +11642,7 @@ static uintptr_t FindNativeUFunction(const char* fnName, const char* outerName,
 
 static void InstallUpdate1pArmsHook()
 {
-    if (!g_motionHands || g_origUpdate1pArms || g_update1pArmsTarget) return;
+    if (g_origUpdate1pArms || g_update1pArmsTarget) return;
 
     uintptr_t scriptTarget = 0;
     const int funcOffset = DeriveUFunctionFuncOffset(&scriptTarget);
@@ -11783,7 +11890,7 @@ static bool g_skelPoseProbed = false;
 
 static void ProbeUpdateSkelPose()
 {
-    if (g_skelPoseProbed || !g_motionHands) return;
+    if (g_skelPoseProbed) return;
 
     uintptr_t scriptTarget = 0;
     const int funcOffset = DeriveUFunctionFuncOffset(&scriptTarget);
@@ -12918,6 +13025,7 @@ void ParkourAnimLock(bool onWall)
 }
 extern float     g_animNow[3];              // camera animation contribution, degrees, P/Y/R
 static bool      g_headPrimed = false;
+static bool CinematicHeadLookRequested();
 static int32_t   g_lastHeadYaw = 0, g_lastHeadPitch = 0;
 static int32_t   g_climbYawRef = 0;         // pipe: the game yaw that corresponds to head yaw 0
 static long      g_climbYawHold = 0;        // PK.24: frames the reference survives off the pipe
@@ -13171,8 +13279,15 @@ extern float g_dofOffset[3];
 extern float g_sceneMat[16];      // read by the steep-pitch trace below
 extern bool  g_sceneMatValid;
 
+static int32_t HeadStepLimit(double interval)
+{
+    return interval>0&&interval<=0.25 ?
+        (std::max)(2000,(std::min)(8192,(int32_t)(interval*900.0*65536.0/360.0))):2000;
+}
+
 static void ApplyHeadTracking(XrTime when)
 {
+    VrControlsTick();
     // Sampled here rather than in the D3D hook: the hook runs thousands of times a frame and
     // an xrLocateSpace per call would be absurd. One sample per frame, used by every upload.
     {
@@ -13231,6 +13346,17 @@ static void ApplyHeadTracking(XrTime when)
     }
 
     if (!GetHeadYawPitch(when, &hy, &hp)) return;
+    static XrTime previousHeadTime=0;
+    const double headInterval=previousHeadTime?(double)(when-previousHeadTime)*1e-9:0;
+    previousHeadTime=when;
+
+    // Scripted cameras own Controller.Rotation. Render relative headset motion
+    // without competing with the script, and keep the delta reference fresh.
+    if(CinematicHeadLookRequested()) {
+        g_lastHeadYaw=hy;g_lastHeadPitch=hp;g_headPrimed=true;
+        g_writtenYawAccum=0;
+        return;
+    }
 
     if (!g_headPrimed) {           // first sample defines the reference, no jump on connect
         g_lastHeadYaw = hy; g_lastHeadPitch = hp; g_headPrimed = true;
@@ -13649,23 +13775,13 @@ static void ApplyHeadTracking(XrTime when)
     // An absolute pitch has to be re-asserted every frame even when the head has not moved -
     // that IS the correction, and it is the frames where something else moved the camera that
     // need it most. Only the relative path can skip a still head.
-    if (dYaw == 0 && dPitch == 0 && !g_pitchAbsolute) return;
+    if (dYaw == 0 && dPitch == 0 && !g_pitchAbsolute && !g_pendingSnapYaw) return;
 
-    // ---- reject an implausibly large single-frame delta ----
-    //
-    // Measured: "primed at pitch 2103" then "write #1 dPitch +4246" - about 23 degrees applied
-    // in one frame, which pointed the camera at the floor. The head had moved between priming
-    // and the first write, because the player was putting the headset on, and the whole
-    // accumulated movement arrived as a single step.
-    //
-    // No real head turns 23 degrees in one frame at 90 Hz. A delta that large means time
-    // passed, not that the head moved that fast, and applying it is always wrong. Dropped and
-    // counted rather than clamped: clamping would still inject a large bogus turn, just more
-    // slowly.
-    // dPitch only counts against this on the relative path. An absolute pitch cannot inject a
-    // bogus turn no matter how large the step is - it names a destination, not a movement - and
-    // letting it veto the write would block YAW as well, for a step that was harmless.
-    const int32_t kMaxStep = 2000;                  // ~11 degrees, far above any real frame
+    // Reject tracking discontinuities without dropping valid slow-frame turns.
+    // Frame pacing varies: 11 degrees is a plausible turn across a slow frame.
+    // Scale the guard by elapsed pose time, bounded at 45 degrees. Long pauses
+    // still resynchronize; they must not inject accumulated headset movement.
+    const int32_t kMaxStep = HeadStepLimit(headInterval);
     const bool bigPitch = !g_pitchAbsolute && (dPitch > kMaxStep || dPitch < -kMaxStep);
     if (dYaw > kMaxStep || dYaw < -kMaxStep || bigPitch) {
         if (++g_headJumpsRejected <= 5 || (g_headJumpsRejected % 100) == 0)
@@ -13752,6 +13868,11 @@ static void ApplyHeadTracking(XrTime when)
         rot[0] += dPitch;
     }
     rot[1] += dYaw;
+    // Artificial turning changes the world reference, not the headset delta.
+    // Leave it out of g_writtenYawAccum so late yaw correction retains the turn.
+    const int snapYaw=VrTakeSnapTurn();
+    rot[1] += snapYaw;
+    if(snapYaw && g_climbYawRefOk){g_climbYawRef+=snapYaw;g_climbYawStickUsed=true;}
 
     // ⚠️ CLAMP THE PITCH. This is the "look all the way up or down and the image rotates".
     //
@@ -14157,7 +14278,7 @@ static void CheckHeadHotkeys()
     {
         static bool pPgUpAlways = false;
         const bool dPgUpAlways = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
-        if (dPgUpAlways && !pPgUpAlways) {
+        if (dPgUpAlways && !pPgUpAlways && (GetAsyncKeyState(VK_CONTROL) & 0x8000) == 0) {
             RecenterSixDof();
             Log("*** [6dof] PAGE UP -> recentring head and motion hands together");
         }
@@ -14223,7 +14344,7 @@ static void CheckHeadHotkeys()
         // the first press always moves somewhere. 72 and 144 are here because they are headset
         // rates in their own right: at 144 Hz it is 72 that divides evenly and 60 that does not,
         // which is the whole point of the annotation below.
-        static const float kCaps[] = { 60.0f, 72.0f, 90.0f, 120.0f, 144.0f, 250.0f, 62.0f };
+        static const float kCaps[] = { 72.0f, 90.0f, 120.0f, 144.0f, 30.0f, 36.0f, 60.0f };
         static int ci = 0;
         ci = (ci + 1) % (int)(sizeof(kCaps) / sizeof(kCaps[0]));
         g_fpsCap = kCaps[ci];
@@ -14426,6 +14547,11 @@ static void CheckHeadHotkeys()
             " (next ~40 arm updates logged densely)", markerCount, g_frames, LogSecs());
         InterlockedExchange(&g_markerBurst, 40);
         g_camBurst = 300;    // ~4 s of dense [cam] freeze-probe lines around the marked moment
+        g_effectCaptureUntil=g_frames+3;
+        Log("[pass-marker] paired effect images armed for next frame; capture may pause briefly"
+            " at this marker only (maximum 32 draw pairs and 12 sampled textures)");
+        Log("[sun-trace] ordered draw thumbnails armed for next frame (2048 color draws plus 256 reserved UI draws);"
+            " includes unknown shaders and logs truncation/readback failures");
     }
     pMark = dMark;
 
@@ -14435,7 +14561,36 @@ static void CheckHeadHotkeys()
     const bool dRight = (GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0;
     const bool dUp    = (GetAsyncKeyState(VK_UP)    & 0x8000) != 0;
     const bool dDown  = (GetAsyncKeyState(VK_DOWN)  & 0x8000) != 0;
-    if (g_overlay && g_motionHands) {
+    const bool gunTune = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool gunPosition = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    static bool pPgUp=false,pPgDown=false;
+    const bool dPgUp=(GetAsyncKeyState(VK_PRIOR)&0x8000)!=0;
+    const bool dPgDown=(GetAsyncKeyState(VK_NEXT)&0x8000)!=0;
+    if (g_motionHands && gunTune && PistolCalibrationActive()) {
+        const int hand=CombatHoldingHand();
+        int downDelta = 0, rightDelta = 0;
+        if (dDown && !pDown) downDelta += 5;
+        if (dUp && !pUp) downDelta -= 5;
+        if (dRight && !pRight) rightDelta += 5;
+        if (dLeft && !pLeft) rightDelta -= 5;
+        const int forwardDelta=((dPgUp&&!pPgUp)?5:0)-((dPgDown&&!pPgDown)?5:0);
+        if (downDelta || rightDelta || (gunPosition && forwardDelta)) {
+            if(gunPosition) {
+                const int delta[3]={forwardDelta,rightDelta,-downDelta};
+                for(int i=0;i<3;++i) g_gunPositionMm[hand][i]=(std::max)(-200,(std::min)(200,g_gunPositionMm[hand][i]+delta[i]));
+            } else {
+                g_gunWristDownDeg[hand] = (std::max)(-90, (std::min)(90, g_gunWristDownDeg[hand] + downDelta));
+                g_gunWristRightDeg[hand] = (std::max)(-90, (std::min)(90, g_gunWristRightDeg[hand] + rightDelta));
+            }
+            SaveGunCalibration();
+            Log("[combat-tune] %s gun down=%d right=%d deg position F/R/U=%d/%d/%d mm (%s)",
+                hand==0?"LEFT":"RIGHT",g_gunWristDownDeg[hand],g_gunWristRightDeg[hand],
+                g_gunPositionMm[hand][0],g_gunPositionMm[hand][1],g_gunPositionMm[hand][2],
+                g_gunCalibrationSaveFailed ? "SAVE FAILED" : "saved");
+        }
+    }
+    pPgUp=dPgUp; pPgDown=dPgDown;
+    if (g_overlay && g_motionHands && !gunTune) {
         if (dLeft && !pLeft) {
             g_handTuneSelected = (g_handTuneSelected + 7) % 8;
         }
@@ -14588,7 +14743,7 @@ static void CheckHeadHotkeys()
     // PAGE UP is handled at the top of this function, outside the debug gate.
     static bool pPgDn = false;
     const bool dPgDn = (GetAsyncKeyState(VK_NEXT)  & 0x8000) != 0;
-    if (dPgDn && !pPgDn) {
+    if (dPgDn && !pPgDn && !gunTune) {
         g_sixDof = !g_sixDof;
         Log("*** [6dof] PAGE DOWN -> %s", g_sixDof ? "ON" : "OFF (decaying to neutral)");
     }
@@ -15034,9 +15189,9 @@ void PkScanClimbableOnce()
 // ---- the reference, found by class rather than by offset ----
 //
 // The pointer sits at TdMove_Climb+0x0198 and at pawn +0x00E4 / +0x02B4 in the run that found
-// it. None of those is hard-coded here. Offsets like that have moved across builds twice in this
-// file already, and "the first field that points at a TdLadderVolume" is both cheaper to verify
-// and immune to the layout shifting.
+// it. The resolved TdMove_Climb::Ladder property is now authoritative. The old
+// pointer scan is retained only when authored metadata could not be resolved;
+// its result can bound climbing, but cannot authorize an automatic roof exit.
 static uintptr_t PkFindClimbVolumeWhere(uintptr_t* srcOut, uint32_t* offOut)
 {
     if (srcOut) *srcOut = 0;
@@ -15050,6 +15205,11 @@ static uintptr_t PkFindClimbVolumeWhere(uintptr_t* srcOut, uint32_t* offOut)
         if (g_offMoveState >= 0 && SafeRead(g_playerPawn + g_offMoveState, &st, 1) &&
             ReadMoveClassName(g_playerPawn, (int)st, cls, sizeof(cls), &mv))
             objs[0] = mv;                    // the move object first: it is the narrower scope
+    }
+    uintptr_t authoredVolume=0;uint32_t authoredOffset=0;
+    if(PkPipeReadVolume(objs[0],&authoredVolume,&authoredOffset)) {
+        if(authoredVolume) {if(srcOut)*srcOut=objs[0];if(offOut)*offOut=authoredOffset;}
+        return authoredVolume; // a null active Ladder must not fall back to a stale touching volume
     }
     for (int o = 0; o < 2; ++o) {
         if (!objs[o]) continue;
@@ -15168,74 +15328,12 @@ void PkClimbVolumeTick()
             (uint32_t)vol, vl[0], vl[1], vl[2], pl[2], g_offActorCollisionComp);
 }
 
-// ---- PK.16: the top-and-bottom guard, off the pipe's own extent ----
-//
-// The gap this closes has been flagged in the direct-drive write since the pipe first moved:
-// "What does NOT exist yet is a top-and-bottom guard - the pipe's version of the end-of-ledge
-// problem." Measured, the pawn was written 1866 UU through a pipe while the game held Climb
-// throughout, so nothing was ever going to stop it but this.
-//
-// The extent is the designer's, read off the TdLadderVolume the player is actually on, and it
-// reproduced across two different pipes at the same component offset:
-//
-//   pipe 1  extent (64 48 608)  ->  Z 4256 to 5472
-//   pipe 2  extent (64 48 400)  ->  Z 4960 to 5760
-//
-// ---- ⚠️ IT FAILS OPEN, AND THAT IS THE PROPERTY THAT MATTERS ----
-//
-// Same reasoning the ledge's blocker is built on, and worth restating because the failure modes
-// are not symmetric. With no volume and no bounds this clamps NOTHING and the player can climb
-// off the end exactly as they can today - a known bug, visible, recoverable. A guard that failed
-// CLOSED on a signal it could not read would pin the player somewhere in the middle of a pipe
-// with no way out, which is worse than the bug it replaces.
-//
-// The reference genuinely does go away: it read absent one frame before Climb -> Walking as the
-// game tore the climb down. So an absent volume is normal at the edges of a climb, not an error,
-// and it must not latch the last pipe's extent onto the next thing the player touches.
-//
-// ⚠️ The clamp is on the WRITE, not on the pull. g_pkDesired stays whatever the player's arm
-// asked for, so a hand that keeps pulling past the top does not accumulate a debt that fires
-// when they come back down - the same reason the ledge's leash clamps the world position rather
-// than `travel`.
-//
-// ⚠️ And what it does NOT do: at the top of a pipe vanilla dismounts you onto the roof, and this
-// only stops you. That is a smaller behaviour than the game's, deliberately - the dismount needs
-// the game's own climb logic to run, which is the stick-probe question the ledge answers and the
-// pipe has never been asked. Stopping at the top is strictly better than flying past it, and it
-// makes the extent's correctness visible before anything is built on top of it.
-// ---- ⚠️ THE TOP NEEDS A MARGIN AND THE BOTTOM DOES NOT ----
-//
-// Measured in the headset over two pipes: clamping the write to the raw volume stopped the
-// player exactly right at the BOTTOM of both, and too high at the TOP of both. So the volume is
-// not symmetric padding around the climbable - its lower face sits where a hanging pawn belongs,
-// and its upper face is somewhere above where one does.
-//
-// That asymmetry is what a ladder volume is FOR. The game has to notice "the player has reached
-// the top" while they are still inside the volume, so the volume has to extend past the last
-// position they can legitimately hold - and the run bears that out: the game's own dismount to
-// Walking fired with the pawn at Z 5749 against a volume top of 5760.
-//
-// The size of that gap is not derivable from anything readable. TdLadderVolume dumps EMPTY even
-// with the walk raised to ten levels, so the retail cook has stripped its property list and
-// there is no authored TopOffset to read. It is a feel value, and this project already has the
-// idiom for feel values: tune it live in the headset against the F3 overlay, then hard-code the
-// measured number back into the global. g_wristCalibrationDeg and g_forearmRollCalibrationDeg
-// were both settled that way, and their comments carry the same warning this one does -
-// once tuned, THIS CONSTANT IS A MEASUREMENT. Do not "clean it up".
-//
-// Starts at 0, which is exactly the behaviour just tested, so the first press moves away from a
-// known state rather than from a guess.
-// ⚠️ 90 IS A MEASUREMENT, and it is now doing two jobs. Tuned live in the headset on
-// 2026-08-31, ten centimetres a press: first to 110 against the body's stopping point alone,
-// then down to 90 once the HAND ceiling was derived from it and the anchors would not reach high
-// enough. The bottom needs no margin at all; see the asymmetry above. Do not round it off.
-//
-// ⚠️ The two are coupled on purpose - handTop = (volume top - this) + rise + reach - so
-// moving this moves both the body's stop and the hands' ceiling together. That is why 20 UU came
-// off it to fix the anchors, and it means the body now stops 20 UU higher than the value tuned
-// for the body alone. If that reads wrong, the fix is g_pkHandReachUU (';' and '''), which
-// raises the hands WITHOUT moving the body - that axis exists precisely so these two do not have
-// to share one number.
+// Pipe body/hand bounds remain derived from the active volume's collision bounds.
+// The physical top margin was measured in the headset at 90 UU. It remains the
+// hand-reach reference and the body stop on pipes without a roof exit.
+// A roof-capable pipe instead stops the body at GetLadderLocation(GetLastStep()),
+// which is the authored root-motion starting step, below the padded volume top.
+// bCanExitAtTop supplies capability; no timeout or previous pawn is evidence of it.
 float g_pkPipeTopMargin = 90.0f;            // UU below the volume top that the pawn may reach
 float g_pkPipeOrg[3] = { 0, 0, 0 }, g_pkPipeExt[3] = { 0, 0, 0 };   // PK.19
 float g_pkPipeZMin = 0.0f, g_pkPipeZMax = 0.0f;   // PK.20: the hands read these too
@@ -15252,43 +15350,23 @@ float g_pkHandRiseUU = 32.0f;
 // moves away from a known state rather than from a guess.
 float g_pkHandReachUU = 0.0f;
 float g_pkPipeHeadroom = 0.0f, g_pkPipeLegroom = 0.0f;   // overlay: UU to the top and bottom
-static long g_pkPipeHeld = 0;               // frames spent against an end, for the log
-bool g_pkTopOpen = false;                   // PK.32: the game is driving the dismount attempt
-// PK.37: 30 frames of descent to re-synchronise the climb, then long enough to climb back and
-// reach the trigger. Measured: the game climbs about 2 UU a frame, so 60 UU down and 95 UU up is
-// roughly 80 frames of travel; 210 leaves room for the mantle itself, which took 25.
-extern const long kPkHandoverFrames;
-const long kPkHandoverFrames = 300;
-// The volumes that have already answered "no dismount". Small and fixed: a level does not have
-// hundreds of pipes, and forgetting one only costs the awkward attempt again.
-static uintptr_t g_pkPipeRefused[16] = { 0 };
-static int       g_pkPipeRefusedN = 0;
-// PK.41: and the ones that DO. The first climb of a pipe cannot know which kind it is; the
-// second can, and there is no reason to make the player prove it twice.
-static uintptr_t g_pkPipeDismounts[16] = { 0 };
-static int       g_pkPipeDismountsN = 0;
-static bool PkPipeDismountsBefore(uintptr_t v)
-{
-    for (int i = 0; i < g_pkPipeDismountsN; ++i) if (g_pkPipeDismounts[i] == v) return true;
-    return false;
+#include "pipe_exit_state.h"
+static mevr::PipeExitSnapshot g_pipeExitSnapshot;
+static mevr::PipeExitSnapshot PkPipeSnapshot() {
+    mevr::PipeExitSnapshot result;
+    if(g_padLockReady) {EnterCriticalSection(&g_padLock);result=g_pipeExitSnapshot;LeaveCriticalSection(&g_padLock);}
+    return result;
 }
-static void PkPipeRememberDismount(uintptr_t v)
-{
-    if (!v || PkPipeDismountsBefore(v)) return;
-    if (g_pkPipeDismountsN < 16) g_pkPipeDismounts[g_pkPipeDismountsN++] = v;
+bool g_pkTopOpen=false;
+long g_pkTopOpenFrames=0; // diagnostic only; timeout uses elapsed time
+static uint64_t g_pkTopDeadline=0;
+static bool g_pkTopRetryBlocked=false;
+static uintptr_t g_pkPipePawn=0;
+static uintptr_t g_pkTopRequestMove=0;
+static void PkPipeResetExit() {
+    g_pkTopOpen=false;g_pkTopOpenFrames=0;g_pkTopRequestMove=0;
+    g_pkTopDeadline=0;g_pkTopRetryBlocked=false;
 }
-static bool PkPipeRefusedBefore(uintptr_t v)
-{
-    for (int i = 0; i < g_pkPipeRefusedN; ++i) if (g_pkPipeRefused[i] == v) return true;
-    return false;
-}
-static void PkPipeRememberRefusal(uintptr_t v)
-{
-    if (!v || PkPipeRefusedBefore(v)) return;
-    if (g_pkPipeRefusedN < 16) g_pkPipeRefused[g_pkPipeRefusedN++] = v;
-}
-long g_pkTopOpenFrames = 0;                 // PK.34: how long the handover may last
-float g_pkHandoverStick = 0.0f;             // PK.38: what the pad sends this frame
 
 // Cheap per-frame refresh. PkFindClimbVolume scans up to 0x1000 bytes on two objects and cannot
 // run every frame, so the pointer is cached with the field it came from and re-read from there;
@@ -15298,15 +15376,17 @@ static uint32_t  g_pkPipeOff = 0;
 
 void PkPipeExtentTick()
 {
-    if (g_pkMode != PK_CLIMB) {
+    uint8_t liveMove=255;
+    if (g_pkMode != PK_CLIMB || !g_playerPawn || g_offMoveState<0 ||
+        !SafeRead(g_playerPawn+g_offMoveState,&liveMove,1) || liveMove!=21) {
         g_pkPipeOk = false; g_pkPipeVol = 0; g_pkPipeSrc = 0;
-        g_pkTopOpen = false; g_pkPipeHeld = 0;   // PK.32: nothing armed on a pipe outlives it
+        PkPipeResetExit();g_pkPipePawn=0;
         g_pkPipeHeadroom = g_pkPipeLegroom = 0.0f;
         return;
     }
     // Still the same volume in the same slot?
     bool still = false;
-    if (g_pkPipeVol && g_pkPipeSrc) {
+    if (g_pkPipeVol && g_pkPipeSrc && g_pkPipePawn==g_playerPawn) {
         uint32_t v = 0;
         still = SafeU32(g_pkPipeSrc + g_pkPipeOff, &v) && (uintptr_t)v == g_pkPipeVol;
     }
@@ -15315,7 +15395,7 @@ void PkPipeExtentTick()
         // above is what made this urgent, but the principle is general and the ledge learned it
         // the same way: "Nothing armed on a ledge may outlive it."
         if (g_pkPipeVol) { g_pkLastGoodOk = false; g_pkGapGoodOk = false; }
-        g_pkPipeOk = false;
+        g_pkPipeOk = false;PkPipeResetExit();g_pkPipePawn=g_playerPawn;
         g_pkPipeVol = PkFindClimbVolumeWhere(&g_pkPipeSrc, &g_pkPipeOff);
         if (!g_pkPipeVol) { g_pkPipeHeadroom = g_pkPipeLegroom = 0.0f; return; }
         float vl[3], org[3], ext[3];
@@ -15339,161 +15419,20 @@ void PkPipeExtentTick()
             (uint32_t)g_pkPipeVol, g_pkPipeZMin, g_pkPipeZMax,
             (g_pkPipeZMax - g_pkPipeZMin) / 100.0f);
     }
-    // ---- ⚠️ PK.34: THE HANDOVER HAS TO BE ABLE TO END, AND ONLY THIS TICK STILL RUNS ----
-    //
-    // Opening the top stands the direct drive down - which is the point - but g_pkTopOpen is SET
-    // inside the clamp, and the clamp is only reached from the drive that just stood down. So
-    // nothing could ever clear it and the player would be left with no body control at all for
-    // the rest of the climb, on a pipe whose game refused to dismount them.
-    //
-    // Exactly the shape of the flicker one rung ago, inverted: there, entering a state destroyed
-    // the evidence for staying in it; here, entering it destroys the code that could leave. Both
-    // come from putting a latch inside something the latch switches off.
-    //
-    // So the window lives here, in the tick that runs every frame on a pipe regardless of who is
-    // driving. Two seconds is several times the measured mantle - the successful one took about
-    // 25 frames from stall to Walking - so a pipe with a roof is long finished, and one without
-    // hands control back rather than swallowing it.
-    // ---- ⚠️ PK.38: CLIMB UNTIL IT STOPS, THEN LET GO - THE RELEASE IS THE TRIGGER ----
-    //
-    // The descent and the climb both work now: on the left pipe the handover took the pawn from
-    // 5661 down to 5597 and back up to 5658 under the game's own power, with direct drive down
-    // and no grips held - the same state every successful dismount runs in. It then stalled at
-    // 5658 and sat there, 37 UU short of the 5695 a real climb reaches.
-    //
-    // The successful trace shows what we were not doing, in the stick column:
-    //
-    //   Z=5652 s=+0.97      climbing
-    //   Z=5680 s=+0.35      easing off
-    //   Z=5694 s=+0.00      released
-    //   Z=5695 s=+0.00      the mantle fires
-    //
-    // The player lets go near the top, and the dismount happens after they do. Holding the axis
-    // at full deflection forever is a command to keep climbing, and the move keeps obeying it -
-    // pinned against its own ceiling, never idle long enough to consider that it has arrived.
-    // I noticed the release in this data two rungs ago, wrote that it "might be needed", and
-    // then held the stick anyway rather than testing it.
-    //
-    // So the handover has three phases and the middle one ends when the pipe does: descend to
-    // re-synchronise, climb until the pawn stops rising, then release and let the game decide.
-    // Ending the climb on the pawn STALLING rather than on a frame count is what makes this work
-    // on a pipe of any length - the stall is the game saying "that is as far as this goes", which
-    // is exactly the moment a player would ease off.
-    if (g_pkTopOpen) {
-        // ---- ⚠️ PK.40: DESCEND PAST THE TRIGGER, THEN CLIMB THROUGH IT ----
-        //
-        // The whole dismount hangs on one number that took far too long to find. Every
-        // ClimbState=1 first-sample ever logged, across every run and always on the pipe that
-        // has a roof, sits at the same height:
-        //
-        //   Z = 5561, 5563, 5560, 5560, 5563, 5577, 5565, 5567
-        //
-        // It engages at about 5560 - 135 UU BELOW the volume top of 5760, at X -5569, with the
-        // pawn still flat against the pipe. From there the pawn runs to 5695 at ~17 UU a sample
-        // against ~5 for an ordinary climb, drifts off the wall, and mantles. ClimbState=1 IS
-        // the dismount, and it is armed a third of the way down the pipe.
-        //
-        // Every version of this handover has run entirely ABOVE it. The descent bottomed at
-        // 5597 and climbed back from there, so the climb never crossed 5560 going up and the
-        // state was never armed. Which is why the stall, the release, the hands and the stick
-        // all looked identical to a successful dismount and none of it helped: they were all
-        // downstream of a threshold we were not reaching.
-        //
-        // So the descent is measured in DISTANCE, not frames - 150 UU below where the handover
-        // began, which from a stop at (top - 90) lands near (top - 240) and guarantees the climb
-        // crosses the trigger from below. Thirty frames of descent bought 64 UU, less than half
-        // of what was needed, and no amount of tuning at the top could have made up the
-        // difference.
-        //
-        // ⚠️ And ClimbState is now READ rather than inferred. It flips to 1 only on a
-        // pipe that dismounts - it has never once been seen on the roofless pipe - so it answers
-        // both questions this rung has been guessing at: whether the attempt is working, and
-        // whether this pipe was ever going to work. Committed means stand well clear; still zero
-        // when the climb runs out means there is nothing here, say so and give the body back.
-        static float lastZ = 0.0f, startZ = 0.0f;
-        static long  still = 0;
-        static bool  rising = false, committed = false;
-        float pz = 0.0f;
-        if (g_playerPawn && g_offActorLocation >= 0) {
-            float pl[3];
-            if (SafeRead(g_playerPawn + g_offActorLocation, pl, sizeof(pl))) pz = pl[2];
+    const auto exit=PkPipeSnapshot();const uint64_t now=GetTickCount64();
+    const bool authored=exit.matches(g_playerPawn,g_pkPipeVol,now);
+    // Observe native/manual exits too. Once root motion starts, never time out
+    // and reacquire the body in the middle of the roof-climb animation.
+    if(authored && exit.state==1) {g_pkTopOpen=true;g_pkTopDeadline=0;}
+    if(g_pkTopOpen) {
+        ++g_pkTopOpenFrames;
+        if(g_pkTopDeadline && now>=g_pkTopDeadline) {
+            g_pkTopOpen=false;g_pkTopRequestMove=0;g_pkTopRetryBlocked=true;
+            g_pkEntryHold=30;g_pkEntryOffsetValid=false;
+            g_pkEntryOffsetHOk[0]=g_pkEntryOffsetHOk[1]=false;
+            PkBeginHold("pipe exit not accepted; restoring hand control");
+            Log("[pipe-exit] request timed out without commitment; no roof classification cached");
         }
-        // The game's own verdict, straight off the move object.
-        int climbState = -1;
-        if (g_offClimbState >= 0 && g_playerPawn && g_offMoveState >= 0) {
-            uint8_t st = 0xFF;
-            uintptr_t mv = 0;
-            char cls[48];
-            if (SafeRead(g_playerPawn + g_offMoveState, &st, 1) &&
-                ReadMoveClassName(g_playerPawn, (int)st, cls, sizeof(cls), &mv) && mv) {
-                uint32_t w = 0;
-                if (SafeU32(mv + g_offClimbState, &w)) climbState = (int)(w & 0xFF);
-            }
-        }
-
-        if (g_pkTopOpenFrames == kPkHandoverFrames) { startZ = pz; lastZ = pz; still = 0;
-                                                      rising = false; committed = false; }
-
-        if (!committed && climbState == 1) {
-            committed = true;
-            g_pkHandoverStick = 0.0f;       // it has this now; the successful runs let go here too
-            PkPipeRememberDismount(g_pkPipeVol);
-            Log("[climb] PK.40: ClimbState went to 1 at Z %.0f - the dismount is armed and the"
-                " game is running it. Standing clear. (remembering that this pipe has a roof, so"
-                " the next attempt on it starts immediately)", pz);
-        } else if (committed) {
-            g_pkHandoverStick = 0.0f;
-            // ⚠️ The give-up timer must not fire mid-mantle. Once the game has committed, the
-            // handover ends when the CLIMB does - PkPipeExtentTick clears g_pkTopOpen the moment
-            // the move stops being Climb - so the window is held open under it rather than
-            // counting down into the middle of the animation and snatching the body back.
-            if (g_pkTopOpenFrames < 60) g_pkTopOpenFrames = 60;
-        } else if (g_pkHandoverStick < 0.0f) {
-            // Phase 1: down, by distance, until past the trigger or the pipe runs out under us.
-            // ⚠️ "not descending", which includes STATIONARY. Written as (pz <= lastZ) it
-            // read a pawn resting on the bottom of the pipe as still falling, so a short pipe
-            // would spend the whole window pressed against its floor. Same edge-of-window
-            // mistake as the stall detector that fired before the climb began.
-            if (pz >= lastZ - 0.5f) ++still; else still = 0;
-            lastZ = pz;
-            if (startZ - pz >= 150.0f || still > 15) {
-                g_pkHandoverStick = 0.97f;
-                still = 0; rising = false;
-                Log("[climb] PK.40: descended %.0f UU to Z %.0f - now climbing back up through"
-                    " the trigger", startZ - pz, pz);
-            }
-        } else if (g_pkHandoverStick > 0.0f) {
-            // Phase 2: up. The trigger arms on the way through; a stall with ClimbState still 0
-            // is this pipe saying it has no roof.
-            if (!rising && pz > lastZ + 25.0f) rising = true;
-            if (rising) { if (pz <= lastZ + 0.5f) ++still; else still = 0; }
-            if (pz > lastZ) lastZ = pz;
-            if (rising && still > 10) {
-                Log("[climb] PK.40: the climb stalled at Z %.0f with ClimbState still %d - this"
-                    " pipe does not dismount", pz, climbState);
-                g_pkTopOpenFrames = 1;      // fall through to the give-up path below
-            }
-        }
-    }
-    if (g_pkTopOpen && --g_pkTopOpenFrames <= 0) {
-        g_pkTopOpen = false;
-        PkPipeRememberRefusal(g_pkPipeVol);
-        // ---- ⚠️ PK.42: this handback had no entry window at all, and it is one ----
-        //
-        // The other three places the game gives the hands back all re-open the 30-frame window
-        // that measures the hand-to-surface offset off the settled pose. This one never did: the
-        // handover stands the hands down for its whole duration (PkSnapHandToLedge returns on
-        // g_pkTopOpen), the down-then-up drags the pawn through 150 UU of pipe, and then the
-        // body is simply taken back with whatever offset was measured at a height the player has
-        // long since left. So it re-measures, exactly like every other handback - and opens the
-        // grace period, because the down-then-up is an animation the player did not ask for.
-        g_pkEntryHold = 30;
-        g_pkEntryOffsetValid = false;
-        g_pkEntryOffsetHOk[0] = g_pkEntryOffsetHOk[1] = false;
-        PkBeginHold("the pipe's dismount probe found nowhere to go");
-        Log("[climb] PK.37: the game did not dismount within the handover - taking the body back,"
-            " and remembering that this pipe (%08X) has nowhere to go, so it will not be asked"
-            " again this run", (uint32_t)g_pkPipeVol);
     }
 
     if (g_pkPipeOk && g_playerPawn && g_offActorLocation >= 0) {
@@ -15551,137 +15490,21 @@ static bool PkPipeBaseIsStale(const float* base)
 static float PkPipeClampZ(float wantZ)
 {
     if (!g_pkPipeGuard || !g_pkPipeOk) return wantZ;
-    // ---- ⚠️ PK.32: KEEP PULLING AT THE TOP AND THE GAME GETS TO RULE ----
-    //
-    // Vanilla mantles the player onto the roof at the top of some pipes, and the stop put in by
-    // PK.16 is exactly what prevents it. What the game actually wants is known, from every
-    // Climb -> Walking transition across every log:
-    //
-    //   all seven fired on the SAME pipe, the one at Y -1632, with the pawn at Z 5755..5759
-    //   against that volume's top of 5760;
-    //   one of them fired with stickY +0.00 - under hand climbing, with the pawn WRITTEN there
-    //   by direct drive - so the trigger is the pawn reaching the top, not a stick command;
-    //   and on the other pipe players were written to Z 5592 against a top of 5472 across 1651
-    //   frames and nothing ever fired, so the dismount is authored per pipe rather than being a
-    //   property of tops in general.
-    //
-    // So there is nothing to ask the game and nothing to imitate: it already does this by
-    // itself, given a pawn at the volume top. The only thing needed is to stop holding the pawn
-    // 90 UU below it.
-    //
-    // ⚠️ But not by default, because the 90 is not arbitrary - it is where the player tuned
-    // the stop to look right, and a pipe with no roof would just sit too high. The two cases
-    // cannot be told apart from the volume, so they are told apart by INTENT: press against the
-    // stop and keep pulling, and the ceiling opens to the real top. Reaching the top while
-    // climbing is not that; a second of continued pull after arriving there is unambiguous.
-    //
-    // On a pipe with a roof the game takes over and the player is on it. On one without, they
-    // touch the top and come back down under their own hand - no snap, because the body follows
-    // the hand that put it there.
-    // ---- ⚠️ PK.33: OPENING IT REMOVED THE CONDITION THAT OPENED IT ----
-    //
-    // Reported as "a flicker or brief camera stutter every second or so" at the top of the pipe,
-    // and the log is unambiguous - 34 events, in pairs, one frame apart:
-    //
-    //   PK.32: held at the top for 73 frames and still pulling - opening the ceiling to 5472
-    //   PK.32: no longer pulling at the top - the stop is back at 5382
-    //
-    // Once open the clamp stops engaging, so g_pkPipeHeld resets to zero, so the `held > 0` test
-    // that kept it open fails, so it closes - and the ceiling drops 90 UU, which drops the body,
-    // which re-engages the clamp, which counts back to 72. A 73-frame cycle at 72 fps is the
-    // one-second period the player felt, and the stutter is the body being moved 90 UU each way.
-    //
-    // The mistake is using the same signal for ENTERING a state and for STAYING in it. Pressing
-    // against the stop is evidence for opening; it cannot also be evidence for remaining open,
-    // because opening is precisely what stops it being true. Hysteresis needs two conditions:
-    //
-    //   open   when the player is pressed against the closed ceiling and still asking - held > 72
-    //   stay   while they are still asking to be above the closed ceiling at all
-    //
-    // The second survives the first being satisfied, which is the whole point.
-    if (wantZ > g_pkPipeZMax - g_pkPipeTopMargin) {
-        // ---- ⚠️ PK.37: A PIPE THAT HAS NO ROOF ONLY GETS ASKED ONCE ----
-        //
-        // "If I'm on a pipe that stops before the roof, it should never play out." Right, and it
-        // cannot be known in advance from anything readable here - the dismount is authored per
-        // pipe, the volume carries no property saying so (TdLadderVolume dumps empty), and
-        // whether there is a roof above the top is a geometry question that needs Actor::Trace,
-        // which is located but has never been called.
-        //
-        // What CAN be done is to stop asking twice. The handover is a question put to the game;
-        // if a particular volume answers "no dismount" once, that answer does not change for the
-        // rest of the session, so it is remembered and that pipe is never handed over again.
-        // The cost of not having the geometry is one awkward attempt per pipe per run instead of
-        // one every time the player reaches the top.
-        // ---- ⚠️ PK.41: THE WAIT IS ONLY THERE TO ANSWER A QUESTION WE MAY ALREADY HAVE ----
-        //
-        // "They have to climb above the actual pipe and then hold that position for a couple of
-        // seconds. A little counter-intuitive. Is this simply because we don't know if it's a
-        // pipe that dislodges or one that ends at the top?"
-        //
-        // Exactly that. Pressing at the top is ambiguous on FIRST contact - it means "let me
-        // off" on one pipe and "I have arrived" on the other - and a second of deliberate pull
-        // is what separates them without geometry. But the ambiguity is only real once. A pipe
-        // that has dismounted before will dismount again, so on that pipe pressing up at the top
-        // means one thing and there is nothing left to ask.
-        //
-        // So: 30 frames on a pipe we know nothing about, and none at all on one that has already
-        // put the player on a roof. Down from 72, which was chosen when every pipe was a stranger
-        // and no amount of evidence could accumulate.
-        const long holdNeeded = PkPipeDismountsBefore(g_pkPipeVol) ? 0 : 30;
-        if (!g_pkTopOpen && g_pkPipeHeld >= holdNeeded && !PkPipeRefusedBefore(g_pkPipeVol)) {
-            g_pkTopOpen = true;
-            g_pkTopOpenFrames = kPkHandoverFrames;   // PK.37: down, then up, then give in
-        g_pkHandoverStick = -0.97f;              // PK.38: phase 1 from the first frame
-            Log("[climb] PK.41: handing the body to the game from Z %.0f after %ld frames%s",
-                g_pkPipeZMax - g_pkPipeTopMargin, g_pkPipeHeld,
-                holdNeeded == 0 ? " - this pipe has dismounted before, so no wait was needed"
-                                : " of pulling at the top");
-        }
-    } else if (g_pkTopOpen) {
-        g_pkTopOpen = false;
-        Log("[climb] PK.35: no longer pulling at the top - the body is ours again");
+    const auto exit=PkPipeSnapshot();const uint64_t now=GetTickCount64();
+    float top=(std::max)(g_pkPipeZMin,g_pkPipeZMax-g_pkPipeTopMargin);
+    const bool authored=exit.matches(g_playerPawn,g_pkPipeVol,now) && exit.canExit &&
+        std::isfinite(exit.top[2]) && exit.top[2]>=g_pkPipeZMin && exit.top[2]<=g_pkPipeZMax;
+    // The top of the collision volume is not the animation's starting step.
+    // Stop hand climbing at the engine's own last step, before passing its trigger.
+    if(authored)top=exit.top[2];
+    if(wantZ<top-10.f)g_pkTopRetryBlocked=false;
+    if(authored && wantZ>top && !g_pkTopOpen && !g_pkTopRetryBlocked) {
+        g_pkTopOpen=true;g_pkTopOpenFrames=0;g_pkTopRequestMove=exit.move;
+        g_pkTopDeadline=now+3000;
+        Log("[pipe-exit] upward pull reached authored step %d at Z %.1f; requesting roof exit",exit.lastStep,top);
     }
-    // The margin trims the TOP only - the bottom measured correct against the raw volume on both
-    // pipes, and trimming a face that is already right would only introduce a second error.
-    // Guarded against a margin big enough to invert the range on a short pipe.
-    // ---- ⚠️ PK.35: THE CEILING SHOULD NEVER HAVE OPENED ----
-    //
-    // "It tried to play the animation but I still did not go onto the roof. Maybe I'm too high
-    // up when the animation starts?" - and that is exactly it. All three dismounts on record
-    // trigger at the SAME pawn height, and then accelerate away from it:
-    //
-    //   5684 5691 [5695] 5698 5709 5722 5732 5740 5750 5759
-    //        [5695] 5694  5696 5704 5717 5729 5737 5747 5756
-    //   5686 5693 [5695] 5701 5713 5725 5735 5744 5755
-    //
-    // 5695, against a volume top of 5760. The mantle is authored to start 65 UU BELOW the top,
-    // not at it - so opening the ceiling to the top carried the player straight past the trigger
-    // and handed the game a pawn 65 UU above where its animation begins. It played from the
-    // wrong place, which is what looked bad and what failed to finish.
-    //
-    // The ceiling was the wrong half of the idea. The stop at (top - 90) already sits 25 UU
-    // BELOW the trigger, which is the right side of it: the game has room to climb up into 5695
-    // under its own power, which is precisely what every successful dismount did. Nothing needed
-    // to be let through. The handover alone was always the whole mechanism.
-    //
-    // So the clamp is unconditional again and g_pkTopOpen means only "the game is driving".
-    float top = g_pkPipeZMax - g_pkPipeTopMargin;
-    if (top < g_pkPipeZMin) top = g_pkPipeZMin;
-    float z = wantZ;
-    if (z > top) z = top;
-    if (z < g_pkPipeZMin) z = g_pkPipeZMin;
-    if (z != wantZ) {
-        const bool atTop = (wantZ > top);
-        if (++g_pkPipeHeld == 1 || (g_pkPipeHeld % 72) == 0)
-            Log("[climb] PK.17: holding at the %s - asked for Z %.0f, held at %.0f"
-                " (volume %.0f..%.0f, top margin %.0f UU, %ld frames against it)",
-                atTop ? "TOP" : "BOTTOM", wantZ, z, g_pkPipeZMin, g_pkPipeZMax,
-                g_pkPipeTopMargin, g_pkPipeHeld);
-        g_pkBlock = atTop ? "at the top of the pipe" : "at the bottom of the pipe";
-    } else {
-        g_pkPipeHeld = 0;
-    }
+    const float z=(std::max)(g_pkPipeZMin,(std::min)(wantZ,top));
+    if(z!=wantZ)g_pkBlock=wantZ>top?"at the top of the pipe":"at the bottom of the pipe";
     return z;
 }
 
@@ -15974,7 +15797,7 @@ enum P13BlockReason {
 static const char* P13ReasonName(P13BlockReason reason)
 {
     switch (reason) {
-        case P13_READY:         return "eligible: unarmed Walking/Jump/Falling/Crouch/Slide/180Turn/Balance/LedgeWalk + tracked grip";
+        case P13_READY:         return "eligible: unarmed or tracked pistol, allowed movement + tracked grip";
         case P13_LAYOUT:        return "rig/controller layout is not ready";
         case P13_RIG:           return "no validated live position rig";
         case P13_VIEW:          return "ViewTarget is not the player pawn";
@@ -16136,7 +15959,8 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13HandPoseSnapshot& 
     if (!SafeU32(pawn + g_offWeapon, &weapon) ||
         !SafeRead(pawn + g_offWeaponAnimState, &weaponAnim, 1))
         return P13_WEAPON_LAYOUT;
-    if (weapon != 0 || weaponAnim != 0) return P13_ARMED;
+    if ((weapon != 0 || weaponAnim != 0) &&
+        !PistolAllowsHandControl(pawn, weapon, weaponAnim)) return P13_ARMED;
 
     uint8_t movement = 0xFF;
     // State 24 is EMovement's 180Turn (the quick-turn move players make when stopping a run).
@@ -16263,7 +16087,9 @@ static P13BlockReason P13Eligibility(uintptr_t pawn, const P13HandPoseSnapshot& 
     if (outMovement) *outMovement = movement;
 
     const XrSpaceLocationFlags need = XR_SPACE_LOCATION_POSITION_VALID_BIT |
-                                      XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+        XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
+        (weapon ? (XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+                   XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT) : 0);
     const long poseAge = g_frames - presentFrame;
     // If XR submission stops while the game continues ticking, the last valid controller pose
     // must not pin the arm in space indefinitely. One frame is normal for this producer/consumer
@@ -16607,7 +16433,48 @@ struct DetachedRigFrame {
     UE3Matrix44 localToWorld{};
 };
 
+// A pawn address can survive a mesh rebuild or be reused after a checkpoint load.
+// Saved raw array addresses must belong to the SAME live rig before ANY restore.
+struct ArmRestoreIdentity {
+    uintptr_t pawn = 0, mesh = 0, tree = 0;
+    uint32_t lists = 0, indices = 0, leftIK = 0, rightIK = 0;
+    int listCount = 0, indexCount = 0;
+};
+
+static bool ReadUE3Array(uintptr_t object, int offset, int maxCount, UE3Array32* out);
+
+static bool CaptureArmRestoreIdentity(uintptr_t pawn, ArmRestoreIdentity* out)
+{
+    uint32_t mesh = 0, tree = 0, leftIK = 0, rightIK = 0;
+    UE3Array32 lists{}, indices{};
+    if (!out || !pawn || !LooksLikePlayerPawn(pawn) ||
+        !SafeU32(pawn + g_offMesh1p, &mesh) ||
+        !LooksLikeRigObject(mesh, "TdSkeletalMeshComponent") ||
+        !SafeU32(mesh + g_offMeshAnimations, &tree) || !LooksLikeRigObject(tree, "AnimTree") ||
+        !SafeU32(pawn + g_offLeftHandWorldIK, &leftIK) ||
+        !SafeU32(pawn + g_offRightHandWorldIK, &rightIK) ||
+        !ReadUE3Array(tree, g_offAnimTreeSkelControlLists, 128, &lists) ||
+        !ReadUE3Array(mesh, g_offMeshSkelControlIndex, 512, &indices)) return false;
+    *out = {pawn, mesh, tree, lists.data, indices.data, leftIK, rightIK, lists.count, indices.count};
+    return true;
+}
+
+static bool SameArmRestoreIdentity(const ArmRestoreIdentity& a, const ArmRestoreIdentity& b)
+{
+    return a.pawn && a.pawn == b.pawn && a.mesh == b.mesh && a.tree == b.tree &&
+        a.lists == b.lists && a.indices == b.indices &&
+        a.leftIK == b.leftIK && a.rightIK == b.rightIK &&
+        a.listCount == b.listCount && a.indexCount == b.indexCount;
+}
+
+static bool ArmRestoreIdentityIsCurrent(uintptr_t pawn, const ArmRestoreIdentity& saved)
+{
+    ArmRestoreIdentity current{};
+    return CaptureArmRestoreIdentity(pawn, &current) && SameArmRestoreIdentity(saved, current);
+}
+
 struct DetachedOverrideState {
+    ArmRestoreIdentity identity{};
     bool active = false;
     bool leftTopology = false;
     bool leftControl = false;
@@ -17581,6 +17448,7 @@ static void __fastcall Hook_UpdateSkelPose(void* self, void* edx, float deltaTim
     if (!ours) return;
     if (!ReadUE3Array(comp, g_offMeshSpaceBases, 512, &bases) ||
         bases.count <= kFingerSpanLast) return;
+    CombatRedirectWeaponBone(comp, bases.data, bases.count);
 
     // ---- the census: does the pose actually change across this call? ----
     //
@@ -17932,8 +17800,11 @@ static void RestoreDetachedArmOverridesBeforeGame(uintptr_t pawn)
 
     // A destroyed/replaced pawn makes every nested pointer suspect. Discard bookkeeping without
     // touching it; a live matching pawn must pass the exact controller-class checks below.
-    if (saved.pawn != pawn || !LooksLikePlayerPawn(pawn)) {
-        Log("[hands-detach] prior override discarded without writes: pawn replaced");
+    if (saved.pawn != pawn || !ArmRestoreIdentityIsCurrent(pawn, saved.identity) ||
+        (saved.leftControl && !LooksLikeRigObject(saved.left, "SkelControlSingleBone")) ||
+        (saved.rightControl && !LooksLikeRigObject(saved.right, "SkelControlSingleBone")) ||
+        (saved.leftTopology && !LooksLikeRigObject(saved.swing, "SkelControlSingleBone"))) {
+        Log("[hands-detach] prior override discarded without writes: rig replaced");
         g_leftDetach = {};
         g_rightDetach = {};
         return;
@@ -18305,6 +18176,14 @@ static bool DetachedControlReadbackIsExact(uintptr_t control,
            fabsf(blend) < 0.001f && VecLength(error) < 0.01f;
 }
 
+static int HigherEntryHand(const bool valid[2], const float height[2])
+{
+    const bool left = valid[0] && std::isfinite(height[0]);
+    const bool right = valid[1] && std::isfinite(height[1]);
+    if (!left) return right ? 1 : -1;
+    return right && height[1] > height[0] ? 1 : 0;
+}
+
 static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
 {
     if (!g_motionHands || g_detachedWriteFault) return;
@@ -18430,6 +18309,9 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
         rig, 17, g_leftDetach.lastApplied, &leftSocket);
     const bool haveRightSocket = ShoulderWorldPosition(
         rig, 46, g_rightDetach.lastApplied, &rightSocket);
+    bool entrySampled[2] = {};
+    MEVR_Vec3 entryOffset[2] = {};
+    float entryHeight[2] = {};
     auto updateGeometry = [&](int hand, int armBone, const MEVR_Vec3& socket,
                               const MEVR_Vec3& target, bool haveSocket) {
         ArmGeometryDiagnostic diag{};
@@ -18505,18 +18387,13 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
                         PkCaptureGhostHand(rig, hand);
                     }
                     if (mag < 60.0f) {
-                        g_pkEntryOffset = off;      // kept fresh; believed when the window closes
+                        entrySampled[hand] = true;
+                        entryOffset[hand] = off;
+                        entryHeight[hand] = meshHand.z;
                         g_pkEntryOffsetH[hand] = off;
                         if (g_pkEntryHold <= 1 && !g_pkEntryOffsetHOk[hand]) {
                             g_pkEntryOffsetHOk[hand] = true;
                             Log("[pk] %s hand's own offset: (%.1f %.1f %.1f), %.1f UU",
-                                hand ? "RIGHT" : "LEFT", off.x, off.y, off.z, mag);
-                        }
-                        if (g_pkEntryHold <= 1 && !g_pkEntryOffsetValid) {
-                            g_pkEntryOffsetValid = true;
-                            Log("[pk] hand-to-%s offset settled off the %s hand:"
-                                " (%.1f %.1f %.1f), %.1f UU - used for both",
-                                PkSurfaceName(),
                                 hand ? "RIGHT" : "LEFT", off.x, off.y, off.z, mag);
                         }
                     } else if (g_pkEntryHold <= 1) {
@@ -18586,6 +18463,20 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
 
     updateGeometry(0, 17, leftSocket, leftWorld, haveLeftSocket);
     updateGeometry(1, 46, rightSocket, rightWorld, haveRightSocket);
+    // Select only after both authored hands have been sampled on THIS tick.
+    // Previously the right-hand update overwrote the left, even when it was lower.
+    const int entryHand = HigherEntryHand(entrySampled, entryHeight);
+    if (entryHand >= 0) {
+        g_pkEntryOffset = entryOffset[entryHand];
+        if (g_pkEntryHold <= 1 && !g_pkEntryOffsetValid) {
+            g_pkEntryOffsetValid = true;
+            Log("[pk] hand-to-%s offset settled off higher %s hand: (%.1f %.1f %.1f);"
+                " authored Z L=%.1f (%d) R=%.1f (%d), shared by ledge anchors",
+                PkSurfaceName(), entryHand ? "RIGHT" : "LEFT",
+                g_pkEntryOffset.x, g_pkEntryOffset.y, g_pkEntryOffset.z,
+                entryHeight[0], entrySampled[0]?1:0, entryHeight[1], entrySampled[1]?1:0);
+        }
+    }
     const bool holdShoulderEngagement = MotionTurnInputActive();
     const MEVR_Vec3 leftOffset = SolveDetachedOffset(
         g_leftDetach, leftSocket, leftWorld,
@@ -18617,6 +18508,7 @@ static void ApplyDetachedShoulders(uintptr_t pawn, const P13PoseSnapshot& pose)
     if (!useLeft && !useRight) return;
 
     DetachedOverrideState frame{};
+    if (!CaptureArmRestoreIdentity(pawn, &frame.identity)) return;
     frame.active = true;
     frame.pawn = pawn;
     frame.swing = rig.swingControl;
@@ -18719,6 +18611,7 @@ struct WristSideFrame {
     DetachedControlSave saved{};
 };
 struct WristOverrideState {
+    ArmRestoreIdentity identity{};
     bool active = false;
     uintptr_t pawn = 0;
     WristSideFrame left{}, right{};
@@ -18823,7 +18716,16 @@ static bool GripQuaternionToUERotator(const XrQuaternionf& raw, bool leftHand,
     const XrQuaternionf rollOffset{ sinf(hr), 0.0f, 0.0f, cosf(hr) };
     const XrQuaternionf gripToHand =
         MultiplyQuaternion(MultiplyQuaternion(yawOffset, pitchOffset), rollOffset);
-    const XrQuaternionf q = MultiplyQuaternion(tracked, gripToHand);
+    // Apply in controller space BEFORE the hand's mirrored rest-frame correction.
+    // Local +Y rotation tips forward (+X) toward down (-Z), including when the
+    // user rolls their hand. All wrist/forearm paths share this same orientation.
+    const bool gun = (leftHand == (CombatHoldingHand() == 0)) && PistolCalibrationActive();
+    const float gunHalf = gun ? g_gunWristDownDeg[leftHand?0:1] * halfToRad : 0.0f;
+    const float gunYawHalf = gun ? g_gunWristRightDeg[leftHand?0:1] * halfToRad : 0.0f;
+    const XrQuaternionf gunTrim = MultiplyQuaternion(
+        {0.0f, 0.0f, sinf(gunYawHalf), cosf(gunYawHalf)},
+        {0.0f, sinf(gunHalf), 0.0f, cosf(gunHalf)});
+    const XrQuaternionf q = MultiplyQuaternion(MultiplyQuaternion(tracked, gunTrim), gripToHand);
     const float norm2 = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
     if (!std::isfinite(norm2) || norm2 < 0.98f || norm2 > 1.02f) return false;
     const float inv = 1.0f / sqrtf(norm2);
@@ -18921,8 +18823,13 @@ static void RestoreWristRotationOverridesBeforeGame(uintptr_t pawn)
     if (!g_wristOverride.active) return;
     const WristOverrideState saved = g_wristOverride;
     g_wristOverride = {};
-    if (saved.pawn != pawn || !LooksLikePlayerPawn(pawn)) {
-        Log("[hands-wrist] prior override discarded without writes: pawn replaced");
+    const auto validSide = [](const WristSideFrame& side) {
+        return !side.active || (LooksLikeRigObject(side.control, "SkelControlSingleBone") &&
+                               LooksLikeRigObject(side.handTail, "SkelControlBase"));
+    };
+    if (saved.pawn != pawn || !ArmRestoreIdentityIsCurrent(pawn, saved.identity) ||
+        !validSide(saved.left) || !validSide(saved.right)) {
+        Log("[hands-wrist] prior override discarded without writes: rig replaced");
         return;
     }
     bool restored = true;
@@ -18984,6 +18891,7 @@ static void ApplyBorrowedWristRotations(uintptr_t pawn, const P13PoseSnapshot& p
     if ((leftEligible && !leftHeld) == false && (rightEligible && !rightHeld) == false) return;
 
     WristOverrideState frame{};
+    if (!CaptureArmRestoreIdentity(pawn, &frame.identity)) return;
     frame.active = true;
     frame.pawn = pawn;
     bool wrote = true;
@@ -19040,6 +18948,7 @@ struct DedicatedRotationSideFrame {
 };
 
 struct DedicatedRotationOverrideState {
+    ArmRestoreIdentity identity{};
     bool active = false;
     uintptr_t pawn = 0;
     int flagsOffset = -1;
@@ -19178,6 +19087,7 @@ static float g_forearmTwistUnwrap[2] = { 0.0f, 0.0f };
 
 static bool MotionTurnInputActive()
 {
+    if(GetTickCount64()<g_artificialTurnUntil)return true;
     if (!g_padEnabled || !g_padLockReady) return false;
     EnterCriticalSection(&g_padLock);
     const SHORT lookX = g_pad.Gamepad.sThumbRX;
@@ -19524,8 +19434,14 @@ static void RestoreDedicatedHandForearmOverridesBeforeGame(uintptr_t pawn)
     if (!g_dedicatedRotationOverride.active) return;
     const DedicatedRotationOverrideState saved = g_dedicatedRotationOverride;
     g_dedicatedRotationOverride = {};
-    if (saved.pawn != pawn || !LooksLikePlayerPawn(pawn)) {
-        Log("[hands-forearm] prior dedicated override discarded: pawn replaced");
+    const auto validSide = [](const DedicatedRotationSideFrame& side) {
+        return !side.active || (LooksLikeRigObject(side.donor, "SkelControlSingleBone") &&
+            LooksLikeRigObject(side.forearm, "SkelControlSingleBone") &&
+            LooksLikeRigObject(side.handTail, "SkelControlBase"));
+    };
+    if (saved.pawn != pawn || !ArmRestoreIdentityIsCurrent(pawn, saved.identity) ||
+        !validSide(saved.left) || !validSide(saved.right)) {
+        Log("[hands-forearm] prior dedicated override discarded without writes: rig replaced");
         return;
     }
     bool restored = true;
@@ -19716,6 +19632,7 @@ static bool ApplyDedicatedHandForearmRotations(uintptr_t pawn, const P13PoseSnap
     if (!leftEligible && !rightEligible) return true;
 
     DedicatedRotationOverrideState frame{};
+    if (!CaptureArmRestoreIdentity(pawn, &frame.identity)) return false;
     frame.active = true; frame.pawn = pawn; frame.flagsOffset = rig.flagsOffset;
     bool wrote = true;
     if (leftEligible)
@@ -20767,6 +20684,43 @@ static long g_vmInjections = 0;
 // uncertainty between the game thread updating this and the render thread reading it - a bound
 // that comes from the measurement rather than from a number chosen in advance.
 static float g_pivotStep = 0.0f;      // how far the camera moved since the last frame
+static float g_previousCam[3]{},g_previousFwd[3]{};
+static bool g_previousCamValid=false;
+static float g_matrixPivot[3]{};
+static bool g_matrixPivotValid=false;
+static bool g_cinematicLook=false;
+static float g_cinematicYaw=0,g_cinematicPitch=0;
+static bool g_scriptedHeadInEngine=false;
+static uintptr_t g_scriptedCameraPawn=0;
+static int32_t g_scriptedCameraRotation[3]{};
+static long g_scriptedCameraFrame=-100;
+static SRWLOCK g_scriptedCameraLock=SRWLOCK_INIT;
+
+static bool SampleScriptedHeadAngles(bool requested)
+{
+    static float entryYaw=0,entryPitch=0;
+    float hy=0,hp=0;
+    if(requested&&GetHeadYawRaw(g_predTime+g_predPeriod,&hy)&&GetHeadPitchRaw(g_predTime+g_predPeriod,&hp)){
+        if(!g_cinematicLook){entryYaw=hy;entryPitch=hp;Log("[head] scripted render head look enabled at frame %ld",g_frames);}
+        g_cinematicYaw=hy-entryYaw;
+        while(g_cinematicYaw>3.14159265f)g_cinematicYaw-=6.28318531f;
+        while(g_cinematicYaw< -3.14159265f)g_cinematicYaw+=6.28318531f;
+        g_cinematicPitch=(hp-entryPitch)*(float)g_pitchSign;
+        g_cinematicLook=true;
+        return true;
+    }
+    if(!requested&&g_cinematicLook){
+        g_cinematicLook=false;g_cinematicYaw=g_cinematicPitch=0;
+        Log("[head] scripted render head look disabled at frame %ld",g_frames);
+    }
+    return false;
+}
+
+static bool AnimationOwnsYawReference(bool follow,bool controllerValid,uint8_t move)
+{
+    // Vault, pull-up, zipline entry and ride: their authored yaw is intentional.
+    return follow&&controllerValid&&(move==9||move==10||move==27||move==28);
+}
 
 static void SampleLivePivot()
 {
@@ -20774,9 +20728,25 @@ static void SampleLivePivot()
     if (lastFrame == g_frames) return;
     lastFrame = g_frames;
 
-    if (g_offCamLoc < 0 || !g_playerPawn) { g_livePivotValid = false; return; }
-    float cl[3];
-    if (!SafeRead(g_playerPawn + g_offCamLoc, cl, sizeof(cl))) { g_livePivotValid = false; return; }
+    g_previousCamValid=g_camCacheValid;
+    memcpy(g_previousCam,g_camCache,sizeof(g_previousCam));
+    memcpy(g_previousFwd,g_camFwd,sizeof(g_previousFwd));
+    float cl[3],forward[3];
+    if (!GetCameraPose(cl,forward)) { g_livePivotValid = false;g_camCacheValid=false;return; }
+    memcpy(g_camCache,cl,sizeof(cl));memcpy(g_camFwd,forward,sizeof(forward));
+    g_camCacheValid=true;
+
+    const bool cinematic=CinematicHeadLookRequested()&&CurrentViewTargetIsPawn(g_playerPawn);
+    int32_t cachedRotation[3]{};
+    AcquireSRWLockShared(&g_scriptedCameraLock);
+    g_scriptedHeadInEngine=cinematic&&g_scriptedCameraPawn==g_playerPawn&&
+        g_frames>=g_scriptedCameraFrame&&g_frames-g_scriptedCameraFrame<=1&&
+        SafeRead(g_playerPawn+g_offCamRot,cachedRotation,12)&&
+        !memcmp(cachedRotation,g_scriptedCameraRotation,12);
+    ReleaseSRWLockShared(&g_scriptedCameraLock);
+    // The early camera hook samples the same predicted display time. Do not
+    // apply the complete head offset again to its already corrected scene.
+    if(!g_scriptedHeadInEngine)SampleScriptedHeadAngles(cinematic);
 
     if (g_livePivotValid) {
         const float dx = cl[0] - g_livePivot[0];
@@ -20827,6 +20797,23 @@ static bool CameraFromVP(const float* q, bool colIsOutput, float out[3])
     if (!std::isfinite(C[0]) || !std::isfinite(C[1]) || !std::isfinite(C[2])) return false;
     out[0] = C[0]; out[1] = C[1]; out[2] = C[2];
     return true;
+}
+
+static bool SceneCameraMatches(const float* q,bool row,const float* position,const float* forward)
+{
+    float camera[3];
+    if(!CameraFromVP(q,row,camera))return false;
+    float distance2=0,direction=0,length2=0;
+    for(int i=0;i<3;++i){
+        const float f=row?q[i*4+3]:q[12+i];
+        direction+=f*forward[i];length2+=f*f;
+        const float d=camera[i]-position[i];distance2+=d*d;
+    }
+    // Full camera position rejects off-axis light/shadow matrices that satisfy
+    // only dot(camera,forward)+translation==0. The previous sample allows UE's
+    // render queue to trail the game camera without accepting arbitrary lights.
+    return std::isfinite(distance2)&&fabsf(length2-1.0f)<0.03f &&
+        direction/sqrtf(length2)>=0.995f && distance2<=25.0f*25.0f;
 }
 
 // ---- which link freezes: the pawn's camera fields, or the matrix actually rendered? ----
@@ -20991,7 +20978,9 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
             // exactly what it always did; on a zip line it opens up by precisely the amount the
             // camera is actually moving, and by nothing more.
             const float tol = 25.0f + g_pivotStep * 1.5f;
-            const bool isScene = (g_camCacheValid && fabsf(w) <= tol && dirOk >= 0.90f);
+            const bool isScene =
+                (g_camCacheValid&&SceneCameraMatches(q,g_vmRow,g_camCache,g_camFwd)) ||
+                (g_previousCamValid&&SceneCameraMatches(q,g_vmRow,g_previousCam,g_previousFwd));
             g_c0IsScene = isScene;   // tracked even when validation is off, for ShouldDuplicate
             // Freeze-hunt classification tallies, printed as deltas by the [cam] probe and
             // the [eye] gate breakdown: WHICH test fails, per window, measured.
@@ -21081,6 +21070,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
             // engine's own matrix is known to be both current and untouched.
             memcpy(g_sceneMat, q, sizeof(float) * 16);
             g_sceneMatValid = true;
+            g_matrixPivotValid=CameraFromVP(q,g_vmRow,g_matrixPivot);
 
             // ---- the controller's pitch, read HERE and not in Present ----
             //
@@ -21107,6 +21097,8 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
             if (g_liveCtlFrame != g_frames && g_offActorRotation >= 0) {
                 g_liveCtlFrame = g_frames;
                 g_liveCtlValid = false;
+                g_liveCameraMove=255;
+                if(g_playerPawn&&g_offMoveState>=0)SafeRead(g_playerPawn+g_offMoveState,&g_liveCameraMove,1);
                 if (LooksLikePlayerController(g_playerCtl)) {
                     int32_t cr[2] = { 0, 0 };            // FRotator {Pitch, Yaw}
                     if (SafeRead(g_playerCtl + g_offActorRotation, cr, sizeof(cr))) {
@@ -21255,9 +21247,16 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                         // that says what the player was actually shown, and the complaint is
                         // about what the player was shown.
                         g_viewYawDeg = atan2f(mfy, mfx) * 57.29578f;
-                        const float psi = wrapf(atan2f(mfy, mfx) + hy);
+                        uint8_t yawMove=255;
+                        if(g_playerPawn&&g_offMoveState>=0)SafeRead(g_playerPawn+g_offMoveState,&yawMove,1);
+                        const bool animationYaw=AnimationOwnsYawReference(g_animYawFollow,g_liveCtlValid,yawMove);
+                        // During authored movement, matrix yaw includes the animation.
+                        // Feeding that into a slow head-lag mean fights the animation and
+                        // then releases it. Track the controller/head pair during this span.
+                        const float psi = wrapf((animationYaw?g_liveCtlYaw:atan2f(mfy,mfx)) + hy);
                         static bool  have = false;
                         static float mean = 0.0f;
+                        static bool previousAnimationYaw=false;
                         if (!have) { mean = psi; have = true; }
 
                         // ---- a mouse turn is not lag, and must not be corrected as one ----
@@ -21291,7 +21290,14 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                         }
                         mean = wrapf(mean + external);
 
+                        if(animationYaw!=previousAnimationYaw){
+                            mean=psi;previousAnimationYaw=animationYaw;
+                            Log("[head] yaw lag reference: %s at frame %ld move %u",
+                                animationYaw?"controller (authored camera turn)":"render matrix",g_frames,(unsigned)yawMove);
+                        }
+
                         float d = wrapf(psi - mean);
+                        if(g_cinematicLook){mean=psi;d=0;}
                         // Only a slow leak now, for accumulated numerical drift. The deliberate
                         // turns it used to have to absorb are handled above, exactly, so this no
                         // longer has to be a compromise between two jobs.
@@ -21426,13 +21432,18 @@ static HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT st
                 // race, a persistent one means FOVAngle is not the field the view is built from.
                 if (g_targetHalfFovY > 0.0f) {
                     static long narrow = 0, total = 0;
+                    static long lastReportFrame = 0;
                     if (g_gameHalfFovY < g_targetHalfFovY * 0.98f) narrow++;
-                    if (++total >= 2000) {
+                    ++total;
+                    // Uploads are per draw, not per frame. Reporting each 2000
+                    // uploads produced several synchronous file writes a second.
+                    if (g_frames - lastReportFrame >= 600) {
                         Log("[fov] scene matrices culling NARROWER than we render: %ld of %ld"
                             " (%.0f%%) - last narrow one was %.1f vertical against our %.1f",
                             narrow, total, 100.0f * (float)narrow / (float)total,
                             degY, g_targetHalfFovY * 114.5916f);
                         narrow = 0; total = 0;
+                        lastReportFrame = g_frames;
                     }
                 }
             }
@@ -21610,7 +21621,7 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_SetRenderTarget)(IDirect3DDevice9*, DWOR
 static PFN_SetRenderTarget g_origSetRenderTarget = nullptr;
 bool  g_rtIsScene = true;
 
-RtSeen        g_rtSeen[16]{};
+std::deque<RtSeen> g_rtSeen;
 int           g_rtSeenCount = 0;
 static RtSeen* g_rtCurrent = nullptr;
 int            g_dupOnlyTarget = -1;   // -1 = every scene-sized target; else an index
@@ -21618,8 +21629,10 @@ int            g_dupOnlyTarget = -1;   // -1 = every scene-sized target; else an
 static HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWORD idx,
                                                       IDirect3DSurface9* surf)
 {
+    const HRESULT hr = g_origSetRenderTarget(dev, idx, surf);
+    if (FAILED(hr)) return hr;   // a refused bind leaves the previous target active
     if (idx == 0) {
-        g_rtIsScene = true;          // a null target restores the backbuffer
+        g_rtIsScene = false;
         g_rtCurrent = nullptr;
         if (surf) {
             D3DSURFACE_DESC d{};
@@ -21630,27 +21643,54 @@ static HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWO
                 const UINT sw = g_sceneW ? g_sceneW : g_capW;
                 const UINT sh = g_sceneH ? g_sceneH : g_capH;
                 g_rtIsScene = (d.Width == sw && d.Height == sh);
-                // Census keyed on the SURFACE, not on its descriptor: several distinct targets
-                // can share a size and format, and merging them is what hid the problem in the
-                // reference for eighteen runs.
+                // A COM address is not a lifetime identity. The engine frees its startup
+                // 1280x720 buffers and D3D can reuse their addresses for full-size targets.
+                // Validate the cached descriptor on EVERY bind, before either the draw gate
+                // or the mono guard sees it. Otherwise both suppress a healthy scene using
+                // the old dimensions, even though GetDesc above already reports full size.
                 for (int i = 0; i < g_rtSeenCount; ++i)
                     if (g_rtSeen[i].surf == surf) { g_rtCurrent = &g_rtSeen[i]; break; }
-                if (!g_rtCurrent && g_rtSeenCount < 16) {
-                    g_rtSeen[g_rtSeenCount] = { surf, d.Width, d.Height, d.Format, 0 };
+                if (g_rtCurrent && (g_rtCurrent->w != d.Width ||
+                    g_rtCurrent->h != d.Height || g_rtCurrent->fmt != d.Format)) {
+                    Log("*** [rt] surface address reused at frame %ld: %p cached %ux%u fmt %d"
+                        " -> live %ux%u fmt %d; discarding stale draw counts",
+                        g_frames, (void*)surf, g_rtCurrent->w, g_rtCurrent->h,
+                        (int)g_rtCurrent->fmt, d.Width, d.Height, (int)d.Format);
+                    *g_rtCurrent = { surf, d.Width, d.Height, d.Format, 0, 0 };
+                }
+                if (!g_rtCurrent) {
+                    // Stable entries, with no 16-target limit: startup alone fills that many
+                    // slots, which used to leave later scene targets out of the census.
+                    g_rtSeen.push_back({ surf, d.Width, d.Height, d.Format, 0, 0 });
                     g_rtCurrent = &g_rtSeen[g_rtSeenCount++];
-                    // The order the engine FIRST binds its targets is the startup fingerprint
-                    // of the half-res fault: a healthy run binds a full-res fmt-21 working
-                    // target right before the full-res HDR scene buffer, a degraded run never
-                    // binds one at all and that phase lands on the 1280x720 fp16 buffer
-                    // instead. Logged unconditionally so a monitor-only run with no headset
-                    // still records which path the engine chose.
+                    // First binds and descriptor changes together describe the target history.
                     Log("[rt-first] #%d at frame %ld: %ux%u fmt %d  surf=%p",
                         g_rtSeenCount, g_frames, d.Width, d.Height, (int)d.Format, (void*)surf);
                 }
             }
         }
     }
-    return g_origSetRenderTarget(dev, idx, surf);
+    return hr;
+}
+
+static void ResetRenderTargetTracking()
+{
+    g_rtCurrent = nullptr;
+    g_rtSeen.clear();
+    g_rtSeenCount = 0;
+    g_rtIsScene = false;
+    g_dupOnlyTarget = -1;
+    g_sceneW = g_sceneH = 0;
+    g_sceneSplitMono = g_scenePartialMono = false;
+    g_frameSceneOnBackbuffer = g_frameSceneOffscreen = 0;
+}
+
+static bool IsReducedSceneColorTarget(const RtSeen& rt, UINT refW, UINT refH)
+{
+    // The startup buffer is fixed at 1280x720 even with Resolution=auto (4224x2376).
+    // Keep the original half-size case too, and exclude shadow formats and full-size targets.
+    return (rt.fmt == 113 || rt.fmt == 21) && rt.w < refW && rt.h < refH &&
+        ((rt.w == 1280 && rt.h == 720) || (rt.w * 2 == refW && rt.h * 2 == refH));
 }
 
 // ---- ⚠️ A FALLBACK, NOT A REPLACEMENT ----
@@ -21685,7 +21725,7 @@ static void AdoptSceneTarget()
             if (sd > bestBackbufferScene) bestBackbufferScene = sd;
         }
         else if (sd > bestScene) { bestScene = sd; best = i; }
-        // Exactly half the capture size, in EITHER of the game's scene colour formats: fp16
+        // The fixed startup size or half the capture size, in EITHER scene colour format: fp16
         // (fmt 113, the 2026-08-28 afternoon runs) or LDR (fmt 21, run 14 on 08-23 and the
         // 22:16 training-area run - which streaked for its whole minute while a guard keyed
         // to 113 alone read "healthy"). Not any-format, deliberately: shadow passes can
@@ -21693,8 +21733,7 @@ static void AdoptSceneTarget()
         // record, and the half-size 21/113 pair are the game's own scene buffers. Scene-
         // classified draws only - the menu legitimately pushes 180k RAW draws through the
         // half-size fmt 21 buffer with zero scene draws, so raw counts here would false-fire.
-        if (g_rtSeen[i].w * 2 == g_capW && g_rtSeen[i].h * 2 == g_capH &&
-            (g_rtSeen[i].fmt == 113 || g_rtSeen[i].fmt == 21))
+        if (IsReducedSceneColorTarget(g_rtSeen[i], g_capW, g_capH))
             halfSizeScene += sd;
     }
     for (int i = 0; i < g_rtSeenCount; ++i) g_rtSeen[i].sceneDraws = 0;
@@ -21851,8 +21890,7 @@ static void ReportRenderTargets()
             (void*)g_rtSeen[i].surf, g_rtSeen[i].w, g_rtSeen[i].h, (int)g_rtSeen[i].fmt,
             g_rtSeen[i].draws, g_rtSeen[i].sceneDraws,   // sceneDraws is a live window, not a total
             (g_rtSeen[i].w == sw && g_rtSeen[i].h == sh) ? "<- scene-sized, DUPLICATED" : "");
-        // Keyed to half the reference size, not a hardcoded 1280x720, so a different game
-        // resolution keeps the verdict honest. The capture size when XR is up; the first
+        // Include the fixed startup size as well as half the reference size. The first
         // target ever bound - the backbuffer - on a monitor-only run, where g_capW stays 0
         // and keying on it made every verdict a false "healthy".
         //
@@ -21864,7 +21902,7 @@ static void ReportRenderTargets()
         // visible streaking.
         const UINT refW = g_capW ? g_capW : (g_rtSeenCount ? g_rtSeen[0].w : 0);
         const UINT refH = g_capH ? g_capH : (g_rtSeenCount ? g_rtSeen[0].h : 0);
-        if (refW && g_rtSeen[i].w * 2 == refW && g_rtSeen[i].h * 2 == refH) {
+        if (IsReducedSceneColorTarget(g_rtSeen[i], refW, refH)) {
             if (g_rtSeen[i].fmt == 113) halfResDraws += g_rtSeen[i].draws;
             if (g_rtSeen[i].fmt == 113 || g_rtSeen[i].fmt == 21)
                 halfSceneDraws += g_rtSeen[i].sceneDraws;
@@ -22689,7 +22727,7 @@ static void ReportPacing()
 // Defined here, above all four users, rather than beside the one that needed it last.
 static const float* RotationPivot()
 {
-    return g_livePivotValid ? g_livePivot : g_camCache;
+    return g_matrixPivotValid ? g_matrixPivot : (g_livePivotValid ? g_livePivot : g_camCache);
 }
 
 // ---- correct the pitch in the matrix instead of waiting for the engine ----
@@ -22710,6 +22748,7 @@ static const float* RotationPivot()
 // only what is SEEN, which is the part that was a frame late.
 static void ApplyPitchFix(float* m, bool rowStorage)
 {
+    if(g_cinematicLook)return;
     if (!g_pitchFix || !g_pitchTargetValid || !g_camCacheValid || !g_pitchAbsolute) return;
 
     auto col = [&](int c, int i) { return rowStorage ? m[i * 4 + c] : m[c * 4 + i]; };
@@ -22722,33 +22761,15 @@ static void ApplyPitchFix(float* m, bool rowStorage)
     if (sinP >  1.0f) sinP =  1.0f;
     if (sinP < -1.0f) sinP = -1.0f;
 
-    // The animation's share, from two values that both belong to THIS frame: the pitch the
-    // matrix carries, and the controller's pitch read beside it. Their difference is by
-    // definition everything the engine added on top of what was written - the camera animation
-    // and the swan neck - with no sample from a previous frame anywhere in it.
-    //
-    // Followed, that share is part of where the view belongs, and the correction reduces to
-    // (head - controller): the mouse is cancelled and the animation is left alone. Cancelled,
-    // the target is the head alone and the correction is (head - matrix), which takes out the
-    // animation as well. Two exact expressions from one line, and neither can go stale.
-    const float matPitch = asinf(sinP);
-    float anim = (g_animFollow && g_liveCtlValid) ? (matPitch - g_liveCtlPitch) : 0.0f;
+    // During walking/crouching, matrix-controller disagreement includes render
+    // latency, so correct directly to the head. Preserve the authored camera
+    // contribution in parkour/melee and unknown movement states.
+    const float matPitch=asinf(sinP);
+    const bool ordinary=g_liveCameraMove==1||g_liveCameraMove==15;
+    float anim = (g_animFollow && g_liveCtlValid && !ordinary) ? (matPitch - g_liveCtlPitch) : 0.0f;
 
-    // ⚠️ This guard was CAUSING the failure it was written to prevent, and the fallback was the
-    // reason. Zeroing the term does not mean "do less"; with animations followed the correction
-    // is (target + anim - matrix), so setting anim to zero leaves (target - matrix) - which
-    // during a steep animation is the whole animation, forty or fifty degrees of it, applied as
-    // a rotation. The guard fired and then yanked the view further than anything it was
-    // protecting against.
-    //
-    // Bailing out is the correct degradation. It leaves the engine's own view alone, which is
-    // never catastrophic. Correcting on a value already judged untrustworthy always can be.
-    //
-    // The bound moves 45 -> 90 as well, for the same reason the pitch clamp moved 20 -> 60: it
-    // was set from an idea of what was reasonable rather than from measurement, and real
-    // contributions exceed it. This run recorded -46 degrees with the matrix and the camera
-    // rotation in agreement - the direction test now confirms they describe the same view, so a
-    // contribution that large is REAL, and the zip line is exactly where it showed.
+    // An untrustworthy animation estimate must skip correction, not become
+    // zero: zero would cancel the entire authored animation.
     const float kAnimMax = 90.0f * (3.14159265f / 180.0f);
     if (anim > kAnimMax || anim < -kAnimMax) {
         static long lastFrame = -1;
@@ -22764,27 +22785,12 @@ static void ApplyPitchFix(float* m, bool rowStorage)
     }
 
     float err = (g_pitchTarget + anim) - matPitch;
+    if(g_camBurst>0){static long traced=-1;if(traced!=g_frames&&g_frames%5==0){traced=g_frames;
+        Log("[head-marker] frame=%ld move=%u pitch head=%.3f matrix=%.3f controller=%.3f animation=%.3f correction=%.3f yawLag=%.3f",
+            g_frames,(unsigned)g_liveCameraMove,g_pitchTarget*57.29578f,matPitch*57.29578f,
+            g_liveCtlPitch*57.29578f,anim*57.29578f,err*57.29578f,g_yawLagRad*57.29578f);}}
 
-    // ---- ⚠️ is this correction even looking at the rendered pitch? ----
-    //
-    // Substitute the definition of anim and the matrix cancels out:
-    //
-    //   err = (target + (matPitch - liveCtl)) - matPitch  =  target - liveCtl
-    //
-    // With animations followed - the default - this correction never reads what was RENDERED. It
-    // compares the head against the CONTROLLER, and the controller is written absolutely from the
-    // head every frame, so the two agree by construction and the correction is near zero whatever
-    // the picture is doing. Any lag between the controller and the matrix - the engine's own
-    // render pipeline, which is what yaw needed five degrees of correction for - is invisible to
-    // it.
-    //
-    // That is consistent with pitch juddering while yaw does not: yaw is measured against the
-    // matrix, pitch is measured against a value that cannot disagree with its target.
-    //
-    // Consistent is not proven, so this reports both. `rendered` is how far the view actually is
-    // from where the head points; `applied` is what the correction decided to do about it. If
-    // rendered is degrees and applied is nothing, the reasoning above is right and the fix is to
-    // measure pitch the way yaw is measured.
+    // Compare rendered error and applied correction in the periodic summary.
     {
         static long lastFrame = -1;
         if (lastFrame != g_frames) {
@@ -22897,6 +22903,7 @@ static void ApplyRollFix(float* m, bool rowStorage)
 // turned by it. Same primitive as the animation locks, about world up for the same reason.
 static void ApplyYawLag(float* m, bool rowStorage)
 {
+    if(g_cinematicLook)return;
     if (!g_yawLagFix || fabsf(g_yawLagRad) < 1e-5f) return;
     if (!g_livePivotValid && !g_camCacheValid) return;
     const float up[3] = { 0.0f, 0.0f, 1.0f };
@@ -22920,6 +22927,7 @@ static void ApplyYawLag(float* m, bool rowStorage)
 // there is a case for it.
 static void ApplyYawFix(float* m, bool rowStorage)
 {
+    if(g_cinematicLook)return;
     if (g_animYawFollow || !g_liveCtlValid || !g_camCacheValid) return;
 
     auto col = [&](int c, int i) { return rowStorage ? m[i * 4 + c] : m[c * 4 + i]; };
@@ -22966,6 +22974,18 @@ static void ApplyRoll(float* m, bool rowStorage)
 
 // Build one eye's matrix from the cached scene matrix: offset along its own right axis, then
 // the FOV force. Same maths as the alternate-eye path, applied to a copy instead of in place.
+static void ApplyCinematicLook(float* m,bool row)
+{
+    if(!g_cinematicLook||g_scriptedHeadInEngine)return;
+    const float right[3]={m[0],row?m[4]:m[1],row?m[8]:m[2]};
+    // Both axes belong to the scripted camera BEFORE the headset offset. World
+    // up reverses apparent yaw when the authored view plus head pitch goes past
+    // vertical, and turns yaw into roll while the camera looks down.
+    const float up[3]={row?m[1]:m[4],m[5],row?m[9]:m[6]};
+    ApplyCameraRotation(m,row,right,g_cinematicPitch,RotationPivot());
+    ApplyCameraRotation(m,row,up,g_cinematicYaw,RotationPivot());
+}
+
 static void BuildEyeMatrix(float* out, int eye)
 {
     memcpy(out, g_sceneMat, sizeof(float) * 16);
@@ -22987,6 +23007,7 @@ static void BuildEyeMatrix(float* out, int eye)
     ApplyPitchFix(m, true);
     ApplyYawFix(m, true);    // last: it turns about world up, which the other two do not touch
     ApplyYawLag(m, true);
+    ApplyCinematicLook(m,true);
     ApplySixDof(m, true);   // a world-space offset, same stage as the per-eye one
     if (g_fovForce && g_gameFovValid && g_targetHalfFovX > 0.0f) {
         // ⚠️ Uses g_targetHalfFovX, the SAME number the projection layer submits.
@@ -23003,6 +23024,29 @@ static void BuildEyeMatrix(float* out, int eye)
     ApplyRoll(m, true);      // after the projection, so the tangents are the real frustum
 }
 
+#include "stereo_sampling.inl"
+
+struct WorldGlassReflection {
+    IDirect3DDevice9* dev;
+    IDirect3DVertexShader9* original=nullptr;
+    float constants[16]{};
+    explicit WorldGlassReflection(IDirect3DDevice9* device);
+    ~WorldGlassReflection();
+};
+
+// UE's world/decal scissor is computed for its mono camera. Reusing it after
+// changing viewport, FOV and head pose clips valid geometry out of either eye.
+// World geometry still clips to the eye viewport and its depth/stencil tests.
+// UI scissoring is separate and must keep its intentional content clipping.
+struct WorldDrawScissor {
+    IDirect3DDevice9* dev;DWORD enabled=0;bool changed=false;
+    explicit WorldDrawScissor(IDirect3DDevice9* device):dev(device) {
+        if(SUCCEEDED(dev->GetRenderState(D3DRS_SCISSORTESTENABLE,&enabled))&&enabled)
+            changed=SUCCEEDED(dev->SetRenderState(D3DRS_SCISSORTESTENABLE,FALSE));
+    }
+    ~WorldDrawScissor(){if(changed)dev->SetRenderState(D3DRS_SCISSORTESTENABLE,enabled);}
+};
+
 // Issue one draw twice, once per eye, into its own half of the backbuffer.
 template <typename FN>
 static HRESULT DuplicateDraw(IDirect3DDevice9* dev, FN issue)
@@ -23010,6 +23054,9 @@ static HRESULT DuplicateDraw(IDirect3DDevice9* dev, FN issue)
     D3DVIEWPORT9 vpWas{};
     if (FAILED(dev->GetViewport(&vpWas))) return issue();
 
+    WorldScreenSampling screenSampling(dev);
+    WorldDrawScissor scissor(dev);
+    WorldGlassReflection reflection(dev);
     g_inDupDraw = true;
     float eyeMat[16];
     HRESULT hr = D3D_OK;
@@ -23027,7 +23074,9 @@ static HRESULT DuplicateDraw(IDirect3DDevice9* dev, FN issue)
         dev->SetViewport(&vp);
         BuildEyeMatrix(eyeMat, eye);
         g_origSetVSConstF(dev, (UINT)g_vmReg, eyeMat, 4);
-        hr = issue();
+        screenSampling.Eye(eye);
+        const HRESULT drawResult=issue();
+        if(FAILED(drawResult))hr=drawResult;
     }
 
     dev->SetViewport(&vpWas);
@@ -23315,10 +23364,56 @@ static void ReportUpSample()
     g_upBCount = 0; g_upOrdinal = 0;
 }
 
+#include "stereo_effects.inl"
+static volatile LONG g_worldUpStereoDraws=0;
+static bool WorldUPWritesStencil(IDirect3DDevice9* dev)
+{
+    DWORD enabled=0,mask=0,twoSided=0;
+    if(FAILED(dev->GetRenderState(D3DRS_STENCILENABLE,&enabled))||!enabled||
+        FAILED(dev->GetRenderState(D3DRS_STENCILWRITEMASK,&mask))||!mask)return false;
+    const D3DRENDERSTATETYPE ops[]={D3DRS_STENCILFAIL,D3DRS_STENCILZFAIL,D3DRS_STENCILPASS,
+        D3DRS_CCW_STENCILFAIL,D3DRS_CCW_STENCILZFAIL,D3DRS_CCW_STENCILPASS};
+    if(FAILED(dev->GetRenderState(D3DRS_TWOSIDEDSTENCILMODE,&twoSided)))return false;
+    for(int i=0;i<(twoSided?6:3);++i){DWORD op=D3DSTENCILOP_KEEP;
+        if(FAILED(dev->GetRenderState(ops[i],&op)))return false;
+        if(op!=D3DSTENCILOP_KEEP)return true;}
+    return false;
+}
+static bool ShouldDuplicateWorldUP(IDirect3DDevice9* dev)
+{
+    // Dynamic world geometry (including particle quads) uses the UP entry points
+    // too. Match the existing scene-matrix/target gate, never the broad UI rule.
+    if(!g_c0IsScene || !g_simulStereo || g_inDupDraw) return false;
+    DWORD color=0;
+    if(FAILED(dev->GetRenderState(D3DRS_COLORWRITEENABLE,&color)))return false;
+    // Shadow-volume masks write stencil without writing color. Their geometry
+    // must follow the eye matrices just like the color projection that uses it.
+    // Occlusion queries and read-only stencil tests remain excluded.
+    if(!color&&!WorldUPWritesStencil(dev))return false;
+    // Depth-disabled world sprites (lens glows) also need stereo. Shader POSITION
+    // must actually consume the validated VP; inherited c0 does not qualify UI,
+    // screen-space shadow composites, or postprocessing for eye correction.
+    if(!WorldUPUsesSceneTransform(dev))return false;
+    return ShouldDuplicate();
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type,
                                                  UINT primCount, const void* data, UINT stride)
 {
     NoteUpDraw(dev, primCount);
+    SunDrawCapture sunCapture(dev,0,primCount);
+    EffectPassCapture passCapture(dev, "PrimitiveUP", primCount);
+    CaptureEffectDraw(dev,primCount,stride,data,primCount?(type>=D3DPT_TRIANGLELIST?3:1):0,"PrimitiveUP");
+    if(SuppressLensFlare(dev))return D3D_OK;
+    HRESULT hazeResult=D3D_OK;
+    if(DrawStereoCanvas(dev,[&]{return g_origDrawPrimUP(dev,type,primCount,data,stride);},&hazeResult,primCount))return hazeResult;
+    if(DrawStereoDistantSun(dev,[&]{return g_origDrawPrimUP(dev,type,primCount,data,stride);},&hazeResult))return hazeResult;
+    if(DrawStereoShadowProjection(dev,[&]{return g_origDrawPrimUP(dev,type,primCount,data,stride);},&hazeResult))return hazeResult;
+    if(DrawStereoSunHaze(dev,[&]{return g_origDrawPrimUP(dev,type,primCount,data,stride);},&hazeResult))return hazeResult;
+    if(ShouldDuplicateWorldUP(dev)) {
+        InterlockedIncrement(&g_worldUpStereoDraws);
+        return DuplicateDraw(dev,[&]{return g_origDrawPrimUP(dev,type,primCount,data,stride);});
+    }
     if (ShouldDuplicateUI(dev))
         return DuplicateViewportOnly(dev, [&] {
             return g_origDrawPrimUP(dev, type, primCount, data, stride);
@@ -23332,6 +23427,19 @@ static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedUP(IDirect3DDevice9* dev, D3DPR
                                                     const void* verts, UINT stride)
 {
     NoteUpDraw(dev, primCount);
+    SunDrawCapture sunCapture(dev,1,primCount);
+    EffectPassCapture passCapture(dev, "IndexedUP", primCount);
+    CaptureEffectDraw(dev,primCount,stride,verts,numVerts,"IndexedUP");
+    if(SuppressLensFlare(dev))return D3D_OK;
+    HRESULT hazeResult=D3D_OK;
+    if(DrawStereoCanvas(dev,[&]{return g_origDrawIndexedUP(dev,type,minVertex,numVerts,primCount,idx,idxFmt,verts,stride);},&hazeResult,primCount))return hazeResult;
+    if(DrawStereoDistantSun(dev,[&]{return g_origDrawIndexedUP(dev,type,minVertex,numVerts,primCount,idx,idxFmt,verts,stride);},&hazeResult))return hazeResult;
+    if(DrawStereoShadowProjection(dev,[&]{return g_origDrawIndexedUP(dev,type,minVertex,numVerts,primCount,idx,idxFmt,verts,stride);},&hazeResult))return hazeResult;
+    if(DrawStereoSunHaze(dev,[&]{return g_origDrawIndexedUP(dev,type,minVertex,numVerts,primCount,idx,idxFmt,verts,stride);},&hazeResult))return hazeResult;
+    if(ShouldDuplicateWorldUP(dev)) {
+        InterlockedIncrement(&g_worldUpStereoDraws);
+        return DuplicateDraw(dev,[&]{return g_origDrawIndexedUP(dev,type,minVertex,numVerts,primCount,idx,idxFmt,verts,stride);});
+    }
     if (ShouldDuplicateUI(dev))
         return DuplicateViewportOnly(dev, [&] {
             return g_origDrawIndexedUP(dev, type, minVertex, numVerts, primCount, idx, idxFmt,
@@ -23343,6 +23451,8 @@ static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedUP(IDirect3DDevice9* dev, D3DPR
 
 static void ReportUpDraws()
 {
+    Log("[stereo-fx] world UP draws duplicated with per-eye matrices: %ld over 600 frames",
+        InterlockedExchange(&g_worldUpStereoDraws,0));
     const LONG all   = InterlockedExchange(&g_upDraws, 0);
     const LONG scene = InterlockedExchange(&g_upOnScene, 0);
     if (all == 0) {
@@ -23361,6 +23471,13 @@ static void ReportUpDraws()
 static HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE type,
                                                UINT start, UINT count)
 {
+    SunDrawCapture sunCapture(dev,2,count);
+    EffectPassCapture passCapture(dev, "Primitive", count);
+    CaptureEffectDraw(dev,count,0,nullptr,0,"Primitive");
+    if(SuppressLensFlare(dev))return D3D_OK;
+    HRESULT uiResult=D3D_OK;
+    if(DrawStereoCanvas(dev,[&]{return g_origDrawPrim(dev,type,start,count);},&uiResult,count))return uiResult;
+    if(DrawStereoDistantSun(dev,[&]{return g_origDrawPrim(dev,type,start,count);},&uiResult))return uiResult;
     if (!ShouldDuplicate()) return g_origDrawPrim(dev, type, start, count);
     return DuplicateDraw(dev, [&] { return g_origDrawPrim(dev, type, start, count); });
 }
@@ -23369,6 +23486,13 @@ static HRESULT STDMETHODCALLTYPE Hook_DrawIndexed(IDirect3DDevice9* dev, D3DPRIM
                                                   INT baseVertex, UINT minIndex, UINT numVerts,
                                                   UINT startIndex, UINT primCount)
 {
+    SunDrawCapture sunCapture(dev,3,primCount);
+    EffectPassCapture passCapture(dev, "Indexed", primCount);
+    CaptureEffectDraw(dev,primCount,0,nullptr,numVerts,"Indexed");
+    if(SuppressLensFlare(dev))return D3D_OK;
+    HRESULT uiResult=D3D_OK;
+    if(DrawStereoCanvas(dev,[&]{return g_origDrawIndexed(dev,type,baseVertex,minIndex,numVerts,startIndex,primCount);},&uiResult,primCount))return uiResult;
+    if(DrawStereoDistantSun(dev,[&]{return g_origDrawIndexed(dev,type,baseVertex,minIndex,numVerts,startIndex,primCount);},&uiResult))return uiResult;
     if (!ShouldDuplicate())
         return g_origDrawIndexed(dev, type, baseVertex, minIndex, numVerts, startIndex, primCount);
     return DuplicateDraw(dev, [&] {
@@ -24645,8 +24769,9 @@ static void ResolveMoveProbeProps()
     for (int i = 0; i < kMoveProbeCount; ++i) {
         MoveProbeProp& p = g_moveProbe[i];
         p.off = LookupProp(p.cls, p.prop, false);
-        // PK.40: this one is read at runtime by the dismount handover, not just printed.
-        if (strcmp(p.prop, "ClimbState") == 0 && p.off >= 0) g_offClimbState = p.off;
+        // Publish only a validated TdMove_Climb byte property, including the
+        // owner-table fallback below (the original handover skipped that path).
+        if (!strcmp(p.cls,"TdMove_Climb") && !strcmp(p.prop,"ClimbState") && p.off>=0)g_offClimbState=p.off;
         // PK.46: the bar reads all of these live. Same mechanism, same reason - the probe table
         // is the only thing that resolves them, and a name typed twice is a name that can drift.
         if (strcmp(p.prop, "SwingAngle") == 0 && p.off >= 0) g_offSwingAngle = p.off;
@@ -24675,6 +24800,8 @@ static void ResolveMoveProbeProps()
             p.off = o2;
             p.mask = m2;
             strcpy_s(p.kind, k2);
+            if (!strcmp(p.cls,"TdMove_Climb") && !strcmp(p.prop,"ClimbState") &&
+                !strcmp(p.kind,"ByteProperty"))g_offClimbState=p.off;
             if (strcmp(p.kind, "BoolProperty") == 0 && !p.mask) {
                 Log("[moveprop]   %s::%s  (BoolProperty via OWNER pass, NO MASK - dropped)",
                     p.cls, p.prop);
@@ -25031,6 +25158,29 @@ static bool ReadFlag(uintptr_t obj, const FlagRef& f, uint32_t* out)
     return true;
 }
 
+static bool CinematicHeadLookRequested()
+{
+    if(!g_headTracking||!g_playerCtl)return false;
+    bool ignoreLook=false;
+    for(int i=0;i<g_gateCount;++i) {
+        const bool lookGate=!_stricmp(g_gates[i].name,"bIgnoreLookInput");
+        if(_stricmp(g_gates[i].name,"bCinematicMode") &&
+           _stricmp(g_gates[i].name,"bCinemaDisableInputLook")&&!lookGate)continue;
+        uint32_t value=0;
+        if(ReadFlag(g_playerCtl,g_gates[i].ref,&value)&&value){
+            if(!lookGate)return true;
+            ignoreLook=true;
+        }
+    }
+    // Tutorial/scripted walking sections lock look without cinematic flags.
+    // The script owns Controller.Rotation there; overlay head motion in the
+    // rendered camera instead of letting the yaw-lag loop fight the script.
+    // Parkour's temporary input gates keep their existing animation handling.
+    uint8_t move=255;
+    return ignoreLook&&g_playerPawn&&g_offMoveState>=0&&
+        SafeRead(g_playerPawn+g_offMoveState,&move,1)&&(move==1||move==15);
+}
+
 static void ProbeInputGates()
 {
     if (g_gateCount == 0 && g_offInputSize < 0) return;
@@ -25164,6 +25314,11 @@ static const unsigned char kFont[][kGlyphH] = {
     // - a silently dropped glyph is indistinguishable from a typo in the string. A filled box
     // is impossible to miss and says "add this glyph" rather than nothing at all.
     {0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F},               // 45 unknown
+    {0x04,0x04,0x08,0,0,0,0},                            // 46 apostrophe
+    {0x0E,0x11,0x01,0x02,0x04,0,0x04},                  // 47 question mark
+    {0,0,0,0,0x04,0x04,0x08},                           // 48 comma
+    {0,0x04,0,0,0x04,0x04,0x08},                        // 49 semicolon
+    {0x19,0x1A,0x02,0x04,0x08,0x0B,0x13},               // 50 percent
 };
 
 static int GlyphIndex(char ch)
@@ -25177,6 +25332,9 @@ static int GlyphIndex(char ch)
         case '(': return 39;  case ')': return 40;
         case ':': return 41;  case '.': return 42;
         case '/': return 43;  case '=': return 44;
+        case '\'': return 46; case '?': return 47;
+        case ',': return 48; case ';': return 49;
+        case '%': return 50;
         default:  return 45;                    // deliberately visible, see above
     }
 }
@@ -25298,7 +25456,7 @@ static void OverlayRow(char lines[][64], int* nl, _Printf_format_string_ const c
 
 static void DrawOverlay(IDirect3DDevice9* dev)
 {
-    if (!g_debug || !g_overlay || !dev) return;   // Debug=off takes the text off the screen
+    if (g_menuBlocksGameplay || !g_debug || !g_overlay || !dev) return;   // Debug=off takes the text off the screen
 
     // Sized with headroom and bounds-checked below. The rows are edited per test by design,
     // and this array had silently grown to nine entries in an eight-row buffer - /analyze
@@ -25333,6 +25491,11 @@ static void DrawOverlay(IDirect3DDevice9* dev)
                         g_handTuneSelected == 7);
     OverlayRow(lines, &nl, "FOREARM R R%s L R%s", rr, lr);
     OverlayRow(lines, &nl, "ARROWS L/R SELECT  U/D CHANGE 5 DEG");
+    const int gunHand=CombatHoldingHand();
+    OverlayRow(lines, &nl, "GUN %s DOWN %+d RIGHT %+d  %s",gunHand==0?"L":"R",g_gunWristDownDeg[gunHand],
+        g_gunWristRightDeg[gunHand], g_gunCalibrationSaveFailed ? "SAVE FAILED" : "SAVED DEFAULT");
+    OverlayRow(lines, &nl, "GUN POSITION F/R/U %+d/%+d/%+d MM",g_gunPositionMm[gunHand][0],g_gunPositionMm[gunHand][1],g_gunPositionMm[gunHand][2]);
+    OverlayRow(lines, &nl, "CTRL+ARROWS ROTATE / ADD SHIFT TO MOVE / PGUP-DN DEPTH");
     // Its own row, outside the arm-swing block: the beam assist is an independent feature and
     // works with ArmSwing off. Shown only on a beam, which is the only place it does anything.
     if (g_balanceRoll && g_animState == 29) {
@@ -25988,6 +26151,100 @@ static void PkDrawGhostHands(IDirect3DDevice9* dev)
             (g_stereoMode && g_simulStereo) ? "both eyes" : "single viewport");
 }
 
+static bool CombatReadHighlight(MEVR_Vec3* position);
+static SRWLOCK g_pickupViewLock=SRWLOCK_INIT;
+static RenderedHeadFrame g_pickupView{};
+static long g_pickupViewFrame=-100;
+static uintptr_t g_pickupViewPawn=0;
+static bool PickupEyeCamera(const float* q,bool row,float out[3])
+{
+    // Solve clip x/y/w=0 together: OpenXR's asymmetric projection means
+    // these three plane normals are not necessarily orthogonal.
+    float a[3][4]{};const int outputs[3]={0,1,3};
+    for(int r=0;r<3;++r)for(int c=0;c<4;++c)a[r][c]=row?q[c*4+outputs[r]]:q[outputs[r]*4+c];
+    const float cross[3]={a[1][1]*a[2][2]-a[1][2]*a[2][1],a[1][2]*a[2][0]-a[1][0]*a[2][2],a[1][0]*a[2][1]-a[1][1]*a[2][0]};
+    const float det=a[0][0]*cross[0]+a[0][1]*cross[1]+a[0][2]*cross[2];
+    if(!std::isfinite(det)||fabsf(det)<1e-8f)return false;
+    for(int c=0;c<3;++c){const int j=(c+1)%3,k=(c+2)%3;
+        out[c]=(-a[0][3]*cross[c]-a[1][3]*(a[2][j]*a[0][k]-a[2][k]*a[0][j])
+            -a[2][3]*(a[0][j]*a[1][k]-a[0][k]*a[1][j]))/det;
+        if(!std::isfinite(out[c]))return false;
+    }
+    return true;
+}
+static void PublishPickupView()
+{
+    if(!g_sceneMatValid||!g_simulStereo||g_sceneSplitMono||g_scenePartialMono)return;
+    float eye[2][16],camera[2][3];
+    for(int i=0;i<2;++i){BuildEyeMatrix(eye[i],i);if(!PickupEyeCamera(eye[i],g_vmRow,camera[i]))return;}
+    RenderedHeadFrame head{};
+    head.position={(camera[0][0]+camera[1][0])*0.5f,(camera[0][1]+camera[1][1])*0.5f,(camera[0][2]+camera[1][2])*0.5f};
+    head.forward=g_vmRow?MEVR_Vec3{eye[0][3],eye[0][7],eye[0][11]}:MEVR_Vec3{eye[0][12],eye[0][13],eye[0][14]};
+    const float length=VecLength(head.forward);if(!FiniteVec(head.position)||!std::isfinite(length)||length<1e-6f)return;
+    head.forward={head.forward.x/length,head.forward.y/length,head.forward.z/length};
+    AcquireSRWLockExclusive(&g_pickupViewLock);
+    g_pickupView=head;g_pickupViewFrame=g_frames;g_pickupViewPawn=g_playerPawn;
+    ReleaseSRWLockExclusive(&g_pickupViewLock);
+}
+static bool ReadPickupView(uintptr_t pawn,RenderedHeadFrame* head)
+{
+    AcquireSRWLockShared(&g_pickupViewLock);
+    const bool valid=pawn==g_pickupViewPawn&&g_frames>=g_pickupViewFrame&&g_frames-g_pickupViewFrame<=3;
+    if(valid){head->position=g_pickupView.position;head->forward=g_pickupView.forward;}
+    ReleaseSRWLockShared(&g_pickupViewLock);
+    return valid;
+}
+#include "pickup_debug.inl"
+static void DrawCombatHighlight(IDirect3DDevice9* dev)
+{
+    PublishPickupView();
+    MEVR_Vec3 center{};
+    const bool highlighted=CombatReadHighlight(&center);
+    PickupDebugSnapshot debug{};const bool diagnostic=ReadPickupDebug(&debug);
+    if((!highlighted&&!diagnostic)||!g_sceneMatValid||!g_simulStereo||g_sceneSplitMono||g_scenePartialMono)return;
+    IDirect3DSurface9* rt=nullptr;D3DSURFACE_DESC desc{};
+    if(FAILED(dev->GetRenderTarget(0,&rt))||!rt)return;
+    const HRESULT hr=rt->GetDesc(&desc);rt->Release();
+    if(FAILED(hr)||desc.Width<4||desc.Height<4)return;
+    if(!g_pkGhostSB&&FAILED(dev->CreateStateBlock(D3DSBT_ALL,&g_pkGhostSB)))return;
+    if(FAILED(g_pkGhostSB->Capture()))return;
+    // Present is outside the engine's scene pair; DrawPrimitiveUP needs its own.
+    if(FAILED(dev->BeginScene()))return;
+    static PickupDebugVertex lines[2048];int n=0;
+    if(highlighted)PickupDebugBox(lines,&n,center,{.16f*g_worldScale,.10f*g_worldScale,.08f*g_worldScale},D3DCOLOR_XRGB(20,120,255));
+    if(diagnostic)BuildPickupDebugLines(debug,lines,&n);
+    D3DMATRIX identity{};identity._11=identity._22=identity._33=identity._44=1;
+    dev->SetVertexShader(nullptr);dev->SetPixelShader(nullptr);
+    dev->SetFVF(D3DFVF_XYZ|D3DFVF_DIFFUSE);dev->SetTexture(0,nullptr);
+    dev->SetTransform(D3DTS_WORLD,&identity);dev->SetTransform(D3DTS_VIEW,&identity);
+    dev->SetRenderState(D3DRS_LIGHTING,FALSE);dev->SetRenderState(D3DRS_CULLMODE,D3DCULL_NONE);
+    dev->SetRenderState(D3DRS_ZENABLE,D3DZB_FALSE);dev->SetRenderState(D3DRS_ZWRITEENABLE,FALSE);
+    dev->SetRenderState(D3DRS_STENCILENABLE,FALSE);dev->SetRenderState(D3DRS_SCISSORTESTENABLE,FALSE);
+    dev->SetRenderState(D3DRS_FOGENABLE,FALSE);dev->SetRenderState(D3DRS_ALPHATESTENABLE,FALSE);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE,FALSE);dev->SetRenderState(D3DRS_COLORWRITEENABLE,15);
+    dev->SetRenderState(D3DRS_SRGBWRITEENABLE,FALSE);
+    dev->SetTextureStageState(0,D3DTSS_COLOROP,D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0,D3DTSS_COLORARG1,D3DTA_DIFFUSE);
+    dev->SetTextureStageState(1,D3DTSS_COLOROP,D3DTOP_DISABLE);
+    for(int eye=0;eye<2;++eye){
+        D3DVIEWPORT9 viewport{eye?desc.Width/2:0,0,desc.Width/2,desc.Height,0,1};
+        dev->SetViewport(&viewport);
+        float matrix[16];BuildEyeMatrix(matrix,eye);D3DMATRIX projection{};
+        memcpy(&projection,matrix,sizeof(projection));dev->SetTransform(D3DTS_PROJECTION,&projection);
+        if(n)g_origDrawPrimUP(dev,D3DPT_LINELIST,n/2,lines,sizeof(PickupDebugVertex));
+        if(diagnostic){
+            static D3DRECT rects[2048];int count=0;
+            const int px=(std::max)(1,(int)viewport.Width/600),x=(int)viewport.X+viewport.Width/8,y=desc.Height*3/4;
+            count=TextRects(rects,count,2048,x,y,px,"PICKUP DEBUG - ENABLED IN INI");
+            count=TextRects(rects,count,2048,x,y+10*px,px,debug.status);
+            count=TextRects(rects,count,2048,x,y+20*px,px,debug.detail);
+            if(count)dev->Clear(count,rects,D3DCLEAR_TARGET,D3DCOLOR_XRGB(255,255,255),1,0);
+        }
+    }
+    g_pkGhostSB->Apply();
+    dev->EndScene();
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT* src,
                                               const RECT* dst, HWND wnd, const RGNDATA* dirty)
 {
@@ -26006,6 +26263,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     {
         const HRESULT coop = dev->TestCooperativeLevel();
         if (coop != D3D_OK) {
+            g_sunTrace.Discard();
             if (!g_deviceLost) {
                 g_deviceLost = true;
                 Log("*** [dev] NOT OPERATIONAL (0x%08lX) - suspending all mod work until it"
@@ -26020,6 +26278,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
         }
     }
 
+    g_sunTrace.Finish();
     long f = InterlockedIncrement(&g_frames);
     if (f == 1) {
         Log("*** first Present - the game is rendering. This is the frame hook everything later hangs off.");
@@ -26048,6 +26307,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     // the backbuffer holds the finished frame here and the capture has not taken it yet, so
     // this is the last moment anything can be added to what reaches the headset.
     PkDrawGhostHands(dev);
+    DrawCombatHighlight(dev);
 
     // ---- rung 2: drive the XR frame loop from the game's Present ----
     //
@@ -26298,6 +26558,8 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     // Written every frame rather than once. Nothing observed pulls it back, but the FOV taught
     // that a field can be recomputed from somewhere else without warning, and a once-only write
     // is invisible when that happens - it reports success and then quietly stops being true.
+    VrMenuFrameCapTick();
+    VrMenuReticleTick();
     if (g_engineObj && g_offMaxSmoothFps >= 0 && g_fpsCap > 0.0f) {
         float cur = 0.0f;
         if (SafeRead(g_engineObj + g_offMaxSmoothFps, &cur, sizeof(float)) &&
@@ -26376,12 +26638,14 @@ static HRESULT STDMETHODCALLTYPE Hook_Reset(IDirect3DDevice9* dev, D3DPRESENT_PA
     // A Reset means the device was recreated - resolution or windowed/fullscreen change,
     // or a lost device on alt-tab. Every DEFAULT-pool resource dies here, which is why the
     // eventual VR path has to care about it. For now it is only worth seeing.
+    g_sunTrace.Discard();
     Log("--- Reset requested ---");
     LogPresentParams("reset", pp);
     // Released before the Reset, not after. SYSTEMMEM does not block a Reset the way DEFAULT
     // does, but the backbuffer size is exactly what tends to change here, and a stale capture
     // chain sized to the old one is a format/size mismatch waiting to happen.
     ReleaseFrameCapture();
+    ResetEffectShaders();
     HRESULT hr = g_origReset(dev, pp);
     Log("--- Reset returned hr=0x%08lX ---", (unsigned long)hr);
     if (FAILED(hr)) {
@@ -26394,6 +26658,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Reset(IDirect3DDevice9* dev, D3DPRESENT_PA
         Log("*** [dev] suspended. If the game does not recover, quit with PAUSE.");
     }
     if (SUCCEEDED(hr)) {
+        ResetRenderTargetTracking();
         g_describedBackbuffer = false;   // re-measure, the surface is new
         DescribeBackbuffer(dev);
     }
@@ -27197,6 +27462,9 @@ static void LogHeader()
 // tell you about a key it was not asked for. A typo would silently do nothing, which in a mod
 // configured while wearing a headset is the worst possible failure. Every line is either applied
 // and logged, or rejected and logged.
+#include "combat.inl"
+#include "pipe_exit.inl"
+
 static bool SettingBool(const char* v, bool* out)
 {
     if (_stricmp(v, "1") == 0 || _stricmp(v, "true") == 0 ||
@@ -27219,13 +27487,59 @@ static bool PathSibling(const wchar_t* full, const wchar_t* leaf, wchar_t* out, 
     return true;
 }
 
+static void SaveGunCalibration()
+{
+    g_gunCalibrationSaveFailed = !SaveMenuSettings();
+}
+
+static int LoadGunCalibrationAngle(const wchar_t* key)
+{
+    wchar_t value[32] = L"";
+    GetPrivateProfileStringW(L"Pistol", key, L"0", value, 32, g_gunCalibrationPath);
+    wchar_t* end = nullptr;
+    const long parsed = wcstol(value, &end, 10);
+    if (end != value && *end == 0 && parsed >= -90 && parsed <= 90) return (int)parsed;
+    Log("[combat-tune] invalid saved wrist angle; using zero");
+    return 0;
+}
+
+static int LoadGunHandValue(int hand,const wchar_t* key,int fallback,int limit)
+{
+    wchar_t value[32]{},defaultValue[32]{};
+    swprintf_s(defaultValue,L"%d",fallback);
+    GetPrivateProfileStringW(hand==0?L"PistolLeft":L"PistolRight",key,defaultValue,value,32,g_gunCalibrationPath);
+    wchar_t* end=nullptr; const long parsed=wcstol(value,&end,10);
+    return end!=value && *end==0 && parsed>=-limit && parsed<=limit ? (int)parsed:fallback;
+}
+
+static void LoadGunCalibration()
+{
+    const int legacyDown=LoadGunCalibrationAngle(L"WristDownDegrees");
+    const int legacyRight=LoadGunCalibrationAngle(L"WristRightDegrees");
+    for(int h=0;h<2;++h) {
+        g_gunWristDownDeg[h]=LoadGunHandValue(h,L"WristDownDegrees",legacyDown,90);
+        g_gunWristRightDeg[h]=LoadGunHandValue(h,L"WristRightDegrees",legacyRight,90);
+        g_gunPositionMm[h][0]=LoadGunHandValue(h,L"ForwardMm",0,200);
+        g_gunPositionMm[h][1]=LoadGunHandValue(h,L"RightMm",0,200);
+        g_gunPositionMm[h][2]=LoadGunHandValue(h,L"UpMm",0,200);
+        Log("[combat-tune] loaded %s gun down=%d right=%d deg F/R/U=%d/%d/%d mm",h==0?"LEFT":"RIGHT",
+            g_gunWristDownDeg[h],g_gunWristRightDeg[h],g_gunPositionMm[h][0],g_gunPositionMm[h][1],g_gunPositionMm[h][2]);
+    }
+}
+
 static void LoadSettings()
 {
+    // A small dedicated file lets live calibration persist without rewriting the
+    // user's commented mevr.ini. The log directory is already created at startup.
+    if (PathSibling(g_logPath, L"mevr-gun.ini", g_gunCalibrationPath, MAX_PATH)) {
+        LoadGunCalibration();
+    }
     wchar_t beside[MAX_PATH] = L"", fallback[MAX_PATH] = L"";
     wchar_t self[MAX_PATH] = L"";
     if (g_selfModule && GetModuleFileNameW(g_selfModule, self, MAX_PATH))
         PathSibling(self, L"mevr.ini", beside, MAX_PATH);
     PathSibling(g_logPath, L"mevr.ini", fallback, MAX_PATH);
+    wcscpy_s(g_settingsPath, beside[0] ? beside : fallback);
 
     const wchar_t* path = nullptr;
     HANDLE h = INVALID_HANDLE_VALUE;
@@ -27233,7 +27547,7 @@ static void LoadSettings()
         if (!cand[0]) continue;
         h = CreateFileW(cand, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h != INVALID_HANDLE_VALUE) { path = cand; break; }
+        if (h != INVALID_HANDLE_VALUE) { path = cand; wcscpy_s(g_settingsPath, cand); break; }
     }
     if (h == INVALID_HANDLE_VALUE) {
         // Both paths named, because "it is not reading my settings" is otherwise a guessing
@@ -27305,6 +27619,10 @@ static void LoadSettings()
         while (*val == ' ' || *val == '\t') ++val;
         for (char* e = val + strlen(val); e > val && (e[-1]==' '||e[-1]=='\t'); --e) e[-1] = 0;
 
+        if(char* comment=strpbrk(val,";#")) {
+            *comment=0;
+            for(char* e=val+strlen(val);e>val && (e[-1]==' '||e[-1]=='\t');--e)e[-1]=0;
+        }
         // ---- the table. One row per setting; adding another is one row. ----
         //
         // The three animation locks are expressed as LOCKS, matching how they are spoken about,
@@ -27312,9 +27630,21 @@ static void LoadSettings()
         // would invert the meaning of `0` relative to every conversation about them.
         bool b = false;
         if (_stricmp(key, "FrameCap") == 0) {
-            const float f = (float)atof(val);
-            if (f >= 20.0f && f <= 1000.0f) { g_fpsCap = f; Log("[cfg]   FrameCap = %.0f", f); applied++; }
-            else { Log("[cfg]   FrameCap '%s' out of range 20..1000 - ignored", val); rejected++; }
+            char* end=nullptr; const float f=strtof(val,&end);
+            if (_stricmp(val,"unlimited")==0 || strcmp(val,"0")==0) {
+                g_fpsCap=0; Log("[cfg]   FrameCap = unlimited"); applied++;
+            } else if (end!=val && *end==0 && std::isfinite(f) && f>=20 && f<=1000) {
+                g_fpsCap=f; Log("[cfg]   FrameCap = %.0f", f); applied++;
+            } else { Log("[cfg]   invalid FrameCap '%s' - use 20..1000 or unlimited",val); rejected++; }
+        } else if (_stricmp(key, "LensFlares") == 0) {
+            if(SettingBool(val,&b)){g_lensFlares=b;Log("[cfg]   LensFlares = %s",b?"on":"off");applied++;}
+            else{Log("[cfg]   LensFlares '%s' is not a boolean - ignored",val);rejected++;}
+        } else if (_stricmp(key, "StereoUI") == 0) {
+            if(SettingBool(val,&b)){g_stereoUI=b;Log("[cfg]   StereoUI = %s",b?"on":"off");applied++;}
+            else{Log("[cfg]   StereoUI '%s' is not a boolean - ignored",val);rejected++;}
+        } else if (_stricmp(key, "NativeLensFlareSuppression") == 0) {
+            if(SettingBool(val,&b)){g_nativeLensFlareSuppression=b;Log("[cfg]   NativeLensFlareSuppression = %s",b?"on":"off");applied++;}
+            else{Log("[cfg]   NativeLensFlareSuppression '%s' is not a boolean - ignored",val);rejected++;}
         } else if (_stricmp(key, "TestStall") == 0) {
             const long fr = atol(val);
             if (fr >= 0 && fr <= 1000000) {
@@ -27370,6 +27700,14 @@ static void LoadSettings()
                     b ? "  (Phase 1.3 two-hand position control enabled)" : "");
                 applied++;
             } else { Log("[cfg]   MotionHands '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "PistolHands") == 0) {
+            if (SettingBool(val, &b)) { g_pistolHands = b; Log("[cfg]   PistolHands = %s", b ? "on" : "off"); applied++; }
+            else { Log("[cfg]   PistolHands '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (_stricmp(key, "PickupDebug") == 0) {
+            if(SettingBool(val,&b)){g_pickupDebug=b;applied++;}else rejected++;
+        } else if (_stricmp(key, "MotionPunch") == 0) {
+            if (SettingBool(val, &b)) { g_motionPunch = b; Log("[cfg]   MotionPunch = %s", b ? "on" : "off"); applied++; }
+            else { Log("[cfg]   MotionPunch '%s' is not a boolean - ignored", val); rejected++; }
         } else if (_stricmp(key, "MotionHandsDebug") == 0) {
             if (SettingBool(val, &b)) {
                 g_motionHandsDebug = b;
@@ -27715,8 +28053,10 @@ static void LoadSettings()
         } else if (_stricmp(key, "LockAnimYaw") == 0) {
             if (SettingBool(val, &b)) { g_animYawFollow = !b; Log("[cfg]   LockAnimYaw = %s", b?"on":"off"); applied++; }
             else { Log("[cfg]   LockAnimYaw '%s' is not a boolean - ignored", val); rejected++; }
+        } else if (VrMenuLoadSetting(key,val)) {
+            Log("[cfg]   %s = %s",key,val); applied++;
         } else {
-            Log("[cfg]   unknown key '%s' - ignored", key);
+            Log("[cfg]   unknown or invalid key '%s' - ignored", key);
             rejected++;
         }
     }
@@ -27741,6 +28081,9 @@ static void LoadSettings()
         applied, rejected);
 }
 
+#include "vr_menu.inl"
+#include "vr_controls.inl"
+
 BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
@@ -27761,6 +28104,7 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID)
         // Straight after the header, so what a run was configured with is the first thing in the
         // log rather than something to be inferred from behaviour further down.
         LoadSettings();
+        VrMenuInitializeSettings();
     } else if (reason == DLL_PROCESS_DETACH) {
         Log("");
         Log("=== SUMMARY ===");

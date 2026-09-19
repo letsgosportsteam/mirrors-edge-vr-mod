@@ -9,8 +9,9 @@
 ;
 ; With no file present every setting keeps its compiled default.
 ;
-; Almost everything here can also be set by a hotkey in game, and the hotkey wins - so a run
-; without this file can reach the same states.
+; Hold Y for one second to open VR settings. The game pauses and the controllers navigate
+; the black/green panel. A short Y press still performs the game's weapon action.
+; Changes save to this file; restart-only settings are labeled in the menu.
 ;
 ; D3D9Ex is the exception, and cannot be otherwise: a graphics device's type is fixed when it
 ; is created, so there is no moment later at which a key could change it.
@@ -46,15 +47,72 @@
 ; the frame cap, the capture and occlusion experiments - is off.
 Debug = on
 
+; Hide the previously captured camera-style glow/ring/starburst materials.
+; Smoke, birds, atmospheric sun haze and bloom remain enabled. Restart to apply.
+LensFlares = off
+; Broad removal is separate: leave off while diagnosing the apparent sun reflection.
+; Enabling this disables all active native lens-flare components when LensFlares is off.
+NativeLensFlareSuppression = off
+; Duplicate recognized Canvas menu/HUD draws into both eyes, including clipping.
+StereoUI = on
+; Native pop-ups/tutorial text/menu scale about each eye's center. Height moves up.
+GameUIScale = 0.65
+GameUIHeight = 0
+; Native aiming dot/crosshair, independent of motion hands or controller type.
+ShowReticle = off
+; Auto selects the controller being used; gamepad suspends motion features.
+; Hold Y opens VR settings on either controller. Other gamepad buttons stay native.
+ControllerMode = auto
+; Original speed at 1.0; multiplier range 0.25..2.0.
+TurnMode = smooth
+SmoothTurnSpeed = 1.0
+; One turn per deflection. Return the stick to center to turn again.
+SnapTurnAngle = 45
+
 
 ; ---------------------------------------------------------------- Phase 1 motion hands (experimental)
 ;
 ; The pose-input foundation is under active development. MotionHands currently samples the
-; controller grip poses but does not move Faith's arms yet. Leave it OFF for ordinary play.
+; controller grip poses and drives Faith's hands during supported movement states.
 ; MotionHandsDebug adds bounded pose validity/tracking transitions and a five-second report of
 ; grip/aim positions relative to the headset to mevr.log.
 
 MotionHands = off
+
+; Pistol hand/aim prototype, active only with MotionHands. Colt1911 and Glock18c
+; follow the holding hand; shots start at the muzzle along the model's barrel axis.
+; Reload/throw/holster and parkour return arms to the game. With GripToGrip, the
+; first squeeze enables release-to-drop. Look at an eligible pistol within 2 m,
+; then squeeze either grip to equip it in that hand; its trigger fires. A blue
+; box marks the selectable pistol. Walls, empty guns and pickup cooldown block it.
+; Ground pickup waits 0.25 s; a fresh squeeze also opens a 0.4 s close catch window
+; within 18 cm of that hand. Release while moving to throw with controller velocity
+; and spin. Grip-acquired pistols are already armed for release-to-drop.
+; Set off to restore game-owned weapon poses and disable spatial pickup.
+PistolHands = on
+; Diagnostic headset pickup cone, target boxes, hand catch zones and rejection reason.
+; Blue ready-to-pick-up boxes remain visible with this off. Insert controls stereo.
+PickupDebug = off
+; Gun-only wrist calibration (Debug + MotionHands): CTRL+DOWN tips toward the
+; pinky, CTRL+UP tips back; CTRL+LEFT/RIGHT turn left/right, 5 degrees per press.
+; Hold CTRL+SHIFT with LEFT/RIGHT or UP/DOWN to move the gun in 5 mm steps.
+; CTRL+SHIFT+PAGE UP/DOWN moves it forward/back. Only the currently holding hand
+; is adjusted, and only while a supported pistol is equipped. The overlay names
+; that hand and shows angles, F/R/U position and save status.
+; Legacy calibration is imported from %LOCALAPPDATA%\MirrorsEdgeVR\mevr-gun.ini
+; under [PistolLeft] and [PistolRight]: WristDownDegrees, WristRightDegrees
+; (-90..90), ForwardMm, RightMm, UpMm (-200..200). The previous [Pistol] angles
+; initialize both hands on migration. New edits save to the GunLeft/GunRight keys below.
+
+; With MotionHands + GripToGrip, an outward fist thrust requests the normal attack.
+; Unarmed walking and an existing ground-melee combo only. Retract to punch again.
+; Normal punches match the physical hand; every fourth accepted attack within
+; a combo requests the two-hand shove. A gap over 0.75 s resets the count. The game's
+; contextual soccer kick takes precedence. The game owns the animated arms.
+; Holding either grip blocks arm-swing running and the hands-up jump gesture.
+; Unarmed disarm: extend both hands forward, then squeeze both grips within
+; 0.25 s. Only attempts a disarm if the game's normal target checks accept it.
+MotionPunch = on
 MotionHandsDebug = off
 
 
@@ -87,14 +145,10 @@ StickJumpTurn = off
 GripToGrip = off
 
 
-; ---------------------------------------------------------------- arm swing locomotion (measuring)
+; ---------------------------------------------------------------- arm swing locomotion
 ;
-; Swing your arms to run, raise both hands to jump, crouch to crouch. None of that is built yet.
-;
-; What is here is rung AS.0, which MEASURES and moves nothing: it works out whether a real arm
-; swing can be told apart from a head turn, a body turn, a gesture and a crouch, by logging four
-; candidate ways of scoring the motion. The pad is not touched, so a run with this on plays
-; exactly as it does with it off.
+; Swing your arms to run and raise both hands to jump. Requires MotionHands.
+; The menu bundles the jump gesture with ArmSwing. Physical crouching remains optional.
 ;
 ; ArmSwingDebug is the one that produces the data - a line a second, to mevr.log. Leave both off
 ; unless you are helping with the measurement.
@@ -333,15 +387,16 @@ ParkourDirectBody = on
 
 ; ---------------------------------------------------------------- frame pacing
 
-; The engine's MaxSmoothedFrameRate. NUMPAD7 cycles 60 / 72 / 90 / 120 / 144 / 250 / 62.
+; Menu choices: 30 / 36 / 60 / 72 / 90 / 120 / 144 / unlimited. Default 72.
 ;
 ; What matters is not the number but whether it divides the headset's refresh EXACTLY: a
 ; frame held for 2 display periods every time is smoother than a faster rate held for 2
 ; then 3. At 120 Hz that means 60; at 144 Hz it means 72. Press NUMPAD7 in game and the log
 ; reports the ratio for the headset actually attached.
 ;
-; 62 is the game's own shipped default, kept for comparison. 250 is effectively uncapped.
-FrameCap = 60
+; unlimited (or 0) disables the engine's frame smoothing cap, rather than raising it.
+; OpenXR still paces frames to the headset. Other numeric values 20..1000 remain supported.
+FrameCap = 72
 
 
 ; ---------------------------------------------------------------- animation locks
@@ -500,3 +555,27 @@ PinMinDesiredFps = on
 ; NUMPAD + or - to change). The handedness is measured rather than assumed.
 
 BalanceHeadRoll = on
+
+; ---------------------------------------------------------------- VR settings panel
+; Works even with Debug off. Width and distance in metres. Both eyes see the same panel.
+MenuWidth = 1.1
+MenuDistance = 1.5
+ShowFPS = off
+
+; Controller hand tracking is the master: arm swing, guns, melee and parkour remember
+; their selections but are inactive when MotionHands is off. Grip-to-fist and the
+; right-stick jump/quick-turn mapping follow MotionHands automatically.
+; Parkour's detailed options above remain INI-only; the menu exposes one Motion parkour switch.
+
+; Independent gun calibration, degrees (-90..90) and millimetres (-200..200).
+; These values take precedence over legacy mevr-gun.ini calibration.
+GunLeftWristDownDegrees = 0
+GunLeftWristRightDegrees = 0
+GunLeftForwardMm = 0
+GunLeftRightMm = 0
+GunLeftUpMm = 0
+GunRightWristDownDegrees = 0
+GunRightWristRightDegrees = 0
+GunRightForwardMm = 0
+GunRightRightMm = 0
+GunRightUpMm = 0

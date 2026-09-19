@@ -65,6 +65,16 @@ $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
 
 Push-Location $here
 try {
+    # Embed the same defaults that ship in the package for the menu's Restore Defaults.
+    $defaultIni = [System.IO.File]::ReadAllText((Join-Path $root 'mevr.ini.example'))
+    $defaultIni = [regex]::Replace($defaultIni, '(?m)^Debug = on\s*$', 'Debug = off')
+    $defaultIni = [regex]::Replace($defaultIni, '(?m)^; Rename this file to  mevr\.ini  and leave it beside d3d9\.dll.*$', '; Keep mevr.ini beside d3d9.dll in the game''s Binaries folder.')
+    $defaultHeader = "static const char kVrShippedDefaults[] =`r`n"
+    for ($part = 0; $part -lt $defaultIni.Length; $part += 4096) {
+        $defaultHeader += 'R"MEVRDEFAULT(' + $defaultIni.Substring($part, [Math]::Min(4096, $defaultIni.Length - $part)) + ")MEVRDEFAULT`"`r`n"
+    }
+    $defaultHeader += ';'
+    [System.IO.File]::WriteAllText((Join-Path $here 'vr_defaults.inl'), $defaultHeader, (New-Object System.Text.UTF8Encoding($false)))
     $mhSrc = ""
     if ($needsMinHook) {
         $mhSrc = @(

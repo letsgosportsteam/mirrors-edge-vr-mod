@@ -48,6 +48,10 @@ foreach ($rel in $files) {
     if (-not $text) { continue }
     foreach ($p in $patterns) {
         foreach ($m in [regex]::Matches($text, $p.Rx)) {
+            # These files describe or implement generic Documents-folder redirection.
+            # The product name alone is not personal; absolute paths still fail above.
+            if ($p.Name -eq 'cloud sync folder' -and $m.Value -eq 'OneDrive' -and
+                $rel -in @('ENGINE_NOTES.md', 'src/build.ps1', 'src/d3d9.cpp')) { continue }
             $ok = $false
             foreach ($a in $allow) { if ($m.Value -match $a.Rx) { $ok = $true; break } }
             if (-not $ok) {

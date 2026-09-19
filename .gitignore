@@ -49,6 +49,7 @@ script_dump/
 *.xxx
 
 # ---- tooling local state ----
+.analysis/
 # Claude Code's per-project settings record absolute paths from this machine. Something
 # already excludes this by default, but "already excluded by something" is not a guarantee
 # worth trusting with a file that provably contains a user profile path.
@@ -60,3 +61,5 @@ script_dump/
 *.user
 Thumbs.db
 desktop.ini
+# Generated from mevr.ini.example by build.ps1.
+src/vr_defaults.inl
