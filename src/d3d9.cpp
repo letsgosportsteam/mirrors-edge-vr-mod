@@ -139,7 +139,7 @@ enum {
 // It exists for one reason: mevr.log is the whole diagnostic channel, and a pasted log that
 // cannot say which build produced it turns every bug report into a round trip. Logged in the
 // header, above everything, so it survives truncation from either end.
-#define MEVR_VERSION "0.2.0-alpha"
+#define MEVR_VERSION "0.2.1-alpha"
 
 // ---------------------------------------------------------------- state
 
@@ -1022,9 +1022,9 @@ static bool FiniteVec(const MEVR_Vec3& v);
 // in the headset for the wrists. Selection order is Right P/Y/R, then Left P/Y/R.
 static int g_wristCalibrationDeg[2][3] = { { -30, 0, 0 }, { 150, 0, 0 } };
 // Independent gun trim: positive tips the right wrist toward the pinky.
-static int g_gunWristDownDeg[2]{};
-static int g_gunWristRightDeg[2]{};
-static int g_gunPositionMm[2][3]{}; // controller-local forward, right, up
+static int g_gunWristDownDeg[2]{40,40};
+static int g_gunWristRightDeg[2]{-10,-10};
+static int g_gunPositionMm[2][3]{{0,40,0},{0,0,0}}; // controller-local forward, right, up
 static wchar_t g_gunCalibrationPath[MAX_PATH] = L"";
 static bool g_gunCalibrationSaveFailed = false;
 static bool PistolCalibrationActive();
@@ -2878,7 +2878,7 @@ static MEVR_Vec3 g_pkBarOffset = {};    // ...and the measured article, taken at
 static bool  g_pkBarOffsetOk = false;
 static float g_pkBarOffsetAt = 0.0f;    // the angle it was taken at, for the log
 static float g_pkExitVel = 0.0f;        // TdMove_Swing::ExitVelocityModifier, live
-static float g_pkExitBoost = 1.0f;      // ParkourSwingExitBoost - 1.0 writes nothing
+static float g_pkExitBoost = 1.5f;      // tested launch multiplier; 1.0 writes nothing
 static float g_pkExitOrig = 0.0f;       // ...and what it read before we touched it
 static bool  g_pkExitSaved = false;
 static float g_pkSwingPeak = 0.0f;      // biggest |angle| this swing has reached
@@ -27492,15 +27492,16 @@ static void SaveGunCalibration()
     g_gunCalibrationSaveFailed = !SaveMenuSettings();
 }
 
-static int LoadGunCalibrationAngle(const wchar_t* key)
+static int LoadGunCalibrationAngle(const wchar_t* key,int fallback=0)
 {
-    wchar_t value[32] = L"";
-    GetPrivateProfileStringW(L"Pistol", key, L"0", value, 32, g_gunCalibrationPath);
+    wchar_t value[32] = L"",defaultValue[32]{};
+    swprintf_s(defaultValue,L"%d",fallback);
+    GetPrivateProfileStringW(L"Pistol", key, defaultValue, value, 32, g_gunCalibrationPath);
     wchar_t* end = nullptr;
     const long parsed = wcstol(value, &end, 10);
     if (end != value && *end == 0 && parsed >= -90 && parsed <= 90) return (int)parsed;
-    Log("[combat-tune] invalid saved wrist angle; using zero");
-    return 0;
+    Log("[combat-tune] invalid saved wrist angle; using default %d",fallback);
+    return fallback;
 }
 
 static int LoadGunHandValue(int hand,const wchar_t* key,int fallback,int limit)
@@ -27514,13 +27515,13 @@ static int LoadGunHandValue(int hand,const wchar_t* key,int fallback,int limit)
 
 static void LoadGunCalibration()
 {
-    const int legacyDown=LoadGunCalibrationAngle(L"WristDownDegrees");
-    const int legacyRight=LoadGunCalibrationAngle(L"WristRightDegrees");
+    const int legacyDown=LoadGunCalibrationAngle(L"WristDownDegrees",40);
+    const int legacyRight=LoadGunCalibrationAngle(L"WristRightDegrees",-10);
     for(int h=0;h<2;++h) {
         g_gunWristDownDeg[h]=LoadGunHandValue(h,L"WristDownDegrees",legacyDown,90);
         g_gunWristRightDeg[h]=LoadGunHandValue(h,L"WristRightDegrees",legacyRight,90);
         g_gunPositionMm[h][0]=LoadGunHandValue(h,L"ForwardMm",0,200);
-        g_gunPositionMm[h][1]=LoadGunHandValue(h,L"RightMm",0,200);
+        g_gunPositionMm[h][1]=LoadGunHandValue(h,L"RightMm",h==0?40:0,200);
         g_gunPositionMm[h][2]=LoadGunHandValue(h,L"UpMm",0,200);
         Log("[combat-tune] loaded %s gun down=%d right=%d deg F/R/U=%d/%d/%d mm",h==0?"LEFT":"RIGHT",
             g_gunWristDownDeg[h],g_gunWristRightDeg[h],g_gunPositionMm[h][0],g_gunPositionMm[h][1],g_gunPositionMm[h][2]);
@@ -27806,11 +27807,11 @@ static void LoadSettingsFile()
             } else { Log("[cfg]   ParkourSwipeSpeed '%s' out of range 0.3..5.0 - ignored", val); rejected++; }
         } else if (_stricmp(key, "ParkourBarWrap") == 0) {
             const float w = (float)atof(val);
-            if (w >= 0.0f && w <= 40.0f) {
+            if (w >= 0.0f && w <= 63.0f) {
                 g_pkBarWrap = w;
                 Log("[cfg]   ParkourBarWrap = %.1f UU  (how far below the bar a closed hand sits)", w);
                 applied++;
-            } else { Log("[cfg]   ParkourBarWrap '%s' out of range 0..40 - ignored", val); rejected++; }
+            } else { Log("[cfg]   ParkourBarWrap '%s' out of range 0..63 - ignored", val); rejected++; }
         } else if (_stricmp(key, "ParkourBarShimmy") == 0) {
             if (SettingBool(val, &b)) {
                 g_pkBarShimmyOn = b;

@@ -1,4 +1,4 @@
-MIRROR'S EDGE VR - v0.2.0-alpha
+MIRROR'S EDGE VR - v0.2.1-alpha
 
 Native stereo rendering and 6-DOF head tracking for Mirror's Edge (2008), with
 optional controller-driven hands, pistols, melee, locomotion, and parkour.
@@ -6,7 +6,7 @@ Hardware coverage is limited; motion interactions remain experimental.
 
 INSTALLATION
 
-Download mevr-0.2.0-alpha.zip from the GitHub release's Assets section.
+Download mevr-0.2.1-alpha.zip from the GitHub release's Assets section.
 It contains exactly the three files below; no INI editing is needed. The
 separate .pdb asset is only for debugging. License notices are in mevr.ini.
 
@@ -114,6 +114,8 @@ Choose Off to use the game's chosen resolution instead. Existing saved Off
 or custom resolution settings are preserved when updating.
 
 Try Comfort's animation pitch/roll locks if camera motion is uncomfortable.
+The v0.2.1-alpha defaults match the installed test configuration, with diagnostic
+logging disabled, including tuned pistol alignment and bar-swing settings.
 Release mevr.ini has Debug off. Deleting it can restore the development overlay.
 
 Keyboard shortcuts:

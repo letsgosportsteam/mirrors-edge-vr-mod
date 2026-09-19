@@ -45,3 +45,8 @@ The install ZIP contains exactly `d3d9.dll`, `openxr_loader.dll`, and `mevr.ini`
 `src/build.ps1 -Package` embeds license notices as INI comments and runs
 `tools/check-package.ps1`. Upload the ZIP and PDB as actual GitHub release assets;
 links in release prose alone are not attachments.
+
+Before a release, compare its INI against the active installed test-build INI
+with `tools/check-release-settings.ps1` (after building the menu harness).
+Compare effective compiled fallbacks as well as explicit keys. Gameplay defaults
+must match the tested configuration; diagnostic options may be disabled.

@@ -22,7 +22,10 @@ try {
     }
     $reader = New-Object System.IO.StreamReader($archive.GetEntry('mevr.ini').Open())
     try { $ini = $reader.ReadToEnd() } finally { $reader.Dispose() }
-    foreach ($setting in @('Debug = off', 'MotionHands = on', 'ArmSwing = on', 'Resolution = auto', 'GripToGrip = on', 'StickJumpTurn = on')) {
+    $defaults = [IO.File]::ReadAllLines((Join-Path $root 'mevr.ini.example')) |
+        Where-Object { $_ -match '^\s*[^;#\s][^=]*=' } |
+        ForEach-Object { if ($_ -match '^Debug\s*=') { 'Debug = off' } else { $_ } }
+    foreach ($setting in $defaults) {
         $key = ($setting -split '=')[0].Trim()
         $matches = [regex]::Matches($ini, '(?im)^' + [regex]::Escape($key) + '\s*=.*$')
         if ($matches.Count -ne 1 -or $matches[0].Value.Trim() -cne $setting) { throw "Wrong or duplicate shipped default: $setting" }
@@ -33,5 +36,5 @@ try {
         $commented = (($text -split '\r?\n' | ForEach-Object { "; $_" }) -join "`n")
         if (-not $ini.Replace("`r`n", "`n").Contains($commented)) { throw "Missing full notice: $notice" }
     }
-    Write-Host 'PASS install ZIP: exactly three files, x86 DLLs, release defaults, and complete license notices.'
+    Write-Host "PASS install ZIP: exactly three files, x86 DLLs, all $($defaults.Count) release defaults, and complete license notices."
 } finally { $archive.Dispose() }

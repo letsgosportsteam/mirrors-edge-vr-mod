@@ -286,7 +286,7 @@ ParkourSwipeSpeed = 1.2
 ParkourSwingPump = on
 
 ; How far the hands must travel fore/aft for full stick deflection, in metres. Range 0.08..1.00.
-ParkourSwingPumpFull = 0.30
+ParkourSwingPumpFull = 0.15
 
 ; Which way round the pump reads. -1 is the anchored-hand inversion the ledge servo also runs on:
 ; the hands are the fixed thing, so pushing them forward carries the body back. +1 follows the
@@ -297,8 +297,8 @@ ParkourSwingPumpSign = -1
 ; ParkourBarWrap: fallback for how far below the bar's line a closed hand sits, in Unreal units.
 ; Normally unused - the real figure is measured from the game at the bottom of the swing, where
 ; the pendulum is at rest and the animation is displacing nothing, and comes out around 65. This
-; only applies if that measurement never lands. Range 0..40 is deliberately below what a real bar
-; reads, because a fallback that looks plausible would hide the measurement having failed.
+; only applies if that measurement never lands. Range 0..63 includes the tested fallback
+; while keeping it below the measured bar offset.
 ParkourBarWrap = 63
 
 ; ParkourBarShimmy: move your anchored hand sideways to travel along the bar. Nothing readable
@@ -323,7 +323,7 @@ ParkourBarShimmyFull = 0.25
 ; cleanly. The session's true original is latched on the first swing and never re-read from a
 ; value the mod has written - an earlier version did, and compounded 600 to 6834 over seven
 ; swings.
-ParkourSwingExitBoost = 1.0
+ParkourSwingExitBoost = 1.5
 
 ; ParkourPullUp: hanging from a ledge with BOTH hands anchored, push both controllers down and
 ; the climb axis is asserted for you - the physical action of pushing off an edge, instead of
@@ -569,13 +569,13 @@ ShowFPS = off
 
 ; Independent gun calibration, degrees (-90..90) and millimetres (-200..200).
 ; These values take precedence over legacy mevr-gun.ini calibration.
-GunLeftWristDownDegrees = 0
-GunLeftWristRightDegrees = 0
+GunLeftWristDownDegrees = 40
+GunLeftWristRightDegrees = -10
 GunLeftForwardMm = 0
-GunLeftRightMm = 0
+GunLeftRightMm = 40
 GunLeftUpMm = 0
-GunRightWristDownDegrees = 0
-GunRightWristRightDegrees = 0
+GunRightWristDownDegrees = 40
+GunRightWristRightDegrees = -10
 GunRightForwardMm = 0
 GunRightRightMm = 0
 GunRightUpMm = 0

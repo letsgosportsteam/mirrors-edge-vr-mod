@@ -13,6 +13,7 @@ read the root [AGENTS.md](../AGENTS.md). Engine measurements remain in
 ## Settings, controllers, and UI
 
 Release notes: [v0.2.0-alpha](RELEASE_v0.2.0-alpha.md).
+Default-settings correction: [v0.2.1-alpha](RELEASE_v0.2.1-alpha.md).
 
 | Note | Scope |
 |---|---|

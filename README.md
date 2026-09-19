@@ -5,11 +5,11 @@ tracking, motion controllers, and optional tracked hands, pistols, and parkour.
 
 > **Alpha.** Hardware coverage is limited, and motion interactions are still experimental.
 
-**[Download v0.2.0-alpha](https://github.com/letsgosportsteam/mirrors-edge-vr-mod/releases/tag/v0.2.0-alpha)**
+**[Download v0.2.1-alpha](https://github.com/letsgosportsteam/mirrors-edge-vr-mod/releases/tag/v0.2.1-alpha)**
 
 ## Installation
 
-1. Download `mevr-0.2.0-alpha.zip` from the release's **Assets** section and extract it.
+1. Download `mevr-0.2.1-alpha.zip` from the release's **Assets** section and extract it.
 2. Copy these three files into the game's `Binaries` folder, beside `MirrorsEdge.exe`:
 
    ```text
@@ -167,6 +167,10 @@ or custom resolution settings are preserved when updating.
 
 The game retains its camera animations by default. If landing dips or wall-run
 roll are uncomfortable, try the pitch and roll locks under **Comfort**.
+
+The v0.2.1-alpha defaults match the installed test configuration, with diagnostic
+logging disabled. This includes the tuned pistol alignment and bar-swing settings;
+the VR menu can still change your preferences and calibrate either pistol hand.
 
 Settings live in `mevr.ini` beside the DLL. An existing
 `%LOCALAPPDATA%\MirrorsEdgeVR\mevr.ini` is also supported; the file beside the DLL

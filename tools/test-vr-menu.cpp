@@ -8,6 +8,35 @@ static std::string ReadTestFile(const wchar_t* path) {
     std::ifstream stream(path,std::ios::binary);
     return std::string(std::istreambuf_iterator<char>(stream),{});
 }
+static void WriteEffectiveSettings(const wchar_t* input) {
+    // Inspect a copy in the test directory, never the live INI or headset cache.
+    assert(!g_headsetCachePath[0]);
+    InitializeCriticalSection(&g_lock);g_lockReady=true;
+    FILE* log=nullptr;_wfopen_s(&log,g_logPath,L"wb");assert(log);fclose(log);
+    assert(CopyFileW(input,g_settingsPath,FALSE));
+    LoadSettings();VrMenuInitializeSettings();
+    assert(MenuAtomicWrite(""));assert(SaveMenuSettings());
+    std::vector<mevr::IniEdit> extra;
+    auto boolean=[&](const char* k,bool b){extra.push_back({k,b?"on":"off"});};
+    auto number=[&](const char* k,float v){char s[48];sprintf_s(s,"%.3g",(double)v);extra.push_back({k,s});};
+    boolean("NativeLensFlareSuppression",g_nativeLensFlareSuppression);boolean("StereoUI",g_stereoUI);
+    boolean("PickupDebug",g_pickupDebug);boolean("ParkourLedgeSnap",g_pkSnapOn);
+    boolean("ParkourCamLeadUp",g_pkCamLeadUpOn);boolean("ParkourCamLeadFwd",g_pkCamLeadFwdOn);
+    boolean("ParkourAskTheGame",g_pkAsk);boolean("ParkourLetGoDrops",g_pkLetGoDrops);
+    number("ParkourLetGoFrames",(float)g_pkLetGoFrames);boolean("ParkourSwipeJump",g_pkSwipeJump);
+    number("ParkourSwipeSpeed",g_pkSwipeSpeed);boolean("ParkourSwingPump",g_pkSwingPump);
+    number("ParkourSwingPumpFull",g_pkPumpFull);number("ParkourSwingPumpSign",g_pkPumpSign);
+    number("ParkourBarWrap",g_pkBarWrap);boolean("ParkourBarShimmy",g_pkBarShimmyOn);
+    number("ParkourBarShimmyFull",g_pkBarShimmyFull);number("ParkourSwingExitBoost",g_pkExitBoost);
+    boolean("ParkourPullUp",g_pkPullUp);number("ParkourPullUpDrop",g_pkPullUpDrop);
+    boolean("ParkourGhostHands",g_pkGhost);number("ParkourGhostAlpha",(float)g_pkGhostAlpha);
+    number("ParkourGhostRadius",g_pkGhostRadius);boolean("ParkourGeomCensus",g_geomCensus);
+    boolean("ParkourLockAnim",g_pkLockAnim);boolean("ParkourDirectBody",g_pkDirectBody);
+    number("TestStall",(float)g_testStallFrame);boolean("TestWideFov",g_targetHalfFovX>0);
+    number("OcclusionMode",(float)g_occlusionMode);boolean("PinMinDesiredFps",g_pinMinDesiredFps);
+    assert(MenuAtomicWrite(mevr::updateIni(ReadTestFile(g_settingsPath),extra)));
+    puts("PASS effective settings snapshot written without launching the game");
+}
 static void ResolutionTests() {
     // No real headset cache is configured in this harness, so auto cannot touch
     // the user's engine INI. Exercise first-run fallback and parser transitions.
@@ -130,7 +159,10 @@ static void IniTests() {
     assert(!g_motionHands&&!g_menuArm&&!g_armSwing&&!g_gripToGrip&&!g_stickJumpTurn);
     MenuRestoreDefaults();
     assert(!g_showReticle);
-    assert(g_gunWristDownDeg[0]==0&&g_gunPositionMm[1][2]==0);
+    assert(g_gunWristDownDeg[0]==40&&g_gunWristDownDeg[1]==40);
+    assert(g_gunWristRightDeg[0]==-10&&g_gunWristRightDeg[1]==-10);
+    assert(g_gunPositionMm[0][1]==40&&g_gunPositionMm[1][1]==0&&g_gunPositionMm[1][2]==0);
+    LoadSettings();assert(g_pkExitBoost==1.5f&&g_pkPumpFull==.15f&&g_pkBarWrap==63.f);
     puts("PASS preferences, all cap roundtrips, gun calibration, atomic failure, comments, defaults");
 }
 static void PauseTests() {
@@ -209,9 +241,12 @@ static void WritePreview(const wchar_t* directory,int page) {
     fwrite(&file,sizeof(file),1,out);fwrite(&info,sizeof(info),1,out);fwrite(g_menuPixels.data(),4,g_menuPixels.size(),out);fclose(out);
 }
 int wmain(int argc,wchar_t** argv) {
-    assert(argc==2);InitializeCriticalSection(&g_padLock);g_padLockReady=true;
+    const bool snapshot=argc==4&&!wcscmp(argv[1],L"--snapshot");
+    assert(argc==2||snapshot);InitializeCriticalSection(&g_padLock);g_padLockReady=true;
     LARGE_INTEGER frequency;QueryPerformanceFrequency(&frequency);g_qpcFreq=(double)frequency.QuadPart;
-    swprintf_s(g_settingsPath,L"%s\\mevr.ini",argv[1]);swprintf_s(g_logPath,L"%s\\mevr.log",argv[1]);
+    const wchar_t* directory=snapshot?argv[3]:argv[1];
+    swprintf_s(g_settingsPath,L"%s\\mevr.ini",directory);swprintf_s(g_logPath,L"%s\\mevr.log",directory);
+    if(snapshot){WriteEffectiveSettings(argv[2]);return 0;}
     VrMenuInitializeSettings();
     assert(g_resAuto&&g_menuResolution=="auto");
     assert(g_motionHands&&g_menuArm&&g_armSwing&&g_armSwingJump&&g_gripToGrip&&g_stickJumpTurn);

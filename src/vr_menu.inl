@@ -354,8 +354,10 @@ static void MenuRestoreDefaults() {
     g_controllerMode=0;g_snapTurning=false;g_smoothTurnSpeed=1;g_snapTurnAngle=45;
     g_gameUiScale=.65f;g_gameUiHeight=0;
     g_showReticle=false;
-    memset(g_gunWristDownDeg,0,sizeof(g_gunWristDownDeg));memset(g_gunWristRightDeg,0,sizeof(g_gunWristRightDeg));
+    g_gunWristDownDeg[0]=g_gunWristDownDeg[1]=40;
+    g_gunWristRightDeg[0]=g_gunWristRightDeg[1]=-10;
     memset(g_gunPositionMm,0,sizeof(g_gunPositionMm));
+    g_gunPositionMm[0][1]=40;
     MenuApplyFeatures();g_menuRestart=true;g_menuPage=4;g_menuRow=0;
     MenuMessage("DEFAULTS SAVED - RESTART TO APPLY ALL SETTINGS");
 }
