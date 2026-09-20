@@ -151,6 +151,12 @@ https://github.com/letsgosportsteam/mirrors-edge-vr-mod/issues
 Attach %LOCALAPPDATA%\MirrorsEdgeVR\mevr.log and include the mod version,
 headset, runtime, controller type, motion settings, and reproduction steps.
 
+With Detailed Logging enabled, mevr.log also records the OpenXR loader,
+32-bit runtime/layer registrations, manifest and DLL checks, and captured
+startup errors. Keep the complete log when VR fails to start. OpenXR errors
+include names and numbers. Restart the game after correcting a startup problem;
+VR initialization is attempted only once per launch.
+
 Full instructions and development notes:
 https://github.com/letsgosportsteam/mirrors-edge-vr-mod
 

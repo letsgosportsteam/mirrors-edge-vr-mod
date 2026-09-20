@@ -656,8 +656,11 @@ static void* PatchVTable(void* obj, int index, void* repl)
 
 // ================================================================ OpenXR (rung 2)
 
+#include "xr_diagnostics.inl"
+
 static bool InitXR()
 {
+    XrStartupDiagnostics diagnostics;
     const char* exts[] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME };
 
     // VirtualDesktopXR is OpenXR 1.0 ONLY and rejects a 1.1 instance with -4. Inherited from
@@ -673,21 +676,27 @@ static bool InitXR()
         ici.enabledExtensionCount = 1;
         ici.enabledExtensionNames  = exts;
         r = xrCreateInstance(&ici, &g_xrInstance);
-        Log("[xr] xrCreateInstance apiVersion=%llu -> %d", (unsigned long long)v, (int)r);
+        Log("[xr] xrCreateInstance API %u.%u.%u -> %s (%d)",
+            (unsigned)XR_VERSION_MAJOR(v), (unsigned)XR_VERSION_MINOR(v), (unsigned)XR_VERSION_PATCH(v),
+            XrResultName(r), (int)r);
         if (XR_SUCCEEDED(r)) break;
     }
     if (XR_FAILED(r)) {
-        Log("[xr] no OpenXR instance. Is the headset connected and Virtual Desktop streaming?");
+        Log("[xr] instance creation failed; see the result and [xr-diag] evidence above");
+        if (r == XR_ERROR_FILE_ACCESS_ERROR)
+            Log("[xr] OpenXR reported a file-access failure; this result alone does not identify the file or component");
         return false;
     }
 
     XrInstanceProperties ip{ XR_TYPE_INSTANCE_PROPERTIES };
     if (XR_SUCCEEDED(xrGetInstanceProperties(g_xrInstance, &ip)))
-        Log("[xr] runtime: %s", ip.runtimeName);
+        Log("[xr] runtime: %s version=%u.%u.%u", ip.runtimeName,
+            (unsigned)XR_VERSION_MAJOR(ip.runtimeVersion), (unsigned)XR_VERSION_MINOR(ip.runtimeVersion),
+            (unsigned)XR_VERSION_PATCH(ip.runtimeVersion));
 
     XrSystemGetInfo sgi{ XR_TYPE_SYSTEM_GET_INFO };
     sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
-    if (XR_FAILED(xrGetSystem(g_xrInstance, &sgi, &g_xrSystem))) { Log("[xr] no HMD"); return false; }
+    if (!XrLogResult("xrGetSystem (HMD)", xrGetSystem(g_xrInstance, &sgi, &g_xrSystem))) return false;
 
     // What the runtime wants per eye. Not used to drive anything yet, but it is the number
     // the finished mod inherits its resolution from, and it already includes whatever
@@ -747,11 +756,11 @@ static bool InitXR()
 
     // The D3D11 device MUST be on the adapter the runtime names, not simply the default one.
     PFN_xrGetD3D11GraphicsRequirementsKHR pfn = nullptr;
-    xrGetInstanceProcAddr(g_xrInstance, "xrGetD3D11GraphicsRequirementsKHR",
-                          (PFN_xrVoidFunction*)&pfn);
+    XrLogResult("xrGetInstanceProcAddr (D3D11 requirements)",
+        xrGetInstanceProcAddr(g_xrInstance, "xrGetD3D11GraphicsRequirementsKHR", (PFN_xrVoidFunction*)&pfn));
     if (!pfn) { Log("[xr] xrGetD3D11GraphicsRequirementsKHR unavailable"); return false; }
     XrGraphicsRequirementsD3D11KHR req{ XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR };
-    if (XR_FAILED(pfn(g_xrInstance, g_xrSystem, &req))) { Log("[xr] graphics requirements failed"); return false; }
+    if (!XrLogResult("xrGetD3D11GraphicsRequirementsKHR", pfn(g_xrInstance, g_xrSystem, &req))) return false;
 
     IDXGIFactory1* fac = nullptr;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&fac))) { Log("[xr] no DXGI factory"); return false; }
@@ -777,21 +786,19 @@ static bool InitXR()
     XrSessionCreateInfo sci{ XR_TYPE_SESSION_CREATE_INFO };
     sci.next = &bind; sci.systemId = g_xrSystem;
     XrResult sr = xrCreateSession(g_xrInstance, &sci, &g_xrSession);
-    if (XR_FAILED(sr)) { Log("[xr] xrCreateSession failed -> %d", (int)sr); return false; }
+    if (!XrLogResult("xrCreateSession", sr)) return false;
 
     XrReferenceSpaceCreateInfo rs{ XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
     rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
     rs.poseInReferenceSpace.orientation.w = 1.0f;
-    if (XR_FAILED(xrCreateReferenceSpace(g_xrSession, &rs, &g_xrSpace))) {
-        Log("[xr] xrCreateReferenceSpace failed"); return false;
-    }
+    if (!XrLogResult("xrCreateReferenceSpace (LOCAL)", xrCreateReferenceSpace(g_xrSession, &rs, &g_xrSpace))) return false;
 
     // A VIEW space located against LOCAL gives the head pose directly. Failing here disables
     // head tracking and nothing else, so it is not treated as fatal.
     XrReferenceSpaceCreateInfo vs{ XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
     vs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     vs.poseInReferenceSpace.orientation.w = 1.0f;
-    if (XR_FAILED(xrCreateReferenceSpace(g_xrSession, &vs, &g_viewSpace))) {
+    if (!XrLogResult("xrCreateReferenceSpace (VIEW)", xrCreateReferenceSpace(g_xrSession, &vs, &g_viewSpace))) {
         g_viewSpace = XR_NULL_HANDLE;
         Log("[xr] VIEW space failed - head tracking unavailable, rendering unaffected");
     }
@@ -2575,6 +2582,11 @@ enum PkHand { PK_HAND_NONE = -1, PK_HAND_L = 0, PK_HAND_R = 1 };
 // trace, the grab-offset watcher, the pkend line and the CanShimmy comparison. A debug flag with
 // no way to set it is worse than no flag, because the gating reads as deliberate.
 bool  g_parkourDebug = true;                // ParkourDebug in mevr.ini
+
+static bool XrDetailedLogging()
+{
+    return g_motionHandsDebug || g_armSwingDebug || g_parkourDebug;
+}
 int   g_pkAnchor = PK_HAND_NONE;            // which hand is holding the world still
 static float g_pkAnchorLat = 0.0f;          // its lateral position when it grabbed, metres
 static float g_pkProgress = 0.0f;           // how far the body has travelled since, metres
@@ -26324,7 +26336,10 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
     // frame-rate numbers taken from here are not comparable with an unmodded run.
     if (!g_xrTried) {
         g_xrTried = true;
-        if (!InitXR()) Log("[xr] VR unavailable this run - continuing as a plain pass-through");
+        if (!InitXR()) {
+            Log("[xr] OpenXR initialization failed; continuing in flat mode");
+            Log("[xr] VR initialization will not retry until the game is restarted");
+        }
     }
     if (g_xrReady) {
         PumpXREvents();

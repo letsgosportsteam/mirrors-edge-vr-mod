@@ -207,6 +207,12 @@ is separate: hand, arm-swing and parkour logging stay enabled.
 `%LOCALAPPDATA%\MirrorsEdgeVR\mevr.log`. Include the mod version, headset, runtime,
 controller type, enabled motion features, and the level or action that reproduces it.
 
+With Detailed Logging enabled, startup diagnostics also record the OpenXR loader,
+32-bit runtime/layer registrations, manifest and DLL checks, and captured startup
+errors in `mevr.log`. Keep the complete log when VR fails to start. OpenXR errors
+include their names as well as numbers; a failed initialization requires a game
+restart before VR can be tried again.
+
 ## Building
 
 Requires Windows, Visual Studio with the C++ x86 toolset, and the
